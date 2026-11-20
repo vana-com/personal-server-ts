@@ -1,0 +1,149 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 31 and seed 7796517403909397592 with 4 workers on 24 cores with 1917MB heap and 64MB offheap memory [pid: 1375936] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file RegistryDelta.tla
+Parsing file Naturals.tla
+Parsing file FiniteSets.tla
+Parsing file TLC.tla
+Parsing file Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RegistryDelta
+Starting... (2026-11-17 05:51:28)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-17 05:51:28.
+Error: Invariant SettledHasNoDebt is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 0
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "idle"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+/\ debt = 0
+
+State 2: <Delta line 177, col 3 to line 191, col 96 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 0
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "applying"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+/\ debt = 0
+
+State 3: <ApplyDelta line 196, col 3 to line 200, col 39 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 0
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "settling"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+/\ debt = 2
+
+State 4: <PublishDebt line 213, col 3 to line 216, col 60 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 0
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "settling"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+/\ debt = 1
+
+State 5: <DeferPublication line 222, col 3 to line 225, col 58 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 0
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "checking"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+/\ debt = 1
+
+State 6: <SettleDelta line 203, col 3 to line 208, col 51 of module RegistryDelta>
+/\ txn = ( w1 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] @@
+  w2 :> [phase |-> "idle", scope |-> "log", op |-> "app", seq |-> 0] )
+/\ chg = [ctl |-> 0, log |-> 0]
+/\ floor = 0
+/\ txns = 0
+/\ rcursor = 0
+/\ floored = FALSE
+/\ counter = 0
+/\ view = [ctl |-> 0, log |-> 0]
+/\ lock = NoWriter
+/\ kind = [ctl |-> "act", log |-> "app"]
+/\ hist = {}
+/\ ver = [ctl |-> 0, log |-> 0]
+/\ rkind = "act"
+/\ rphase = "idle"
+/\ nextSeq = 1
+/\ rbuf = [view |-> [ctl |-> 0, log |-> 0], rkind |-> "act", handoff |-> FALSE]
+/\ since = 0
+/\ debt = 1
+
+18218 states generated, 6357 distinct states found, 4134 states left on queue.
+The depth of the complete state graph search is 8.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 7).
+Finished in 01s at (2026-11-17 05:51:28)
+exit 12

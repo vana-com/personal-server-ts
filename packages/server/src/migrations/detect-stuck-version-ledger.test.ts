@@ -7,6 +7,7 @@ import {
   findStuckScopes,
   detectStuckVersionLedger,
 } from "./detect-stuck-version-ledger.js";
+import { HOLD_FOR_TESTS } from "@opendatalabs/personal-server-ts-core/test-utils";
 
 function countRows(db: Database.Database, scope: string): number {
   return (
@@ -26,7 +27,7 @@ describe("detect-stuck-version-ledger", () => {
     opts: { version: number; dataPointId?: string | null },
   ): void {
     path += 1;
-    index.insert({
+    index.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: `${scope}/${path}.json`,
       scope,

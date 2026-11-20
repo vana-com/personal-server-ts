@@ -1,3 +1,8 @@
+export type {
+  PublicationReceipt,
+  ViewChange,
+  ViewChangeListener,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 export {
   createIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntime,
@@ -6,6 +11,8 @@ export {
 
 export {
   startPersonalServer,
+  type PersonalServerLiteHandle,
+  type PersonalServerLitePublicationResult,
   type StartPersonalServerLiteOptions,
   type StartPersonalServerLiteRelayOptions,
 } from "./client.js";
@@ -79,10 +86,17 @@ export {
 export {
   createPsLitePendingBlobDeletionStore,
   createPsLiteSyncCursor,
+  createPsLiteUploadAttemptStore,
   createPsLiteSyncManager,
   type PsLiteSyncOptions,
   type PsLiteOwnerSyncSigner,
 } from "./sync.js";
+
+export {
+  openLiteLocalDb,
+  type LiteLocalDbOptions,
+  type LiteSqlDriverFactory,
+} from "./localdb-port.js";
 
 export {
   resolvePsLiteOwner,
@@ -106,6 +120,7 @@ export {
   type PsLiteReadAuthInput,
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
+  type PsLiteActivitySource,
   type PsLiteStorageAdapter,
   type PsLiteTokenStore,
   type PsLiteWriteSessionAuthOptions,
@@ -266,3 +281,5 @@ export {
 } from "./oura-import.js";
 
 export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";
+
+export type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";

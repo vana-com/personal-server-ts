@@ -1,0 +1,191 @@
+/**
+ * A run that ends with rows wakes the sync manager, so publish starts at once
+ * and does not wait for the notify debounce or the 60 s poll.
+ *
+ * Real Node composition: HTTP intake, real SQLite, the real sync manager. Only
+ * the registration check is stubbed (it asks the gateway) and the registry post
+ * is the fixture's. The poll interval is the manager's default; the test never
+ * advances time that far.
+ */
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { privateKeyToAccount } from "viem/accounts";
+import { afterEach, expect, it, vi } from "vitest";
+import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { createMemoryModeRecordStore } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
+import { endRequest } from "@opendatalabs/personal-server-ts-core/test-utils";
+import type * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
+import { createStreamSyncKeyPorts } from "../../core/src/stream-sync/crypto.js";
+import { remoteFixture } from "./localdb/apply-fixture.test-utils.js";
+import { createServer, type ServerContext } from "./bootstrap.js";
+
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/sync",
+  async (importOriginal) => {
+    const actual = await importOriginal<typeof SyncModule>();
+    return {
+      ...actual,
+      createSyncManager: (
+        ...args: Parameters<typeof actual.createSyncManager>
+      ) =>
+        actual.createSyncManager(args[0], args[1], {
+          ...args[2],
+          canSync: () => ({ ok: true }),
+        }),
+    };
+  },
+);
+
+const contexts: ServerContext[] = [];
+const directories: string[] = [];
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const context of contexts.splice(0)) await context.cleanup();
+  for (const directory of directories.splice(0))
+    await rm(directory, { recursive: true, force: true });
+  vi.unstubAllEnvs();
+});
+
+const POLL_MS = 60_000;
+const headers = { Authorization: "Bearer publish-wake-fixture" };
+
+async function world() {
+  const root = await mkdtemp(join(tmpdir(), "publish-wake-"));
+  directories.push(root);
+  const declaration = JSON.stringify({
+    source_id: "https://example.test/fixture-source",
+    source_kind: "connector",
+    version: "1",
+    streams: [
+      {
+        name: "items",
+        fields: ["id"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+      },
+    ],
+  });
+  const manifest = JSON.stringify({
+    connector_key: "fixture-source",
+    version: "1",
+    streams: [
+      {
+        name: "items",
+        semantics: "mutable_state",
+        primary_key: ["id"],
+        coverage_strategy: "full_inventory",
+      },
+    ],
+  });
+  await writeFile(join(root, "declaration.json"), declaration);
+  await writeFile(join(root, "manifest.json"), manifest);
+  const digest = createHash("sha256").update(manifest).digest("hex");
+  const signature = await privateKeyToAccount(
+    `0x${"11".repeat(32)}`,
+  ).signMessage({ message: "Disposable publish wake fixture" });
+  const remote = await remoteFixture(createStreamSyncKeyPorts(signature));
+  // The publish is one batch commit: count those.
+  const post = vi.fn(remote.registry.postBatch!.bind(remote.registry));
+  remote.registry.postBatch = post;
+  vi.stubEnv("PS_ACCESS_TOKEN", "publish-wake-fixture");
+  vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
+  const context = await createServer(
+    ServerConfigSchema.parse({
+      tunnel: { enabled: false },
+      sync: { enabled: true },
+      logging: { level: "fatal", pretty: false },
+      pdpp: {
+        enabled: true,
+        declarationPaths: [join(root, "declaration.json")],
+        methods: [
+          {
+            method_id: "fixture-source",
+            declaration_path: join(root, "declaration.json"),
+            manifest_path: join(root, "manifest.json"),
+            manifest_sha256: digest,
+          },
+        ],
+      },
+    }),
+    {
+      rootPath: root,
+      ownerSignature: signature,
+      accountModeStore: createMemoryModeRecordStore(),
+      streamSyncRegistry: remote.registry,
+      streamSyncBlobs: remote.storage,
+    },
+  );
+  contexts.push(context);
+  await context.accountModeAuthority.submitEvidence({
+    owner: context.serverOwner!,
+    state: "on",
+  });
+  const send = (path: string, method: string, value: unknown) =>
+    context.app.request(path, {
+      method,
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    });
+  const intake = (
+    run: string,
+    id: string,
+    outcome: "succeeded" | "failed",
+  ) => ({
+    async finish() {
+      const base = `/v1/stream-sync/runs/${run}`;
+      const begin = await send(base, "PUT", {
+        connector: "fixture-source",
+        artifactDigest: digest,
+        join: true,
+        owner: { address: context.serverOwner!, leaseId: null },
+        wantFull: true,
+        observedAt: Date.now(),
+      });
+      expect(begin.status).toBe(200);
+      const batch = await send(`${base}/batches`, "POST", {
+        batch: 0,
+        records: [{ stream: "items", data: { id } }],
+      });
+      expect(batch.status).toBe(200);
+      // A failed run: the connector skipped its one stream.
+      return send(
+        `${base}/end`,
+        "POST",
+        outcome === "succeeded"
+          ? endRequest({
+              lastBatch: 0,
+              live: ["items"],
+              provenFullStreams: ["items"],
+            })
+          : endRequest({ lastBatch: 0, live: ["items"], skipped: ["items"] }),
+      );
+    },
+  });
+  return { context, post, intake };
+}
+
+it("publishes as the run ends, not after the notify debounce or the next poll", async () => {
+  const { context, post, intake } = await world();
+  const local = await context.getLocalSync!();
+  const cycle = vi.spyOn(local, "cycle");
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+  const end = await intake("wake", "item-1", "succeeded").finish();
+  expect(end.status).toBe(200);
+  expect(await end.json()).toMatchObject({ result: "queued" });
+
+  // The cycle starts when the run commits: well inside the 500 ms debounce
+  // (the wait steps the faked clock by 50 ms, so a debounce would show).
+  await vi.waitFor(() => expect(cycle).toHaveBeenCalledTimes(1), {
+    timeout: 300,
+    interval: 50,
+  });
+  await cycle.mock.results[0]!.value;
+  expect(post).toHaveBeenCalledTimes(1);
+  // The 500 ms debounce is not owed afterwards either.
+  await vi.advanceTimersByTimeAsync(600);
+  expect(POLL_MS).toBeGreaterThan(600);
+  expect(cycle).toHaveBeenCalledTimes(1);
+});

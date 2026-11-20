@@ -2,16 +2,16 @@
 
 This harness collects canonical records and blob bytes on device A, replicates them through the dev Gateway, storage service and finalized Moksha registry to device B, then drives the real authorization and resource HTTP routes. It generates a new random owner and server signers for each run. It never loads existing accounts, environment files or personal server configuration.
 
-Use Linux, Node 22 and this checkout's existing dependencies:
+Use Linux, Node 22 and this checkout's existing dependencies. `WORK_DIR` is a disk-backed work directory of your choice.
 
 ```sh
-export TMPDIR="$HOME/.tmp"
+export TMPDIR="$WORK_DIR"
 ./node_modules/.bin/tsc --build packages/core packages/server scripts
 ./node_modules/.bin/vitest run \
   packages/server/src/pdpp/replica-authorization.test.ts \
   scripts/pdpp-replica-consent-live-journey.test.ts
 ./node_modules/.bin/tsx scripts/pdpp-replica-consent-live-journey.ts \
-  "$HOME/.tmp/replica-consent.json"
+  "$WORK_DIR/replica-consent.json"
 ```
 
 The issuer holds the grant, authorization code, token and revocation state in its own SQLite database. B holds canonical replicated records and blob bytes. On every application request, B authenticates to that issuer's existing introspection endpoint using an explicitly provisioned source-scoped owner credential. B validates the issuer's complete v0.2 grant and maps its handles through the trusted local owner/source/connection registry. A missing mapping, ambiguous mapping, different owner, unavailable issuer, invalid credential or inactive token denies access. No positive authorization cache or second issuer is created.

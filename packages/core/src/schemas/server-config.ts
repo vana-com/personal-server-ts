@@ -51,6 +51,30 @@ export const DEFAULTS = {
     enabled: false,
     lastProcessedTimestamp: null,
   },
+  streamSync: {
+    // There is no write or read key: whether this server writes and reads
+    // through stream sync is the account-mode authority's answer (see
+    // `sync/account-mode`), not a setting. A saved config that still names
+    // either key parses and the key is dropped.
+    // Off by default. When true, the old legacy files, a one-time seed, are
+    // removed after this server's own import of them finishes, for a switched
+    // owner. When false the same step only reads them back and reports.
+    retireLegacy: false,
+    // Period of the registry change probe, in milliseconds: one cheap read of
+    // "did anything change?" that starts a sync cycle early. 0 turns it off.
+    // See DEFAULT_CHANGE_PROBE_MS for why 5000.
+    changeProbeMs: 5_000,
+    // The gateway tells this server when the registry changed (a held request
+    // answered on a write), so a save on another device is pulled at once.
+    // The probe above stays as the fallback and rests while that push is
+    // healthy and its answers carry a position. false: probe only.
+    changePush: true,
+    // Off by default. When true, an owner read of a stream that has no complete
+    // head yet serves the parts applied so far, marked partial, and a reader
+    // fills in as parts apply. When false, a stream is readable only when its
+    // head is complete, as before.
+    progressiveFirstLoad: false,
+  },
   replication: {
     // Off by default. When false, no replica code runs and no replica
     // schema is created. When true, the record store is built with the
@@ -92,7 +116,18 @@ export const DEFAULTS = {
     declarationPaths: [] as Array<string | { path: string; sha256: string }>,
     // At most one acquisition method may write each retained source. The
     // declaration path ties an artifact method id to the source it produces.
-    methods: [] as Array<{ method_id: string; declaration_path: string }>,
+    //
+    // A method may also pin the connector's signed manifest document
+    // (`manifest_path` plus the sha256 of its exact bytes). The stream-sync
+    // run intake resolves a run's artifact digest only to a manifest pinned
+    // this way, and takes the connector key from the manifest's own
+    // `connector_key`, which must equal `method_id` (the signed pin id).
+    methods: [] as Array<{
+      method_id: string;
+      declaration_path: string;
+      manifest_path?: string;
+      manifest_sha256?: string;
+    }>,
     optInMethods: [] as string[],
     // Per-source connection methods are independent of canonical record
     // declarations. They let Desktop manage account handles while canonical
@@ -216,6 +251,20 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.sync.lastProcessedTimestamp),
     })
     .default(DEFAULTS.sync),
+  streamSync: z
+    .object({
+      retireLegacy: z.boolean().default(DEFAULTS.streamSync.retireLegacy),
+      changeProbeMs: z
+        .number()
+        .int()
+        .min(0)
+        .default(DEFAULTS.streamSync.changeProbeMs),
+      changePush: z.boolean().default(DEFAULTS.streamSync.changePush),
+      progressiveFirstLoad: z
+        .boolean()
+        .default(DEFAULTS.streamSync.progressiveFirstLoad),
+    })
+    .default(DEFAULTS.streamSync),
   replication: z
     .object({
       enabled: z.boolean().default(DEFAULTS.replication.enabled),
@@ -287,6 +336,11 @@ export const ServerConfigSchema = z.object({
           z.object({
             method_id: z.string().min(1),
             declaration_path: z.string().min(1),
+            manifest_path: z.string().min(1).optional(),
+            manifest_sha256: z
+              .string()
+              .regex(/^[0-9a-f]{64}$/, "lowercase hex sha256")
+              .optional(),
           }),
         )
         .default(DEFAULTS.pdpp.methods),

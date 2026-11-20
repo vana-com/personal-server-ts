@@ -17,6 +17,9 @@ export type PdppErrorType =
   | "api_error";
 
 export type PdppErrorCode =
+  | "ACCOUNT_MODE_UNKNOWN"
+  | "STREAM_READ_UNAVAILABLE"
+  | "STREAM_HISTORY_UNAVAILABLE"
   | "invalid_cursor"
   | "invalid_request"
   | "invalid_expand"
@@ -40,6 +43,9 @@ export type PdppErrorCode =
   | "api_error";
 
 const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
+  ACCOUNT_MODE_UNKNOWN: 503,
+  STREAM_READ_UNAVAILABLE: 503,
+  STREAM_HISTORY_UNAVAILABLE: 503,
   invalid_cursor: 400,
   invalid_request: 400,
   invalid_expand: 400,
@@ -64,6 +70,9 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
 };
 
 const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
+  ACCOUNT_MODE_UNKNOWN: "api_error",
+  STREAM_READ_UNAVAILABLE: "api_error",
+  STREAM_HISTORY_UNAVAILABLE: "api_error",
   invalid_cursor: "invalid_request_error",
   invalid_request: "invalid_request_error",
   invalid_expand: "invalid_request_error",

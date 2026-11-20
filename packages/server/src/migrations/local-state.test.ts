@@ -6,6 +6,7 @@ import { migrateLocalState } from "./local-state.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { DETECT_STUCK_VERSION_LEDGER_ID } from "./detect-stuck-version-ledger.js";
+import { HOLD_FOR_TESTS } from "@opendatalabs/personal-server-ts-core/test-utils";
 
 describe("migrateLocalState", () => {
   let tempDir: string;
@@ -129,7 +130,7 @@ describe("migrateLocalState", () => {
     // Seed a stuck scope: two pending (unsynced) rows.
     const db = initializeDatabase(join(storageRoot, "index.db"));
     const index = createIndexManager(db);
-    index.insert({
+    index.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "spotify.savedTracks/1.json",
       scope: "spotify.savedTracks",
@@ -137,7 +138,7 @@ describe("migrateLocalState", () => {
       sizeBytes: 10,
       version: 4,
     });
-    index.insert({
+    index.insert(HOLD_FOR_TESTS, {
       fileId: null,
       path: "spotify.savedTracks/2.json",
       scope: "spotify.savedTracks",

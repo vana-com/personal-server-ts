@@ -1,0 +1,262 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { applyConnection } from "../../../core/src/localdb/apply.js";
+import {
+  bootstrapConnections,
+  knownActiveConnections,
+  newConnectionsWithStreams,
+} from "../../../core/src/localdb/bootstrap.js";
+import { runCycle, syncConnection } from "../../../core/src/localdb/cycle.js";
+import type {
+  ConnectionRow,
+  LocalSyncDeps,
+} from "../../../core/src/localdb/deps.js";
+import { publishLog } from "../../../core/src/localdb/log-publish.js";
+import { connectionQueue } from "../../../core/src/localdb/queue.js";
+
+vi.mock("../../../core/src/localdb/bootstrap.js", () => ({
+  bootstrapConnections: vi.fn(),
+  knownActiveConnections: vi.fn(),
+  newConnectionsWithStreams: vi.fn(),
+}));
+vi.mock("../../../core/src/localdb/apply.js", () => ({
+  applyConnection: vi.fn(),
+}));
+vi.mock("../../../core/src/localdb/log-publish.js", () => ({
+  publishLog: vi.fn(),
+}));
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+const connection = (connectionId: string): ConnectionRow => ({
+  connectionId,
+  connector: connectionId,
+  ns: "",
+  generation: 1,
+  controlState: "active",
+  controlVersion: 1,
+});
+const published = (id: string) => [
+  { stream: id, outcome: "published" as const, watermark: 1 },
+];
+// The mocked siblings only need the real queue, not database or network ports.
+// The cycle's one listing of the owner; the mocked siblings only pass it on.
+const LISTED: readonly never[] = [];
+const dependencies = () =>
+  ({
+    queue: connectionQueue(),
+    registry: { listOwnerRows: async () => LISTED },
+    logger: { info: vi.fn(), warn: vi.fn() },
+  }) as unknown as LocalSyncDeps;
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  // No connection here is known to the device before the listing.
+  vi.mocked(knownActiveConnections).mockResolvedValue([]);
+  vi.mocked(newConnectionsWithStreams).mockResolvedValue([]);
+});
+
+describe("local database cycle", () => {
+  it.each([[], ["missing"]])(
+    "avoids registry calls when no scoped connection is held: %j",
+    async (connections) => {
+      const deps = dependencies();
+      deps.db = {
+        query: vi.fn().mockResolvedValue([]),
+      } as unknown as LocalSyncDeps["db"];
+      const list = vi.spyOn(deps.registry, "listOwnerRows");
+      expect(await runCycle(deps, { connections })).toEqual({
+        connections: [],
+      });
+      expect(list).not.toHaveBeenCalled();
+      expect(publishLog).not.toHaveBeenCalled();
+      expect(applyConnection).not.toHaveBeenCalled();
+    },
+  );
+
+  it("lists first and applies before publishing each queued connection", async () => {
+    const deps = dependencies();
+    const events: string[] = [];
+    const listingStarted = deferred();
+    const listingReady = deferred();
+    const priorStarted = deferred();
+    const priorReady = deferred();
+    const applyStarted = deferred();
+    const applyReady = deferred();
+    const otherPublished = deferred();
+    const prior = deps.queue.run("first", "end", async () => {
+      priorStarted.resolve();
+      await priorReady.promise;
+    });
+    await priorStarted.promise;
+    vi.mocked(bootstrapConnections).mockImplementation(async () => {
+      events.push("listing:start");
+      listingStarted.resolve();
+      await listingReady.promise;
+      events.push("listing:end");
+      return [connection("first"), connection("second")];
+    });
+    vi.mocked(applyConnection).mockImplementation((queued, id) =>
+      queued.queue.run(id, "apply", async () => {
+        events.push(`apply:${id}:start`);
+        if (id === "first") {
+          applyStarted.resolve();
+          await applyReady.promise;
+        }
+        events.push(`apply:${id}:end`);
+      }),
+    );
+    vi.mocked(publishLog).mockImplementation((queued, id) =>
+      queued.queue.run(id, "publish", async () => {
+        events.push(`publish:${id}`);
+        if (id === "second") otherPublished.resolve();
+        return published(id);
+      }),
+    );
+
+    const cycle = runCycle(deps);
+    await listingStarted.promise;
+    expect(events).toEqual(["listing:start"]);
+    expect(applyConnection).not.toHaveBeenCalled();
+    expect(publishLog).not.toHaveBeenCalled();
+    listingReady.resolve();
+    await otherPublished.promise;
+    // One connection's existing operation does not hold up the other.
+    expect(events).toEqual([
+      "listing:start",
+      "listing:end",
+      "apply:second:start",
+      "apply:second:end",
+      "publish:second",
+    ]);
+    priorReady.resolve();
+    await applyStarted.promise;
+    const next = deps.queue.run("first", "end", async () => {
+      events.push("next:first");
+    });
+    expect(events).not.toContain("publish:first");
+    applyReady.resolve();
+    const report = await cycle;
+    await Promise.all([prior, next]);
+    // Apply keeps its slot. Publish takes its own slots afterwards, so an
+    // operation queued during apply (a run's begin) runs before it rather
+    // than behind the whole publish.
+    expect(events.slice(-4)).toEqual([
+      "apply:first:start",
+      "apply:first:end",
+      "next:first",
+      "publish:first",
+    ]);
+    expect(report.connections).toEqual(
+      ["first", "second"].map((id) => ({
+        connectionId: id,
+        published: published(id),
+        error: null,
+      })),
+    );
+
+    events.length = 0;
+    await syncConnection(deps, "direct");
+    expect(events).toEqual([
+      "apply:direct:start",
+      "apply:direct:end",
+      "publish:direct",
+    ]);
+    expect(bootstrapConnections).toHaveBeenCalledTimes(1);
+    expect(bootstrapConnections).toHaveBeenCalledWith(deps, LISTED);
+  });
+
+  it("reports a connection's failure without stopping the other connections", async () => {
+    const deps = dependencies();
+    vi.mocked(bootstrapConnections).mockResolvedValue(
+      ["apply-fails", "publish-fails", "succeeds"].map(connection),
+    );
+    vi.mocked(applyConnection).mockImplementation(async (_deps, id) => {
+      if (id === "apply-fails") throw new Error("apply failed");
+    });
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
+      if (id === "publish-fails") throw "publish failed";
+      return published(id);
+    });
+
+    expect(await runCycle(deps)).toEqual({
+      connections: [
+        {
+          connectionId: "apply-fails",
+          published: [],
+          error: "apply failed",
+        },
+        {
+          connectionId: "publish-fails",
+          published: [],
+          error: "publish failed",
+        },
+        {
+          connectionId: "succeeds",
+          published: published("succeeds"),
+          error: null,
+        },
+      ],
+    });
+    expect(vi.mocked(publishLog).mock.calls.map(([, id]) => id)).toEqual([
+      "publish-fails",
+      "succeeds",
+    ]);
+    // The failure is logged, not only returned: the timer drops the report.
+    expect(vi.mocked(deps.logger.warn).mock.calls).toEqual([
+      [
+        { connectionId: "apply-fails", error: "apply failed" },
+        "Stream sync cycle failed for a connection",
+      ],
+      [
+        { connectionId: "publish-fails", error: "publish failed" },
+        "Stream sync cycle failed for a connection",
+      ],
+    ]);
+  });
+
+  it("publishes the other connections while one is still failing", async () => {
+    const deps = dependencies();
+    vi.mocked(bootstrapConnections).mockResolvedValue(
+      ["slow-failure", "healthy"].map(connection),
+    );
+    vi.mocked(applyConnection).mockResolvedValue(undefined);
+    const healthyPublished = deferred();
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
+      if (id === "healthy") {
+        healthyPublished.resolve();
+        return published(id);
+      }
+      // Storage keeps refusing this connection's reads; it fails late.
+      await healthyPublished.promise;
+      throw new Error(
+        "vana-storage download failed: 500 Internal Server Error",
+      );
+    });
+
+    const report = await runCycle(deps);
+
+    expect(report.connections).toEqual([
+      expect.objectContaining({
+        connectionId: "slow-failure",
+        published: [],
+        error: "vana-storage download failed: 500 Internal Server Error",
+      }),
+      expect.objectContaining({
+        connectionId: "healthy",
+        published: published("healthy"),
+        error: null,
+      }),
+    ]);
+    // The healthy connection published before the failing one gave up.
+    expect(vi.mocked(publishLog).mock.calls.map(([, id]) => id)).toEqual([
+      "slow-failure",
+      "healthy",
+    ]);
+  });
+});

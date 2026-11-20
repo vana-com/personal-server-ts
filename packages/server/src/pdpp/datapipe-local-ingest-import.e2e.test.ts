@@ -59,6 +59,8 @@ import {
   type PdppImporter,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import {
+  fixedLegacyWriteSeal,
+  fixedOwnedAccountStorageMode,
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
@@ -163,6 +165,7 @@ function buildImporter(store: PdppRecordStore): PdppImporter {
   expect(document).toBe(DECLARATION_DOCUMENT);
 
   return createPdppImporter({
+    legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
     store,
     declarations: [
       {
@@ -212,6 +215,8 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     };
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -373,6 +378,8 @@ describe("local POST /v1/data/:scope -> PDPP import -> scoped read", () => {
     const indexDb = initializeDatabase(":memory:");
     const indexManager = createIndexManager(indexDb);
     const bare = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions: { dataDir },
       logger,

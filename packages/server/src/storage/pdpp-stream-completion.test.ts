@@ -576,14 +576,8 @@ describe("stream completion over the real SQLite record store", () => {
       expectRefusedWithoutChange(attempt(override), { reason });
     });
 
-    it("refuses a stale generation after reset and a deleted connection", () => {
-      store.resetInstanceBinding({
-        instance: INSTANCE,
-        expectedMethod: METHOD,
-        expectedGeneration: 1,
-        nextMethod: METHOD,
-      });
-      expectRefusedWithoutChange(attempt({}), {
+    it("refuses a foreign generation and a deleted connection", () => {
+      expectRefusedWithoutChange(attempt({ generation: 2 }), {
         reason: "binding_generation_mismatch",
       });
       store.deleteConnection(INSTANCE);
@@ -904,14 +898,9 @@ describe("stream completion over the real SQLite record store", () => {
       expect(receipts()).toEqual([]);
     });
 
-    it("reset erases the receipts of that connection only", () => {
+    it("connection delete erases the receipts of that connection only", () => {
       complete([proof("messages", 0, EMPTY_MESSAGES_SHA)]);
-      store.resetInstanceBinding({
-        instance: INSTANCE,
-        expectedMethod: METHOD,
-        expectedGeneration: 1,
-        nextMethod: METHOD,
-      });
+      store.deleteConnection(INSTANCE);
       expect(receipts()).toEqual([]);
     });
   });

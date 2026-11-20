@@ -19,7 +19,8 @@ import {
   openPdppAuthStore,
   PdppTokenService,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import type { ServerContext } from "./bootstrap.js";
+import { createUnswitchedServer as createServer } from "./account-mode/unswitched-server.test-utils.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =

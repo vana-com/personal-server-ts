@@ -328,6 +328,47 @@ function checkReplicaProfile(packets: readonly unknown[]) {
     throw new ReplicaObjectRefused("profile");
 }
 
+type IteratedS2k = {
+  salt: Uint8Array;
+  getCount(): number;
+  produceKey(passphrase: string, numBytes: number): Promise<Uint8Array>;
+};
+
+/**
+ * Every blob carries its own random 8-byte salt, so each one needs its own
+ * derivation: nothing repeats across blobs and nothing can be shared. What
+ * can move is the hashing. OpenPGP.js hashes the 16 MiB iterated-S2K input
+ * in JavaScript on the calling thread; WebCrypto hashes it natively, off that
+ * thread. This computes RFC 4880 §3.7.1.3 for SHA-256 (one digest, so up to
+ * 32 key bytes) and leaves OpenPGP.js's own derivation in place where
+ * WebCrypto or that size is unavailable. `checkReplicaProfile` has already
+ * proved the packet is iterated SHA-256.
+ */
+function hashS2kOnWebCrypto(session: SymEncryptedSessionKeyPacket) {
+  const s2k = (session as unknown as { s2k: IteratedS2k }).s2k;
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) return;
+  const jsProduceKey = s2k.produceKey.bind(s2k);
+  s2k.produceKey = async (passphrase, numBytes) => {
+    if (numBytes > 32) return jsProduceKey(passphrase, numBytes);
+    const data = new Uint8Array([
+      ...s2k.salt,
+      ...new TextEncoder().encode(passphrase),
+    ]);
+    const count = Math.max(s2k.getCount(), data.length);
+    const toHash = new Uint8Array(count);
+    toHash.set(data);
+    for (
+      let pos = data.length, len = data.length;
+      pos < count;
+      pos += len, len *= 2
+    )
+      toHash.copyWithin(pos, 0, pos);
+    const digest = await subtle.digest("SHA-256", toHash);
+    return new Uint8Array(digest, 0, numBytes);
+  };
+}
+
 /**
  * The SDK's password decryption inside the writers' profile, refusing
  * compression before it inflates anything. OpenPGP 6.3 constructs the allowed
@@ -351,6 +392,7 @@ async function decryptUncompressed(encrypted: Uint8Array, password: string) {
   try {
     const message = await readMessage({ binaryMessage: encrypted, config });
     checkReplicaProfile(message.packets);
+    hashS2kOnWebCrypto(message.packets[0] as SymEncryptedSessionKeyPacket);
     const { data } = await decrypt({
       message,
       passwords: [password],

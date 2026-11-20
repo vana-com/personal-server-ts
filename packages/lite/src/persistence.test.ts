@@ -12,10 +12,11 @@
  * record shape + plaintext-at-rest behavior are preserved.
  */
 
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import forge from "node-forge";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
-import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
+import { signOwnerMasterKey } from "@opendatalabs/personal-server-ts-core/keys";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   assertCompletePsLitePersistenceBundle,
@@ -50,9 +51,7 @@ const SERVER_OWNER = ownerAccount.address;
 let OWNER_SIGNATURE: `0x${string}`;
 
 beforeAll(async () => {
-  OWNER_SIGNATURE = await ownerAccount.signMessage({
-    message: buildPersonalServerLiteOwnerBindingMessage(SERVER_OWNER),
-  });
+  OWNER_SIGNATURE = await signOwnerMasterKey(ownerAccount);
 });
 
 function ownerAuth() {
@@ -99,6 +98,7 @@ async function runtimeOverBundle(
 ) {
   const { config: configDefaults, ...runtimeOverrides } = options;
   return createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...(await psLitePersistenceRuntimeOptions(bundle, configDefaults)),
     auth: ownerAuth(),
     gateway: createMockPsLiteGateway(),
@@ -197,6 +197,24 @@ describe("PS Lite persistence bundle — injected state + data continuity", () =
       status: "healthy",
       runtime: "ps-lite",
     });
+  });
+
+  it("hands the host the built runtime's view-change and sync-status subscriptions", async () => {
+    // A host (Web) learns that data changed from these. A handle that drops
+    // them leaves the host re-listing on a timer, which is a wait of up to a
+    // whole timer period after the data already arrived.
+    const server = await startServerOverBundle(memoryBundle(), {
+      relay: false,
+    });
+    try {
+      expect(typeof server.subscribeViewChanges).toBe("function");
+      expect(typeof server.subscribeSyncStatus).toBe("function");
+      const stop = server.subscribeViewChanges!(() => {});
+      expect(typeof stop).toBe("function");
+      stop();
+    } finally {
+      await server.stop();
+    }
   });
 
   it("persists data + access logs through injected stores across a runtime restart", async () => {

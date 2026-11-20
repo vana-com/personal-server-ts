@@ -610,28 +610,6 @@ describe("strava legacy scopes over the real SQLite record store", () => {
       ]);
     });
 
-    it("starts a fresh order after a reset", async () => {
-      const a = connect("conn_a");
-      ingest(
-        "conn_a",
-        arrival.map((id) => activity(id)),
-      );
-      store.resetInstanceBinding({
-        instance: "conn_a",
-        expectedMethod: METHOD,
-        expectedGeneration: 1,
-        nextMethod: METHOD,
-      });
-
-      ingest("conn_a", [activity("3"), activity("100"), activity("9")], {
-        generation: 2,
-      });
-
-      const result = await read("strava.activities", a);
-      expect(ids(result)).toEqual(["3", "100", "9"]);
-      expect(result).toMatchObject({ ok: true, complete: true });
-    });
-
     it("keeps each account's order apart", async () => {
       const a = connect("conn_a");
       const b = connect("conn_b");

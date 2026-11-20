@@ -1,0 +1,618 @@
+{
+  "owner chatgpt.conversations": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 3255,
+    "sha256": "fdca5202072eac7b6f0a691b6b199763595f1619ff83df964377ff339e3f81f0"
+  },
+  "builder chatgpt.conversations": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 3255,
+    "sha256": "fdca5202072eac7b6f0a691b6b199763595f1619ff83df964377ff339e3f81f0"
+  },
+  "owner chatgpt.memories": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 256,
+    "sha256": "81c07252e6043fcc5ba2641fb8253a150e1e03fca22beace539f90df232c4fc2"
+  },
+  "builder chatgpt.memories": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 256,
+    "sha256": "81c07252e6043fcc5ba2641fb8253a150e1e03fca22beace539f90df232c4fc2"
+  },
+  "owner claude.conversations": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 4350,
+    "sha256": "ac060ceb6800efc96d40a60082ab423bd13b14819165283a783ea43ff1146770"
+  },
+  "builder claude.conversations": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 4350,
+    "sha256": "ac060ceb6800efc96d40a60082ab423bd13b14819165283a783ea43ff1146770"
+  },
+  "owner claude.projects": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 2544,
+    "sha256": "1c881699ddf21bb4ce852f03abcf5b3e7895e4b7016757cfe6e8245c4dc79465"
+  },
+  "builder claude.projects": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 2544,
+    "sha256": "1c881699ddf21bb4ce852f03abcf5b3e7895e4b7016757cfe6e8245c4dc79465"
+  },
+  "owner github.events": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 590,
+    "sha256": "af9ab97a7cb1f9225231a6420ecd32a7c9cbdaeebf8385548a23e67505dfb46a"
+  },
+  "builder github.events": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 590,
+    "sha256": "af9ab97a7cb1f9225231a6420ecd32a7c9cbdaeebf8385548a23e67505dfb46a"
+  },
+  "owner github.history": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 801,
+    "sha256": "c87d484233def3455ffb012330f268cb480344b7b686e72d17fc2c85df7685b5"
+  },
+  "builder github.history": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 801,
+    "sha256": "c87d484233def3455ffb012330f268cb480344b7b686e72d17fc2c85df7685b5"
+  },
+  "owner github.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 380,
+    "sha256": "b5bfa24bb5ecd2ae95cec46e75d7b7d91d8be706f54a3190436b94d4016a8ef0"
+  },
+  "builder github.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 380,
+    "sha256": "b5bfa24bb5ecd2ae95cec46e75d7b7d91d8be706f54a3190436b94d4016a8ef0"
+  },
+  "owner github.repositories": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 320,
+    "sha256": "ce64fc002952c175ef8cda92e67c3f744a890dcc86296c10aabd0756380f5665"
+  },
+  "builder github.repositories": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 320,
+    "sha256": "ce64fc002952c175ef8cda92e67c3f744a890dcc86296c10aabd0756380f5665"
+  },
+  "owner github.starred": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 252,
+    "sha256": "49f57d9514e77efcc5c4690730408d4ef253b2def9362d554647146b28a1e608"
+  },
+  "builder github.starred": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 252,
+    "sha256": "49f57d9514e77efcc5c4690730408d4ef253b2def9362d554647146b28a1e608"
+  },
+  "owner heb.nutrition": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 530,
+    "sha256": "cf18201c7a6afa1a70a870216cc5c5ddf761bf2185763e8f83df6c8133336ba4"
+  },
+  "builder heb.nutrition": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 530,
+    "sha256": "cf18201c7a6afa1a70a870216cc5c5ddf761bf2185763e8f83df6c8133336ba4"
+  },
+  "owner heb.orders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 490,
+    "sha256": "995d59bbc8b7599d5af300972ddfde3236447cc7e6c63c62fc67906bffc642d0"
+  },
+  "builder heb.orders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 490,
+    "sha256": "995d59bbc8b7599d5af300972ddfde3236447cc7e6c63c62fc67906bffc642d0"
+  },
+  "owner heb.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 234,
+    "sha256": "8a15155d86cf4c8c01c196728d26a06fee677a1e61fdd13ba6280db3b33e9f9c"
+  },
+  "builder heb.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 234,
+    "sha256": "8a15155d86cf4c8c01c196728d26a06fee677a1e61fdd13ba6280db3b33e9f9c"
+  },
+  "owner icloud_notes.folders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 161,
+    "sha256": "6043ec9608bd5b6722a864cd8fc0a3db323ba854700ed7fb3dcf0f756787cb0f"
+  },
+  "builder icloud_notes.folders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 161,
+    "sha256": "6043ec9608bd5b6722a864cd8fc0a3db323ba854700ed7fb3dcf0f756787cb0f"
+  },
+  "owner icloud_notes.notes": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 366,
+    "sha256": "a81f1481f492576c3cd0d9d29d1214b78455d6b6bd46f8338dc0c727ce34c714"
+  },
+  "builder icloud_notes.notes": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 366,
+    "sha256": "a81f1481f492576c3cd0d9d29d1214b78455d6b6bd46f8338dc0c727ce34c714"
+  },
+  "owner instagram.ads": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 234,
+    "sha256": "04bca5d38cb1f0de474d1f97915e0f87836e28b7d89ce16e00bc0b07916abb0c"
+  },
+  "builder instagram.ads": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 234,
+    "sha256": "04bca5d38cb1f0de474d1f97915e0f87836e28b7d89ce16e00bc0b07916abb0c"
+  },
+  "owner instagram.following": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 277,
+    "sha256": "b530b12f5b6445ae004e9baff1015f1dcbf2dcea9b26f357fbafb19f62cae85d"
+  },
+  "builder instagram.following": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 277,
+    "sha256": "b530b12f5b6445ae004e9baff1015f1dcbf2dcea9b26f357fbafb19f62cae85d"
+  },
+  "owner instagram.posts": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 343,
+    "sha256": "f9e5f905094c710ad83d3df29b21d3018bf6d3ea0effe9f11f88080ab1eb1878"
+  },
+  "builder instagram.posts": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 343,
+    "sha256": "f9e5f905094c710ad83d3df29b21d3018bf6d3ea0effe9f11f88080ab1eb1878"
+  },
+  "owner instagram.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 383,
+    "sha256": "04cc56ef6d9d15975972388db63ae936977151e6875a99e50674c4a3765dadf6"
+  },
+  "builder instagram.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 383,
+    "sha256": "04cc56ef6d9d15975972388db63ae936977151e6875a99e50674c4a3765dadf6"
+  },
+  "owner linkedin.connections": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 246,
+    "sha256": "866b2bcf14ed3993eb2510ec08ff4c2a78b3ca22dacfd6610409f47df717013b"
+  },
+  "builder linkedin.connections": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 246,
+    "sha256": "866b2bcf14ed3993eb2510ec08ff4c2a78b3ca22dacfd6610409f47df717013b"
+  },
+  "owner linkedin.education": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 256,
+    "sha256": "cabe2629a0ca98757dc87430f0f06c618fb78aaefe3743f053ab542f49ad3723"
+  },
+  "builder linkedin.education": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 256,
+    "sha256": "cabe2629a0ca98757dc87430f0f06c618fb78aaefe3743f053ab542f49ad3723"
+  },
+  "owner linkedin.experience": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 243,
+    "sha256": "73195d58a1a5fca49450c8f6d7072c238bbe176b7c15ec695abab8e687704db9"
+  },
+  "builder linkedin.experience": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 243,
+    "sha256": "73195d58a1a5fca49450c8f6d7072c238bbe176b7c15ec695abab8e687704db9"
+  },
+  "owner linkedin.languages": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 152,
+    "sha256": "02634ddf95742ee71acb7f0c8bb7663ce864e3356ee60e1a892a4b2334aba991"
+  },
+  "builder linkedin.languages": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 152,
+    "sha256": "02634ddf95742ee71acb7f0c8bb7663ce864e3356ee60e1a892a4b2334aba991"
+  },
+  "owner linkedin.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 311,
+    "sha256": "2a3ebe6bbf2368b58e5764a4d6f6bdc57dca3ea91f0f41b3b48333e1af918a31"
+  },
+  "builder linkedin.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 311,
+    "sha256": "2a3ebe6bbf2368b58e5764a4d6f6bdc57dca3ea91f0f41b3b48333e1af918a31"
+  },
+  "owner linkedin.skills": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 146,
+    "sha256": "d5a07419e2f367911905638435604201701beab5770af52f09db2fcc0cc0452e"
+  },
+  "builder linkedin.skills": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 146,
+    "sha256": "d5a07419e2f367911905638435604201701beab5770af52f09db2fcc0cc0452e"
+  },
+  "owner oura.activity": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 251,
+    "sha256": "8cac37ab7a7e5e80453a3c3726d379bfbfb180a660c7b06ae97c33cdcab5cd71"
+  },
+  "builder oura.activity": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 251,
+    "sha256": "8cac37ab7a7e5e80453a3c3726d379bfbfb180a660c7b06ae97c33cdcab5cd71"
+  },
+  "owner oura.readiness": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 255,
+    "sha256": "a95d93db1f1620b1509b4dc8bab546f55d473ababac675fcc2b5fe301142aba3"
+  },
+  "builder oura.readiness": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 255,
+    "sha256": "a95d93db1f1620b1509b4dc8bab546f55d473ababac675fcc2b5fe301142aba3"
+  },
+  "owner oura.sleep": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 264,
+    "sha256": "a9637ce10b8196c02fc30044ef48ab60c24396756640f4f5a4dd7af79d5acfe2"
+  },
+  "builder oura.sleep": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 264,
+    "sha256": "a9637ce10b8196c02fc30044ef48ab60c24396756640f4f5a4dd7af79d5acfe2"
+  },
+  "owner shop.orders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 365,
+    "sha256": "c94cc586bab4d4da7525427fbb085ef3a1993ae20211f8e74bcfbfa77fde493f"
+  },
+  "builder shop.orders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 365,
+    "sha256": "c94cc586bab4d4da7525427fbb085ef3a1993ae20211f8e74bcfbfa77fde493f"
+  },
+  "owner spotify.playlists": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 710,
+    "sha256": "f8b86551fcb1442b7c9a786087340f6e75cf497ae34119cfed93df520e889816"
+  },
+  "builder spotify.playlists": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 710,
+    "sha256": "f8b86551fcb1442b7c9a786087340f6e75cf497ae34119cfed93df520e889816"
+  },
+  "owner spotify.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 251,
+    "sha256": "c26aecddb34988a23c0b80a355616ec9aa9c18fbcb5cae1f34a8048027cda5cc"
+  },
+  "builder spotify.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 251,
+    "sha256": "c26aecddb34988a23c0b80a355616ec9aa9c18fbcb5cae1f34a8048027cda5cc"
+  },
+  "owner wholefoods.nutrition": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 430,
+    "sha256": "6cb25789c93665ab602ce5a702ebcada9bef45b6005da973b2a7e13c3cd623b8"
+  },
+  "builder wholefoods.nutrition": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 430,
+    "sha256": "6cb25789c93665ab602ce5a702ebcada9bef45b6005da973b2a7e13c3cd623b8"
+  },
+  "owner wholefoods.orders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 500,
+    "sha256": "3751f296c064d0bcac4fd71712e929a9e7b7fa82b6f26ea034825ffedb786d22"
+  },
+  "builder wholefoods.orders": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 500,
+    "sha256": "3751f296c064d0bcac4fd71712e929a9e7b7fa82b6f26ea034825ffedb786d22"
+  },
+  "owner wholefoods.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 144,
+    "sha256": "0aae106d369baef4ba3359bcc194506319b9d7adddcaef6dc7b0cf0b24cfcd39"
+  },
+  "builder wholefoods.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 144,
+    "sha256": "0aae106d369baef4ba3359bcc194506319b9d7adddcaef6dc7b0cf0b24cfcd39"
+  },
+  "owner youtube.history": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 11561,
+    "sha256": "a3882ac82c55d23531dbec7ef887187339aedc64115fa44d5b2de77b6773d36c"
+  },
+  "builder youtube.history": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 11561,
+    "sha256": "a3882ac82c55d23531dbec7ef887187339aedc64115fa44d5b2de77b6773d36c"
+  },
+  "owner youtube.likes": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 335,
+    "sha256": "a8064c40b07fb68221178367b8ca6e1d397975a021bf2f47d6671347f31648f6"
+  },
+  "builder youtube.likes": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 335,
+    "sha256": "a8064c40b07fb68221178367b8ca6e1d397975a021bf2f47d6671347f31648f6"
+  },
+  "owner youtube.playlistItems": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 416,
+    "sha256": "1b7d2208145c350c652984e78692d83ac28e70f7b2de96b1a2c47fee0cedca56"
+  },
+  "builder youtube.playlistItems": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 416,
+    "sha256": "1b7d2208145c350c652984e78692d83ac28e70f7b2de96b1a2c47fee0cedca56"
+  },
+  "owner youtube.playlists": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 310,
+    "sha256": "b16a44b74ec0cf6f8feb851dea14e8887e2fa262ee5fb188c33b8b41a6e41cd0"
+  },
+  "builder youtube.playlists": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 310,
+    "sha256": "b16a44b74ec0cf6f8feb851dea14e8887e2fa262ee5fb188c33b8b41a6e41cd0"
+  },
+  "owner youtube.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 412,
+    "sha256": "f9221c856b931dfa8aa48db274bf8066f2eb2cd90c22de125619eca9f01098e9"
+  },
+  "builder youtube.profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 412,
+    "sha256": "f9221c856b931dfa8aa48db274bf8066f2eb2cd90c22de125619eca9f01098e9"
+  },
+  "owner youtube.subscriptions": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 426,
+    "sha256": "0b21ec2299264f8e38b0b2b4c1cbd7859ef4f87ee57207e1354af86c11a00fbb"
+  },
+  "builder youtube.subscriptions": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 426,
+    "sha256": "0b21ec2299264f8e38b0b2b4c1cbd7859ef4f87ee57207e1354af86c11a00fbb"
+  },
+  "owner youtube.watchLater": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 339,
+    "sha256": "8cb6c7d806eeab0f28456355036c7c96f7a8180f5372e4e4c6c074d8bcaaec1e"
+  },
+  "builder youtube.watchLater": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 339,
+    "sha256": "8cb6c7d806eeab0f28456355036c7c96f7a8180f5372e4e4c6c074d8bcaaec1e"
+  },
+  "raw pdpp stream": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 139,
+    "sha256": "a87ecdd46541d94db94b23dd916bf25a692f0e43d2f336d27c2c0ce4a954a688"
+  },
+  "connection and cursor ignored": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 139,
+    "sha256": "a87ecdd46541d94db94b23dd916bf25a692f0e43d2f336d27c2c0ce4a954a688"
+  },
+  "bad connection ignored": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 3255,
+    "sha256": "fdca5202072eac7b6f0a691b6b199763595f1619ff83df964377ff339e3f81f0"
+  },
+  "stored view": {
+    "status": 200,
+    "contentType": "application/json",
+    "source": "legacy",
+    "bytes": 139,
+    "sha256": "a87ecdd46541d94db94b23dd916bf25a692f0e43d2f336d27c2c0ce4a954a688"
+  },
+  "unknown scope": {
+    "status": 404,
+    "contentType": "application/json",
+    "source": null,
+    "bytes": 74,
+    "sha256": "d9fd72609bb6c2b9dce8846a6369c4c6c353b6363372c72d2e0f7a2b4df31535"
+  },
+  "physical stream name": {
+    "status": 400,
+    "contentType": "application/json",
+    "source": null,
+    "bytes": 177,
+    "sha256": "45416ad166ae0a19e7364823db208353a1936452939828da4046eb54721dfd4d"
+  },
+  "physical control name": {
+    "status": 400,
+    "contentType": "application/json",
+    "source": null,
+    "bytes": 177,
+    "sha256": "45416ad166ae0a19e7364823db208353a1936452939828da4046eb54721dfd4d"
+  },
+  "identity-less physical name": {
+    "status": 400,
+    "contentType": "application/json",
+    "source": null,
+    "bytes": 177,
+    "sha256": "45416ad166ae0a19e7364823db208353a1936452939828da4046eb54721dfd4d"
+  }
+}

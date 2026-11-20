@@ -1,13 +1,38 @@
+import { withStrictMcpGrantRegistration } from "@opendatalabs/personal-server-ts-core/mcp";
+import { grantBlobStore } from "./localdb/grant-blobs.js";
+import type {
+  LocalSync,
+  LocalHistory,
+  RecordQuery,
+  ConnectionLink,
+  ViewChanges,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { ouraRoutes } from "./routes/oura.js";
-import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
-import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
+import {
+  streamSyncSeedRoutes,
+  type StreamSyncSeedRouteDeps,
+} from "./routes/stream-sync-seed.js";
+import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
+import {
+  streamSyncReadStatusRoutes,
+  type StreamSyncReadStatusRouteDeps,
+} from "./routes/stream-sync-read-status.js";
+import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
+import { accountModeRoutes } from "./routes/account-mode.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
+import type { RunIntake } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  createLegacyWriteSeal,
+  type LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import { unwiredLegacyWriteSeal } from "./storage/unwired-legacy-write-seal.js";
 import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
@@ -15,7 +40,16 @@ import type {
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
-import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
+import type {
+  ConnectionDeletePort,
+  PersonalServerReadFulfillmentReporter,
+  StreamSyncReadPort,
+} from "@opendatalabs/personal-server-ts-core/api";
+import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
+import {
+  accountStorageModeOf,
+  type ModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import {
@@ -34,7 +68,7 @@ import {
 import { derivativesRoutes } from "./routes/derivatives.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
-import { syncRoutes } from "./routes/sync.js";
+import { syncRoutes, type SyncRouteDeps } from "./routes/sync.js";
 import {
   executeMcpConnectionRequest,
   mcpActivityRoutes,
@@ -147,14 +181,43 @@ export interface AppDeps {
   accessToken?: string;
   configPath?: string;
   syncManager?: SyncManager | null;
+  /** Desktop seed intake (§2.9); Account mode gates the host database capability. */
+  streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
+  /** Last finished legacy store import report, for `read-status?audit=1`. */
+  legacyStoreImport?: StreamSyncReadStatusRouteDeps["legacyStoreImport"];
+  /** Run intake (V2 §2); absent when stream sync writing is off. */
+  streamSyncIntake?: RunIntake;
+  localSync?: () => Promise<LocalSync>;
+  /** The recorder the database is opened with (`GET /v1/sync/events`). */
+  viewChanges?: ViewChanges;
+  localFile?: SyncRouteDeps["localFile"];
+  history?: LocalHistory;
+  /** The stream-sync writer's connection delete (`DELETE /v1/owner/connectors/:id`). */
+  streamSyncConnectionDelete?: ConnectionDeletePort | null;
+  /**
+   * False once the host is shutting down: stream-sync requests then answer
+   * 503 before they start a file operation, so the home can close and drain.
+   */
+  streamSyncAdmitting?: () => boolean;
   /** Read-side tombstone memory; reads of a deleted scope answer 410. */
   scopeDeletions?: ScopeDeletionTracker;
   serverSigner?: ServerSigner;
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /**
+   * The seal legacy writes through the routes here become durable behind. The
+   * host passes the seal of its one account-mode authority (the same one its
+   * storage was built with). Without it the app derives one from
+   * `accountModeAuthority`, and with neither it refuses every legacy write as
+   * unknown. Only matters to a route that builds its own fallback storage or
+   * finalizes a chunked import; a given `dataStorage` carries its own seal.
+   */
+  legacyWriteSeal?: LegacyWriteSeal;
   /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
   legacyScopeView?: LegacyScopeViewPort;
+  /** Stream-sync reads; absent = reads as before. */
+  streamSyncRead?: StreamSyncReadPort;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -190,6 +253,15 @@ export interface AppDeps {
    * and `$pdpp` envelopes are stored and indexed exactly as before.
    */
   pdppImporter?: PdppImporter;
+  /**
+   * The account-mode module: the only source of the account's storage mode.
+   * The legacy write gate, the data routes and every MCP engine read the port
+   * derived from it, and no option supplies a mode separately. When wired, the
+   * owner-authenticated `POST /v1/account-mode/evidence` and
+   * `POST /v1/account-mode/import-done` routes mount. Absent = unknown: every
+   * legacy write answers a retryable 503.
+   */
+  accountModeAuthority?: ModeAuthority;
   getTunnelStatus?: HealthDeps["getTunnelStatus"];
   /**
    * Invoked when the /ui/api registration route confirms the server is
@@ -232,6 +304,15 @@ export interface AppDeps {
   };
   /** See `CreateServerOptions.mcpScopeRequestApprovalUrl`. */
   mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  mcpScopeRequestReviewHint?: string;
+  /** See `CreateServerOptions.mcpExposeUnsharedScopes`. */
+  mcpExposeUnsharedScopes?: boolean;
+  /** See `CreateServerOptions.mcpScopeRequestGuidance`. */
+  mcpScopeRequestGuidance?: boolean;
+  /** Allow the owner to narrow connection scopes; default off. */
+  mcpOwnerAccessEdit?: boolean;
+  /** See `CreateServerOptions.mcpRequestableScopes`. */
+  mcpRequestableScopes?: string[];
   mcpActivityRecorder?: McpActivityRecorder;
   mcpHydrateScopes?: (scopes: string[]) => Promise<void>;
   /**
@@ -254,6 +335,7 @@ export interface AppDeps {
    * resolution, and stream declarations are mutually required).
    */
   pdpp?: {
+    connectionLink?: ConnectionLink;
     store: PdppRecordStore;
     /**
      * Required reader capability for every canonical-derived response:
@@ -271,6 +353,7 @@ export interface AppDeps {
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
     instancesForSource?: (subjectId: string, sourceId: string) => string[];
+    sourceIdForConnector?: (connector: string) => string | undefined;
     readBlobBytes?: (
       blobId: string,
     ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
@@ -295,9 +378,78 @@ function isMcpPath(path: string): boolean {
   );
 }
 
+function streamSyncClosing(): ProtocolError {
+  return new ProtocolError(
+    503,
+    "STREAM_SYNC_CLOSING",
+    "Stream sync is shutting down on this server",
+  );
+}
+
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
-
+  // One mode for every read and legacy write this server serves, derived
+  // from the account-mode module and nothing else; with no module, the mode
+  // is unknown and legacy writes refuse. Bound to this server's owner once,
+  // here: every consumer below receives the bound view, which cannot be asked
+  // about another account.
+  const accountStorageMode = accountStorageModeFor(
+    deps.accountModeAuthority
+      ? accountStorageModeOf(deps.accountModeAuthority)
+      : { read: () => "unknown" },
+    deps.serverOwner,
+  );
+  const localSync = deps.localSync;
+  const history: LocalHistory | undefined =
+    deps.history ??
+    (localSync
+      ? {
+          additions: async (input) =>
+            (await localSync()).history.additions(input),
+          versions: async (input) =>
+            (await localSync()).history.versions(input),
+          lineage: async (input) => (await localSync()).history.lineage(input),
+        }
+      : undefined);
+  // Absence is a missing host capability, not an unresolved connection.
+  // Leave the query absent so switched routes use their typed refusal.
+  const connectionLink = deps.pdpp?.connectionLink;
+  const linkedQuery = async () => {
+    const local = await localSync!();
+    return local.recordsFor(connectionLink!);
+  };
+  const recordQuery: RecordQuery | undefined =
+    localSync && connectionLink
+      ? {
+          listRecords: async (input) =>
+            (await linkedQuery()).listRecords(input),
+          getRecord: async (input) => (await linkedQuery()).getRecord(input),
+          changesSince: async (input) =>
+            (await linkedQuery()).changesSince(input),
+          async *streamRecords(connection, stream) {
+            yield* (await linkedQuery()).streamRecords(connection, stream);
+          },
+        }
+      : undefined;
+  const streamSyncRead: StreamSyncReadPort | undefined = localSync
+    ? {
+        resolve: async (input) => (await localSync()).resolver.resolve(input),
+        listScopes: async (input) =>
+          (await localSync()).listing.listScopes(input),
+      }
+    : deps.streamSyncRead;
+  // The one seal for the legacy writes these routes make durable: the host's
+  // own, else one over the host's authority, else a seal that refuses (no
+  // authority wired is unknown, never permission).
+  const legacyWriteSeal =
+    deps.legacyWriteSeal ??
+    deps.dataStorage?.legacyWriteSeal ??
+    (deps.accountModeAuthority
+      ? createLegacyWriteSeal({
+          authority: deps.accountModeAuthority,
+          owner: deps.serverOwner,
+        })
+      : unwiredLegacyWriteSeal());
   // One store for mint (POST /v1/write/session) and redeem (data ingest and
   // derivative question registration), and one replay guard for the proofs
   // both redeeming routes verify.
@@ -356,24 +508,7 @@ export function createApp(deps: AppDeps): Hono {
       : cors(c, next),
   );
 
-  const claudeTransition =
-    deps.pdpp && deps.legacyScopeView && deps.dataStorage
-      ? createClaudeMethodTransition(
-          deps.pdpp.bindingStore,
-          deps.legacyScopeView,
-          deps.dataStorage,
-        )
-      : undefined;
-  const claudeView = claudeTransition?.view ?? deps.legacyScopeView;
-  const stravaTransition =
-    deps.pdpp && claudeView && deps.dataStorage
-      ? createStravaMethodTransition(
-          deps.pdpp.bindingStore,
-          claudeView,
-          deps.dataStorage,
-        )
-      : undefined;
-  const legacyScopeView = stravaTransition?.view ?? claudeView;
+  const legacyScopeView = deps.legacyScopeView;
 
   // Mount health route
   app.route(
@@ -400,7 +535,7 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   if (deps.pdpp) {
-    // Not a reader surface: `empty` is the binding/reset precondition the
+    // Not a reader surface: `empty` is the binding precondition the
     // store itself enforces (no canonical row or history), so it reads the
     // store, never `reads`. A pending or conflict-hidden row does not change it.
     app.route(
@@ -412,21 +547,26 @@ export function createApp(deps: AppDeps): Hono {
         instancesForSubject: deps.pdpp.instancesForSubject!,
         instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
-        transitionClaude: claudeTransition?.transition,
-        transitionStrava: stravaTransition?.transition,
-        stravaTransitionStatus: stravaTransition?.status,
       }),
     );
     app.route(
       "/v1",
       pdppRecordsRoutes({
         store: deps.pdpp.store,
+        accountStorageMode,
+        recordQuery,
+        recordHistory:
+          localSync && connectionLink
+            ? async (stream, options) =>
+                (await localSync()).changesFor(connectionLink)(stream, options)
+            : undefined,
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
         instancesForSource: deps.pdpp.instancesForSource,
+        sourceIdForConnector: deps.pdpp.sourceIdForConnector,
         bindingStore: deps.pdpp.bindingStore,
         configuredMethods: deps.pdpp.configuredMethods,
         // An `api_error` on the resource surface is a server fault and must
@@ -465,7 +605,46 @@ export function createApp(deps: AppDeps): Hono {
       "/v1/blobs",
       pdppBlobsRoutes({
         store: deps.pdpp.store,
-        reads: deps.pdpp.reads,
+        prepareReads: async (context, blobId) => {
+          const mode = accountStorageMode.read();
+          if (mode === "unknown")
+            throw new PdppError(
+              "ACCOUNT_MODE_UNKNOWN",
+              "Account mode is unavailable",
+            );
+          if (mode === "unswitched")
+            return deps.pdpp!.reads(
+              context.tokenKind === "owner" ? "owner" : "grant",
+            );
+          if (!localSync || !connectionLink)
+            throw new PdppError(
+              "STREAM_READ_UNAVAILABLE",
+              "Database is unavailable",
+            );
+          const subject = context.subjectId ?? "";
+          return grantBlobStore({
+            local: await localSync(),
+            link: connectionLink,
+            context,
+            blobId,
+            declarations: deps.pdpp!.declarations,
+            ownerInstances: context.sourceId
+              ? (deps.pdpp!.instancesForSource?.(subject, context.sourceId) ??
+                [])
+              : (deps.pdpp!.instancesForSubject?.(subject) ?? []),
+          });
+        },
+        reads: (reader) => {
+          const mode = accountStorageMode.read();
+          if (mode !== "unswitched")
+            throw new PdppError(
+              mode === "unknown"
+                ? "ACCOUNT_MODE_UNKNOWN"
+                : "STREAM_READ_UNAVAILABLE",
+              "Blob authorization is unavailable for this storage mode",
+            );
+          return deps.pdpp!.reads(reader);
+        },
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
@@ -497,7 +676,102 @@ export function createApp(deps: AppDeps): Hono {
     );
   }
 
-  app.route("/v1/import/oura-browser", ouraRoutes(deps));
+  app.route(
+    "/v1/import/oura-browser",
+    ouraRoutes({ ...deps, legacyWriteSeal, accountStorageMode }),
+  );
+
+  if (deps.accountModeAuthority) {
+    app.route(
+      "/v1/account-mode",
+      accountModeRoutes({
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        gateway: deps.gateway,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        tokenStore: deps.tokenStore,
+        accountModeAuthority: deps.accountModeAuthority,
+      }),
+    );
+  }
+
+  app.use("/v1/stream-sync/*", async (_c, next) => {
+    if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+      throw streamSyncClosing();
+    }
+    await next();
+  });
+
+  app.route(
+    "/v1/owner/connectors",
+    ownerConnectorsRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      connectionDelete: deps.streamSyncConnectionDelete ?? null,
+      mode: accountStorageMode,
+      // Checked by the route after owner authorization.
+      assertAdmitting: () => {
+        if (deps.streamSyncAdmitting && !deps.streamSyncAdmitting()) {
+          throw streamSyncClosing();
+        }
+      },
+    }),
+  );
+
+  app.route(
+    "/v1/stream-sync/seed",
+    streamSyncSeedRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      streamSyncSeed: deps.streamSyncSeed ?? null,
+    }),
+  );
+
+  app.route(
+    "/v1/stream-sync/read-status",
+    streamSyncReadStatusRoutes({
+      serverOrigin: deps.serverOrigin,
+      serverOwner: deps.serverOwner,
+      gateway: deps.gateway,
+      devToken: deps.devToken,
+      accessToken: deps.accessToken,
+      tokenStore: deps.tokenStore,
+      streamSyncRead,
+      localSync,
+      accountStorageMode,
+      legacyStoreImport: deps.legacyStoreImport,
+    }),
+  );
+
+  if (deps.streamSyncIntake) {
+    app.route(
+      "/v1/stream-sync/runs",
+      streamSyncRunsRoutes({
+        serverOrigin: deps.serverOrigin,
+        serverOwner: deps.serverOwner,
+        gateway: deps.gateway,
+        devToken: deps.devToken,
+        accessToken: deps.accessToken,
+        tokenStore: deps.tokenStore,
+        intake: deps.streamSyncIntake,
+        blobs: localSync
+          ? {
+              put: async (input) => (await localSync()).blobs.put(input),
+              get: async (id) => (await localSync()).blobs.get(id),
+            }
+          : undefined,
+      }),
+    );
+  }
 
   // Mount data routes (ingest + read + delete)
   app.route(
@@ -519,7 +793,12 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      legacyWriteSeal,
       legacyScopeView,
+      streamSyncRead,
+      history,
+      // The account's storage mode (see the top of createApp).
+      accountStorageMode,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
@@ -645,6 +924,10 @@ export function createApp(deps: AppDeps): Hono {
       accessToken: deps.accessToken,
       tokenStore: deps.tokenStore,
       syncManager: deps.syncManager ?? null,
+      localSync,
+      ...(deps.viewChanges ? { viewChanges: deps.viewChanges } : {}),
+      localFile: deps.localFile,
+      accountStorageMode,
       mountPath: "/v1/sync",
     }),
   );
@@ -666,7 +949,9 @@ export function createApp(deps: AppDeps): Hono {
     serverOwner: deps.serverOwner,
     serverAddress: deps.identity?.address,
     serverSigner: deps.serverSigner,
-    gateway: deps.gateway,
+    gateway: deps.gatewayConfig?.url
+      ? withStrictMcpGrantRegistration(deps.gateway, deps.gatewayConfig.url)
+      : deps.gateway,
     gatewayConfig: deps.gatewayConfig,
     paymentEnabled: deps.paymentEnabled,
     ownAppAccountUrl: deps.ownAppAccountUrl,
@@ -679,12 +964,25 @@ export function createApp(deps: AppDeps): Hono {
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
+    legacyWriteSeal,
+    streamSyncRead,
+    history,
+    accountStorageMode,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
     oauthClientStore: deps.mcpOAuthClientStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
+    scopeRequestReviewHint: deps.mcpScopeRequestReviewHint,
+    mcpExposeUnsharedScopes: deps.mcpExposeUnsharedScopes,
+    mcpOwnerListingDeps: {
+      scopeDeletions: deps.scopeDeletions,
+      serverOwner: deps.serverOwner,
+    },
+    mcpOwnerAccessEdit: deps.mcpOwnerAccessEdit,
+    mcpScopeRequestGuidance: deps.mcpScopeRequestGuidance,
+    mcpRequestableScopes: deps.mcpRequestableScopes,
     activityRecorder: mcpActivityRecorder,
     localApprovalPort: deps.localApprovalPort,
     serverPort: deps.serverPort,

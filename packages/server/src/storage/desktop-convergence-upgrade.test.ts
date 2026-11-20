@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createUnswitchedServer } from "../account-mode/unswitched-server.test-utils.js";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -18,7 +19,7 @@ import {
   createLegacyScopeView,
   type LegacyScopeListing,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
-import { createServer, type ServerContext } from "../bootstrap.js";
+import type { ServerContext } from "../bootstrap.js";
 import { initializeDatabase } from "./index-schema.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
@@ -201,7 +202,7 @@ async function boot(scenario: Scenario) {
       },
     }),
   } as unknown as GatewayClient;
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       payment: { enabled: false },

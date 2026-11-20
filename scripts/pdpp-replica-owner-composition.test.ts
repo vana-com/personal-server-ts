@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   createTestWallet,
+  fixedOwnedAccountStorageMode,
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
@@ -44,6 +45,10 @@ async function setup() {
   roots.push(root);
   const owner = createTestWallet(0);
   const host = await createOwnerComposition({
+    accountStorageMode: fixedOwnedAccountStorageMode(
+      "unswitched",
+      owner.address,
+    ),
     root,
     owner: owner.address,
     origin,
@@ -105,6 +110,10 @@ it("reuses the existing authority with an exact verified dynamic declaration and
   });
   await expect(
     createOwnerComposition({
+      accountStorageMode: fixedOwnedAccountStorageMode(
+        "unswitched",
+        owner.address,
+      ),
       root: join(root, "missing-authority"),
       owner: owner.address,
       origin,
@@ -116,6 +125,10 @@ it("reuses the existing authority with an exact verified dynamic declaration and
   ).rejects.toThrow(/existing auth.sqlite/);
   await expect(
     createOwnerComposition({
+      accountStorageMode: fixedOwnedAccountStorageMode(
+        "unswitched",
+        owner.address,
+      ),
       root,
       owner: createTestWallet(1).address,
       origin,
@@ -126,6 +139,10 @@ it("reuses the existing authority with an exact verified dynamic declaration and
     }),
   ).rejects.toThrow(/configured owner/);
   const real = await createOwnerComposition({
+    accountStorageMode: fixedOwnedAccountStorageMode(
+      "unswitched",
+      owner.address,
+    ),
     root,
     owner: owner.address,
     origin,
@@ -137,6 +154,10 @@ it("reuses the existing authority with an exact verified dynamic declaration and
       const storage = openReplicaOwnerLegacyStorage({ root: ports.root });
       return {
         routes: createReplicaOwnerLegacyRoutes({
+          accountStorageMode: fixedOwnedAccountStorageMode(
+            "unswitched",
+            ports.serverOwner,
+          ),
           ...storage,
           logger: pino({ level: "silent" }),
           serverOwner: ports.serverOwner,

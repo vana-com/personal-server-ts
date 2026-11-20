@@ -1,4 +1,6 @@
+import { isSystemScope } from "../policy/reserved-scopes.js";
 import { isReplicaScope } from "../replication/namespace.js";
+import { isPhysicalScope } from "../stream-sync-read/routing.js";
 import type {
   CreateGrantParams,
   DataPortabilityGatewayConfig,
@@ -179,6 +181,23 @@ export async function createGrantContract(
       "RESERVED_SCOPE",
       "Replica transport scopes are private",
     );
+  // Grants carry logical names only.
+  if (
+    scopes.some((scope) =>
+      isPhysicalScope(scope.startsWith("write:") ? scope.slice(6) : scope),
+    )
+  )
+    return contractError(
+      400,
+      "RESERVED_SCOPE",
+      "Stream-sync names are not grantable; grant the logical name",
+    );
+  if (
+    scopes.some((scope) =>
+      isSystemScope(scope.startsWith("write:") ? scope.slice(6) : scope),
+    )
+  )
+    return contractError(400, "RESERVED_SCOPE", "System streams are private");
   const builder = await input.gateway.getBuilder(granteeAddress);
   if (!builder) {
     return contractProtocolError(
@@ -289,6 +308,12 @@ export async function verifyGrantContract({
       "Body must include grantorAddress, granteeId, scopes, grantVersion, expiresAt, and signature",
     );
   }
+  if (
+    body.scopes.some((scope) =>
+      isSystemScope(scope.startsWith("write:") ? scope.slice(6) : scope),
+    )
+  )
+    return contractOk({ valid: false, error: "System streams are private" });
   if (!isDataPortabilityGatewayConfig(gatewayConfig)) {
     return contractProtocolError(
       500,

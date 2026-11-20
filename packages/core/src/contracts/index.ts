@@ -6,6 +6,7 @@ export {
   ingestBinaryDataContract,
   listDataScopesContract,
   listDataVersionsContract,
+  parseDataReadScopeContract,
   parseDataScopeContract,
   readDataContract,
   VersionSupersededError,

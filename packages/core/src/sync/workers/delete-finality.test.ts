@@ -30,6 +30,9 @@ import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.
 import { createInventoryTombstoneFinality } from "../tombstone-finality.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
+import { fixedLegacyWriteSeal } from "../../test-utils/legacy-write-seal.js";
+import { legacyWriteRefusedErrorFor } from "../../api/legacy-write-gate.js";
+import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
 import type { Logger } from "../../logger/index.js";
 import type {
   DataPointFeedPort,
@@ -643,6 +646,59 @@ describe("storage cleanup converges on the user's delete", () => {
     expect(retried.remaining).toBe(0);
     expect(storage.blobs.size).toBe(0);
     expect(deleteData.tombstone).toHaveBeenCalledTimes(2);
+  });
+
+  describe("on an account that has moved to stream sync", () => {
+    /** The failed-tombstone scenario, with the account switched afterwards. */
+    async function rolledBack(seal: LegacyWriteSeal) {
+      const f = setup();
+      f.gateway.register(1n, keccak256(bytes("v1")));
+      f.storage.put(1n, bytes("v1"));
+      f.gateway.settle(1n, "finalized");
+      f.syncedLocal(1);
+      await deleteScope(f.deps, SCOPE); // tombstone v2
+      f.gateway.settle(2n, "failed");
+      f.syncedLocal(1);
+      // The account switches after the user's delete started.
+      f.deps.storage = createMemoryDataStorage({ legacyWriteSeal: seal });
+      return f;
+    }
+
+    // TOMBSTONE_RESUBMIT_UNSEALED
+    it("does not re-submit the tombstone and spends no attempt", async () => {
+      const f = await rolledBack(fixedLegacyWriteSeal("switched"));
+      for (let minute = 0; minute < 5; minute++) await f.cycle(MINUTE);
+      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
+      expect(f.resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
+    });
+
+    it("waits while the mode is unknown, with no attempt spent", async () => {
+      const f = await rolledBack(fixedLegacyWriteSeal("unknown"));
+      await f.cycle(MINUTE);
+      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
+      expect(f.resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
+    });
+
+    it("treats a refusal at the tombstone as a clean stop, not a failed attempt", async () => {
+      // The early check said allow; the account switched before the commit.
+      const refusing: LegacyWriteSeal = {
+        ...fixedLegacyWriteSeal("unswitched"),
+        verdict: () => "allow",
+        commit: async () => {
+          throw legacyWriteRefusedErrorFor("switched");
+        },
+      };
+      const f = await rolledBack(refusing);
+      const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls
+        .length;
+      await expect(f.cycle(MINUTE)).resolves.toBeDefined();
+      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
+      expect(
+        (logger.warn as ReturnType<typeof vi.fn>).mock.calls
+          .slice(warned)
+          .map((call) => String(call[1])),
+      ).not.toContain("Re-submitted scope delete failed; will retry");
+    });
   });
 
   it("never re-deletes a scope the user re-added on this replica after the delete", async () => {

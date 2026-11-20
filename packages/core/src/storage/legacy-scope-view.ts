@@ -13,11 +13,13 @@ import {
   legacyBindingsForProfile,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
+  requiredLegacyStreams,
   STRAVA_BROWSER_BINDINGS,
 } from "../legacy-projection/index.js";
 import {
   legacyConnectorKey,
   readCanonicalLegacyScope,
+  canonicalLegacyCollectionHorizon,
   type CanonicalConnectionBinding,
   type CanonicalConnectionSelection,
   type CanonicalLegacyReadFailure,
@@ -108,37 +110,15 @@ async function retainClaudeProfile(
   }
 }
 
-/** An export-to-live transition never treats missing old entities as deletions. */
-export async function coversClaudeTransition(
-  current: { envelope: DataFileEnvelope; revision: string },
-  previous: DataFileEnvelope,
-): Promise<boolean> {
-  if (
-    current.envelope.scope !== "claude.conversations" ||
-    previous.scope !== "claude.conversations" ||
-    typeof previous.data.organizationId !== "string" ||
-    !previous.data.organizationId ||
-    previous.data.organizationId !== current.envelope.data.organizationId
-  )
-    return false;
-  await retainClaudeProfile(current, previous);
-  return compareLegacyCoverage(previous.data, current.envelope.data, {
-    scope: "claude.conversations",
-    entityKeys: LEGACY_SCOPE_ENTITY_KEYS["claude.conversations"],
-    canonicalNewer:
-      Date.parse(current.envelope.collectedAt) >
-      Date.parse(previous.collectedAt),
-    allowProvenDeletion: false,
-  }).covered;
-}
-
-function scopeDeclarationCursor(scope: string): string {
+/** The binding facts a cached view or cursor is only good for. */
+export function scopeDeclarationCursor(scope: string): string {
   return JSON.stringify(
     BINDING_PROFILES.flatMap((profile) => [...profile.values()])
       .filter((binding) => binding.scope === scope)
       .map((binding) => ({
         pdppSource: binding.pdppSource,
         pdppStreams: binding.pdppStreams,
+        optionalStreams: binding.optionalStreams ?? [],
         primaryKey: binding.primaryKey,
         fieldsRead: binding.fieldsRead,
         provenance: binding.provenance,
@@ -301,7 +281,7 @@ export type LegacyScopeLatest =
 export type LegacyScopeListing =
   | { kind: "file"; deletion: LegacyScopeDeletion }
   | { kind: "canonical"; collectedAt: string }
-  | { kind: "refused" };
+  | { kind: "refused"; refusal?: LegacyScopeRefusal };
 
 /**
  * The deletion history of a body, decided with the body. Callers never
@@ -321,7 +301,7 @@ export interface LegacyScopeViewPort {
   /** The latest body of a scope. Never used for an explicit version. */
   readLatest(scope: string): Promise<LegacyScopeLatest>;
   /**
-   * Listing metadata from counts and receipts only, without reading rows.
+   * Listing metadata from the same served rows and receipts as the body, without blob-body reads.
    * A refusal here is also a refusal on read; a read can still refuse what
    * this lists (for example a projection rejection).
    */
@@ -378,7 +358,14 @@ type Decision =
       records: CanonicalLegacyReadStore;
       selection: CanonicalConnectionSelection;
       generation: number;
+      /** Every stream the binding reads: what holds data, and what a cached view depends on. */
       streams: readonly string[];
+      /**
+       * The streams that must be complete before the canonical view serves,
+       * replaces a legacy file or proves a deletion: `streams` less those the
+       * binding serves without (`requiredLegacyStreams` owns the rule).
+       */
+      requiredStreams: readonly string[];
     };
 
 export function createLegacyScopeView(
@@ -554,12 +541,19 @@ export function createLegacyScopeView(
         detail: "method_not_configured",
       });
     }
+    if (requiredStreamsOf(scope, method).length === 0)
+      return refused({
+        status: "unavailable",
+        reason: "invalid_binding",
+        scope,
+      });
     return {
       kind: "canonical",
       records,
       selection: { instance, sourceId, method },
       generation: only.generation,
       streams: streamsByMethod.get(method) ?? [],
+      requiredStreams: requiredStreamsOf(scope, method),
     };
   }
 
@@ -606,6 +600,11 @@ export function createLegacyScopeView(
     scope: string,
     decision: Decision,
   ): { kind: "file" } | Exclude<LegacyScopeListing, { kind: "file" }> {
+    if (
+      decision.kind === "refused" &&
+      decision.refusal.reason === "invalid_binding"
+    )
+      return { kind: "refused", refusal: decision.refusal };
     if (authority.isReset(scope)) return { kind: "file" };
     const legacyHead = authority.eligibleLegacyHead(scope);
     const hasTakeover = authority.hasTakeover(
@@ -681,14 +680,17 @@ export function createLegacyScopeView(
     ) {
       return { kind: "refused" };
     }
-    const collectedAt = listedCollectedAt(
-      decision.records,
-      decision.selection.instance,
-      decision.streams,
-    );
-    return collectedAt === null
-      ? { kind: "refused" }
-      : { kind: "canonical", collectedAt };
+    const horizon = canonicalLegacyCollectionHorizon({
+      store: decision.records,
+      scope,
+      selection: decision.selection,
+      declarations: input.declarations,
+      profileBy: "method",
+      allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
+    });
+    return horizon.ok
+      ? { kind: "canonical", collectedAt: horizon.collectedAt }
+      : { kind: "refused" };
   }
 
   function ouraHasRetainedEntityLoss(
@@ -972,6 +974,28 @@ export function createLegacyScopeView(
       confirmSelection: () => sameSelection(decide(scope), decision),
     });
     if (!read.ok) {
+      // A taken-over stream that lost its last row without a completion receipt
+      // has no collection horizon, but its loss is still an incomplete view.
+      if (
+        read.reason === "invalid_collected_at" &&
+        hasTakeover &&
+        missingCompletionReceipts(decision).some(
+          (stream) =>
+            !decision.records
+              .listStreams([decision.selection.instance])
+              .some(
+                (entry) => entry.stream === stream && entry.recordCount > 0,
+              ),
+        )
+      )
+        return {
+          kind: "refused",
+          refusal: {
+            status: "incomplete",
+            reason: "canonical_view_incomplete",
+            diagnostics: [],
+          },
+        };
       if (
         legacyHead !== null &&
         input.readLegacyHead &&
@@ -1078,7 +1102,11 @@ export function createLegacyScopeView(
       legacyHead !== null &&
       replacementEligible &&
       read.complete &&
-      allStreamsProvenAfter(read, decision.streams, legacyHead.collectedAt)
+      allStreamsProvenAfter(
+        read,
+        decision.requiredStreams,
+        legacyHead.collectedAt,
+      )
     ) {
       const confirmed = authority.confirmRead(
         scope,
@@ -1190,7 +1218,7 @@ export function createLegacyScopeView(
           projectionOmissions: read.projectionOmissions,
           canonicalNewer: allStreamsNewerThan(
             read,
-            decision.streams,
+            decision.requiredStreams,
             legacyHead.collectedAt,
           ),
           // A partial row is present, only short of detail, so it does not
@@ -1204,7 +1232,7 @@ export function createLegacyScopeView(
             (read.diagnostics.unproven?.length ?? 0) === 0 &&
             allStreamsProvenAfter(
               read,
-              decision.streams,
+              decision.requiredStreams,
               legacyHead.collectedAt,
             ),
           ...input.coverageThresholds,
@@ -1389,7 +1417,7 @@ function missingCompletionReceipts(
   const receipts = decision.records.listStreamCompletions(
     decision.selection.instance,
   );
-  return decision.streams.filter((stream) => {
+  return decision.requiredStreams.filter((stream) => {
     const liveCount =
       listings.find((entry) => entry.stream === stream)?.recordCount ?? 0;
     return !receipts.some(
@@ -1547,46 +1575,18 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
   return methods;
 }
 
+/** The streams a method's binding for `scope` needs complete; see `Decision.requiredStreams`. */
+function requiredStreamsOf(scope: string, method: string): readonly string[] {
+  const binding = legacyBindingsForProfile(method).get(scope);
+  return binding ? requiredLegacyStreams(binding) : [];
+}
+
 function boundScopes(): string[] {
   const scopes = new Set<string>();
   for (const profile of BINDING_PROFILES) {
     for (const scope of profile.keys()) scopes.add(scope);
   }
   return [...scopes].sort();
-}
-
-/**
- * The `collectedAt` a read would return, from listing counts and receipts:
- * a stream's valid receipt time, else its newest row time. Null when a bound
- * stream is empty without a valid receipt, which a read refuses.
- */
-function listedCollectedAt(
-  store: CanonicalLegacyReadStore,
-  instance: string,
-  streams: readonly string[],
-): string | null {
-  const binding = store.getInstanceBinding(instance);
-  const listing = store.listStreams([instance]);
-  const receipts = store.listStreamCompletions(instance);
-  let newest = Number.NEGATIVE_INFINITY;
-  for (const stream of streams) {
-    const entry = listing.find((candidate) => candidate.stream === stream);
-    const count = entry?.recordCount ?? 0;
-    const receipt = receipts.find(
-      (candidate) =>
-        candidate.stream === stream &&
-        candidate.method === binding.method &&
-        candidate.generation === binding.generation &&
-        candidate.liveCount === count,
-    );
-    const stamp = receipt?.sourceCollectedAt ?? entry?.lastUpdated ?? null;
-    if (count === 0 && !receipt) return null;
-    if (stamp === null) return null;
-    const ms = Date.parse(stamp);
-    if (Number.isNaN(ms)) return null;
-    newest = Math.max(newest, ms);
-  }
-  return Number.isFinite(newest) ? new Date(newest).toISOString() : null;
 }
 
 function incompleteness(

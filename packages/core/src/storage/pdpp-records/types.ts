@@ -102,6 +102,8 @@ export interface ListRecordsPage {
 }
 
 export interface ChangesSinceOptions {
+  /** Database snapshot cursors cannot cross listing/change-feed endpoints. */
+  purpose?: "listing" | "changes";
   /** Candidate visibility policy, evaluated at BOTH historical horizons. */
   isVisible?: (row: PdppStoredRecord) => boolean;
   /**

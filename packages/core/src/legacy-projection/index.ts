@@ -22,6 +22,18 @@ import type {
   ProjectionResult,
 } from "./types.js";
 
+/**
+ * The bound streams a host must have completed before it serves a binding:
+ * every stream except the ones the projection serves without. Every host
+ * reads this one rule; none compares against `pdppStreams` itself.
+ */
+export function requiredLegacyStreams(
+  binding: Pick<LegacyScopeBinding, "pdppStreams" | "optionalStreams">,
+): string[] {
+  const optional = new Set(binding.optionalStreams ?? []);
+  return binding.pdppStreams.filter((stream) => !optional.has(stream));
+}
+
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
@@ -33,6 +45,10 @@ export {
 export { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
+export {
+  eraseLegacyScopesOf,
+  legacyScopesOfConnector,
+} from "./erase-connector.js";
 export type {
   LegacyProjectionWindow,
   LegacyScopeBinding,
@@ -71,6 +87,40 @@ export function alternateLegacyBindingsForScope(
       .filter(([, bindings]) => bindings.has(scope))
       .map(([profileKey, bindings]) => [profileKey, bindings.get(scope)!]),
   );
+}
+
+/** Host-facing adapter for retained legacy grant scopes. The database only
+ * receives this port; it never knows the binding catalogue or its shapes. */
+export function legacyAliasScopes(scope: string) {
+  const targets = new Map(alternateLegacyBindingsForScope(scope));
+  const original = LEGACY_SCOPE_BINDINGS.get(scope);
+  if (original) {
+    const connector = original.pdppSource.slice(
+      original.pdppSource.lastIndexOf("/") + 1,
+    );
+    if (!targets.has(connector)) targets.set(connector, original);
+  }
+  return [...targets].map(([connector, binding]) => {
+    const required = requiredLegacyStreams(binding);
+    return {
+      connector,
+      streams: binding.pdppStreams,
+      requiredStreams: required,
+      servedStream: binding.window?.parentStream,
+      windowed: Boolean(binding.window),
+      project: (
+        records: readonly PdppRecord[],
+        now: string,
+        fetched: readonly string[],
+      ) =>
+        projectPdppRecordsToLegacyPayload(scope, [...records], {
+          fetchedStreams: [...fetched],
+          profileKey: connector,
+          orderByPrimaryKey: true,
+          now,
+        }),
+    };
+  });
 }
 
 /** Only declaration-reviewed profile keys may project into retained scopes. */
@@ -118,6 +168,9 @@ export function legacyScopeToPdppSelection(
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
 
+  if (requiredLegacyStreams(binding).length === 0)
+    return { ok: false, error: { kind: "invalid_binding", scope } };
+
   return {
     ok: true,
     selection: { source: binding.pdppSource, streams: binding.pdppStreams },
@@ -154,6 +207,8 @@ export function projectPdppRecordsToLegacyPayload(
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
+  if (requiredLegacyStreams(binding).length === 0)
+    return { ok: false, error: { kind: "invalid_binding", scope } };
   let decodeDiagnostics: ProjectionDiagnostic[] = [];
   try {
     const decoded = decodeDeclaredRecordsForProjection(

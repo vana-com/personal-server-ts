@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildDataFilePath } from "../../packages/core/src/storage/hierarchy/index.js";
 import type { IndexManager } from "../../packages/core/src/storage/index/index.js";
+import { openLegacyWriteSealForTests } from "../../packages/core/src/test-utils/legacy-write-seal.js";
 import {
   SCOPE_IMPORT_TTL_MS,
   beginScopeImport,
@@ -261,6 +262,7 @@ describe("legacy chunked scope import (real server)", () => {
         findByPath: () => undefined,
         findLatestByScope: () => undefined,
       } as unknown as IndexManager,
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       serverOwner: "0x1111111111111111111111111111111111111111",
       authorizeOwner: async () => undefined,
       afterTombstoneVersion: async () => {

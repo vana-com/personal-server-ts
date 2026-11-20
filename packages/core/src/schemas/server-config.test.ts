@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import {
   DEFAULTS,
   ServerConfigSchema,
@@ -15,13 +14,118 @@ import {
 import { loadConfig, saveConfig } from "../../../server/src/config/loader.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await mkdtemp(join(tmpdir(), "server-config-test-"));
+  const dir = await mkdtemp(join(process.cwd(), ".server-config-test-"));
   try {
     await fn(dir);
   } finally {
     await rm(dir, { recursive: true });
   }
 }
+
+describe("ServerConfigSchema — streamSync.retireLegacy", () => {
+  it("retire-legacy-default-off", () => {
+    expect(DEFAULTS.streamSync.retireLegacy).toBe(false);
+    expect(ServerConfigSchema.parse({ streamSync: {} }).streamSync).toEqual({
+      retireLegacy: false,
+      progressiveFirstLoad: false,
+      changeProbeMs: 5_000,
+      changePush: true,
+    });
+  });
+
+  it("retire-legacy-explicit-true-only", () => {
+    expect(
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: true } })
+        .streamSync.retireLegacy,
+    ).toBe(true);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { retireLegacy: false } })
+        .streamSync.retireLegacy,
+    ).toBe(false);
+
+    for (const retireLegacy of ["true", "false", "", 1, 0, null, {}, []]) {
+      expect(
+        ServerConfigSchema.safeParse({ streamSync: { retireLegacy } }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("retire-legacy-absent-host-option-off", () => {
+    for (const hostOptions of [
+      {},
+      { streamSync: undefined },
+      { streamSync: { retireLegacy: undefined } },
+      {
+        streamSync: { write: true, read: true, refuseLegacyWrites: true },
+      },
+    ]) {
+      expect(
+        ServerConfigSchema.parse(hostOptions).streamSync.retireLegacy,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("ServerConfigSchema — streamSync.write, read, refuseLegacyWrites (removed)", () => {
+  it("a saved config that still names them parses, and the keys are dropped", () => {
+    const parsed = ServerConfigSchema.parse({
+      streamSync: { write: true, read: true, refuseLegacyWrites: true },
+    });
+    expect(parsed.streamSync).toEqual({
+      retireLegacy: false,
+      progressiveFirstLoad: false,
+      changeProbeMs: 5_000,
+      changePush: true,
+    });
+    for (const key of ["write", "read", "refuseLegacyWrites"]) {
+      expect(key in DEFAULTS.streamSync).toBe(false);
+      expect(key in parsed.streamSync).toBe(false);
+    }
+  });
+});
+
+describe("ServerConfigSchema — streamSync.changeProbeMs", () => {
+  it("is the registry change probe period: 5 s by default, 0 turns it off", () => {
+    expect(DEFAULTS.streamSync.changeProbeMs).toBe(5_000);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changeProbeMs: 0 } }).streamSync
+        .changeProbeMs,
+    ).toBe(0);
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changeProbeMs: 15_000 } })
+        .streamSync.changeProbeMs,
+    ).toBe(15_000);
+  });
+
+  it("refuses a negative or fractional period", () => {
+    for (const changeProbeMs of [-1, 2.5, "5000"]) {
+      expect(
+        ServerConfigSchema.safeParse({ streamSync: { changeProbeMs } }).success,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("ServerConfigSchema — streamSync registry change push", () => {
+  it("is on by default", () => {
+    const parsed = ServerConfigSchema.parse({});
+    expect(parsed.streamSync.changePush).toBe(true);
+  });
+
+  it("can be switched off, which keeps the 5 s probe alone", () => {
+    expect(
+      ServerConfigSchema.parse({ streamSync: { changePush: false } }).streamSync
+        .changePush,
+    ).toBe(false);
+  });
+
+  it("refuses a non-boolean setting", () => {
+    expect(
+      ServerConfigSchema.safeParse({ streamSync: { changePush: "yes" } })
+        .success,
+    ).toBe(false);
+  });
+});
 
 describe("ServerConfigSchema — sync fields", () => {
   it("default config has sync.enabled: false and sync.lastProcessedTimestamp: null", () => {
@@ -259,5 +363,27 @@ describe("pdpp.protocolProfile", () => {
       ServerConfigSchema.safeParse({ pdpp: { protocolProfile: "candidate" } })
         .success,
     ).toBe(false);
+  });
+});
+
+describe("ServerConfigSchema — server.port", () => {
+  it.each([-1, 1.5, 65536, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid configured port %s",
+    (port) => {
+      expect(ServerConfigSchema.safeParse({ server: { port } }).success).toBe(
+        false,
+      );
+    },
+  );
+
+  it("keeps configured ports concrete; ephemeral binding is a node handle option", () => {
+    expect(ServerConfigSchema.safeParse({ server: { port: 0 } }).success).toBe(
+      false,
+    );
+    for (const port of [1, 65535]) {
+      expect(ServerConfigSchema.parse({ server: { port } }).server.port).toBe(
+        port,
+      );
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * The v0.2 durable client-token query surface, and what falls outside it.
  *
@@ -94,6 +95,7 @@ function buildApp(g: Grant = grant(["date", "amount"])) {
     () => ["id"],
   );
   return pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store,
     auth: createFixtureAuthorizationService(tokens),
     declarations,
@@ -223,6 +225,7 @@ describe("v0.2: a revoked grant denies reads across every surface", () => {
   function revoked() {
     const store = createMemoryRecordStore();
     return pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth: createFixtureAuthorizationService({
         "client-tok": {

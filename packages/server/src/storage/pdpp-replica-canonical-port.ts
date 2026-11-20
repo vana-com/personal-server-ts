@@ -228,12 +228,6 @@ export interface ReplicaCanonicalPort {
   replicaVisibilityEpoch(instanceIds?: string[]): string;
   assertKeyWritable(instance: string, stream: string, recordKey: string): void;
   assertConnectionWritable(instance: string): void;
-  /**
-   * Strava and Claude method transitions change a connection's method and
-   * generation without journaling a lifecycle operation, so a replica could not
-   * follow them. Refuse them while replication is enabled.
-   */
-  assertMethodTransitionAllowed(): void;
   assertStreamWritable(
     instance: string,
     stream: string,
@@ -418,10 +412,6 @@ export function createReplicaCanonicalPort(db: Database) {
           .get(instance)
       )
         throw new PdppBindingError("replica_integrity_quarantine");
-    },
-    assertMethodTransitionAllowed() {
-      if (db.prepare("SELECT 1 FROM pdpp_replica_settings").get())
-        throw new PdppBindingError("replica_method_transition_unsupported");
     },
     assertStreamWritable(instance, stream, generation) {
       if (

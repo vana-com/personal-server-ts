@@ -19,8 +19,11 @@ import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
+  openLegacyWriteSealForTests,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -195,6 +198,8 @@ describe("POST /v1/data/:scope with a write session", () => {
     });
 
     app = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -379,11 +384,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     // request must be accepted on retry rather than rejected as a replay.
     const flakyIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: flakyIndex,
       hierarchyOptions,
     });
     let failures = 1;
     const flakyApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: flakyIndex,
       hierarchyOptions,
       logger,
@@ -443,11 +451,14 @@ describe("POST /v1/data/:scope with a write session", () => {
     // post-commit step. Retrying with the same proof would duplicate it.
     const partialIndex = createIndexManager(initializeDatabase(":memory:"));
     const realStorage = createNodeDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
       indexManager: partialIndex,
       hierarchyOptions,
     });
     let indexFailures = 1;
     const partialApp = dataRoutes({
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager: partialIndex,
       hierarchyOptions,
       logger,
@@ -693,5 +704,57 @@ describe("POST /v1/data/:scope with a write session", () => {
     );
     // Expired session is unknown to the store -> owner fall-through -> 401.
     expect(res.status).toBe(401);
+  });
+});
+
+describe("POST /v1/data/:scope with a write session after the stream-sync switch", () => {
+  let dataDir: string;
+  let app: ReturnType<typeof dataRoutes>;
+  let index: ReturnType<typeof createIndexManager>;
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "data-write-switch-test-"));
+    index = createIndexManager(initializeDatabase(":memory:"));
+    const writeSessionStore = createInMemoryWriteSessionStore();
+    await seedSession(writeSessionStore);
+    app = dataRoutes({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway({
+        getGrant: vi.fn().mockResolvedValue(makeGrant()),
+      }),
+      accessLogWriter: { write: vi.fn().mockResolvedValue(undefined) },
+      writeSessionStore,
+      accountStorageMode: fixedOwnedAccountStorageMode(
+        "switched",
+        ownerWallet.address,
+      ),
+      legacyWriteSeal: fixedLegacyWriteSeal("switched", ownerWallet.address),
+    });
+  });
+
+  afterEach(async () => {
+    index.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("refuses a builder write whose signature verifies: no delegated builder is exempt", async () => {
+    const res = await sessionWrite(app, SCOPE, { note: "builder" });
+    expect(res.status).toBe(426);
+    expect(index.countByScope(SCOPE)).toBe(0);
+  });
+
+  it("stores nothing from a builder write whose signature does not verify", async () => {
+    const res = await sessionWrite(
+      app,
+      SCOPE,
+      { note: "builder" },
+      { signatureWallet: ownerWallet },
+    );
+    expect(res.status).not.toBe(201);
+    expect(index.countByScope(SCOPE)).toBe(0);
   });
 });

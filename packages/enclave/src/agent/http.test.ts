@@ -270,6 +270,20 @@ describe("agent HTTP server", () => {
       },
     },
     {
+      label: "stream-sync physical scope (ruling Q7)",
+      body: (valid: PrewarmRequestBody) => ({
+        ...valid,
+        scope: "pdpp.chatgpt~0123456789abcdef.conversations",
+      }),
+      assertInvalidField: (body: Record<string, unknown>) => {
+        expect(body).toMatchObject({
+          userPsId: prewarmBody.userPsId,
+          sealedEnvelope: prewarmBody.sealedEnvelope,
+          scope: "pdpp.chatgpt~0123456789abcdef.conversations",
+        });
+      },
+    },
+    {
       label: "bad envelope",
       body: (valid: PrewarmRequestBody) => ({
         ...valid,

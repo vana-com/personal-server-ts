@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { alwaysLive } from "../test-utils/live-grants.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import { McpDataReadError, type McpDataReadClient } from "./read-client.js";
 import type { McpConnectionRecord } from "./types.js";
@@ -70,6 +71,7 @@ function fixture(
       {
         connection,
         readClient,
+        verifyGrantsLive: alwaysLive(connection),
         reporterDeps: {
           readFulfillmentReporter: { report: vi.fn(), reportDenied },
         },

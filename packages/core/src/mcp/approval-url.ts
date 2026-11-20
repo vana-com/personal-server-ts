@@ -28,6 +28,26 @@ export const VANA_WEB_ORIGIN = "https://app.vana.org";
 /** Vana Web route that renders one MCP scope request. */
 export const MCP_SCOPE_REQUEST_APPROVAL_PATH = "/mcp/requests";
 
+/**
+ * Loopback path that 302s to the host's approval URL. A chat client opens
+ * links by handing them to the browser, which ignores a bare custom-scheme
+ * URL but follows an http link and passes the redirect target to the OS.
+ */
+export const MCP_SCOPE_REQUEST_OPEN_PATH = "/mcp/scope-request/open";
+
+/** Query param naming the connection on the opener route. */
+export const MCP_SCOPE_REQUEST_OPEN_CONNECTION_PARAM = "connection";
+
+/**
+ * The ids this server mints for MCP connections: a UUID, or `mcp-` plus 16 hex
+ * digits when `crypto.randomUUID` is missing (see `connection-api.ts`).
+ */
+export function isMcpConnectionId(value: string): boolean {
+  return /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mcp-[0-9a-f]{16})$/i.test(
+    value,
+  );
+}
+
 /** Query param naming the server that holds the request. */
 export const MCP_APPROVAL_PS_ORIGIN_PARAM = "ps_origin";
 
@@ -131,4 +151,77 @@ export function vanaWebMcpScopeRequestApprovalUrl(
       webOrigin: options.webOrigin,
       readToken: context.readToken,
     });
+}
+
+/**
+ * Hook from a host-supplied URL template such as
+ * `vana://mcp-scope-request?connection={connectionId}#t={token}`.
+ * `{connectionId}` is URL-encoded wherever it appears. `{token}` is allowed
+ * only after the `#`, so the read token never reaches a query, path or log
+ * line; the fragment is dropped when the request has no token. Throws on a
+ * template that puts `{token}` before the `#`.
+ */
+export function templateMcpScopeRequestApprovalUrl(
+  template: string,
+): McpScopeRequestApprovalUrlHook {
+  const hashAt = template.indexOf("#");
+  const base = hashAt === -1 ? template : template.slice(0, hashAt);
+  const fragment = hashAt === -1 ? "" : template.slice(hashAt + 1);
+  if (base.includes("{token}")) {
+    throw new Error(
+      "MCP scope request approval URL template may use {token} only after '#'",
+    );
+  }
+  return (connectionId, context) => {
+    const encodedId = encodeURIComponent(connectionId);
+    const url = base.replaceAll("{connectionId}", encodedId);
+    if (!fragment) return url;
+    if (fragment.includes("{token}") && !context.readToken) return url;
+    const filled = fragment
+      .replaceAll("{connectionId}", encodedId)
+      .replaceAll("{token}", encodeURIComponent(context.readToken ?? ""));
+    return `${url}#${filled}`;
+  };
+}
+
+/** The loopback http link that redirects to the host's approval URL. */
+export function buildMcpScopeRequestOpenerUrl(
+  loopbackOrigin: string,
+  connectionId: string,
+): string {
+  return `${loopbackOrigin}${MCP_SCOPE_REQUEST_OPEN_PATH}?${MCP_SCOPE_REQUEST_OPEN_CONNECTION_PARAM}=${encodeURIComponent(connectionId)}`;
+}
+
+/**
+ * Whether a link to `approvalUrl` can be served through the opener: a custom
+ * app scheme (not http/https), and a URL that does not depend on the read
+ * token, because the opener resolves the host hook without one.
+ */
+export function isOpenerEligibleApprovalUrl(
+  approvalUrl: string,
+  urlWithoutToken: string | undefined,
+): boolean {
+  if (urlWithoutToken !== approvalUrl) return false;
+  try {
+    const { protocol } = new URL(approvalUrl);
+    return protocol !== "http:" && protocol !== "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** Run the host hook; a missing, empty or throwing hook gives undefined. */
+export function resolveMcpScopeRequestApprovalUrl(
+  hook: McpScopeRequestApprovalUrlHook | undefined,
+  connectionId: string,
+  context: McpScopeRequestApprovalUrlContext,
+): string | undefined {
+  if (!hook) return undefined;
+  try {
+    const url = hook(connectionId, context);
+    return typeof url === "string" && url.trim() ? url.trim() : undefined;
+  } catch {
+    // A broken host hook must not fail the request itself; fall back to Vana.
+    return undefined;
+  }
 }

@@ -420,7 +420,9 @@ describe("legacy scope binding self-check", () => {
     });
 
     it(`${scope}: missing_stream is returned for every bound stream, one at a time`, () => {
+      const optional = new Set(binding.optionalStreams ?? []);
       for (const missing of binding.pdppStreams) {
+        if (optional.has(missing)) continue;
         const fetchedStreams = binding.pdppStreams.filter((s) => s !== missing);
         const records: PdppRecord[] = fetchedStreams.map((s) => ({
           stream: s,
@@ -438,6 +440,40 @@ describe("legacy scope binding self-check", () => {
             expectedStream: missing,
           },
         });
+      }
+    });
+
+    it(`${scope}: optionalStreams names only bound streams and leaves at least one required`, () => {
+      const optional = binding.optionalStreams ?? [];
+      expect(
+        new Set(optional).size,
+        `${scope}: duplicate optional stream`,
+      ).toBe(optional.length);
+      for (const stream of optional) {
+        expect(
+          binding.pdppStreams,
+          `${scope}: optional stream "${stream}" is not a bound stream`,
+        ).toContain(stream);
+      }
+      expect(
+        binding.pdppStreams.length - optional.length,
+        `${scope}: every stream is optional, so no stream gates the projection`,
+      ).toBeGreaterThan(0);
+    });
+
+    it(`${scope}: a stream declared optional is served without it`, () => {
+      for (const optional of binding.optionalStreams ?? []) {
+        expect(binding.pdppStreams).toContain(optional);
+        const fetchedStreams = binding.pdppStreams.filter(
+          (s) => s !== optional,
+        );
+        const result = binding.project([], { fetchedStreams });
+        expect(
+          result.ok === false && result.error.kind === "missing_stream"
+            ? result.error.expectedStream
+            : undefined,
+          `${scope}: "${optional}" is optional but its absence is reported`,
+        ).not.toBe(optional);
       }
     });
 

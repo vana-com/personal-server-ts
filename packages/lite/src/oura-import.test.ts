@@ -1,4 +1,9 @@
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import ouraProfileProvenance from "../../core/src/legacy-projection/declarations/oura-browser.provenance.json";
+import {
+  fixedModeAuthority,
+  fixedOwnedAccountStorageMode,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import { describe, expect, it, vi } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -8,11 +13,10 @@ import {
   createMemoryPsLiteTokenStore,
   createMemoryPsLitePersistence,
 } from "./test-support/memory.js";
-import { createPersistentPsLiteStorage } from "./storage.js";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
-  importOuraBrowserRecords,
+  importOuraBrowserRecords as importOuraBrowserRecordsWithMode,
   type OuraBrowserImportInput,
 } from "./index.js";
 
@@ -155,6 +159,7 @@ function runtimeFor(
 ) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     storage,
     active: true,
     accessLogReader: accessLogs,
@@ -180,6 +185,17 @@ function runtimeFor(
     );
   return { post, runtime };
 }
+
+/** The import as an unswitched account runs it; a test may pass its own mode. */
+const importOuraBrowserRecords: typeof importOuraBrowserRecordsWithMode = (
+  storage,
+  input,
+  options = {},
+) =>
+  importOuraBrowserRecordsWithMode(storage, input, {
+    accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+    ...options,
+  });
 
 describe("Lite Oura browser takeover", () => {
   it("refuses a restricted all-stream batch even when it covers every retained ID", async () => {
@@ -357,7 +373,7 @@ describe("Lite Oura browser takeover", () => {
 
   it("keeps appended and legacy files across persistent Lite reloads and serves all three owner/builder reads", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -380,7 +396,7 @@ describe("Lite Oura browser takeover", () => {
         expect(rows[0].score).toBe(80);
       }
     }
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -396,7 +412,7 @@ describe("Lite Oura browser takeover", () => {
 
   it("replaces rather than unions complete disjoint batches across reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
-    const storage = await createPersistentPsLiteStorage(
+    const storage = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
@@ -405,12 +421,13 @@ describe("Lite Oura browser takeover", () => {
     expect(await first.json()).toMatchObject({ ok: true });
     expect(storage.countVersions("oura.activity")).toBe(2);
     expect(storage.countVersions("oura.sleep")).toBe(1);
-    const reloaded = await createPersistentPsLiteStorage(
+    const reloaded = await createOpenPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
     );
     const accessLogs = createMemoryPsLiteAccessLogStore();
     const runtime = createPsLiteRuntime({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       storage: reloaded,
       active: true,
       auth: createBearerTokenPsLiteAuth({
@@ -650,7 +667,7 @@ describe("fresh complete Oura replacement", () => {
     "replaces current data with %s records and retains historical versions across restart",
     async (variant) => {
       const persistence = createMemoryPsLitePersistence();
-      const storage = await createPersistentPsLiteStorage(
+      const storage = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );
@@ -688,7 +705,7 @@ describe("fresh complete Oura replacement", () => {
             : [stream + (variant === "disjoint" ? "-fresh" : "-1")],
         );
       }
-      const reloaded = await createPersistentPsLiteStorage(
+      const reloaded = await createOpenPersistentPsLiteStorage(
         { kind: "indexeddb" },
         persistence,
       );

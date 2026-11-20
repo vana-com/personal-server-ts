@@ -1,7 +1,9 @@
 {
   "references": [
     { "path": "packages/core" },
+    { "path": "packages/core/tsconfig.test-support.json" },
     { "path": "packages/lite" },
+    { "path": "packages/stream-sync" },
     { "path": "packages/server" },
     { "path": "packages/cli" },
     { "path": "packages/enclave" },

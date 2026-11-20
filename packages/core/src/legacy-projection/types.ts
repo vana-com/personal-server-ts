@@ -12,7 +12,10 @@ export interface PdppRecord {
   stream: string;
 }
 
+export type InvalidLegacyBinding = { kind: "invalid_binding"; scope: string };
+
 export type LegacyScopeLookupError =
+  | InvalidLegacyBinding
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "test_debris_scope"; scope: string; reason: string };
@@ -29,6 +32,7 @@ export type LegacyScopeLookupResult =
   LegacyScopeLookupOk | LegacyScopeLookupErr;
 
 export type ProjectionError =
+  | InvalidLegacyBinding
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "missing_stream"; scope: string; expectedStream: string }
@@ -158,6 +162,12 @@ export interface LegacyScopeBinding {
    * and fail the self-check (S1).
    */
   fieldsRead: Record<string, string[]>;
+  /**
+   * Bound streams the projection serves without. A caller that did not fetch
+   * one gets the payload, not `missing_stream`, because connectors that
+   * predate the stream never had it.
+   */
+  optionalStreams?: string[];
   /** Optional passthrough fields supplied by newer profiles, absent at the pinned declaration. */
   optionalFieldsRead?: Record<string, string[]>;
   /** Legacy JSON Schema path this binding's output must validate against, relative to ./legacy-schemas. */

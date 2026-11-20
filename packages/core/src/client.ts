@@ -1,5 +1,9 @@
 import type { ReplicationDoorStatus } from "./replication/door.js";
 import type { ReplicaWriterRotation } from "./replication/writer-identity.js";
+import type {
+  ModeDecision,
+  ModeEvidenceInput,
+} from "./sync/account-mode/index.js";
 import {
   buildWeb3SignedHeader,
   type DataFileEnvelope,
@@ -147,6 +151,8 @@ export interface PersonalServerListDataOptions {
 }
 
 export interface PersonalServerListDataResult {
+  /** The store that served this page, fixed before any listing read. */
+  listingStore?: "stream-sync" | "legacy";
   scopes: ScopeSummary[];
   total: number;
   limit: number;
@@ -249,6 +255,15 @@ export interface PersonalServerHandle {
     status(): ReplicationDoorStatus;
     writerRotation?(): ReplicaWriterRotation;
   };
+  /**
+   * Give the account-mode module the Account's answer for this server's
+   * owner, as a host does after sign-in and at every launch. Until the first
+   * answer, reads and legacy writes pause with a retryable 503. The answer is
+   * kept with no expiry and still used while the Account cannot be read: a read
+   * that failed (state `unknown`) changes nothing, so an Off keeps allowing
+   * legacy writes, and with no answer saved yet it is the same 503. Absent on a runtime that takes evidence another way.
+   */
+  submitAccountModeEvidence?(input: ModeEvidenceInput): Promise<ModeDecision>;
   ready(options?: PersonalServerReadyOptions): Promise<PersonalServerInfo>;
   info(): Promise<PersonalServerInfo>;
   prepareRegistration(
@@ -331,13 +346,40 @@ export class PersonalServerClientError extends Error {
     errorCode?: string;
     details?: unknown;
     body?: unknown;
+    cause?: unknown;
   }) {
-    super(params.message);
+    super(
+      params.message,
+      params.cause === undefined ? undefined : { cause: params.cause },
+    );
     this.name = "PersonalServerClientError";
     this.status = params.status;
     this.errorCode = params.errorCode;
     this.details = params.details;
     this.body = params.body;
+  }
+}
+
+/**
+ * A response's body stopped before its end. In process the body errors with
+ * what produced it (a view whose head moved while the body was read, which
+ * the database layer calls `PartialViewMoved`); over HTTP the connection drops
+ * after the headers and the reader sees only a network error. Both reach the
+ * caller as this one error, so a caller does not need to know which transport
+ * it has. The body is not a complete read of anything: a read that follows
+ * starts from the data as it then stands. `cause` holds the original error.
+ */
+export class PersonalServerReadInterrupted extends PersonalServerClientError {
+  readonly retryable = true;
+
+  constructor(params: { status: number; cause: unknown }) {
+    super({
+      message: "Personal Server response body stopped before its end",
+      status: params.status,
+      errorCode: "READ_INTERRUPTED",
+      cause: params.cause,
+    });
+    this.name = "PersonalServerReadInterrupted";
   }
 }
 
@@ -582,7 +624,17 @@ export async function parsePersonalServerJsonResponse<T>(
 }
 
 async function readJsonBody(response: Response): Promise<unknown> {
-  const text = await response.text();
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    // A body it stopped reading still holds what produced it.
+    await response.body?.cancel(error).catch(() => undefined);
+    throw new PersonalServerReadInterrupted({
+      status: response.status,
+      cause: error,
+    });
+  }
   if (!text) return null;
   try {
     return JSON.parse(text) as unknown;

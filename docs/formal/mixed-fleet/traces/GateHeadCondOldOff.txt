@@ -1,0 +1,119 @@
+Error: Invariant NoSilentStale is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ nextK = <<1, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 2: <Collect line 85, col 3 to line 89, col 82 of module MixedFleet>
+/\ nextK = <<1, 2, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{}, {3}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {3}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 3: <Collect line 85, col 3 to line 89, col 82 of module MixedFleet>
+/\ nextK = <<2, 2, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {3}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {3}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 4: <PubRead line 118, col 3 to line 126, col 76 of module MixedFleet>
+/\ nextK = <<2, 2, 1>>
+/\ seen = <<0, -1, -1>>
+/\ view = <<{1}, {3}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {3}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 5: <PubRead line 118, col 3 to line 126, col 76 of module MixedFleet>
+/\ nextK = <<2, 2, 1>>
+/\ seen = <<0, 0, -1>>
+/\ view = <<{1}, {3}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {3}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 6: <PubCommit line 133, col 3 to line 161, col 41 of module MixedFleet>
+/\ nextK = <<2, 2, 1>>
+/\ seen = <<-1, 0, -1>>
+/\ view = <<{1}, {3}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {3}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, TRUE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+State 7: <PubCommit line 133, col 3 to line 161, col 41 of module MixedFleet>
+/\ nextK = <<2, 2, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {3}, {}>>
+/\ late = {3}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<TRUE, TRUE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+State 8: <Read line 96, col 3 to line 108, col 80 of module MixedFleet>
+/\ nextK = <<2, 2, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {3}, {}>>
+/\ late = {3}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, TRUE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+779 states generated, 290 distinct states found, 143 states left on queue.
+The depth of the complete state graph search is 9.
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 5 and the 95th percentile is 4).
+Finished in 00s at (2026-11-15 23:52:23)
+EXIT=12

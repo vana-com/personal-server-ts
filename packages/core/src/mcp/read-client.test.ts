@@ -17,11 +17,139 @@ function createAccount() {
 }
 
 describe("mcp/read-client", () => {
+  it("uses authorized local listing metadata without resolving a stream body", async () => {
+    const scope = "pdpp.oura.sleep";
+    const collectedAt = "2026-10-01T00:00:00.000Z";
+    const authorizeBuilderRead = vi
+      .fn()
+      .mockResolvedValue({ grantId: "grant-1" });
+    const resolve = vi.fn(async () => {
+      throw new Error("metadata must not resolve a body");
+    });
+    const findEntry = vi.fn(() => {
+      throw new Error("metadata must not read the legacy index");
+    });
+    const write = vi.fn();
+    const listScopes = vi.fn(
+      async ({
+        canRead,
+      }: {
+        canRead: (scope: string) => boolean | Promise<boolean>;
+      }) => {
+        expect(authorizeBuilderRead).toHaveBeenCalledWith(
+          expect.objectContaining({
+            scope,
+            grantId: "grant-1",
+            metadataOnly: true,
+          }),
+        );
+        expect(await canRead(scope)).toBe(true);
+        expect(await canRead("pdpp.oura.other")).toBe(false);
+        return [
+          {
+            scope,
+            connector: "oura",
+            ns: "",
+            records: 123,
+            updatedAt: Date.parse(collectedAt),
+            latestCollectedAt: collectedAt,
+          },
+        ];
+      },
+    );
+    const streamSyncRead = { resolve, listScopes };
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: { findEntry } as never,
+        streamSyncRead,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead,
+        },
+        accessLogWriter: { write },
+      },
+    });
+
+    await expect(client.getScopeMetadata(scope, "grant-1")).resolves.toEqual({
+      scope,
+      collectedAt,
+    });
+    expect(listScopes).toHaveBeenCalledTimes(1);
+    expect(resolve).not.toHaveBeenCalled();
+    expect(findEntry).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+
+    authorizeBuilderRead.mockRejectedValueOnce(
+      new ProtocolError(403, "FORBIDDEN", "denied"),
+    );
+    await expect(
+      client.getScopeMetadata(scope, "grant-1"),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(listScopes).toHaveBeenCalledTimes(1);
+    expect(resolve).not.toHaveBeenCalled();
+    await expect(client.getScopeMetadata(scope)).resolves.toBeNull();
+    expect(listScopes).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps stream size and readiness unknown when listing has no timestamp or port", async () => {
+    const resolve = vi.fn(async () => {
+      throw new Error("unexpected body read");
+    });
+    const streamSyncRead: NonNullable<
+      Parameters<
+        typeof createMcpDataReadClient
+      >[0]["dataApiDeps"]["streamSyncRead"]
+    > = {
+      resolve,
+      listScopes: vi.fn().mockResolvedValue([]),
+    };
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {} as never,
+        streamSyncRead,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1" }),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+    await expect(
+      client.getScopeMetadata("pdpp.oura.sleep", "grant-1"),
+    ).resolves.toEqual({ scope: "pdpp.oura.sleep" });
+    streamSyncRead.listScopes = vi.fn().mockResolvedValue([
+      {
+        scope: "pdpp.oura.sleep",
+        connector: "oura",
+        ns: "",
+        records: null,
+        updatedAt: null,
+      },
+    ]);
+    await expect(
+      client.getScopeMetadata("pdpp.oura.sleep", "grant-1"),
+    ).resolves.toEqual({ scope: "pdpp.oura.sleep" });
+    delete streamSyncRead.listScopes;
+    await expect(
+      client.getScopeMetadata("pdpp.oura.sleep", "grant-1"),
+    ).resolves.toEqual({ scope: "pdpp.oura.sleep" });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("preserves a projection refusal from the block manifest read", async () => {
     const client = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           findEntry: () => ({
             scope: "oura.sleep",
@@ -65,6 +193,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           listScopes: () => ({
             scopes: [
@@ -112,6 +241,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -162,6 +292,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -237,6 +368,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -312,6 +444,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -388,6 +521,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -493,6 +627,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -560,6 +695,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -638,6 +774,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -695,6 +832,7 @@ describe("mcp/read-client", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -792,6 +930,7 @@ describe("mcp/read-client deletion gate", () => {
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
       dataApiDeps: {
+        accountStorageMode: { owner: "fixture", read: () => "unswitched" },
         storage: {
           kind: "custom",
           listScopes: () => ({ scopes: [], total: 0 }),
@@ -953,6 +1092,7 @@ describe("mcp/read-client deletion gate", () => {
         serverOrigin: SERVER_ORIGIN,
         granteeAccount: createAccount(),
         dataApiDeps: {
+          accountStorageMode: { owner: "fixture", read: () => "unswitched" },
           storage: {
             kind: "custom",
             listScopes: () => ({ scopes: [], total: 0 }),

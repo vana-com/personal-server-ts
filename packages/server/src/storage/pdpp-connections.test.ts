@@ -91,44 +91,6 @@ describe("PDPP connection registry", () => {
     expect(store.getRecord(unregistered, "playlists", "one")).toBeUndefined();
   });
 
-  it("keeps a registered connection's method fixed across reset", () => {
-    const account = "conn_123e4567-e89b-42d3-a456-426614174000";
-    store.registerConnection({
-      instance: account,
-      sourceId: SOURCE,
-      method: METHOD,
-      label: "Personal",
-    });
-    store.ingestBatch(
-      [
-        {
-          instance: account,
-          stream: "playlists",
-          key: "one",
-          data: { id: "one" },
-          emitted_at: EMITTED_AT,
-        },
-      ],
-      () => "mutable_state",
-      () => ["id"],
-      { method: METHOD, generation: 1 },
-    );
-
-    expect(() =>
-      store.resetInstanceBinding({
-        instance: account,
-        expectedMethod: METHOD,
-        expectedGeneration: 1,
-        nextMethod: "another-method",
-      }),
-    ).toThrowError(new PdppBindingError("connection_conflict"));
-    expect(store.getRecord(account, "playlists", "one")).toBeDefined();
-    expect(store.getInstanceBinding(account)).toMatchObject({
-      method: METHOD,
-      generation: 1,
-    });
-  });
-
   it("keeps A's rows when B replaces its stream snapshot", () => {
     const accountA = "conn_123e4567-e89b-42d3-a456-426614174000";
     const accountB = "conn_123e4567-e89b-42d3-a456-426614174001";

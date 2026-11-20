@@ -838,7 +838,7 @@ item needs a test that fails when the property fails.
 5. Late finality: B waits, then imports; it never imports unproven data.
 6. Blobs of 1 MiB − 1, 1 MiB, 1 MiB + 1 and 200 MiB replicate. The large one
    spans many steps and survives a restart part-way.
-7. Deletion, reset and quarantine reach the peer with the right outcome.
+7. Deletion and quarantine reach the peer with the right outcome.
 8. Both devices report the same records and cursors after quiet.
 9. Flag off: no step runs, nothing is sent or read.
 10. Door: off then on is refused. So is on, then a write by a build without

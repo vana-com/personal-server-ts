@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * Candidate response records and tombstones name their instance; the current
  * contract's wire shape is unchanged (request-resolution audit F5).
@@ -60,6 +61,7 @@ for (const backend of ["memory", "sqlite"])
             ],
           };
           const records = pdppRecordsRoutes({
+            accountStorageMode: explicitLegacyStorageMode("unswitched"),
             store,
             auth: createFixtureAuthorizationService({
               t: { active: true, tokenKind: "client", subjectId: "s", grant },

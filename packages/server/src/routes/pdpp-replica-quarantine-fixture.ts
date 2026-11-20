@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /** Test-only real issuer/replica HTTP fixture; never imports the live harness. */
 import assert from "node:assert/strict";
 import { join } from "node:path";
@@ -173,6 +174,7 @@ export async function openReplicaResourceServer(
   app.route(
     "/pdpp/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       logger,
       store,
       bindingStore: store,

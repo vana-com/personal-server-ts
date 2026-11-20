@@ -21,14 +21,19 @@ export interface TombstoneResubmitState {
   /** ISO time of the last re-submission. */
   lastAttemptAt: string;
   /**
-   * Why the delete stopped (failed entries only): every attempt failed, or
-   * the gateway restored a head other than the one the delete replaced, so
-   * it is not re-submitted automatically.
+   * Why the delete stopped (failed entries only): every attempt failed, the
+   * gateway restored a head other than the one the delete replaced, or the
+   * pass has no way to send a new tombstone. It is not re-submitted
+   * automatically.
    */
   reason?: TombstoneResubmitFailure;
 }
 
-export type TombstoneResubmitFailure = "attempts-exhausted" | "head-changed";
+export type TombstoneResubmitFailure =
+  | "attempts-exhausted"
+  | "head-changed"
+  /** The pass that saw the rollback has no way to send a new tombstone. */
+  | "no-reissue-path";
 
 export interface TombstoneResubmitSnapshot {
   /** Scopes with a re-submission in progress or due. */

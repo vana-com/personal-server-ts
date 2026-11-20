@@ -17,9 +17,17 @@
     "access": "public"
   },
   "files": [
-    "dist"
+    "dist",
+    "dist-test",
+    "contracts"
   ],
   "exports": {
+    "./host-contract.json": "./contracts/host-contract.json",
+    "./routes.json": "./contracts/routes.json",
+    "./replace-conformance.json": "./contracts/replace-conformance.json",
+    "./run-finish-plan.json": "./contracts/run-finish-plan.json",
+    "./run-saved.json": "./contracts/run-saved.json",
+    "./scope-delete-receipt.json": "./contracts/scope-delete-receipt.json",
     "./config": {
       "types": "./dist/config/index.d.ts",
       "import": "./dist/config/index.js"
@@ -39,6 +47,18 @@
     "./api": {
       "types": "./dist/api/index.d.ts",
       "import": "./dist/api/index.js"
+    },
+    "./api/scope-delete-verdict": {
+      "types": "./dist/api/scope-delete-verdict.d.ts",
+      "import": "./dist/api/scope-delete-verdict.js"
+    },
+    "./localdb": {
+      "types": "./dist/localdb/index.d.ts",
+      "import": "./dist/localdb/index.js"
+    },
+    "./localdb/conformance": {
+      "types": "./dist-test/localdb/conformance.d.ts",
+      "import": "./dist-test/localdb/conformance.js"
     },
     "./logger": {
       "types": "./dist/logger/index.d.ts",
@@ -79,6 +99,10 @@
     "./storage/canonical-legacy-projection": {
       "types": "./dist/storage/canonical-legacy-projection.d.ts",
       "import": "./dist/storage/canonical-legacy-projection.js"
+    },
+    "./storage/legacy-write-seal": {
+      "types": "./dist/storage/legacy-write-seal.d.ts",
+      "import": "./dist/storage/legacy-write-seal.js"
     },
     "./storage/legacy-scope-view": {
       "types": "./dist/storage/legacy-scope-view.d.ts",
@@ -164,9 +188,21 @@
       "types": "./dist/publication/publish.d.ts",
       "import": "./dist/publication/publish.js"
     },
+    "./sync/account-mode": {
+      "types": "./dist/sync/account-mode/index.d.ts",
+      "import": "./dist/sync/account-mode/index.js"
+    },
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"
+    },
+    "./stream-sync": {
+      "types": "./dist/stream-sync/index.d.ts",
+      "import": "./dist/stream-sync/index.js"
+    },
+    "./stream-sync-read": {
+      "types": "./dist/stream-sync-read/index.d.ts",
+      "import": "./dist/stream-sync-read/index.js"
     },
     "./sync/manager": {
       "types": "./dist/sync/engine/sync-manager.d.ts",
@@ -175,6 +211,10 @@
     "./storage/adapters": {
       "types": "./dist/storage/adapters/index.d.ts",
       "import": "./dist/storage/adapters/index.js"
+    },
+    "./test-utils/legacy-write-seal": {
+      "types": "./dist/test-utils/legacy-write-seal.d.ts",
+      "import": "./dist/test-utils/legacy-write-seal.js"
     },
     "./test-utils": {
       "types": "./dist/test-utils/index.d.ts",
@@ -219,10 +259,11 @@
     "./oura": {
       "types": "./dist/oura/index.d.ts",
       "import": "./dist/oura/index.js"
-    }
+    },
+    "./raw-end.json": "./contracts/raw-end.json"
   },
   "scripts": {
-    "build": "tsc --build"
+    "build": "tsc --build && tsc --build tsconfig.test-support.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -233,6 +274,20 @@
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
     "zod": "^4.4.3",
-    "@noble/hashes": "1.8.0"
+    "@noble/ciphers": "1.3.0",
+    "@noble/hashes": "1.8.0",
+    "@opendatalabs/personal-server-ts-stream-sync": "*"
+  },
+  "peerDependencies": {
+    "vitest": ">=4",
+    "better-sqlite3": "^12.11.1"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    },
+    "better-sqlite3": {
+      "optional": true
+    }
   }
 }

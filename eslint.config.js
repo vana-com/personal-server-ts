@@ -1,12 +1,24 @@
 import tseslint from "typescript-eslint";
 import eslintConfigPrettier from "eslint-config-prettier";
 
+const legacyProjectionImport = {
+  group: [
+    "**/legacy-projection",
+    "**/legacy-projection/**",
+    "@opendatalabs/personal-server-ts-core/legacy-projection",
+  ],
+  message:
+    "Stream sync holds no connector-specific knowledge: do not import the legacy projection.",
+};
+
 export default tseslint.config(
   {
     ignores: [
       "**/dist/**",
       "**/node_modules/**",
       "**/*.d.ts",
+      // Plain CommonJS the SQLite worker thread loads without a build step.
+      "packages/server/src/localdb/*.cjs",
       // Offline parity generator; never built or published.
       "packages/core/parity-oracle/**",
     ],
@@ -14,15 +26,37 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   eslintConfigPrettier,
   {
+    files: ["packages/core/src/**/*.ts", "packages/lite/src/**/*.ts"],
+    ignores: ["**/*.test.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: 'CallExpression > Literal.arguments[value="base64url"]',
+          message:
+            "Use the portable encoding/base64url codec instead of a Buffer encoding.",
+        },
+        {
+          selector:
+            'MemberExpression[object.name="Buffer"][property.name="compare"], MemberExpression[object.name="Buffer"][computed=true][property.value="compare"]',
+          message:
+            "Compare Uint8Array bytes without Buffer.compare for browser compatibility.",
+        },
+      ],
+    },
+  },
+  {
     // Runs in browsers and WebViews: no Node built-ins.
     files: [
       "packages/core/src/legacy-projection/**/*.ts",
       "packages/core/src/additions/**/*.ts",
       "packages/core/src/replication/**/*.ts",
       "packages/core/src/storage/pdpp-records/completion.ts",
+      "packages/stream-sync/src/**/*.ts",
     ],
     ignores: [
       "**/*.test.ts",
+      "**/test-support/**",
       "**/__fixtures__/**",
       "**/github-browser-parity-fixtures.ts",
     ],
@@ -32,6 +66,47 @@ export default tseslint.config(
         {
           patterns: [
             { group: ["node:*"], message: "Keep this module browser-safe." },
+          ],
+        },
+      ],
+    },
+  },
+  // Stream sync holds no connector-specific knowledge. The legacy projection is
+  // a hand-written per-connector map; reaching it from here would bring
+  // connector names back into the stream-sync writer, reader or protocol.
+  // A later `no-restricted-imports` replaces an earlier one for the same file,
+  // so the protocol package repeats the browser-safe pattern from above.
+  {
+    files: [
+      "packages/core/src/stream-sync/**/*.ts",
+      "packages/core/src/stream-sync-read/**/*.ts",
+    ],
+    ignores: [
+      "**/*.test.ts",
+      "**/test-support/**",
+      "**/__fixtures__/**",
+      // The two modules that still serve legacy data-set names to readers.
+      // Nothing else under these directories may join them.
+      "packages/core/src/stream-sync-read/service.ts",
+      "packages/core/src/stream-sync-read/projection.ts",
+    ],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        { patterns: [legacyProjectionImport] },
+      ],
+    },
+  },
+  {
+    files: ["packages/stream-sync/src/**/*.ts"],
+    ignores: ["**/*.test.ts", "**/test-support/**", "**/__fixtures__/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { group: ["node:*"], message: "Keep this module browser-safe." },
+            legacyProjectionImport,
           ],
         },
       ],

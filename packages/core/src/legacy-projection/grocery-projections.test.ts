@@ -651,4 +651,53 @@ describe("grocery legacy scope projections", () => {
       project([order, { ...item, data: { ...item.data, product_id: null } }]),
     ).toMatchObject({ ok: false, error: { kind: "incomplete_scope" } });
   });
+  // Before the desktop cutover (#421) one order line without a product id made
+  // heb.orders and wholefoods.orders fail whole. The line is now left out and
+  // counted; every other order and line is served.
+  it.each(["heb.orders", "wholefoods.orders"] as const)(
+    "%s leaves out one line with a null product id and keeps every other order and line",
+    (scope) => {
+      const orders = [
+        { stream: "orders", data: { id: "o1", item_count: 2 } },
+        { stream: "orders", data: { id: "o2", item_count: 1 } },
+      ];
+      const line = (id: string, orderId: string, productId: string | null) => ({
+        stream: "order_items",
+        data: {
+          id,
+          order_id: orderId,
+          name: `Item ${id}`,
+          product_id: productId,
+          quantity: 1,
+        },
+      });
+      const result = LEGACY_SCOPE_BINDINGS.get(scope)?.project(
+        [
+          ...orders,
+          line("l1", "o1", "A1"),
+          line("l2", "o1", null),
+          line("l3", "o2", "B2"),
+        ],
+        { fetchedStreams: ["orders", "order_items"] },
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        payload: {
+          orders: [
+            { orderId: "o1", items: [{ productId: "A1" }] },
+            { orderId: "o2", items: [{ productId: "B2" }] },
+          ],
+          totalOrders: 2,
+          totalItems: 2,
+        },
+      });
+      expect(result?.ok && result.diagnostics).toContainEqual({
+        kind: "records_dropped",
+        scope,
+        stream: "order_items",
+        count: 1,
+        reasons: ["projection_order_item_missing_product_id"],
+      });
+    },
+  );
 });

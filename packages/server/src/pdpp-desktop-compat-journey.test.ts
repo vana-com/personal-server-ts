@@ -5,6 +5,7 @@
  * PS must bootstrap account one and accept the legacy Desktop source keys at
  * the HTTP boundary while storing canonical retained source ids.
  */
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import Database from "better-sqlite3";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import type { ServerContext } from "./bootstrap.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 
@@ -57,7 +58,7 @@ async function boot(
   const declarationPath = join(tempDir, "declarations", "claude.json");
   await mkdir(join(tempDir, "declarations"), { recursive: true });
   await writeFile(declarationPath, DECLARATION, "utf-8");
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       pdpp: {
@@ -338,7 +339,7 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
   it("does not reactivate retained canonical writers when a source is registry-only", async () => {
     ctx = await boot();
     await ctx.cleanup();
-    ctx = await createServer(
+    ctx = await createUnswitchedServer(
       ServerConfigSchema.parse({
         tunnel: { enabled: false },
         pdpp: {

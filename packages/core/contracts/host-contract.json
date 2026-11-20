@@ -1,0 +1,115 @@
+{
+  "format": 1,
+  "runIntake": {
+    "errors": [
+      {
+        "name": "invalid_request",
+        "status": 400
+      },
+      {
+        "name": "owner_mismatch",
+        "status": 409
+      },
+      {
+        "name": "lease_lost",
+        "status": 409
+      },
+      {
+        "name": "connection_busy",
+        "status": 409
+      },
+      {
+        "name": "connection_stopped",
+        "status": 409
+      },
+      {
+        "name": "delete_pending",
+        "status": 409
+      },
+      {
+        "name": "gone",
+        "status": 410
+      },
+      {
+        "name": "run_conflict",
+        "status": 409
+      },
+      {
+        "name": "unknown_artifact",
+        "status": 422
+      },
+      {
+        "name": "batch_gap",
+        "status": 409
+      },
+      {
+        "name": "restricted_scope_unsupported",
+        "status": 422
+      },
+      {
+        "name": "control_basis_mismatch",
+        "status": 409
+      },
+      {
+        "name": "control_basis_unavailable",
+        "status": 503
+      },
+      {
+        "name": "control_foreign",
+        "status": 409
+      },
+      {
+        "name": "join_required",
+        "status": 409
+      },
+      {
+        "name": "connector_update_required",
+        "status": 409
+      }
+    ],
+    "endResults": [
+      "queued",
+      "checkpoint_only",
+      "no_checkpoint",
+      "discarded",
+      "aborted"
+    ],
+    "endOutcomes": [
+      "succeeded",
+      "partial",
+      "retry_pending",
+      "failed",
+      "cancelled"
+    ],
+    "endAcceptance": [
+      {
+        "result": "queued",
+        "outcomes": ["succeeded", "partial", "retry_pending"],
+        "recordsSent": "any"
+      },
+      {
+        "result": "checkpoint_only",
+        "outcomes": ["retry_pending"],
+        "recordsSent": "any"
+      },
+      {
+        "result": "checkpoint_only",
+        "outcomes": ["succeeded"],
+        "recordsSent": "none"
+      },
+      {
+        "result": "no_checkpoint",
+        "outcomes": ["retry_pending"],
+        "recordsSent": "any"
+      },
+      {
+        "result": "no_checkpoint",
+        "outcomes": ["succeeded"],
+        "recordsSent": "none"
+      }
+    ]
+  },
+  "localDatabase": {
+    "namePattern": "^vana-[A-Za-z0-9:/._-]+-[0-9a-f]{32}$"
+  }
+}

@@ -26,6 +26,7 @@
  * CHAIN_ID, SCOPE — same defaults as e2e-storage-sync.ts.
  */
 
+import { fixedLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -229,6 +230,8 @@ async function makeStoreSide(
   const storage = createNodeDataStorage({
     indexManager,
     hierarchyOptions: { dataDir },
+    // These runs model an account that has not switched.
+    legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
   });
   const storageAdapter = createVanaSyncStorageAdapter({
     config,

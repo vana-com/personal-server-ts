@@ -10,13 +10,9 @@ function binding(instance: string): PdppInstanceBinding {
 }
 
 function buildApp() {
-  const resetInstanceBinding = vi.fn((input: { instance: string }) => ({
-    binding: { ...binding(input.instance), method: "m2", generation: 2 },
-    alreadyReset: false,
-  }));
   const getInstanceBinding = vi.fn((instance: string) => binding(instance));
   const app = pdppInstanceBindingRoutes({
-    store: { getInstanceBinding, resetInstanceBinding },
+    store: { getInstanceBinding },
     auth: {
       async resolveToken(token: string) {
         if (token !== "owner-token") return { active: false as const };
@@ -35,7 +31,7 @@ function buildApp() {
       ["inst_2", ["m1"]],
     ]),
   });
-  return { app, getInstanceBinding, resetInstanceBinding };
+  return { app, getInstanceBinding };
 }
 
 describe("pdpp instance binding routes", () => {
@@ -49,51 +45,5 @@ describe("pdpp instance binding routes", () => {
     expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("authentication_error");
     expect(getInstanceBinding).not.toHaveBeenCalled();
-  });
-
-  it("denies resets outside the owner token's persisted instance scope without mutating", async () => {
-    const { app, resetInstanceBinding } = buildApp();
-
-    const response = await app.request("/pdpp/instances/inst_2/reset", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer owner-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        expected_method: "m1",
-        expected_generation: 1,
-        next_method: "m2",
-      }),
-    });
-
-    expect(response.status).toBe(401);
-    expect((await response.json()).error.code).toBe("authentication_error");
-    expect(resetInstanceBinding).not.toHaveBeenCalled();
-  });
-
-  it("allows resets inside the owner token's persisted instance scope", async () => {
-    const { app, resetInstanceBinding } = buildApp();
-
-    const response = await app.request("/pdpp/instances/inst_1/reset", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer owner-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        expected_method: "m1",
-        expected_generation: 1,
-        next_method: "m2",
-      }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(resetInstanceBinding).toHaveBeenCalledWith({
-      instance: "inst_1",
-      expectedMethod: "m1",
-      expectedGeneration: 1,
-      nextMethod: "m2",
-    });
   });
 });

@@ -7,6 +7,7 @@
  * of fabricated route mocks.
  */
 
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -18,7 +19,7 @@ import {
   openPdppAuthStore,
   PdppTokenService,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import type { ServerContext } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
@@ -75,7 +76,7 @@ async function writeDeclaration(name: string, document: string) {
 async function bootBoth() {
   const claude = await writeDeclaration("claude", CLAUDE_DECLARATION);
   const oura = await writeDeclaration("oura", OURA_DECLARATION);
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       pdpp: {

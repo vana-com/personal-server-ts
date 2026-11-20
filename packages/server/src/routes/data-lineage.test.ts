@@ -19,8 +19,10 @@ import type {
 } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
+  fixedLegacyWriteSeal,
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedOwnedAccountStorageMode,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   WRITE_SIGNATURE_HEADER,
@@ -196,6 +198,8 @@ describe("derivative data routes", () => {
     accessLogWriter = { write: vi.fn().mockResolvedValue(undefined) };
     lineageGateway = createMockLineageGateway();
     deps = {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       indexManager,
       hierarchyOptions,
       logger,
@@ -655,7 +659,12 @@ describe("derivative data routes", () => {
     });
 
     it("answers 503 when the server has no lineage gateway", async () => {
-      const localApp = dataRoutes({ ...deps, lineageGateway: undefined });
+      const localApp = dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
+        ...deps,
+        lineageGateway: undefined,
+      });
       const res = await localApp.request(`/${DERIVED_SCOPE}/lineage`, {
         headers: {
           Authorization: await ownerHeader("GET", `/${DERIVED_SCOPE}/lineage`),
@@ -884,7 +893,12 @@ describe("derivative data routes", () => {
     });
 
     it("serves the full envelope to a policy-bypass credential", async () => {
-      const localApp = dataRoutes({ ...deps, devToken: "dev-secret" });
+      const localApp = dataRoutes({
+        accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
+        ...deps,
+        devToken: "dev-secret",
+      });
       const seed = await app.request(`/${SOURCE_SCOPE}`, {
         method: "POST",
         headers: {

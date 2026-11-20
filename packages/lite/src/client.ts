@@ -1,11 +1,11 @@
 import {
-  accessLogsListPath,
-  createOwnerSignedPersonalServerRequest,
+  leavesUnconfirmed,
+  type PublicationReceipt,
+  type SeedIntake,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import {
   createPersonalServerInfoFromHealth,
   createPersonalServerRegistrationRequest,
-  dataListPath,
-  dataReadPath,
-  dataVersionsPath,
   grantRevokePath,
   parsePersonalServerJsonResponse,
   PersonalServerClientError,
@@ -16,18 +16,10 @@ import {
   type PersonalServerCreateGrantResult,
   type PersonalServerHandle,
   type PersonalServerInfo,
-  type PersonalServerListAccessLogsOptions,
-  type PersonalServerListAccessLogsResult,
-  type PersonalServerListDataOptions,
-  type PersonalServerListDataResult,
   type PersonalServerListGrantsResult,
-  type PersonalServerListVersionsOptions,
-  type PersonalServerListVersionsResult,
   type PersonalServerOpenScopeUploadOptions,
-  type PersonalServerOwnerAuth,
   type PersonalServerPostDataOptions,
   type PersonalServerPrepareRegistrationOptions,
-  type PersonalServerReadDataOptions,
   type PersonalServerReadyOptions,
   type PersonalServerRevokeGrantResult,
   type PersonalServerRegistrationRequest,
@@ -35,19 +27,22 @@ import {
   type PersonalServerScopeUploadResult,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
-  type PersonalServerSyncTriggerResult,
 } from "@opendatalabs/personal-server-ts-core/client";
-import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  RunIntake,
+  RunPublicationStatus,
+} from "@opendatalabs/personal-server-ts-core/stream-sync";
 import {
   prepareScopeUploadBatches,
   type PreparedScopeUploadBatch,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   createGatewayClient,
-  type DataFileEnvelope,
   type GatewayClient,
   type RegisterServerResult,
 } from "@opendatalabs/vana-sdk/browser";
+import { createOwnerRequest } from "./owner-request.js";
+import { createPersonalServerClient } from "./personal-server-client.js";
 import {
   createIndexedDbPsLiteRuntime,
   type IndexedDbPsLiteRuntime,
@@ -86,6 +81,9 @@ export interface StartPersonalServerLiteOptions extends Omit<
   IndexedDbPsLiteRuntimeOptions,
   "ownerSignature" | "active"
 > {
+  /** Pull switched owner data before advertising. Incoming relay and cycle
+   * publication stay closed until registration is confirmed. Built runtimes only. */
+  ownerReadBeforeRegistration?: boolean;
   ownerSignature?: `0x${string}`;
   active?: boolean;
   runtime?: PsLiteRuntime;
@@ -96,9 +94,48 @@ export interface StartPersonalServerLiteOptions extends Omit<
   onStatus?: (status: PersonalServerStatus) => void;
 }
 
+export type PersonalServerLitePublicationResult = {
+  readonly outcome: "published" | "noop";
+  readonly publications: readonly PublicationReceipt[];
+};
+
+/** The Lite handle: the shared handle plus the host's run-intake door. */
+export type PersonalServerLiteHandle = PersonalServerHandle & {
+  /** True only when this handle admits verified owner pulls before registration. */
+  readonly ownerReadBeforeRegistration: boolean;
+  /** Local identity/status only: never looks up server registration. */
+  localInfo(): Promise<PersonalServerInfo>;
+  /** In-process run intake; `null` unless the host built a run intake. */
+  readonly streamSyncIntake: RunIntake | null;
+  /** One-time retained-snapshot intake, with the runtime's Account admission. */
+  readonly streamSyncSeed: SeedIntake | null;
+  /** Await a database publication cycle. Rejects if any stream cannot confirm publication.
+   * A stream of a deleted connection (outcome `purged`) is settled, not
+   * unconfirmed: it neither rejects nor appears in the receipts.
+   * Receipts cover individual streams, not every stream of a connection.
+   * A noop contains no new coverage. Unavailable or stopped runtimes reject.
+   */
+  publish(): Promise<PersonalServerLitePublicationResult>;
+  /** Whether an ended run is saved, from durable local state. Use it when a
+   * `publish()` reply was lost; it does not collect or publish anything.
+   * Errors as `streamSyncIntake.publicationStatus` does.
+   */
+  publicationStatus(runId: string): Promise<RunPublicationStatus>;
+  /**
+   * The built runtime's change announcements, for a host that shows the data
+   * (see `IndexedDbPsLiteRuntime`). Absent over a supplied runtime: its
+   * storage is the caller's. A host without them can only re-read on a timer.
+   */
+  readonly subscribeViewChanges?: IndexedDbPsLiteRuntime["subscribeViewChanges"];
+  readonly subscribeSyncStatus?: IndexedDbPsLiteRuntime["subscribeSyncStatus"];
+};
+
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
-): Promise<PersonalServerHandle> {
+): Promise<PersonalServerLiteHandle> {
+  if (options.ownerReadBeforeRegistration && options.runtime) {
+    throw new Error("Early owner reads require a verified built runtime");
+  }
   if (options.persistence && options.runtime) {
     throw new Error(
       "runtime cannot be supplied with a complete persistence bundle",
@@ -151,10 +188,15 @@ export async function startPersonalServer(
           () => relayClientForDrain,
         )
       : options.readFulfillmentReporter;
+  let registrationConfirmed = false;
+  const earlyOwnerReads = options.ownerReadBeforeRegistration === true;
   const runtimeBundle: IndexedDbPsLiteRuntime | null = options.runtime
     ? null
     : await createIndexedDbPsLiteRuntime({
         ...options,
+        ...(earlyOwnerReads && {
+          registrationReady: () => registrationConfirmed,
+        }),
         readFulfillmentReporter,
         ownerSignature: requiredOwnerSignature(options.ownerSignature),
         active: options.active ?? true,
@@ -170,6 +212,7 @@ export async function startPersonalServer(
     runtime.activate();
   }
 
+  let stopping = false;
   let status: PersonalServerStatus = "ready";
   let relayStatus: PsLiteRelayStatus = "closed";
   let relayClient: PsLiteRelayClient | undefined;
@@ -183,7 +226,15 @@ export async function startPersonalServer(
     options.onStatus?.(nextStatus);
   };
 
-  if (resolvedRelayOptions) {
+  publicUrl = initialPublicUrl;
+  function startRelay(): void {
+    if (
+      !resolvedRelayOptions ||
+      relayClient ||
+      status === "stopped" ||
+      stopping
+    )
+      return;
     relayStatus = "connecting";
     publicUrl = initialPublicUrl;
     relayClient = startPsLiteRelayClient({
@@ -201,12 +252,24 @@ export async function startPersonalServer(
     });
     relayClientForDrain = relayClient;
   }
+  function confirmRegistration(): void {
+    if (registrationConfirmed || stopping || status === "stopped") return;
+    registrationConfirmed = true;
+    startRelay();
+    // A pull may already be running. Trigger coalesces the publication pass
+    // behind it, without delaying the registration receipt on historical data.
+    if (earlyOwnerReads)
+      void runtimeBundle?.syncManager?.trigger().catch(() => {});
+  }
+  if (!earlyOwnerReads) startRelay();
 
-  async function info(): Promise<PersonalServerInfo> {
+  async function readInfo(lookup: boolean): Promise<PersonalServerInfo> {
     if (status === "stopped" && lastInfo) {
       return { ...lastInfo, status: "stopped" };
     }
-    const response = await runtime.fetch(new Request(`${localOrigin}/health`));
+    const response = await runtime.fetch(
+      new Request(`${localOrigin}/health${lookup ? "" : "?registration=skip"}`),
+    );
     const body = await response.json();
     lastInfo = createPersonalServerInfoFromHealth({
       kind: "lite",
@@ -218,7 +281,20 @@ export async function startPersonalServer(
       localUrl: localOrigin,
       publicUrl,
     });
+    if (lastInfo.registration.registered) confirmRegistration();
     return lastInfo;
+  }
+  const info = () => readInfo(true);
+
+  /**
+   * Where API calls go: the relay URL once there is one, else the local
+   * runtime. It is the `urls.apiOrigin` that `info()` reports, without the
+   * `/health` request behind `info()`, which looks this server up at the
+   * gateway. A call that needs only the origin must not pay that lookup: the
+   * handle's calls each did, twice.
+   */
+  function apiOrigin(): string {
+    return publicUrl ?? localOrigin;
   }
 
   async function prepareRegistration(
@@ -259,6 +335,7 @@ export async function startPersonalServer(
       signature: submitOptions.signature,
     }).then(async (result) => {
       await rememberRegisteredRelay(request.candidate.serverUrl);
+      confirmRegistration();
       return result;
     });
   }
@@ -267,8 +344,7 @@ export async function startPersonalServer(
     input: string | URL | Request,
     init?: RequestInit,
   ): Promise<Response> {
-    const origin = (await info()).urls.apiOrigin ?? localOrigin;
-    return runtime.fetch(await toRuntimeRequest(input, origin, init));
+    return runtime.fetch(await toRuntimeRequest(input, apiOrigin(), init));
   }
 
   async function postData(
@@ -276,8 +352,7 @@ export async function startPersonalServer(
     body: unknown,
     postOptions: PersonalServerPostDataOptions,
   ): Promise<{ scope: string; collectedAt: string; status: string }> {
-    const current = await info();
-    const origin = requiredApiOrigin(current);
+    const origin = apiOrigin();
     const path = `/v1/data/${encodeURIComponent(scope)}`;
     const request = await createOwnerRequest({
       origin,
@@ -300,7 +375,7 @@ export async function startPersonalServer(
     scope: string,
     uploadOptions: PersonalServerOpenScopeUploadOptions,
   ): Promise<PersonalServerScopeUpload> {
-    const origin = requiredApiOrigin(await info());
+    const origin = apiOrigin();
     const base = `/v1/data/${encodeURIComponent(scope)}/uploads`;
     // Every request below is already addressed to `origin`, so each goes
     // straight to the runtime. `callFetch` would ask `info()` for the origin
@@ -467,99 +542,26 @@ export async function startPersonalServer(
     };
   }
 
-  async function listData(
-    listOptions: PersonalServerListDataOptions = {},
-  ): Promise<PersonalServerListDataResult> {
-    const current = await info();
-    const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
-      path: dataListPath(listOptions),
-      method: "GET",
-      authOptions: listOptions,
-      headers: listOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "data list",
-    );
-  }
+  // The read calls are the factory's, over this handle's `fetch` and origin.
+  const client = createPersonalServerClient({
+    fetch: (request) => callFetch(request),
+    origin: apiOrigin,
+  });
+  const listData = client.listData;
 
-  async function listAccessLogs(
-    accessLogOptions: PersonalServerListAccessLogsOptions = {},
-  ): Promise<PersonalServerListAccessLogsResult> {
-    const current = await info();
-    const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
-      path: accessLogsListPath(accessLogOptions),
-      method: "GET",
-      authOptions: accessLogOptions,
-      headers: accessLogOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "access logs list",
-    );
-  }
+  const listAccessLogs = client.listAccessLogs;
 
-  async function listVersions(
-    scope: string,
-    versionOptions: PersonalServerListVersionsOptions = {},
-  ): Promise<PersonalServerListVersionsResult> {
-    const current = await info();
-    const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
-      path: dataVersionsPath(scope, versionOptions),
-      method: "GET",
-      authOptions: versionOptions,
-      headers: versionOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "data versions list",
-    );
-  }
+  const listVersions = client.listVersions;
 
-  async function readData(
-    scope: string,
-    readOptions: PersonalServerReadDataOptions = {},
-  ): Promise<DataFileEnvelope> {
-    const current = await info();
-    const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
-      path: dataReadPath(scope, readOptions),
-      method: "GET",
-      authOptions: readOptions,
-      headers: readOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "data read",
-    );
-  }
+  const readData = client.readData;
 
-  async function syncStatus(
-    syncOptions: PersonalServerAuthRequestOptions = {},
-  ): Promise<SyncStatus> {
-    const current = await info();
-    const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
-      path: "/v1/sync/status",
-      method: "GET",
-      authOptions: syncOptions,
-      headers: syncOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "sync status",
-    );
-  }
+  const syncStatus = client.syncStatus;
 
   async function createGrant(
     grantOptions: PersonalServerCreateGrantOptions,
   ): Promise<PersonalServerCreateGrantResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: "/v1/grants",
       method: "POST",
       body: {
@@ -587,9 +589,8 @@ export async function startPersonalServer(
   async function listGrants(
     grantOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<PersonalServerListGrantsResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: "/v1/grants",
       method: "GET",
       authOptions: grantOptions,
@@ -605,9 +606,8 @@ export async function startPersonalServer(
     grantId: string,
     grantOptions: PersonalServerAuthRequestOptions = {},
   ): Promise<PersonalServerRevokeGrantResult> {
-    const current = await info();
     const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
+      origin: apiOrigin(),
       path: grantRevokePath(grantId),
       method: "DELETE",
       authOptions: grantOptions,
@@ -619,22 +619,7 @@ export async function startPersonalServer(
     );
   }
 
-  async function syncNow(
-    syncOptions: PersonalServerAuthRequestOptions = {},
-  ): Promise<PersonalServerSyncTriggerResult> {
-    const current = await info();
-    const request = await createOwnerRequest({
-      origin: requiredApiOrigin(current),
-      path: "/v1/sync/trigger",
-      method: "POST",
-      authOptions: syncOptions,
-      headers: syncOptions.headers,
-    });
-    return parsePersonalServerJsonResponse(
-      await callFetch(request),
-      "sync trigger",
-    );
-  }
+  const syncNow = client.syncNow;
 
   async function rememberRegisteredRelay(serverUrl: string): Promise<void> {
     if (!resolvedRelayOptions || !relayStateStore) return;
@@ -646,43 +631,76 @@ export async function startPersonalServer(
     });
   }
 
-  async function createOwnerRequest(params: {
-    origin: string;
-    path: string;
-    method: string;
-    body?: unknown;
-    authOptions:
-      PersonalServerAuthRequestOptions | PersonalServerPostDataOptions;
-    headers?: Record<string, string>;
-  }): Promise<Request> {
-    const encoded =
-      params.body === undefined
-        ? undefined
-        : new TextEncoder().encode(JSON.stringify(params.body));
-    const auth = authFromOptions(params.authOptions);
-    if (auth) {
-      return createOwnerSignedPersonalServerRequest({
-        origin: params.origin,
-        path: params.path,
-        method: params.method,
-        body: encoded,
-        auth,
-        headers: params.headers,
-      });
+  const publishing = new Set<Promise<PersonalServerLitePublicationResult>>();
+  const seedPort = runtime.streamSyncSeed;
+  const streamSyncSeed: SeedIntake | null = seedPort
+    ? {
+        async status(connector) {
+          if (stopping || status === "stopped")
+            throw new Error("Stream seed intake is unavailable");
+          return seedPort.status(connector);
+        },
+        async put(connector, stream, body) {
+          if (stopping || status === "stopped")
+            throw new Error("Stream seed intake is unavailable");
+          return seedPort.put(connector, stream, body);
+        },
+      }
+    : null;
+  function publish(): Promise<PersonalServerLitePublicationResult> {
+    if (stopping)
+      return Promise.reject(new Error("Stream publication is unavailable"));
+    const operation = publishCycle();
+    publishing.add(operation);
+    void operation.finally(() => publishing.delete(operation)).catch(() => {});
+    return operation;
+  }
+
+  async function publishCycle(): Promise<PersonalServerLitePublicationResult> {
+    if (
+      (earlyOwnerReads && !registrationConfirmed) ||
+      status === "stopped" ||
+      !runtimeBundle?.getLocalSync
+    )
+      throw new Error("Stream publication is unavailable");
+    const report = await (await runtimeBundle.getLocalSync()).publish();
+    const publications: PublicationReceipt[] = [];
+    for (const connection of report.connections) {
+      if (connection.error) throw new Error(connection.error);
+      for (const result of connection.published) {
+        if (leavesUnconfirmed(result.outcome))
+          throw new Error(
+            `Stream publication ${result.outcome}: ${connection.connectionId}/${result.stream}`,
+          );
+        if (result.publication) publications.push(result.publication);
+      }
     }
-    return new Request(`${params.origin}${params.path}`, {
-      method: params.method,
-      body: encoded,
-      headers: params.headers,
-    });
+    return {
+      outcome: publications.length ? "published" : "noop",
+      publications,
+    };
+  }
+
+  async function publicationStatus(
+    runId: string,
+  ): Promise<RunPublicationStatus> {
+    const intake = runtimeBundle?.streamSyncIntake;
+    if (stopping || status === "stopped" || !intake)
+      throw new Error("Stream publication is unavailable");
+    return intake.publicationStatus(runId);
   }
 
   async function stop(): Promise<void> {
     if (status === "stopped") return;
+    stopping = true;
     relayClient?.close("personal-server-stop");
     relayClient = undefined;
     runtime.deactivate();
+    // The importer writes through the stores; stop it before they wind down.
+    await runtimeBundle?.importWaker?.stop();
     await runtimeBundle?.syncManager?.stop?.();
+    await Promise.allSettled([...publishing]);
+    await runtimeBundle?.closeStreamSync?.();
     setStatus("stopped");
   }
 
@@ -691,6 +709,8 @@ export async function startPersonalServer(
   const replicationStatus = runtimeBundle?.replication;
   return {
     kind: "lite",
+    ownerReadBeforeRegistration: earlyOwnerReads,
+    localInfo: () => readInfo(false),
     ...(replicationStatus && {
       replication: { status: () => replicationStatus },
     }),
@@ -710,6 +730,14 @@ export async function startPersonalServer(
     revokeGrant,
     syncStatus,
     syncNow,
+    ...(runtimeBundle && {
+      subscribeViewChanges: runtimeBundle.subscribeViewChanges,
+      subscribeSyncStatus: runtimeBundle.subscribeSyncStatus,
+    }),
+    streamSyncIntake: runtimeBundle?.streamSyncIntake ?? null,
+    streamSyncSeed,
+    publish,
+    publicationStatus,
     stop,
   };
 }
@@ -732,15 +760,6 @@ function randomSessionId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
-}
-
-function authFromOptions(
-  options: PersonalServerAuthRequestOptions | PersonalServerPostDataOptions,
-): PersonalServerOwnerAuth | undefined {
-  if ("auth" in options && options.auth) return options.auth;
-  if ("signMessage" in options) return { signMessage: options.signMessage };
-  if ("bearerToken" in options) return { bearerToken: options.bearerToken };
-  return undefined;
 }
 
 function requiredOwnerSignature(
@@ -770,13 +789,6 @@ function requiredGatewayUrl(info: PersonalServerInfo): string {
     throw new Error("Personal Server gateway URL is required");
   }
   return info.gatewayUrl;
-}
-
-function requiredApiOrigin(info: PersonalServerInfo): string {
-  if (!info.urls.apiOrigin) {
-    throw new Error("Personal Server API origin is required");
-  }
-  return info.urls.apiOrigin;
 }
 
 async function toRuntimeRequest(

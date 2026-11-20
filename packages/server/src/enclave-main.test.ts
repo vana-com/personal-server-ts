@@ -11,9 +11,15 @@ const serviceMocks = vi.hoisted(() => ({
   loadConfig: vi.fn(),
 }));
 
-vi.mock("@opendatalabs/personal-server-ts-core/keys", () => ({
-  createPublicOnlyAccount: serviceMocks.createPublicOnlyAccount,
-}));
+import type * as CoreKeys from "@opendatalabs/personal-server-ts-core/keys";
+
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/keys",
+  async (importOriginal) => ({
+    ...(await importOriginal<typeof CoreKeys>()),
+    createPublicOnlyAccount: serviceMocks.createPublicOnlyAccount,
+  }),
+);
 vi.mock("./bootstrap.js", () => ({ createServer: serviceMocks.createServer }));
 vi.mock("./config/index.js", () => ({ loadConfig: serviceMocks.loadConfig }));
 vi.mock("./listen.js", () => ({

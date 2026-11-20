@@ -64,6 +64,7 @@ it.each([
         dbName: crypto.randomUUID(),
       }),
       ownerSignature: signature,
+      accountStorageMode: { owner: owner.address, read: () => "unswitched" },
       serverAccount: owner,
       ownerSyncSigner: {
         address: owner.address,
@@ -160,6 +161,7 @@ it.each([undefined, false])(
         dbName: crypto.randomUUID(),
       }),
       ownerSignature: signature,
+      accountStorageMode: { owner: owner.address, read: () => "unswitched" },
       serverAccount: owner,
       ownerSyncSigner: {
         address: owner.address,

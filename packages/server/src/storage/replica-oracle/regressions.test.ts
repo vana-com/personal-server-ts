@@ -159,16 +159,6 @@ describe("terminal quarantine rejects every mutating path and changes nothing", 
   ][] = [
     ["deleteConnection", (driver) => driver.store.deleteConnection("c1")],
     [
-      "resetInstanceBinding",
-      (driver) =>
-        driver.store.resetInstanceBinding({
-          instance: "c1",
-          expectedMethod: METHOD,
-          expectedGeneration: 1,
-          nextMethod: METHOD,
-        }),
-    ],
-    [
       "storeBlobBytesForInstance",
       (driver) =>
         driver.store.storeBlobBytesForInstance({

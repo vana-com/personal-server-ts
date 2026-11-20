@@ -1,3 +1,4 @@
+import { fixedModeAuthority as explicitLegacyAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * PDPP integrated journey: seeded data -> real AS review/approval -> real
  * grant-bound token -> real RS constrained read -> revoke -> denial.
@@ -309,6 +310,7 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
 
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: explicitLegacyAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),

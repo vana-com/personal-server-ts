@@ -24,6 +24,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { MAX_INGEST_BODY_BYTES } from "./routes/pdpp-records.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
@@ -103,7 +104,7 @@ async function boot(
       }),
     )
   ).filter((sourceId): sourceId is string => typeof sourceId === "string");
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       pdpp: {
@@ -204,31 +205,6 @@ async function ingest(
     status: response.status,
     body: (await response.json()) as IngestBody,
   };
-}
-
-async function reset(
-  context: ServerContext,
-  token: string,
-  instance: string,
-  expectedMethod: string | null,
-  expectedGeneration: number,
-  nextMethod: string | null,
-) {
-  return context.app.request(
-    `/pdpp/instances/${encodeURIComponent(instance)}/reset`,
-    {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        expected_method: expectedMethod,
-        expected_generation: expectedGeneration,
-        next_method: nextMethod,
-      }),
-    },
-  );
 }
 
 async function uploadBlob(
@@ -621,7 +597,7 @@ describe("P2: streams are keyed by source and stream name", () => {
 });
 
 describe("P6: scoped owner tokens on a real server", () => {
-  it("cannot read or reset another owned instance's binding", async () => {
+  it("cannot read another owned instance's binding", async () => {
     ctx = await bootBoth();
     const claudeToken = await ownerToken(ctx, CLAUDE);
     const ouraToken = await ownerToken(ctx, OURA);
@@ -631,17 +607,6 @@ describe("P6: scoped owner tokens on a real server", () => {
     const crossRead = await read(ctx, claudeToken, bindingPath);
     expect(crossRead.status).toBe(401);
     expect(crossRead.body.error.code).toBe("authentication_error");
-    const crossReset = await reset(
-      ctx,
-      claudeToken,
-      ouraInstance,
-      null,
-      1,
-      "oura",
-    );
-    expect(crossReset.status).toBe(401);
-    expect((await crossReset.json()).error.code).toBe("authentication_error");
-
     const ownedRead = await read(ctx, ouraToken, bindingPath);
     expect(ownedRead.status).toBe(200);
     expect(ownedRead.body).toMatchObject({ method: "oura", generation: 1 });
@@ -849,7 +814,7 @@ describe("P4: ingest body limit", () => {
   });
 });
 
-describe("P8: active method, owner reset, and generation-fenced blobs", () => {
+describe("P8: active method and generation-fenced blobs", () => {
   it("locks an instance when configuration names multiple active methods", async () => {
     const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
     ctx = await boot(
@@ -921,223 +886,6 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
     );
     expect(binding.body).toMatchObject({ method: "oura", empty: true });
     expect(storeCounters()).toEqual({ clock: 0, changes: 0 });
-  });
-
-  it("rejects stale-generation writes after reset and expires old change tokens", async () => {
-    const ouraPath = await writeDeclaration("oura", OURA_DECLARATION);
-    const claudePath = await writeDeclaration("claude", CLAUDE_DECLARATION);
-    ctx = await boot([claudePath, ouraPath]);
-    const token = await ownerToken(ctx);
-    const instance = `oura:${owner}`;
-    const binding = await read(
-      ctx,
-      token,
-      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
-    );
-    expect(binding.body).toMatchObject({
-      method: "oura",
-      generation: 1,
-      empty: true,
-      configured_active_method: "oura",
-    });
-    const uploaded = await uploadBlob(
-      ctx,
-      token,
-      instance,
-      "oura",
-      1,
-      new TextEncoder().encode("method A image"),
-    );
-    expect(uploaded.status).toBe(200);
-    const blob = (await uploaded.json()) as { blob_id: string };
-
-    const event = await ingest(ctx, token, "events", {
-      instance,
-      key: "event-a",
-      data: {
-        id: "event-a",
-        kind: "sleep",
-        blob_ref: { blob_id: blob.blob_id },
-      },
-      emitted_at: "2026-09-01T00:00:00Z",
-    });
-    expect(outcomes(event.body)).toEqual(["accepted"]);
-    const mutable = await ingest(ctx, token, "profile", {
-      instance,
-      key: "user-a",
-      data: { user_id: "user-a", email: "a@example.com" },
-      emitted_at: "2026-09-01T00:00:00Z",
-    });
-    expect(outcomes(mutable.body)).toEqual(["accepted"]);
-
-    const baseline = await read(
-      ctx,
-      token,
-      "/v1/streams/events/records?changes_since=",
-    );
-    const oldToken = baseline.body.next_changes_since as string;
-    const switched = await reset(ctx, token, instance, "oura", 1, "oura");
-    expect(switched.status).toBe(200);
-    expect(await switched.json()).toMatchObject({
-      method: "oura",
-      generation: 2,
-    });
-    expect(storeCounters()).toEqual({ clock: 4, changes: 0 });
-
-    const staleAAfterReset = await ingest(
-      ctx,
-      token,
-      "events",
-      {
-        instance,
-        key: "event-a-after-switch",
-        data: { id: "event-a-after-switch", kind: "late" },
-        emitted_at: "2026-09-02T00:00:00Z",
-      },
-      "oura",
-      1,
-    );
-    expect(staleAAfterReset.status).toBe(409);
-    expect((staleAAfterReset.body as any).error.code).toBe(
-      "binding_generation_mismatch",
-    );
-    const blobCountersAfterSwitch = blobStoreCounters();
-    const staleABlobAfterReset = await uploadBlob(
-      ctx,
-      token,
-      instance,
-      "oura",
-      1,
-      new TextEncoder().encode("stale A bytes after switch"),
-    );
-    expect(staleABlobAfterReset.status).toBe(409);
-    expect((await staleABlobAfterReset.json()).error.code).toBe(
-      "binding_generation_mismatch",
-    );
-    expect(blobStoreCounters()).toEqual(blobCountersAfterSwitch);
-
-    const resetAgain = await reset(ctx, token, instance, "oura", 1, "oura");
-    expect(resetAgain.status).toBe(200);
-    expect(await resetAgain.json()).toMatchObject({ status: "already_reset" });
-    const afterReset = await read(
-      ctx,
-      token,
-      `/v1/streams/events/records?changes_since=${encodeURIComponent(oldToken)}`,
-    );
-    expect(afterReset.status).toBe(410);
-
-    await ctx.cleanup();
-    ctx = await boot(
-      [claudePath, ouraPath],
-      [
-        { method_id: "claude", declaration_path: claudePath },
-        { method_id: "oura", declaration_path: ouraPath },
-      ],
-    );
-    const newToken = await ownerToken(ctx);
-
-    const staleRecord = await ingest(
-      ctx,
-      newToken,
-      "events",
-      {
-        instance,
-        key: "event-a-late",
-        data: { id: "event-a-late", kind: "late" },
-        emitted_at: "2026-09-02T00:00:00Z",
-      },
-      "oura",
-      1,
-    );
-    expect(staleRecord.status).toBe(409);
-    expect(
-      (staleRecord.body as unknown as { error: { code: string } }).error.code,
-    ).toBe("binding_generation_mismatch");
-    const staleBlob = await uploadBlob(
-      ctx,
-      newToken,
-      instance,
-      "oura",
-      1,
-      new TextEncoder().encode("late A bytes"),
-    );
-    expect(staleBlob.status).toBe(409);
-    expect((await staleBlob.json()).error.code).toBe(
-      "binding_generation_mismatch",
-    );
-    const beforeStaleBlob = blobStoreCounters();
-    const staleGenerationBlob = await uploadBlob(
-      ctx,
-      newToken,
-      instance,
-      "oura",
-      1,
-      new TextEncoder().encode("old generation browser bytes"),
-    );
-    expect(staleGenerationBlob.status).toBe(409);
-    expect((await staleGenerationBlob.json()).error.code).toBe(
-      "binding_generation_mismatch",
-    );
-    expect(blobStoreCounters()).toEqual(beforeStaleBlob);
-
-    const pendingBBlob = await uploadBlob(
-      ctx,
-      newToken,
-      instance,
-      "oura",
-      2,
-      new TextEncoder().encode("pending B bytes"),
-    );
-    expect(pendingBBlob.status).toBe(200);
-    const repeatedReset = await reset(
-      ctx,
-      newToken,
-      instance,
-      "oura",
-      1,
-      "oura",
-    );
-    expect(repeatedReset.status).toBe(200);
-    expect(await repeatedReset.json()).toMatchObject({
-      status: "already_reset",
-    });
-
-    const beforeStaleGeneration = storeCounters();
-    const staleGeneration = await ingest(
-      ctx,
-      newToken,
-      "events",
-      {
-        instance,
-        key: "event-b-stale-generation",
-        data: { id: "event-b-stale-generation", kind: "browser" },
-        emitted_at: "2026-09-02T00:00:00Z",
-      },
-      "oura",
-      1,
-    );
-    expect(staleGeneration.status).toBe(409);
-    expect(
-      (staleGeneration.body as unknown as { error: { code: string } }).error
-        .code,
-    ).toBe("binding_generation_mismatch");
-    expect(storeCounters()).toEqual(beforeStaleGeneration);
-
-    const bRecord = await ingest(
-      ctx,
-      newToken,
-      "events",
-      {
-        instance,
-        key: "event-b",
-        data: { id: "event-b", kind: "browser" },
-        emitted_at: "2026-09-02T00:00:00Z",
-      },
-      "oura",
-      2,
-    );
-    expect(bRecord.status).toBe(200);
-    expect(outcomes(bRecord.body)).toEqual(["accepted"]);
   });
 
   it("persists claimed blob bytes and sweeps stale and orphaned rows after restart", async () => {
@@ -1353,85 +1101,6 @@ describe("P10c and method authority over HTTP", () => {
     expect(outcomes(result.body)).toEqual(keys.map(() => "accepted"));
   }
 
-  it("expires pre-reset list and changes_since page cursors, and never mixes A and B rows", async () => {
-    const { ouraPath, claudePath, token } = await bootSwitchable();
-    const instance = `oura:${owner}`;
-    await seedEvents(token, instance, ["a1", "a2", "a3"]);
-
-    const listPage = await read(
-      ctx!,
-      token,
-      "/v1/streams/events/records?order=asc&limit=1",
-    );
-    expect(listPage.body.data.map((r: any) => r.id)).toEqual(["a1"]);
-    const listCursor = listPage.body.next_cursor as string;
-    const changesPage = await read(
-      ctx!,
-      token,
-      "/v1/streams/events/records?changes_since=&limit=1",
-    );
-    const changesCursor = changesPage.body.next_cursor as string;
-    expect(changesCursor).toBeTruthy();
-
-    expect((await reset(ctx!, token, instance, "oura", 1, "oura")).status).toBe(
-      200,
-    );
-    await ctx!.cleanup();
-    ctx = await boot(
-      [claudePath, ouraPath],
-      [
-        { method_id: "claude", declaration_path: claudePath },
-        { method_id: "oura", declaration_path: ouraPath },
-      ],
-    );
-    const newToken = await ownerToken(ctx);
-    const bRecord = await ingest(
-      ctx,
-      newToken,
-      "events",
-      ["b1", "b2"].map((key, i) => ({
-        instance,
-        key,
-        data: { id: key, kind: "b" },
-        emitted_at: `2026-09-0${i + 8}T00:00:00Z`,
-      })),
-      "oura",
-      2,
-    );
-    expect(outcomes(bRecord.body)).toEqual(["accepted", "accepted"]);
-
-    const staleList = await read(
-      ctx,
-      newToken,
-      `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(listCursor)}`,
-    );
-    expect(staleList.status).toBe(410);
-    expect(staleList.body.error.code).toBe("cursor_expired");
-    const staleChanges = await read(
-      ctx,
-      newToken,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
-    );
-    expect(staleChanges.status).toBe(410);
-
-    // A listing started after the reset pages through B rows only. Its
-    // cursor is re-encoded by the route and must keep the store's horizon,
-    // or page 2 would be refused as a pre-reset cursor.
-    const bPage1 = await read(
-      ctx,
-      newToken,
-      "/v1/streams/events/records?order=asc&limit=1",
-    );
-    expect(bPage1.body.data.map((r: any) => r.id)).toEqual(["b1"]);
-    const bPage2 = await read(
-      ctx,
-      newToken,
-      `/v1/streams/events/records?order=asc&limit=1&cursor=${encodeURIComponent(bPage1.body.next_cursor)}`,
-    );
-    expect(bPage2.status).toBe(200);
-    expect(bPage2.body.data.map((r: any) => r.id)).toEqual(["b2"]);
-  });
-
   it("refuses a list or changes_since horizon that is not a non-negative safe integer", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
@@ -1464,11 +1133,6 @@ describe("P10c and method authority over HTTP", () => {
         }),
       ).toString("base64url");
 
-    // A reset after the session starts: a NaN horizon would compare false
-    // against reset_clock and pass the fence.
-    expect((await reset(ctx!, token, instance, "oura", 1, "oura")).status).toBe(
-      200,
-    );
     // 2^53 + 1 rounds to 2^53 as a number, so it must fail the
     // safe-integer check rather than pass the fence as a huge horizon.
     const badHorizons = ["abc", "-1", "1.5", null, "9007199254740993"];
@@ -1638,45 +1302,6 @@ describe("P10c and method authority over HTTP", () => {
     expect(nextSession.body.data.map((r: any) => r.id)).toEqual(["a3"]);
   });
 
-  it("refuses a reset to an empty method, and changes nothing", async () => {
-    const { token } = await bootSwitchable();
-    const instance = `oura:${owner}`;
-    await seedEvents(token, instance, ["a1"]);
-    for (const nextMethod of ["", "  ", " oura "]) {
-      const refused = await reset(ctx!, token, instance, "oura", 1, nextMethod);
-      expect(refused.status).toBe(400);
-      expect((await refused.json()).error.code).toBe("invalid_request");
-    }
-    const unchanged = await read(
-      ctx!,
-      token,
-      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
-    );
-    expect(unchanged.body).toMatchObject({ method: "oura", generation: 1 });
-    const listed = await read(ctx!, token, "/v1/streams/events/records");
-    expect(listed.body.data.map((r: any) => r.id)).toEqual(["a1"]);
-
-    const switched = await reset(ctx!, token, instance, "oura", 1, null);
-    expect(switched.status).toBe(409);
-    expect((await switched.json()).error.code).toBe("connection_conflict");
-    const sameMethod = await reset(ctx!, token, instance, "oura", 1, "oura");
-    expect(sameMethod.status).toBe(200);
-    expect(await sameMethod.json()).toMatchObject({
-      method: "oura",
-      generation: 2,
-    });
-    const empty = await read(
-      ctx!,
-      token,
-      `/pdpp/instances/${encodeURIComponent(instance)}/binding`,
-    );
-    expect(empty.body).toMatchObject({
-      method: "oura",
-      generation: 2,
-      empty: true,
-    });
-  });
-
   it("reads account one after the PS bootstraps its empty legacy binding", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
@@ -1710,7 +1335,7 @@ describe("P10c and method authority over HTTP", () => {
     expect(bindingRows()).toBe(2);
   });
 
-  it("keeps a keyset snapshot valid and excludes later writes without a reset", async () => {
+  it("keeps a keyset snapshot valid and excludes later writes", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     await seedEvents(token, instance, ["a1", "a2"]);
@@ -2187,16 +1812,6 @@ describe("P7: stream snapshot replace", () => {
     expect(malformed.status).toBe(400);
 
     expect({ counters: storeCounters(), rows: currentRows() }).toEqual(before);
-
-    // After a reset the old generation is fenced; the new one replaces.
-    const resetResponse = await reset(ctx, token, instance, "oura", 1, "oura");
-    expect(resetResponse.status).toBe(200);
-    const old = await replace(ctx, token, "profile", snapshot, "oura", 1);
-    expect(old.status).toBe(409);
-    expect(old.body.error.code).toBe("binding_generation_mismatch");
-    const fresh = await replace(ctx, token, "profile", snapshot, "oura", 2);
-    expect(fresh.status).toBe(200);
-    expect(fresh.body).toMatchObject({ accepted: 1, deleted: 0 });
   });
 
   it("binds an empty unbound instance, and an empty snapshot tombstones every live key", async () => {

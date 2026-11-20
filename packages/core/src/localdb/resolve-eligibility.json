@@ -1,0 +1,195 @@
+{
+  "behavior": "#573",
+  "description": "Installed-head conformance. Foreign-key publications never install an image. Route mapping is outside ResolveInput/ReadDecision.",
+  "controls": ["active", "deleted", "foreign"],
+  "states": [
+    "absent",
+    "tombstoned",
+    "foreign_key",
+    "older_generation",
+    "current_generation"
+  ],
+  "heads": ["partial", "complete"],
+  "cases": [
+    {
+      "control": "active",
+      "state": "absent",
+      "head": "partial",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "absent",
+      "head": "complete",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "tombstoned",
+      "head": "partial",
+      "decision": "deleted"
+    },
+    {
+      "control": "active",
+      "state": "tombstoned",
+      "head": "complete",
+      "decision": "deleted"
+    },
+    {
+      "control": "active",
+      "state": "foreign_key",
+      "head": "partial",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "foreign_key",
+      "head": "complete",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "older_generation",
+      "head": "partial",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "older_generation",
+      "head": "complete",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "current_generation",
+      "head": "partial",
+      "decision": "no_data"
+    },
+    {
+      "control": "active",
+      "state": "current_generation",
+      "head": "complete",
+      "decision": "view"
+    },
+    {
+      "control": "deleted",
+      "state": "absent",
+      "head": "partial",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "absent",
+      "head": "complete",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "tombstoned",
+      "head": "partial",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "tombstoned",
+      "head": "complete",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "foreign_key",
+      "head": "partial",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "foreign_key",
+      "head": "complete",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "older_generation",
+      "head": "partial",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "older_generation",
+      "head": "complete",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "current_generation",
+      "head": "partial",
+      "decision": "deleted"
+    },
+    {
+      "control": "deleted",
+      "state": "current_generation",
+      "head": "complete",
+      "decision": "deleted"
+    },
+    {
+      "control": "foreign",
+      "state": "absent",
+      "head": "partial",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "absent",
+      "head": "complete",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "tombstoned",
+      "head": "partial",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "tombstoned",
+      "head": "complete",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "foreign_key",
+      "head": "partial",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "foreign_key",
+      "head": "complete",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "older_generation",
+      "head": "partial",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "older_generation",
+      "head": "complete",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "current_generation",
+      "head": "partial",
+      "decision": "key_mismatch"
+    },
+    {
+      "control": "foreign",
+      "state": "current_generation",
+      "head": "complete",
+      "decision": "key_mismatch"
+    }
+  ]
+}

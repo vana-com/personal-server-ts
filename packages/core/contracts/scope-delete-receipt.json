@@ -1,0 +1,616 @@
+{
+  "version": 1,
+  "contract": "decideScopeDeletion({status, receipt, scope}) in packages/core/src/api/scope-delete-verdict.ts",
+  "doc": "`receipt` is the delete answer's JSON body as read (the receipt, or an error answer attaching it as error.details.result); `status` is its HTTP status. `verdict` is what every host must answer.",
+  "cases": [
+    {
+      "id": "happy-path",
+      "why": "Every step ok on a 200.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "durably-deleted"
+      }
+    },
+    {
+      "id": "gateway-not-registered",
+      "why": "A scope the gateway never held has nothing to tombstone.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "skipped",
+            "reason": "not-registered"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "durably-deleted"
+      }
+    },
+    {
+      "id": "gateway-skipped-sync-disabled",
+      "why": "No sync manager: only the local copy went.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": null,
+        "durable": false,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "skipped",
+            "reason": "sync-disabled"
+          },
+          "storage": {
+            "status": "skipped",
+            "reason": "sync-disabled"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "local-copy-only"
+      }
+    },
+    {
+      "id": "gateway-skipped-other-reason-durable",
+      "why": "A skip is complete only for `not-registered`.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "skipped",
+            "reason": "owner-unknown"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": []
+      }
+    },
+    {
+      "id": "storage-failed-requeued",
+      "why": "Failed blob keys are re-queued like deferred ones.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": true,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "failed",
+            "error": "storage 500"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "deleted-cleanup-pending"
+      }
+    },
+    {
+      "id": "storage-deferred",
+      "why": "Blob deletes queued for later passes.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": true,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "deferred"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "deleted-cleanup-pending"
+      }
+    },
+    {
+      "id": "not-durable",
+      "why": "`durable:false`: sync can bring the scope back.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": null,
+        "durable": false,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "skipped"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "local-copy-only"
+      }
+    },
+    {
+      "id": "pending-blob-deletion",
+      "why": "Storage ok but the receipt still marks blob deletion pending.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": true,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": []
+      }
+    },
+    {
+      "id": "blobs-pending-3",
+      "why": "Storage ok but three blobs are still pending.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok",
+            "blobsPending": 3
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": []
+      }
+    },
+    {
+      "id": "blobs-pending-0",
+      "why": "Zero pending blobs is the same as none.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok",
+            "blobsPending": 0
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "durably-deleted"
+      }
+    },
+    {
+      "id": "local-failed",
+      "why": "The local copy is still listed.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "failed",
+            "error": "disk"
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": ["local"]
+      }
+    },
+    {
+      "id": "storage-deferred-local-failed",
+      "why": "Cleanup is queued, but the local copy was not erased.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "deferred"
+          },
+          "local": {
+            "status": "failed",
+            "error": "disk"
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": ["storage", "local"]
+      }
+    },
+    {
+      "id": "gateway-failed-attached-502",
+      "why": "A failed tombstone answers 502 and attaches the receipt; nothing was deleted.",
+      "scope": "spotify.savedTracks",
+      "status": 502,
+      "receipt": {
+        "error": {
+          "errorCode": "DELETE_TOMBSTONE_FAILED",
+          "message": "gateway down",
+          "details": {
+            "result": {
+              "scope": "spotify.savedTracks",
+              "dataPointId": null,
+              "durable": false,
+              "pendingBlobDeletion": false,
+              "steps": {
+                "gateway": {
+                  "status": "failed",
+                  "error": "gateway down"
+                },
+                "storage": {
+                  "status": "skipped"
+                },
+                "local": {
+                  "status": "skipped"
+                }
+              }
+            }
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "local-copy-only"
+      }
+    },
+    {
+      "id": "gateway-failed-durable-attached",
+      "why": "A failed gateway step on a durable receipt names the step.",
+      "scope": "spotify.savedTracks",
+      "status": 502,
+      "receipt": {
+        "error": {
+          "errorCode": "DELETE_TOMBSTONE_FAILED",
+          "message": "gateway down",
+          "details": {
+            "result": {
+              "scope": "spotify.savedTracks",
+              "dataPointId": "0xabc",
+              "durable": true,
+              "pendingBlobDeletion": false,
+              "steps": {
+                "gateway": {
+                  "status": "failed",
+                  "error": "gateway down"
+                },
+                "storage": {
+                  "status": "ok"
+                },
+                "local": {
+                  "status": "ok",
+                  "deletedCount": 1
+                }
+              }
+            }
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": ["gateway"]
+      }
+    },
+    {
+      "id": "non-ok-http-with-receipt",
+      "why": "A perfect receipt on a non-2xx answer is not a finished delete.",
+      "scope": "spotify.savedTracks",
+      "status": 500,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "incomplete",
+        "reason": "unfinished",
+        "steps": []
+      }
+    },
+    {
+      "id": "receipt-for-another-scope",
+      "why": "A receipt for a different scope confirms nothing.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.playlists",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "unconfirmed"
+      }
+    },
+    {
+      "id": "attached-receipt-for-another-scope",
+      "why": "Same, when the receipt is attached to an error.",
+      "scope": "spotify.savedTracks",
+      "status": 502,
+      "receipt": {
+        "error": {
+          "errorCode": "DELETE_TOMBSTONE_FAILED",
+          "message": "gateway down",
+          "details": {
+            "result": {
+              "scope": "spotify.playlists",
+              "dataPointId": "0xabc",
+              "durable": true,
+              "pendingBlobDeletion": false,
+              "steps": {
+                "gateway": {
+                  "status": "ok"
+                },
+                "storage": {
+                  "status": "ok"
+                },
+                "local": {
+                  "status": "ok",
+                  "deletedCount": 1
+                }
+              }
+            }
+          }
+        }
+      },
+      "verdict": {
+        "kind": "unconfirmed"
+      }
+    },
+    {
+      "id": "refusal-without-receipt",
+      "why": "The switched-account refusal carries no receipt.",
+      "scope": "spotify.savedTracks",
+      "status": 409,
+      "receipt": {
+        "error": {
+          "errorCode": "USE_CONNECTOR_DELETE",
+          "message": "Delete the connection instead"
+        }
+      },
+      "verdict": {
+        "kind": "unconfirmed"
+      }
+    },
+    {
+      "id": "empty-body",
+      "why": "A body that did not parse as JSON reads as null.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": null,
+      "verdict": {
+        "kind": "unconfirmed"
+      }
+    },
+    {
+      "id": "unknown-step-status",
+      "why": "A status outside the four names is not a receipt.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "done"
+          }
+        }
+      },
+      "verdict": {
+        "kind": "unconfirmed"
+      }
+    },
+    {
+      "id": "missing-step",
+      "why": "A receipt without a step is not a receipt.",
+      "scope": "spotify.savedTracks",
+      "status": 200,
+      "receipt": {
+        "scope": "spotify.savedTracks",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          }
+        }
+      },
+      "verdict": {
+        "kind": "unconfirmed"
+      }
+    },
+    {
+      "id": "hyphenated-logical-scope",
+      "why": "A logical stream-sync name is matched as written.",
+      "scope": "pdpp.github-browser.contributions",
+      "status": 200,
+      "receipt": {
+        "scope": "pdpp.github-browser.contributions",
+        "dataPointId": "0xabc",
+        "durable": true,
+        "pendingBlobDeletion": false,
+        "steps": {
+          "gateway": {
+            "status": "ok"
+          },
+          "storage": {
+            "status": "ok"
+          },
+          "local": {
+            "status": "ok",
+            "deletedCount": 1
+          }
+        }
+      },
+      "verdict": {
+        "kind": "durably-deleted"
+      }
+    }
+  ]
+}

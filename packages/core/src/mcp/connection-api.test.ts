@@ -11,6 +11,7 @@ import {
 } from "./store.js";
 import {
   approveMcpConnection,
+  editMcpConnectionAccess,
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpScopeAccessRequest,
@@ -27,12 +28,15 @@ import {
   McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
+  narrowGrants,
   readMcpScopeRequestWithToken,
   requestMcpScopeAccess,
   revokeMcpConnection,
   toMcpConnectionView,
   DEFAULT_MCP_GRANT_TTL_SECONDS,
   mcpGrantDefaultExpiry,
+  isGrantExpired,
+  liveMcpGrants,
 } from "./connection-api.js";
 import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
 import { ensureMcpGranteeRegistered } from "./builder-registration.js";
@@ -672,10 +676,15 @@ describe("mcp/connection-api scope request answers", () => {
       { displayName: "Claude" },
       { store, publicOrigin: PUBLIC_ORIGIN },
     );
+    // Seeded straight into the store: some tests need a grant approval refuses.
     await approveMcpConnection(
-      { connectionId: created.connectionId, grants },
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "seed", scopes: ["instagram.profile"] }],
+      },
       { store },
     );
+    await store.update(created.connectionId, { grants });
     await requestMcpScopeAccess(
       {
         connectionId: created.connectionId,
@@ -700,9 +709,11 @@ describe("mcp/connection-api scope request answers", () => {
     };
   }
 
-  it("re-signs the union of existing and approved scopes, never dropping one", async () => {
+  it("re-signs the stored scopes the gateway still holds plus the approved ones, never a gateway-only scope", async () => {
     const { store, id, grantee } = await connectionWithRequest();
-    // The gateway grant holds a scope this record never saw; it must survive.
+    // The gateway grant holds a scope this record never saw (a write whose
+    // local commit was lost, possibly denied since). It must not be re-signed:
+    // reads already never serve it, and approval must not bring it back.
     const gateway = gatewayMock(
       liveGrant({ scopes: ["instagram.profile", "github.profile"] }),
     );
@@ -717,14 +728,13 @@ describe("mcp/connection-api scope request answers", () => {
       expect.objectContaining({
         grantorAddress: OWNER,
         granteeId: "0xbuilder",
-        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        scopes: ["instagram.profile", "spotify.profile"],
         grantVersion: "4",
         expiresAt: "0",
       }),
     );
     expect(gateway.getBuilder).toHaveBeenCalledWith(grantee);
     expect(result.grantedScopes).toEqual([
-      "github.profile",
       "instagram.profile",
       "spotify.profile",
     ]);
@@ -735,7 +745,7 @@ describe("mcp/connection-api scope request answers", () => {
     expect(view?.grants).toEqual([
       {
         grantId: "0xgrant2",
-        scopes: ["github.profile", "instagram.profile", "spotify.profile"],
+        scopes: ["instagram.profile", "spotify.profile"],
       },
     ]);
     expect(view?.grantedScopes).toEqual(result.grantedScopes);
@@ -846,6 +856,96 @@ describe("mcp/connection-api scope request answers", () => {
     );
   });
 
+  it("does not carry an expired grant's scopes into the new grant when a perpetual one is live", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+      { grantId: "0xgrant-old", scopes: ["youtube.history"] },
+    ]);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) =>
+      grantId === "0xgrant-old"
+        ? liveGrant({
+            id: grantId,
+            scopes: ["youtube.history"],
+            expiresAt: "1000",
+            expired: true,
+          })
+        : liveGrant({ expiresAt: null }),
+    );
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+        expiresAt: "0",
+      }),
+    );
+  });
+
+  it("judges an inherited grant's expiry by the clock after its lookup returns", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant1", scopes: ["instagram.profile"] },
+      { grantId: "0xgrant-a", scopes: ["youtube.history"] },
+    ]);
+    let clockMs = Date.parse(DECIDED_AT);
+    const expiresAt = String(Math.floor(clockMs / 1000) + 1);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) => {
+      if (grantId !== "0xgrant-a") return liveGrant();
+      clockMs += 2000; // the lookup takes two seconds
+      return liveGrant({ id: grantId, scopes: ["youtube.history"], expiresAt });
+    });
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      { ...approveOptions(store, gateway), now: () => new Date(clockMs) },
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+      }),
+    );
+  });
+
+  it("drops a grant that expired while a later grant's lookup ran, so its scopes are not signed", async () => {
+    const { store, id } = await connectionWithRequest([
+      { grantId: "0xgrant-a", scopes: ["youtube.history"] },
+      { grantId: "0xgrant-b", scopes: ["instagram.profile"] },
+    ]);
+    let clockMs = Date.parse(DECIDED_AT);
+    const expiresAt = String(Math.floor(clockMs / 1000) + 1);
+    const gateway = gatewayMock();
+    gateway.getGrant.mockImplementation(async (grantId: string) => {
+      if (grantId === "0xgrant-a") {
+        // A answers at once, still live.
+        return liveGrant({
+          id: grantId,
+          scopes: ["youtube.history"],
+          expiresAt,
+        });
+      }
+      clockMs += 2000; // B's lookup runs past A's expiry
+      return liveGrant({ id: grantId, expiresAt: null });
+    });
+
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      { ...approveOptions(store, gateway), now: () => new Date(clockMs) },
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+        expiresAt: "0",
+      }),
+    );
+  });
+
   it("signs a perpetual grant by default when there is no live grant to inherit from", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock(null);
@@ -951,6 +1051,23 @@ describe("mcp/connection-api scope request answers", () => {
     ]);
   });
 
+  it("refuses a bare wildcard, an empty scope or a source wildcard at scope-request approval", async () => {
+    const { store, id } = await connectionWithRequest(
+      [{ grantId: "0xgrant1", scopes: ["chatgpt.conversations"] }],
+      ["*", "youtube.*"],
+    );
+    const gateway = gatewayMock();
+    for (const scopes of [["*"], [""], ["youtube.*"]]) {
+      await expect(
+        approveMcpScopeAccessRequest(
+          { connectionId: id, scopes },
+          approveOptions(store, gateway),
+        ),
+      ).rejects.toMatchObject({ status: 400 });
+    }
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
   it("records an exact write: request when only a write wildcard is held", async () => {
     // remember ignores write wildcards, so the exact grant must stay requestable.
     const { store, id } = await connectionWithRequest(
@@ -963,7 +1080,7 @@ describe("mcp/connection-api scope request answers", () => {
     ]);
   });
 
-  it("records and approves a write: scope even when a read wildcard is held, but never a write wildcard", async () => {
+  it("never approves a write: scope while the live grant holds a bare wildcard, and never a write wildcard", async () => {
     // A read grant of "*" must not count as covering a write request.
     const { store, id } = await connectionWithRequest(
       [{ grantId: "0xgrant1", scopes: ["*"] }],
@@ -990,16 +1107,36 @@ describe("mcp/connection-api scope request answers", () => {
     ).rejects.toMatchObject({ status: 400 });
     expect(gateway.createGrant).not.toHaveBeenCalled();
 
+    // The merged array keeps the gateway's "*", which is never storable.
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["write:memory.claude"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
+  it("never re-signs a gateway wildcard the record does not hold, and keeps the scope reads serve under it", async () => {
+    const { store, id } = await connectionWithRequest(
+      [{ grantId: "0xgrant1", scopes: ["chatgpt.conversations"] }],
+      ["write:memory.app"],
+    );
+    // The live gateway grant holds "*", whatever the record says.
+    const gateway = gatewayMock(liveGrant({ scopes: ["*"] }));
     const result = await approveMcpScopeAccessRequest(
-      { connectionId: id, scopes: ["write:memory.claude"] },
+      { connectionId: id, scopes: ["write:memory.app"] },
       approveOptions(store, gateway),
     );
-
-    expect(gateway.createGrant).toHaveBeenCalledWith(
-      expect.objectContaining({ scopes: ["*", "write:memory.claude"] }),
+    expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.conversations", "write:memory.app"],
+      }),
     );
-    expect(result.approvedScopes).toEqual(["write:memory.claude"]);
-    expect(result.deniedScopes).toEqual(["write:memory.*"]);
+    expect(result.grantedScopes).not.toContain("*");
+    expect(
+      (await store.getById(id))!.grants.flatMap((grant) => grant.scopes),
+    ).not.toContain("*");
   });
 
   it("leaves the request pending when the gateway refuses the grant", async () => {
@@ -1092,10 +1229,220 @@ describe("mcp/connection-api scope request answers", () => {
       denyMcpScopeAccessRequest({ connectionId: "nope" }, { store }),
     ).rejects.toBeInstanceOf(McpConnectionNotFoundError);
   });
+
+  it("does not re-sign a stored scope the gateway no longer holds", async () => {
+    const { store, id } = await connectionWithRequest([
+      {
+        grantId: "0xgrant1",
+        scopes: ["instagram.profile", "youtube.history"],
+      },
+    ]);
+    const gateway = gatewayMock(liveGrant({ scopes: ["instagram.profile"] }));
+    await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["spotify.profile"] },
+      approveOptions(store, gateway),
+    );
+    expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        scopes: ["instagram.profile", "spotify.profile"],
+      }),
+    );
+  });
+
+  it.each([
+    {
+      stored: ["chatgpt.*"],
+      live: ["chatgpt.conversations"],
+      kept: ["chatgpt.conversations"],
+    },
+    {
+      stored: ["chatgpt.conversations"],
+      live: ["chatgpt.*"],
+      kept: ["chatgpt.conversations"],
+    },
+    { stored: ["chatgpt.*"], live: ["chatgpt.*"], kept: ["chatgpt.*"] },
+  ])(
+    "approve keeps what reads serve: stored $stored, gateway $live keeps $kept",
+    async ({ stored, live, kept }) => {
+      const { store, id } = await connectionWithRequest([
+        { grantId: "0xgrant1", scopes: stored },
+      ]);
+      const gateway = gatewayMock(liveGrant({ scopes: live }));
+      await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["spotify.profile"] },
+        approveOptions(store, gateway),
+      );
+      expect(gateway.createGrant).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ scopes: [...kept, "spotify.profile"] }),
+      );
+    },
+  );
+
+  describe("client traffic during an owner write", () => {
+    const USED_AT = "2030-01-01T00:00:00.000Z";
+    const heldScopes = ["instagram.profile", "youtube.history"];
+
+    it("approve commits locally when only lastUsedAt changed during the gateway write", async () => {
+      const { store, id } = await connectionWithRequest([
+        { grantId: "0xgrant1", scopes: heldScopes },
+      ]);
+      const gateway = gatewayMock(liveGrant({ scopes: heldScopes }));
+      // Every MCP request stamps lastUsedAt.
+      gateway.createGrant.mockImplementation(async () => {
+        await store.update(id, { lastUsedAt: USED_AT });
+        return { grantId: "0xgrant2" };
+      });
+      const result = await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["spotify.profile"] },
+        approveOptions(store, gateway),
+      );
+      const stored = (await store.getById(id))!;
+      expect(stored.grants).toEqual([
+        {
+          grantId: "0xgrant2",
+          scopes: ["instagram.profile", "spotify.profile", "youtube.history"],
+        },
+      ]);
+      expect(stored.scopeAccessRequest).toBeUndefined();
+      expect(stored.lastUsedAt).toBe(USED_AT);
+      expect(result.approvedScopes).toEqual(["spotify.profile"]);
+    });
+
+    it("edit commits locally when only lastUsedAt changed during the gateway write", async () => {
+      const { store, id } = await connectionWithRequest([
+        { grantId: "0xgrant1", scopes: heldScopes },
+      ]);
+      const gateway = gatewayMock(liveGrant({ scopes: heldScopes }));
+      gateway.createGrant.mockImplementation(async () => {
+        await store.update(id, { lastUsedAt: USED_AT });
+        return { grantId: "0xgrant2" };
+      });
+      const result = await editMcpConnectionAccess(
+        { connectionId: id, scopes: ["instagram.profile"] },
+        approveOptions(store, gateway),
+      );
+      const grants = [{ grantId: "0xgrant2", scopes: ["instagram.profile"] }];
+      expect(result.grants).toEqual(grants);
+      expect((await store.getById(id))!.grants).toEqual(grants);
+    });
+
+    it("still refuses the local commit when the record really changed", async () => {
+      const { store, id } = await connectionWithRequest();
+      const gateway = gatewayMock();
+      gateway.createGrant.mockImplementation(async () => {
+        await requestMcpScopeAccess(
+          { connectionId: id, scopes: ["linkedin.profile"] },
+          { store },
+        );
+        return { grantId: "0xgrant2" };
+      });
+      await expect(
+        approveMcpScopeAccessRequest(
+          { connectionId: id, scopes: ["spotify.profile"] },
+          approveOptions(store, gateway),
+        ),
+      ).rejects.toMatchObject({ code: "CONCURRENT_UPDATE", status: 409 });
+    });
+  });
 });
 
 describe("mcp/connection-api scope request read token", () => {
   const T0 = new Date("2026-10-07T10:00:00.000Z");
+  const grantState = (overrides: Record<string, unknown> = {}) => ({
+    id: "g1",
+    scopes: ["instagram.profile"],
+    grantVersion: "1",
+    expiresAt: null,
+    revokedAt: null,
+    ...overrides,
+  });
+  const liveG1 = { getGrant: async () => grantState() } as never;
+
+  it("names only the scopes the gateway still holds for a live grant id", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    await store.update(connectionId, {
+      grants: [
+        { grantId: "g1", scopes: ["instagram.profile", "youtube.history"] },
+      ],
+    });
+    const gateway = {
+      getGrant: async () =>
+        grantState({ scopes: ["instagram.profile", "spotify.library"] }),
+    } as never;
+    const view = await readMcpScopeRequestWithToken(
+      { connectionId, token: requested.readToken },
+      { store, gateway, now: () => T0 },
+    );
+    // youtube.history was narrowed away; spotify.library was never stored.
+    expect(view?.grantedScopes).toEqual(["instagram.profile"]);
+  });
+
+  it("judges expiry by the clock after the lookup returns, not before it started", async () => {
+    const { store, connectionId } = await connectionWithRequest();
+    const connection = (await store.getById(connectionId))!;
+    let nowMs = Date.parse("2026-10-07T10:00:00.000Z");
+    const expiresAt = String(Math.floor(nowMs / 1000) + 1);
+    const gateway = {
+      getGrant: async () => {
+        nowMs += 2000; // the lookup takes two seconds
+        return grantState({ expiresAt });
+      },
+    } as never;
+    expect(
+      await liveMcpGrants(connection, gateway, () => new Date(nowMs)),
+    ).toEqual([]);
+  });
+
+  it("does not return a grant that expired while a later grant's lookup ran", async () => {
+    const { store, connectionId } = await connectionWithRequest();
+    await store.update(connectionId, {
+      grants: [
+        { grantId: "ga", scopes: ["instagram.profile"] },
+        { grantId: "gb", scopes: ["spotify.profile"] },
+      ],
+    });
+    const connection = (await store.getById(connectionId))!;
+    let nowMs = Date.parse("2026-10-07T10:00:00.000Z");
+    const expiresAt = String(Math.floor(nowMs / 1000) + 1);
+    const gateway = {
+      getGrant: async (grantId: string) => {
+        if (grantId === "ga") return grantState({ id: "ga", expiresAt });
+        // gb answers later, after ga already came back, and the clock has
+        // passed ga's expiry by then.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        nowMs += 2000;
+        return grantState({ id: "gb", scopes: ["spotify.profile"] });
+      },
+    } as never;
+    expect(
+      await liveMcpGrants(connection, gateway, () => new Date(nowMs)),
+    ).toEqual([{ grantId: "gb", scopes: ["spotify.profile"] }]);
+  });
+
+  it("names no scope from a revoked, expired, missing or unverifiable grant", async () => {
+    const { store, connectionId, requested } = await connectionWithRequest();
+    const names = async (gateway: unknown) =>
+      (
+        await readMcpScopeRequestWithToken(
+          { connectionId, token: requested.readToken },
+          { store, gateway: gateway as never, now: () => T0 },
+        )
+      )?.grantedScopes;
+    expect(await names(liveG1)).toEqual(["instagram.profile"]);
+    for (const dead of [
+      { getGrant: async () => grantState({ revokedAt: "2026-10-01" }) },
+      { getGrant: async () => grantState({ expired: true }) },
+      { getGrant: async () => null },
+      {
+        getGrant: async () => {
+          throw new Error("down");
+        },
+      },
+      undefined,
+    ]) {
+      expect(await names(dead)).toEqual([]);
+    }
+  });
 
   async function connectionWithRequest() {
     const store = createInMemoryMcpConnectionStore();
@@ -1145,7 +1492,7 @@ describe("mcp/connection-api scope request read token", () => {
     const read = (at: number, token = requested.readToken) =>
       readMcpScopeRequestWithToken(
         { connectionId, token },
-        { store, now: () => new Date(at) },
+        { store, gateway: liveG1, now: () => new Date(at) },
       );
     const view = await read(T0.getTime());
     expect(view).toEqual({
@@ -1178,7 +1525,7 @@ describe("mcp/connection-api scope request read token", () => {
           connectionId: denied.connectionId,
           token: denied.requested.readToken,
         },
-        { store: denied.store, now: () => T0 },
+        { store: denied.store, gateway: liveG1, now: () => T0 },
       ),
     ).toBeNull();
 
@@ -1202,14 +1549,14 @@ describe("mcp/connection-api scope request read token", () => {
     const replaced = await connectionWithRequest();
     const again = await requestMcpScopeAccess(
       { connectionId: replaced.connectionId, scopes: ["github.profile"] },
-      { store: replaced.store, now: () => T0 },
+      { store: replaced.store, gateway: liveG1, now: () => T0 },
     );
     expect(again.readToken).toBeDefined();
     expect(again.readToken).not.toBe(replaced.requested.readToken);
     const readReplaced = (token?: string) =>
       readMcpScopeRequestWithToken(
         { connectionId: replaced.connectionId, token },
-        { store: replaced.store, now: () => T0 },
+        { store: replaced.store, gateway: liveG1, now: () => T0 },
       );
     expect(await readReplaced(replaced.requested.readToken)).toBeNull();
     expect(await readReplaced(again.readToken)).not.toBeNull();
@@ -1230,7 +1577,7 @@ describe("mcp/connection-api scope request read token", () => {
     expect(
       await readMcpScopeRequestWithToken(
         { connectionId, token: requested.readToken },
-        { store, now: () => T0 },
+        { store, gateway: liveG1, now: () => T0 },
       ),
     ).not.toBeNull();
   });
@@ -1425,6 +1772,36 @@ describe("mcp/connection-api superseded OAuth authorizations", () => {
     expect(gateway.createGrant).not.toHaveBeenCalled();
   });
 
+  it("signs no grant for a bare wildcard or an empty scope", async () => {
+    const stores = newStores();
+    const created = await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+
+    for (const scopes of [["*"], [""], ["chatgpt.history", "*"], ["  "]]) {
+      await expect(
+        approveMcpOAuthAuthorizationWithScopes(
+          { authorizationId: created.authorizationId, scopes },
+          {
+            ...stores,
+            gateway: gateway as never,
+            gatewayConfig: GATEWAY_CONFIG as never,
+            gatewayUrl: "https://gateway.test",
+            serverOwner: "0x00000000000000000000000000000000000000aa",
+            serverSigner: {
+              signGrantRegistration: vi.fn(
+                async () => "0xsig" as `0x${string}`,
+              ),
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_scope", status: 400 });
+    }
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
   it("signs no grant for a superseded authorization", async () => {
     const stores = newStores();
     const first = await authorize(stores, "client-a");
@@ -1450,5 +1827,168 @@ describe("mcp/connection-api superseded OAuth authorizations", () => {
       ),
     ).rejects.toMatchObject({ code: "invalid_state" });
     expect(gateway.createGrant).not.toHaveBeenCalled();
+  });
+
+  it("signs the expiry at the gateway but stores no expiresAt on the grant", async () => {
+    const stores = newStores();
+    const created = await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+    await approveMcpOAuthAuthorizationWithScopes(
+      { authorizationId: created.authorizationId, scopes: ["chatgpt.history"] },
+      {
+        ...stores,
+        gateway: gateway as never,
+        gatewayConfig: GATEWAY_CONFIG as never,
+        gatewayUrl: "https://gateway.test",
+        serverOwner: "0x00000000000000000000000000000000000000aa",
+        serverSigner: {
+          signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+        },
+        grantTtlSeconds: 3600,
+        now: () => START,
+      },
+    );
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: expect.any(String) }),
+    );
+    const grants = (await stores.connectionStore.getById(created.connectionId))
+      ?.grants;
+    expect(grants).toEqual([
+      { grantId: "0xgrant", scopes: ["chatgpt.history"] },
+    ]);
+    expect(Object.keys(grants![0]!)).not.toContain("expiresAt");
+  });
+});
+
+describe("mcp/connection-api grants never resurrect and never store a bare wildcard", () => {
+  const T0 = new Date("2026-10-07T10:00:00.000Z");
+  const PUBLIC_ORIGIN = "https://ps.example";
+  const dead = [
+    ["revoked", { revokedAt: "2026-10-01T00:00:00Z" }],
+    ["expired", { expired: true }],
+    ["past its expiry", { expiresAt: "1000" }],
+  ] as const;
+
+  it.each(dead)(
+    "approving a new scope does not carry the scopes of a %s grant",
+    async (_name, state) => {
+      const store = createInMemoryMcpConnectionStore();
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: PUBLIC_ORIGIN },
+      );
+      await approveMcpConnection(
+        {
+          connectionId: created.connectionId,
+          grants: [{ grantId: "g-old", scopes: ["youtube.history"] }],
+        },
+        { store },
+      );
+      await requestMcpScopeAccess(
+        { connectionId: created.connectionId, scopes: ["spotify.profile"] },
+        { store, publicOrigin: PUBLIC_ORIGIN, now: () => T0 },
+      );
+      const gateway = {
+        getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+        getGrant: vi.fn(async () => ({
+          id: "g-old",
+          scopes: ["youtube.history"],
+          grantVersion: "3",
+          expiresAt: null,
+          revokedAt: null,
+          ...state,
+        })),
+        createGrant: vi.fn(async () => ({ grantId: "g-new" })),
+      };
+      const out = await approveMcpScopeAccessRequest(
+        { connectionId: created.connectionId, scopes: ["spotify.profile"] },
+        {
+          store,
+          gateway: gateway as never,
+          serverOwner: "0xowner" as `0x${string}`,
+          serverSigner: {
+            signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+          } as never,
+          now: () => T0,
+        },
+      );
+      expect(out.grantedScopes).toEqual(["spotify.profile"]);
+      expect((await store.getById(created.connectionId))?.grants).toEqual([
+        { grantId: "g-new", scopes: ["spotify.profile"] },
+      ]);
+    },
+  );
+
+  it("the owner approve refuses a bare wildcard, an empty scope and a wildcard write", async () => {
+    for (const scopes of [["*"], [""], ["write:memory.*"], ["ok.scope", "*"]]) {
+      const store = createInMemoryMcpConnectionStore();
+      const created = await createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: PUBLIC_ORIGIN },
+      );
+      await expect(
+        approveMcpConnection(
+          {
+            connectionId: created.connectionId,
+            grants: [{ grantId: "g", scopes }],
+          },
+          { store },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_scope", status: 400 });
+      expect((await store.getById(created.connectionId))?.grants).toEqual([]);
+    }
+  });
+});
+
+describe("mcp/connection-api narrowGrants", () => {
+  const stored = [{ grantId: "g", scopes: ["a.one", "b.two", "c.*"] }];
+  it.each([
+    [
+      [{ grantId: "g", scopes: ["a.one", "b.two", "c.*"] }],
+      ["a.one", "b.two", "c.*"],
+    ],
+    [[{ grantId: "g", scopes: ["a.one"] }], ["a.one"]],
+    // A narrower gateway scope under a stored wildcard stands; the wildcard does not.
+    [[{ grantId: "g", scopes: ["c.x"] }], ["c.x"]],
+    // A scope only the gateway names is never added.
+    [[{ grantId: "g", scopes: ["a.one", "z.new"] }], ["a.one"]],
+    [[{ grantId: "g", scopes: ["z.new"] }], undefined],
+    [[], undefined],
+  ])("gateway %j leaves %j", (live, expected) => {
+    const out = narrowGrants(stored, live);
+    expect(out.flatMap((grant) => grant.scopes)).toEqual(expected ?? []);
+    expect(out).toHaveLength(expected ? 1 : 0);
+  });
+});
+
+describe("mcp/connection-api isGrantExpired", () => {
+  const NOW = 1_800_000_000;
+  it.each([
+    ["", true],
+    ["abc", true],
+    ["2026", true],
+    ["1731300000000", true],
+    ["Infinity", true],
+    ["9".repeat(400), true],
+    ["2020-01-01T00:00:00Z", true],
+    ["2020-01-01", true],
+    ["2030-01-01T00:00:00Z", false],
+    ["2030-01-01T00:00:00.500+02:00", false],
+    ["0", false],
+    [null, false],
+    [undefined, false],
+    ["1900000000", false],
+    ["1700000000", true],
+    [1900000000, true],
+    [Number.NaN, true],
+  ])("expiresAt %j is expired: %s", (expiresAt, expired) => {
+    expect(isGrantExpired({ expiresAt } as never, NOW)).toBe(expired);
+  });
+
+  it("keeps the gateway's expired flag authoritative", () => {
+    expect(isGrantExpired({ expired: true, expiresAt: null }, NOW)).toBe(true);
   });
 });

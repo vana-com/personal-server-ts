@@ -19,6 +19,7 @@ function depsWithAuth(
   };
   return {
     // The lineage route never touches local storage before the gate.
+    accountStorageMode: { owner: "fixture", read: () => "unswitched" },
     storage: {} as PersonalServerDataApiDeps["storage"],
     auth,
     accessLogWriter: { write: vi.fn(async () => undefined) },

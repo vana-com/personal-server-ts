@@ -1,0 +1,86 @@
+import type { LocalSyncDeps } from "./deps.js";
+import { dropUnpublishedCursors } from "./cursor.js";
+import type { SqlStatement } from "./driver.js";
+import { dropRunRows, withOrigin } from "./merge.js";
+
+/**
+ * C.2 step 3: a run accepted at `end` but now refused is un-written in ONE
+ * batch with origin `purge`: delete the stream's rows whose stamp is the
+ * run's stamp, and record the run's stream decision as `refused`. The caller
+ * then applies the log at once, so rows that existed only in the refused run
+ * are lost.
+ * DELETES USER DATA. Spec: C.2 step 3 (must-fix 2).
+ *
+ * A run that was admitting (`runs.admitting`, fixed at begin) admitted its rows
+ * into `records` as they arrived, so they are not only its own: a newer run
+ * may have seen or replaced them, and the publisher may have sent some. Its
+ * stamp no longer says which rows are the run's alone, so nothing is removed:
+ * only the stream's decision is recorded as `refused`, and the admitted
+ * records stay.
+ *
+ * Runs inside the caller's connection-queue turn (publish, C.2); it does
+ * not take the queue itself. The run's stamp is (`runs.o`, `run_id`); the
+ * run must belong to this connection. The batch's origin is `purge`, so the
+ * `record_changes` trigger logs every removed row with origin `purge`.
+ */
+export async function unwriteRefusedRun(
+  deps: LocalSyncDeps,
+  input: {
+    readonly connectionId: string;
+    readonly stream: string;
+    readonly runId: string;
+    readonly reason: "connector_update_required" | "out_of_order";
+  },
+): Promise<void> {
+  const [run] = await deps.db.query<{
+    o: number;
+    connection_id: string;
+    admitting: number;
+  }>("SELECT o, connection_id, admitting FROM runs WHERE run_id = ?", [
+    input.runId,
+  ]);
+  if (!run) {
+    throw new Error(`unwrite: unknown run ${input.runId}`);
+  }
+  if (run.connection_id !== input.connectionId) {
+    throw new Error(
+      `unwrite: run ${input.runId} belongs to another connection`,
+    );
+  }
+  const refuse: SqlStatement = {
+    sql: `UPDATE run_streams SET decision = 'refused', reason = ?,
+   publication_state = 'superseded', publication_reason = ?
+ WHERE run_id = ? AND stream = ?`,
+    params: [input.reason, input.reason, input.runId, input.stream],
+  };
+  if (run.admitting === 1) {
+    await deps.db.batch([refuse, dropUnpublishedCursors(input.connectionId)]);
+    deps.logger.info(
+      {
+        connectionId: input.connectionId,
+        stream: input.stream,
+        runId: input.runId,
+        reason: input.reason,
+      },
+      "refused admitting run: admitted records kept",
+    );
+    return;
+  }
+  const { changes } = await deps.db.batch(
+    withOrigin("purge", [
+      ...dropRunRows(input.connectionId, input.stream, run.o, input.runId),
+      refuse,
+      dropUnpublishedCursors(input.connectionId),
+    ]),
+  );
+  deps.logger.info(
+    {
+      connectionId: input.connectionId,
+      stream: input.stream,
+      runId: input.runId,
+      reason: input.reason,
+      rowsRemoved: changes[1],
+    },
+    "unwrite refused run",
+  );
+}

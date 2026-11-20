@@ -1,5 +1,9 @@
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
+  LegacyWriteHold,
+  LegacyWriteSeal,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
+import type {
   DataBlockManifest,
   DataScopeBlock,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
@@ -111,7 +115,28 @@ export function createMemoryPsLiteTokenStore(): PsLiteTokenStore {
   } as PsLiteTokenStore & PsLiteRuntimeStoreCapabilities;
 }
 
-export function createMemoryPsLiteStorage(): DataStoragePort {
+/**
+ * An in-memory storage for tests. It takes a seal only when a test is about
+ * the account switch: then its writes run inside `seal.commit` and its
+ * removals inside `seal.remove` (or under a passed `hold`), as the persistent
+ * storage does. Without one it is unsealed. Production uses the persistent
+ * storage.
+ */
+export function createMemoryPsLiteStorage(
+  options: { legacyWriteSeal?: LegacyWriteSeal } = {},
+): DataStoragePort {
+  const seal = options.legacyWriteSeal;
+  /** A legacy write: sealed when a seal was given, synchronous otherwise. */
+  function sealed<T>(write: () => T): T | Promise<T> {
+    return seal ? seal.commit(() => write()) : write();
+  }
+  /** A pure removal: under the seal's shared lock unless a hold is passed. */
+  function removing<T>(
+    hold: LegacyWriteHold | undefined,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    return seal && !hold ? seal.remove(work) : work();
+  }
   const entries = new Map<string, IndexEntry>();
   const envelopes = new Map<string, DataFileEnvelope>();
   const blockManifests = new Map<string, DataBlockManifest>();
@@ -147,6 +172,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       files: "memory",
       opfsAvailable: false,
     } satisfies PsLiteStorageCapabilities,
+    ...(seal ? { legacyWriteSeal: seal } : {}),
     ...createStorageReadMethods(() => entries.values(), entriesForScope),
 
     findByFileId(fileId) {
@@ -186,15 +212,17 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
     },
 
     async writeEnvelope(envelope) {
-      envelopes.set(
-        envelopeKey(envelope.scope, envelope.collectedAt),
-        envelope,
-      );
-      return {
-        path: `${envelope.scope}/${envelope.collectedAt}.json`,
-        relativePath: `${envelope.scope}/${envelope.collectedAt}.json`,
-        sizeBytes: new TextEncoder().encode(JSON.stringify(envelope)).length,
-      };
+      return sealed(() => {
+        envelopes.set(
+          envelopeKey(envelope.scope, envelope.collectedAt),
+          envelope,
+        );
+        return {
+          path: `${envelope.scope}/${envelope.collectedAt}.json`,
+          relativePath: `${envelope.scope}/${envelope.collectedAt}.json`,
+          sizeBytes: new TextEncoder().encode(JSON.stringify(envelope)).length,
+        };
+      });
     },
 
     async readScopeBlocks(scope, collectedAt, options) {
@@ -324,25 +352,27 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
     },
 
     insertEntry(entry) {
-      const version =
-        entry.version ??
-        Array.from(entries.values()).reduce(
-          (max, e) =>
-            e.scope === entry.scope && e.version > max ? e.version : max,
-          0,
-        ) + 1;
-      const indexed: IndexEntry = {
-        ...entry,
-        schemaId: entry.schemaId ?? null,
-        version,
-        dataPointId: entry.dataPointId ?? null,
-        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
-        id: nextId,
-        createdAt: new Date().toISOString(),
-      };
-      nextId += 1;
-      entries.set(entry.path, indexed);
-      return indexed;
+      return sealed(() => {
+        const version =
+          entry.version ??
+          Array.from(entries.values()).reduce(
+            (max, e) =>
+              e.scope === entry.scope && e.version > max ? e.version : max,
+            0,
+          ) + 1;
+        const indexed: IndexEntry = {
+          ...entry,
+          schemaId: entry.schemaId ?? null,
+          version,
+          dataPointId: entry.dataPointId ?? null,
+          afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
+          id: nextId,
+          createdAt: new Date().toISOString(),
+        };
+        nextId += 1;
+        entries.set(entry.path, indexed);
+        return indexed;
+      });
     },
 
     updateFileId(path, fileId) {
@@ -359,16 +389,18 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       );
     },
 
-    updateDataPointId(path, dataPointId) {
+    updateDataPointId(path, dataPointId, expectedId) {
       const entry = entries.get(path);
-      if (!entry) return false;
+      if (!entry || (expectedId !== undefined && entry.id !== expectedId))
+        return false;
       entries.set(path, { ...entry, dataPointId });
       return true;
     },
 
-    updateEntryVersion(path, version) {
+    updateEntryVersion(path, version, expectedId) {
       const entry = entries.get(path);
-      if (!entry) return false;
+      if (!entry || (expectedId !== undefined && entry.id !== expectedId))
+        return false;
       entries.set(path, { ...entry, version });
       return true;
     },
@@ -385,67 +417,73 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       firstSeenLedgers.delete(scope);
     },
 
-    async deleteScope(scope) {
-      firstSeenLedgers.delete(scope);
-      let deleted = 0;
-      for (const [path, entry] of entries.entries()) {
-        if (entry.scope === scope) {
-          entries.delete(path);
-          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
-          const key = blockKey(entry.scope, entry.collectedAt);
-          blockManifests.delete(key);
-          for (const payloadKey of blockPayloads.keys()) {
-            if (payloadKey.startsWith(`${key}\n`)) {
-              blockPayloads.delete(payloadKey);
+    deleteScope(scope, hold) {
+      return removing(hold, async () => {
+        firstSeenLedgers.delete(scope);
+        let deleted = 0;
+        for (const [path, entry] of entries.entries()) {
+          if (entry.scope === scope) {
+            entries.delete(path);
+            envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+            const key = blockKey(entry.scope, entry.collectedAt);
+            blockManifests.delete(key);
+            for (const payloadKey of blockPayloads.keys()) {
+              if (payloadKey.startsWith(`${key}\n`)) {
+                blockPayloads.delete(payloadKey);
+              }
             }
+            deleted += 1;
           }
-          deleted += 1;
         }
-      }
-      return deleted;
+        return deleted;
+      });
     },
 
-    async deleteVersion(scope, collectedAt, fence) {
-      for (const [path, entry] of entries.entries()) {
-        if (
-          entry.scope === scope &&
-          entry.collectedAt === collectedAt &&
-          (fence === undefined ||
-            (entry.id === fence.id && entry.path === fence.path))
-        ) {
-          entries.delete(path);
-          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
-          const key = blockKey(entry.scope, entry.collectedAt);
-          blockManifests.delete(key);
-          for (const payloadKey of blockPayloads.keys()) {
-            if (payloadKey.startsWith(`${key}\n`)) {
-              blockPayloads.delete(payloadKey);
+    deleteVersion(scope, collectedAt, fence, hold) {
+      return removing(hold, async () => {
+        for (const [path, entry] of entries.entries()) {
+          if (
+            entry.scope === scope &&
+            entry.collectedAt === collectedAt &&
+            (fence === undefined ||
+              (entry.id === fence.id && entry.path === fence.path))
+          ) {
+            entries.delete(path);
+            envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+            const key = blockKey(entry.scope, entry.collectedAt);
+            blockManifests.delete(key);
+            for (const payloadKey of blockPayloads.keys()) {
+              if (payloadKey.startsWith(`${key}\n`)) {
+                blockPayloads.delete(payloadKey);
+              }
             }
+            dropEmptyLedger(entry.scope);
+            return true;
           }
-          dropEmptyLedger(entry.scope);
-          return true;
         }
-      }
-      return false;
+        return false;
+      });
     },
 
-    async deleteByFileId(fileId) {
-      for (const [path, entry] of entries.entries()) {
-        if (entry.fileId === fileId) {
-          entries.delete(path);
-          envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
-          const key = blockKey(entry.scope, entry.collectedAt);
-          blockManifests.delete(key);
-          for (const payloadKey of blockPayloads.keys()) {
-            if (payloadKey.startsWith(`${key}\n`)) {
-              blockPayloads.delete(payloadKey);
+    deleteByFileId(fileId, hold) {
+      return removing(hold, async () => {
+        for (const [path, entry] of entries.entries()) {
+          if (entry.fileId === fileId) {
+            entries.delete(path);
+            envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+            const key = blockKey(entry.scope, entry.collectedAt);
+            blockManifests.delete(key);
+            for (const payloadKey of blockPayloads.keys()) {
+              if (payloadKey.startsWith(`${key}\n`)) {
+                blockPayloads.delete(payloadKey);
+              }
             }
+            dropEmptyLedger(entry.scope);
+            return true;
           }
-          dropEmptyLedger(entry.scope);
-          return true;
         }
-      }
-      return false;
+        return false;
+      });
     },
   } as DataStoragePort & { capabilities: PsLiteStorageCapabilities };
 }
@@ -601,6 +639,8 @@ function pageBlock(
   };
 }
 
+let memoryStateStores = 0;
+
 export function createMemoryPsLiteStateStore(
   seed?: Partial<Record<PsLiteStateKey, unknown>>,
 ): PsLiteStateStore {
@@ -608,6 +648,7 @@ export function createMemoryPsLiteStateStore(
     Object.entries(seed ?? {}) as Array<[PsLiteStateKey, unknown]>,
   );
   return {
+    namespace: `memory:${++memoryStateStores}`,
     async get<T>(key: PsLiteStateKey) {
       return values.has(key) ? clone(values.get(key) as T) : null;
     },

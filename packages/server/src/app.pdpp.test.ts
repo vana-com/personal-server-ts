@@ -1,3 +1,4 @@
+import { fixedModeAuthority as explicitLegacyAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -107,6 +108,7 @@ describe("createApp: PDPP routes are reachable through the real app", () => {
 
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: explicitLegacyAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),

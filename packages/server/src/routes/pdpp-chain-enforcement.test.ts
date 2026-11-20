@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * Vana chain enforcement on the PDPP bearer read path.
  *
@@ -199,6 +200,7 @@ function harness(options: HarnessOptions = {}) {
   app.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       auth: createFixtureAuthorizationService({ "client-tok": token }),
       chainEnforcement: enforcement,
       declarations,

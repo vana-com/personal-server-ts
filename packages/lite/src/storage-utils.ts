@@ -55,7 +55,9 @@ function findEntryInScope(
   lookup: DataStorageEntryLookup,
 ): IndexEntry | undefined {
   if (lookup.fileId) {
-    return entries.find((entry) => entry.fileId === lookup.fileId);
+    return entries.find(
+      (entry) => entry.fileId === lookup.fileId && entry.scope === lookup.scope,
+    );
   }
   if (lookup.at) {
     return entries.find((entry) => entry.collectedAt === lookup.at);

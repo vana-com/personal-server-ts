@@ -1,0 +1,694 @@
+/** The statement every view trigger runs: add one to the connection's counter. */
+const bumpView = (row: "NEW" | "OLD") =>
+  `INSERT OR REPLACE INTO view_versions(connection_id, version) VALUES (${row}.connection_id, COALESCE((SELECT version FROM view_versions WHERE connection_id = ${row}.connection_id), 0) + 1);`;
+
+/**
+ * The same bump for the connections of the intent's connector that a reader
+ * can reach: every read gate is `control_state = 'active'` and no intent. An
+ * intent changes what a reader sees only for such a connection. One that is
+ * deleted, as a purge leaves it and as the resolver marks it when it meets an
+ * intent, stays unreadable whether the intent exists or not.
+ */
+const bumpConnector = (row: "NEW" | "OLD") =>
+  `INSERT OR REPLACE INTO view_versions(connection_id, version) SELECT c.connection_id, COALESCE(v.version, 0) + 1 FROM connections c LEFT JOIN view_versions v ON v.connection_id = c.connection_id WHERE c.connector = ${row}.connector AND c.control_state = 'active';`;
+
+/**
+ * The triggers of `records` as the migrations up to the rowid rebuild left
+ * them (`records_key_type_conflict`, `records_ai/au/ad` from migration 1,
+ * `view_records_*` from the view migration), created again by that rebuild.
+ * A conformance test checks the rebuild keeps their text.
+ */
+const RECORDS_TRIGGERS: readonly string[] = [
+  `CREATE TRIGGER records_key_type_conflict BEFORE INSERT ON records
+WHEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'remote'
+ AND EXISTS (SELECT 1 FROM records x WHERE x.connection_id = NEW.connection_id
+             AND x.stream = NEW.stream AND x.record_key = NEW.record_key AND x.pk_hash <> NEW.pk_hash)
+BEGIN SELECT RAISE(ABORT, 'key_type_conflict'); END`,
+  `CREATE TRIGGER records_ai AFTER INSERT ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (NEW.connection_id,NEW.stream,NEW.pk_hash,NEW.record_key,'upsert',NEW.stamp_o,NEW.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+END`,
+  `CREATE TRIGGER records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256 ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (NEW.connection_id,NEW.stream,NEW.pk_hash,NEW.record_key,'upsert',NEW.stamp_o,NEW.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+END`,
+  `CREATE TRIGGER records_ad AFTER DELETE ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (OLD.connection_id,OLD.stream,OLD.pk_hash,OLD.record_key,'remove',OLD.stamp_o,OLD.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+  DELETE FROM blob_refs WHERE connection_id = OLD.connection_id AND stream = OLD.stream AND pk_hash = OLD.pk_hash;
+END`,
+  `CREATE TRIGGER view_records_ai AFTER INSERT ON records BEGIN
+  ${bumpView("NEW")}
+END`,
+  `CREATE TRIGGER view_records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256, seen_o, first_o ON records
+WHEN OLD.stamp_o IS NOT NEW.stamp_o OR OLD.stamp_r IS NOT NEW.stamp_r OR OLD.body_sha256 IS NOT NEW.body_sha256
+  OR OLD.first_o IS NOT NEW.first_o OR COALESCE(OLD.seen_o, OLD.stamp_o) IS NOT COALESCE(NEW.seen_o, NEW.stamp_o) BEGIN
+  ${bumpView("NEW")}
+END`,
+  `CREATE TRIGGER view_records_ad AFTER DELETE ON records BEGIN
+  ${bumpView("OLD")}
+END`,
+];
+
+/**
+ * Migration 1 of the local database, taken from the SQL proof. Shared SQL keeps
+ * to SQLite 3.22: no UPSERT, RETURNING, JSON1, window functions or STRICT.
+ * Each migration is one batch; `migrate` appends `PRAGMA user_version`.
+ */
+export const MIGRATIONS: readonly (readonly string[])[] = [
+  [
+    `CREATE TABLE db_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  owner TEXT NOT NULL, network TEXT NOT NULL, device_id TEXT NOT NULL, created_at INTEGER NOT NULL);`,
+    `CREATE TABLE write_ctx (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  origin TEXT NOT NULL CHECK (origin IN ('local','import','remote','refresh','purge')));`,
+    `INSERT INTO write_ctx VALUES (1, 'local');`,
+    `CREATE TABLE connections (
+  connection_id TEXT PRIMARY KEY, connector TEXT NOT NULL, ns TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1,
+  control_state TEXT NOT NULL DEFAULT 'absent' CHECK (control_state IN ('absent','active','deleted','foreign')),
+  control_version INTEGER NOT NULL DEFAULT 0,
+  checkpoint TEXT, label TEXT, deleted_at INTEGER);`,
+    `CREATE TABLE records (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  body TEXT NOT NULL, body_sha256 TEXT NOT NULL, first_o INTEGER,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
+    `CREATE INDEX records_by_key ON records(connection_id, stream, record_key);`,
+    `CREATE INDEX records_by_first ON records(first_o) WHERE first_o IS NOT NULL;`,
+    `CREATE TABLE record_changes (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
+  op TEXT NOT NULL CHECK (op IN ('upsert','remove')),
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  origin TEXT NOT NULL);`,
+    `CREATE INDEX record_changes_by_key ON record_changes(connection_id, stream, pk_hash, seq);`,
+    `CREATE TABLE stream_state (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL,
+  primary_key TEXT NOT NULL, semantics TEXT NOT NULL, incremental INTEGER NOT NULL,
+  profile_key TEXT, profile_version TEXT,
+  complete INTEGER NOT NULL DEFAULT 0, needs_full INTEGER NOT NULL DEFAULT 0,
+  floor_version TEXT, floor_o INTEGER, floor_r TEXT,
+  last_delete_version INTEGER NOT NULL DEFAULT 0,
+  head_version INTEGER NOT NULL DEFAULT 0, head_generation INTEGER, head_data_hash TEXT, head_blob TEXT,
+  publish_watermark INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (connection_id, stream)) WITHOUT ROWID;`,
+    `CREATE TABLE stream_versions (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, version INTEGER NOT NULL,
+  generation INTEGER NOT NULL, head_blob TEXT NOT NULL, head_format INTEGER NOT NULL,
+  record_count INTEGER NOT NULL, observed_at INTEGER NOT NULL, complete INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('published','applied','delete')),
+  PRIMARY KEY (connection_id, stream, version)) WITHOUT ROWID;`,
+    `CREATE TABLE runs (
+  run_id TEXT PRIMARY KEY CHECK (run_id NOT GLOB '*[^A-Za-z0-9._-]*' AND length(run_id) BETWEEN 1 AND 128),
+  connection_id TEXT NOT NULL, o INTEGER NOT NULL, generation INTEGER,
+  artifact_version TEXT NOT NULL, collection_mode TEXT NOT NULL CHECK (collection_mode IN ('full_refresh','incremental')),
+  state TEXT NOT NULL CHECK (state IN ('collecting','ended')),
+  last_batch INTEGER NOT NULL DEFAULT -1);`,
+    `CREATE TABLE run_streams (
+  run_id TEXT NOT NULL, stream TEXT NOT NULL,
+  delete_snapshot INTEGER NOT NULL,
+  basis_version INTEGER, basis_generation INTEGER, basis_data_hash TEXT,
+  primary_key TEXT, profile_key TEXT, profile_version TEXT,
+  full_read INTEGER NOT NULL DEFAULT 0, foreign_checkpoint INTEGER NOT NULL DEFAULT 0,
+  seed TEXT NOT NULL DEFAULT 'none' CHECK (seed IN ('none','merged','unresolved')),
+  replace INTEGER NOT NULL DEFAULT 0,
+  decision TEXT CHECK (decision IN ('publish','noop','refused','deferred','discarded')), reason TEXT,
+  PRIMARY KEY (run_id, stream)) WITHOUT ROWID;`,
+    `CREATE TABLE run_rows (
+  run_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
+  body TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+  PRIMARY KEY (run_id, stream, pk_hash)) WITHOUT ROWID;`,
+    `CREATE TABLE blobs (
+  blob_id TEXT PRIMARY KEY, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+  generation INTEGER, bytes BLOB);`,
+    `CREATE TABLE blob_refs (
+  blob_id TEXT NOT NULL, connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  PRIMARY KEY (blob_id, connection_id, stream, pk_hash)) WITHOUT ROWID;`,
+    `CREATE TABLE import_ledger (
+  source TEXT NOT NULL, connection_id TEXT NOT NULL, stream TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('imported','verified','retired','excluded')),
+  rows INTEGER NOT NULL, fingerprint TEXT NOT NULL, reason TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (source, connection_id, stream)) WITHOUT ROWID;`,
+    `CREATE TABLE delete_intents (
+  connector TEXT PRIMARY KEY, delete_id TEXT NOT NULL, intent TEXT NOT NULL);`,
+    `CREATE TRIGGER records_key_type_conflict BEFORE INSERT ON records
+WHEN (SELECT origin FROM write_ctx WHERE id = 1) <> 'remote'
+ AND EXISTS (SELECT 1 FROM records x WHERE x.connection_id = NEW.connection_id
+             AND x.stream = NEW.stream AND x.record_key = NEW.record_key AND x.pk_hash <> NEW.pk_hash)
+BEGIN SELECT RAISE(ABORT, 'key_type_conflict'); END;`,
+    `CREATE TRIGGER records_ai AFTER INSERT ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (NEW.connection_id,NEW.stream,NEW.pk_hash,NEW.record_key,'upsert',NEW.stamp_o,NEW.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+END;`,
+    `CREATE TRIGGER records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256 ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (NEW.connection_id,NEW.stream,NEW.pk_hash,NEW.record_key,'upsert',NEW.stamp_o,NEW.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+END;`,
+    `CREATE TRIGGER records_ad AFTER DELETE ON records BEGIN
+  INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
+  VALUES (OLD.connection_id,OLD.stream,OLD.pk_hash,OLD.record_key,'remove',OLD.stamp_o,OLD.stamp_r,
+          (SELECT origin FROM write_ctx WHERE id = 1));
+  DELETE FROM blob_refs WHERE connection_id = OLD.connection_id AND stream = OLD.stream AND pk_hash = OLD.pk_hash;
+END;`,
+  ],
+  [
+    `ALTER TABLE import_ledger ADD COLUMN revision TEXT;`,
+    `ALTER TABLE import_ledger ADD COLUMN generation INTEGER;`,
+    `ALTER TABLE import_ledger ADD COLUMN highest_seq INTEGER;`,
+  ],
+  [
+    `CREATE TABLE legacy_erase_intents (
+      copy_key TEXT PRIMARY KEY, descriptor TEXT NOT NULL, at INTEGER NOT NULL
+    ) WITHOUT ROWID;`,
+  ],
+  [
+    // A connection can compact newer events while another retains older ones.
+    // MIN(seq) alone cannot detect those holes. Retain only the deletion floor.
+    `ALTER TABLE db_meta ADD COLUMN change_floor INTEGER NOT NULL DEFAULT 0`,
+    `UPDATE db_meta SET change_floor=COALESCE((SELECT seq FROM sqlite_sequence WHERE name='record_changes'),0)`,
+    `CREATE TRIGGER record_changes_compacted AFTER DELETE ON record_changes BEGIN
+      UPDATE db_meta SET change_floor=MAX(change_floor,OLD.seq) WHERE id=1;
+    END`,
+  ],
+  [`ALTER TABLE run_streams ADD COLUMN coverage_strategy TEXT`],
+  [
+    `ALTER TABLE run_rows ADD COLUMN op TEXT NOT NULL DEFAULT 'upsert' CHECK(op IN ('upsert','delete'))`,
+    `ALTER TABLE run_streams ADD COLUMN semantics TEXT`,
+    `UPDATE run_streams SET semantics=(SELECT s.semantics FROM stream_state s JOIN runs r ON r.connection_id=s.connection_id WHERE r.run_id=run_streams.run_id AND s.stream=run_streams.stream)`,
+    `ALTER TABLE record_changes ADD COLUMN explicit_delete INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
+    `ALTER TABLE runs ADD COLUMN begin_control_version INTEGER`,
+    `ALTER TABLE runs ADD COLUMN begin_request TEXT`,
+    `ALTER TABLE runs ADD COLUMN begin_response TEXT`,
+    `ALTER TABLE runs ADD COLUMN end_response TEXT`,
+  ],
+  [
+    // Staging checks every new row for a key conflict with rows already staged
+    // by the connection's runs. Without this index each check scans all staged
+    // rows, so a batch costs more than the one before it.
+    `CREATE INDEX run_rows_by_key ON run_rows(stream, record_key)`,
+  ],
+  [
+    // Durable link from a run's stream to the publication that covered it.
+    // Existing rows stay 'unknown': no publication is inferred from a
+    // watermark, which counts local changes, not time. `published_watermark`
+    // is evidence only; never compare it with `runs.o`.
+    `ALTER TABLE run_streams ADD COLUMN publication_state TEXT NOT NULL DEFAULT 'unknown' CHECK (publication_state IN ('unknown','pending','published','superseded'))`,
+    `ALTER TABLE run_streams ADD COLUMN published_generation INTEGER`,
+    `ALTER TABLE run_streams ADD COLUMN published_version INTEGER`,
+    `ALTER TABLE run_streams ADD COLUMN published_data_hash TEXT`,
+    `ALTER TABLE run_streams ADD COLUMN published_watermark INTEGER`,
+    `ALTER TABLE run_streams ADD COLUMN publication_reason TEXT`,
+  ],
+  // A table of the per-stream head path (`publish_spool`) was created here.
+  // The slot stays, so a database's version keeps its meaning.
+  [],
+  [
+    // The newest stamp of a run that observed this row's body, when that is
+    // newer than the stamp in the published bytes. Local only: never in a
+    // part, and not watched by `records_au`, so moving it logs no change. NULL
+    // means the row was last observed at its own stamp. Read it through
+    // `SEEN_O` and `SEEN_R` in merge.ts, never as the bare column.
+    `ALTER TABLE records ADD COLUMN seen_o INTEGER`,
+    `ALTER TABLE records ADD COLUMN seen_r TEXT`,
+  ],
+  [
+    // "Rows last observed before run R" (a full refresh's replace) is a range
+    // on the effective observation. This holds it, in the same terms as
+    // `seenStamp` in merge.ts, so that read seeks and does not scan the stream.
+    `CREATE INDEX records_by_observation ON records(connection_id, stream, COALESCE(seen_o, stamp_o), COALESCE(seen_r, stamp_r))`,
+  ],
+  [
+    // The bytes of `body`, set by `mergeIncoming` with the body. Local only:
+    // never in a part, and not watched by `records_au`. NULL means the row was
+    // written before this column existed; `bodySizes` in part-layout.ts
+    // measures the body for those rows.
+    `ALTER TABLE records ADD COLUMN body_bytes INTEGER`,
+    // The size alone, in an index. A column after `body` is stored behind the
+    // body's overflow pages, and a lookup in `records` reads a wide row page
+    // for each key, so the column by itself leaves the size reads as slow as
+    // measuring the body. This index answers them without touching `records`.
+    `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
+  ],
+  [
+    // What a reader sees of a connection, as one counter per connection. A
+    // trigger bumps it in the same transaction as every change of a column the
+    // read path uses, and only when the value differs (`IS NOT`), so a write
+    // that keeps a value changes nothing and a listener that rewrites a value
+    // cannot cause an event. Watched:
+    //   records: the body hash, the stamp, the first-seen time and the
+    //     effective seen time `COALESCE(seen_o, stamp_o)` (a run that saw the
+    //     same body moves it, and so does un-writing that run);
+    //   stream_state: the primary key and profile binding, completeness, the
+    //     delete version and the installed head (version, generation, data
+    //     hash, blob);
+    //   stream_versions: a version row inserted, changed or deleted, which is
+    //     what picks the head, its completeness and its observation time, and
+    //     what a version listing reports (`record_count`) and a historical
+    //     read checks (`head_format`);
+    //   delete_intents: a connector's intent starting or ending to exist, which
+    //     hides or restores the active connections of that connector to a
+    //     reader (a deleted one is unreadable with or without the intent);
+    //     replacing one intent with another of the same connector is
+    //     bookkeeping and stays silent;
+    //   connections: identity and control state.
+    // Not watched: publish and apply bookkeeping no read shows (watermarks,
+    // floors, `needs_full`, checkpoints, labels). Nothing prunes the counter,
+    // unlike `record_changes`, so a compaction cannot erase a change. Local
+    // only: never in a part.
+    `CREATE TABLE view_versions (
+  connection_id TEXT PRIMARY KEY, version INTEGER NOT NULL) WITHOUT ROWID`,
+    `CREATE TRIGGER view_records_ai AFTER INSERT ON records BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_records_au AFTER UPDATE OF stamp_o, stamp_r, body_sha256, seen_o, first_o ON records
+WHEN OLD.stamp_o IS NOT NEW.stamp_o OR OLD.stamp_r IS NOT NEW.stamp_r OR OLD.body_sha256 IS NOT NEW.body_sha256
+  OR OLD.first_o IS NOT NEW.first_o OR COALESCE(OLD.seen_o, OLD.stamp_o) IS NOT COALESCE(NEW.seen_o, NEW.stamp_o) BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_records_ad AFTER DELETE ON records BEGIN
+  ${bumpView("OLD")}
+END`,
+    `CREATE TRIGGER view_connections_ai AFTER INSERT ON connections BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_connections_ad AFTER DELETE ON connections BEGIN
+  ${bumpView("OLD")}
+END`,
+    `CREATE TRIGGER view_connections_au AFTER UPDATE OF generation, control_state, control_version, deleted_at ON connections
+WHEN OLD.generation IS NOT NEW.generation OR OLD.control_state IS NOT NEW.control_state OR OLD.control_version IS NOT NEW.control_version OR OLD.deleted_at IS NOT NEW.deleted_at BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_streams_ai AFTER INSERT ON stream_state BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_streams_ad AFTER DELETE ON stream_state BEGIN
+  ${bumpView("OLD")}
+END`,
+    `CREATE TRIGGER view_streams_au AFTER UPDATE OF primary_key, profile_key, profile_version, complete, last_delete_version, head_version, head_generation, head_data_hash, head_blob ON stream_state
+WHEN OLD.primary_key IS NOT NEW.primary_key OR OLD.profile_key IS NOT NEW.profile_key OR OLD.profile_version IS NOT NEW.profile_version
+  OR OLD.complete IS NOT NEW.complete OR OLD.last_delete_version IS NOT NEW.last_delete_version
+  OR OLD.head_version IS NOT NEW.head_version OR OLD.head_generation IS NOT NEW.head_generation
+  OR OLD.head_data_hash IS NOT NEW.head_data_hash OR OLD.head_blob IS NOT NEW.head_blob BEGIN
+  ${bumpView("NEW")}
+END`,
+    // `INSERT OR REPLACE` removes a replaced row without firing a delete
+    // trigger (recursive triggers are off), and an AFTER trigger cannot tell
+    // the row it replaced. A BEFORE trigger sees the stored row, so it bumps
+    // unless an identical row is already there.
+    `CREATE TRIGGER view_versions_bi BEFORE INSERT ON stream_versions
+WHEN NOT EXISTS (SELECT 1 FROM stream_versions o WHERE o.connection_id = NEW.connection_id AND o.stream = NEW.stream AND o.version = NEW.version
+  AND o.generation IS NEW.generation AND o.head_blob IS NEW.head_blob AND o.head_format IS NEW.head_format AND o.record_count IS NEW.record_count
+  AND o.complete IS NEW.complete AND o.observed_at IS NEW.observed_at AND o.kind IS NEW.kind) BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_versions_au AFTER UPDATE OF generation, head_blob, head_format, record_count, complete, observed_at, kind ON stream_versions
+WHEN OLD.generation IS NOT NEW.generation OR OLD.head_blob IS NOT NEW.head_blob OR OLD.head_format IS NOT NEW.head_format
+  OR OLD.record_count IS NOT NEW.record_count OR OLD.complete IS NOT NEW.complete
+  OR OLD.observed_at IS NOT NEW.observed_at OR OLD.kind IS NOT NEW.kind BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_versions_ad AFTER DELETE ON stream_versions BEGIN
+  ${bumpView("OLD")}
+END`,
+    // Every read of a connection hides it while its connector has an intent,
+    // so the intent existing is part of the view. `INSERT OR REPLACE` of an
+    // existing connector's intent fires no delete trigger (recursive triggers
+    // are off), and an AFTER INSERT trigger cannot tell it from a first
+    // insert, so a BEFORE trigger bumps only when no intent is stored yet.
+    `CREATE TRIGGER view_intents_bi BEFORE INSERT ON delete_intents
+WHEN NOT EXISTS (SELECT 1 FROM delete_intents o WHERE o.connector = NEW.connector) BEGIN
+  ${bumpConnector("NEW")}
+END`,
+    `CREATE TRIGGER view_intents_ad AFTER DELETE ON delete_intents BEGIN
+  ${bumpConnector("OLD")}
+END`,
+  ],
+  [
+    // Apply has no rollback. Set before an apply's first write to a
+    // connection, cleared when an apply of the whole connection completes. A
+    // begin never goes on offline while it is set: the registry cannot say
+    // what the half-applied local data lacks.
+    `ALTER TABLE connections ADD COLUMN apply_partial INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
+    // The stream-sync log (stream-sync/src/log.ts). `log_state` is one row per
+    // connection: the position this device has applied, the position the log
+    // began after (`base`), the refs of positions base+1..position as JSON,
+    // which is what the next segment this device writes lists, and the snapshot
+    // pointer the log rests on (JSON, null before the first compaction).
+    // `log_tombstones`
+    // keeps the stamp of every delete and omission the log carried, and
+    // its rank (an omission's cutoff 0, an explicit delete 2; an observation is
+    // 1), so a reordered or repeated upsert cannot bring a deleted record back
+    // and an observation at an omission's cutoff is not refused. Both
+    // are local only, and empty until a connection runs with the log flag.
+    `CREATE TABLE log_state (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, base INTEGER NOT NULL,
+  refs TEXT NOT NULL, snapshot TEXT) WITHOUT ROWID;`,
+    `CREATE TABLE log_tombstones (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL, rank INTEGER NOT NULL,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
+  ],
+  [
+    // Publish while collecting (flag `publishWhileCollecting`). A run's batch
+    // is admitted into `records` as it arrives, so an older run can admit a row
+    // after a newer run deleted it. This remembers each delete by the stamp of
+    // the run that made it (never the stamp of the row it removed), so admission
+    // skips an upsert that an equal-or-newer delete already covers. Local only:
+    // never published or applied. A tombstone is kept only while a collecting run
+    // older than it exists (`compactTombstones` in admit.ts); with none open,
+    // every later run starts later and carries a newer stamp.
+    `CREATE TABLE record_tombstones (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID;`,
+    // 1 = the run's batches were admitted into `records` as they arrived, so
+    // run end does not merge its upserts again. Fixed at begin from the flag.
+    `ALTER TABLE runs ADD COLUMN admitting INTEGER NOT NULL DEFAULT 0`,
+    // The highest tombstone stamp compaction ever dropped for the connection.
+    // A run that begins later takes an `o` that puts its stamp above it
+    // (`clampRunStart` in admit.ts), so "a later run has a newer stamp" holds
+    // even when the caller passes an old `observedAt`.
+    `ALTER TABLE connections ADD COLUMN tombstone_wm_o INTEGER`,
+    `ALTER TABLE connections ADD COLUMN tombstone_wm_r TEXT`,
+    // 1 = some upserts of this stream were staged in `run_rows` and not
+    // admitted (the connector check blocked them, or the stream's head or floor
+    // changed between that check and the batch commit). Run end merges them.
+    `ALTER TABLE run_streams ADD COLUMN unadmitted INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
+    // A stream's first load, while its parts are still being applied. One row
+    // per stream, written by apply in the same transaction as each part's
+    // rows, so a reader that sees rows of the load sees the row that names
+    // their head. It names the head (`version`, `generation`, `data_hash`) the
+    // rows belong to and how many of its parts are applied. `failed` and
+    // `last_error` say the apply stopped before the last part, and why; the
+    // next part clears them. Completion, purge and a tombstone delete the row.
+    // Local only: never in a part. A reader serves it only when asked to
+    // (`progressiveFirstLoad`).
+    `CREATE TABLE stream_partial (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL,
+  version INTEGER NOT NULL, generation INTEGER NOT NULL, data_hash TEXT NOT NULL, head_blob TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  parts_applied INTEGER NOT NULL, parts_total INTEGER NOT NULL, records_total INTEGER NOT NULL,
+  failed INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+  PRIMARY KEY (connection_id, stream)) WITHOUT ROWID`,
+    // The rows a stream held when its load began, which the load has not yet
+    // matched with a part: rows of an earlier head, and local rows the
+    // complete state keeps. They stay stored, because only the complete state
+    // knows which go, and a partial view leaves them out until a part holds
+    // their key. Gone with the row of `stream_partial` they belong to.
+    `CREATE TABLE partial_hidden (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  PRIMARY KEY (connection_id, stream, pk_hash)) WITHOUT ROWID`,
+    `CREATE TRIGGER partial_hidden_ad AFTER DELETE ON stream_partial BEGIN
+  DELETE FROM partial_hidden WHERE connection_id = OLD.connection_id AND stream = OLD.stream;
+END`,
+    // Each part moves the row, and a screen shows the progress, so any change
+    // of it is a change of the view. `INSERT OR REPLACE` fires no delete
+    // trigger, so a BEFORE trigger bumps unless an identical row is stored.
+    // A stream that reads as complete has no first load: whichever path
+    // completes it (a head's last part, the log's apply) ends its row here, so
+    // none of them has to remember to.
+    `CREATE TRIGGER partial_complete_au AFTER UPDATE ON stream_state
+WHEN NEW.complete = 1 BEGIN
+  DELETE FROM stream_partial WHERE connection_id = NEW.connection_id AND stream = NEW.stream;
+END`,
+    `CREATE TRIGGER view_partial_bi BEFORE INSERT ON stream_partial
+WHEN NOT EXISTS (SELECT 1 FROM stream_partial o WHERE o.connection_id = NEW.connection_id AND o.stream = NEW.stream
+  AND o.version = NEW.version AND o.generation = NEW.generation AND o.data_hash = NEW.data_hash AND o.head_blob = NEW.head_blob
+  AND o.observed_at = NEW.observed_at AND o.parts_applied = NEW.parts_applied AND o.parts_total = NEW.parts_total
+  AND o.records_total = NEW.records_total AND o.failed = NEW.failed AND o.last_error IS NEW.last_error) BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_partial_au AFTER UPDATE ON stream_partial BEGIN
+  ${bumpView("NEW")}
+END`,
+    `CREATE TRIGGER view_partial_ad AFTER DELETE ON stream_partial BEGIN
+  ${bumpView("OLD")}
+END`,
+  ],
+  [
+    // A log tombstone also keeps the canonical record key of the deletion it
+    // records (log format 2): the key a record-level reader needs for a key it
+    // never held, which the hash cannot give back. Local only. NULL only for a
+    // tombstone written before the column; format 1 wrote none that shipped.
+    `ALTER TABLE log_tombstones ADD COLUMN record_key TEXT`,
+  ],
+  [
+    // A deletion in the log names its key as the typed primary-key values its
+    // pk hash is computed from (log format 2). A run row holds the record's
+    // data, which run end purges, and a change keeps only the lossy string
+    // `record_key`; so an explicit delete keeps the values themselves, as
+    // canonical JSON, from the run row that made it. NULL for a change made
+    // before the column: its typed key is gone, and the log never carried it.
+    `ALTER TABLE run_rows ADD COLUMN pk_values TEXT`,
+    `ALTER TABLE record_changes ADD COLUMN pk_values TEXT`,
+    // The types the stream's schema declares for its key fields (JSON array of
+    // type names or null), from the latest run's declarations. With the record
+    // key they give a delete made before `pk_values` its typed key back.
+    `ALTER TABLE stream_state ADD COLUMN key_types TEXT`,
+  ],
+  [
+    // The intake batch ordinal of the run that observed a record's body: the
+    // order between two bodies of one key at one stamp (`mergeIncoming`). A run
+    // that publishes while collecting can admit a key again in a later batch
+    // with a changed body, at the same stamp; the later batch is the fresher
+    // observation. 0 for a row from before the column and for a run's first batch.
+    `ALTER TABLE records ADD COLUMN stamp_n INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
+    // A key-ordered first load of the log (log-keyed.ts) writes its rows one
+    // key range at a time and moves `log_state` in the last commit. Between
+    // them the rows are in `records` and `log_tombstones` with no stream
+    // version. This keeps, per connection, the position and refs that load
+    // means to publish, written with its first range and deleted with its
+    // last, so a retry that holds a shorter prefix cannot publish over those
+    // rows. Local only.
+    `CREATE TABLE log_keyed_pending (
+  connection_id TEXT PRIMARY KEY, position INTEGER NOT NULL, base INTEGER NOT NULL,
+  refs TEXT NOT NULL) WITHOUT ROWID`,
+  ],
+  [
+    // `records` becomes a rowid table with a unique key. A WITHOUT ROWID
+    // table keeps each row in the b-tree of its key, and a row here is a few
+    // KB (`body`), more than 1/20 of a page, which SQLite's guidance
+    // (withoutrowid.html) puts outside what that layout suits. `pk_hash` is a
+    // hash, so a load that does not arrive in key order puts every insert on
+    // a random leaf of a tree as large as the table, and the page cache holds
+    // a small part of it. Even an insert at the end of the key order rewrites
+    // two neighbours of the leaf it fills: SQLite moves an append to a new
+    // page (`balance_quick`) only in a rowid table. A rowid table appends each
+    // row in insert order whatever its key, and the key's random inserts land
+    // in `records_key`, whose entries hold no body. Every index and trigger is
+    // created again with the same columns: dropping the table drops them.
+    // Their entries now end with the rowid where they ended with the key.
+    // Naming `pk_hash` in them would keep ties in key order, but it makes
+    // every load insert at random places in two more indexes, and with the
+    // key index they no longer fit the page cache of a browser's first load:
+    // the write count of that load triples. A tie on `record_key` is sorted
+    // at read time instead, and the hashes a replacement omits are found
+    // through the table, one row each.
+    `CREATE TABLE records_rowid (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  record_key TEXT NOT NULL, stamp_o INTEGER NOT NULL, stamp_r TEXT NOT NULL,
+  body TEXT NOT NULL, body_sha256 TEXT NOT NULL, first_o INTEGER, seen_o INTEGER, seen_r TEXT, body_bytes INTEGER, stamp_n INTEGER NOT NULL DEFAULT 0)`,
+    `INSERT INTO records_rowid (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, seen_o, seen_r, body_bytes, stamp_n)
+  SELECT connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o, seen_o, seen_r, body_bytes, stamp_n FROM records ORDER BY connection_id, stream, pk_hash`,
+    `DROP TABLE records`,
+    `ALTER TABLE records_rowid RENAME TO records`,
+    `CREATE UNIQUE INDEX records_key ON records(connection_id, stream, pk_hash)`,
+    `CREATE INDEX records_by_key ON records(connection_id, stream, record_key)`,
+    `CREATE INDEX records_by_first ON records(first_o) WHERE first_o IS NOT NULL`,
+    `CREATE INDEX records_by_observation ON records(connection_id, stream, COALESCE(seen_o, stamp_o), COALESCE(seen_r, stamp_r))`,
+    `CREATE INDEX records_size ON records(connection_id, stream, pk_hash, body_bytes)`,
+    ...RECORDS_TRIGGERS,
+  ],
+  [
+    // The tables of the per-stream head path, on a database created before
+    // the migrations above stopped creating them. The `consumed_*` columns of
+    // `stream_state` such a database has stay: nothing reads them, and
+    // SQLite before 3.35 (a phone's 3.22) cannot drop a column.
+    `DROP TABLE IF EXISTS head_parts`,
+    `DROP TABLE IF EXISTS log_replay`,
+    `DROP TABLE IF EXISTS publish_spool`,
+  ],
+  [
+    // The stream meta the log said at each local version, beside its
+    // `complete`. A run's end writes its own meta into `stream_state` before
+    // its publish, so the publish compares the run with these. Every writer
+    // of a version row sets them.
+    `ALTER TABLE stream_versions ADD COLUMN primary_key TEXT`,
+    `ALTER TABLE stream_versions ADD COLUMN profile_key TEXT`,
+    `ALTER TABLE stream_versions ADD COLUMN profile_version TEXT`,
+  ],
+  [
+    // A version row written before those columns gets the stream's own meta,
+    // so the publish can read every row's meta from the row itself.
+    `UPDATE stream_versions SET
+       primary_key = (SELECT s.primary_key FROM stream_state s
+                       WHERE s.connection_id = stream_versions.connection_id
+                         AND s.stream = stream_versions.stream),
+       profile_key = (SELECT s.profile_key FROM stream_state s
+                       WHERE s.connection_id = stream_versions.connection_id
+                         AND s.stream = stream_versions.stream),
+       profile_version = (SELECT s.profile_version FROM stream_state s
+                           WHERE s.connection_id = stream_versions.connection_id
+                             AND s.stream = stream_versions.stream)
+     WHERE primary_key IS NULL`,
+  ],
+  [
+    // Whether a stream's rows changed after a reader looked, which each page of
+    // a complete read asks (complete-read.ts). Every write of a row leaves an
+    // entry in `record_changes`, so a trigger on that table sees them all. It
+    // writes the mark only for the first change after a reader cleared it:
+    // `dirty` says a change came since, `epoch` counts those first changes. A
+    // trigger that wrote on every row would cost every record write; this one
+    // reads one primary-key row.
+    `CREATE TABLE stream_change_marks (
+  connection_id TEXT NOT NULL, stream TEXT NOT NULL,
+  epoch INTEGER NOT NULL, dirty INTEGER NOT NULL,
+  PRIMARY KEY (connection_id, stream)) WITHOUT ROWID`,
+    `CREATE TRIGGER stream_change_marks_ai AFTER INSERT ON record_changes
+WHEN NOT EXISTS (SELECT 1 FROM stream_change_marks m
+                  WHERE m.connection_id = NEW.connection_id AND m.stream = NEW.stream AND m.dirty = 1)
+BEGIN
+  INSERT OR REPLACE INTO stream_change_marks(connection_id, stream, epoch, dirty)
+  VALUES (NEW.connection_id, NEW.stream,
+          COALESCE((SELECT epoch FROM stream_change_marks
+                     WHERE connection_id = NEW.connection_id AND stream = NEW.stream), 0) + 1, 1);
+END`,
+  ],
+  [
+    // Why eligible work is still waiting. Completion reads this only while work remains.
+    `ALTER TABLE record_changes ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
+    `ALTER TABLE run_streams ADD COLUMN publish_blocked_reason TEXT CHECK (publish_blocked_reason IN ('deferred','backoff','discarded','purged','refused'))`,
+  ],
+  [
+    `CREATE TABLE bootstrap_load(id INTEGER PRIMARY KEY CHECK(id=1),connection_id TEXT NOT NULL,generation INTEGER NOT NULL,base INTEGER NOT NULL,preview_done INTEGER NOT NULL DEFAULT 0)`,
+    `CREATE TABLE bootstrap_segments(position INTEGER PRIMARY KEY,data_hash TEXT NOT NULL,first_row INTEGER NOT NULL,last_row INTEGER NOT NULL,observed_at INTEGER NOT NULL,metas TEXT NOT NULL,removes INTEGER NOT NULL)`,
+    `CREATE TABLE bootstrap_deletions(connection_id TEXT NOT NULL,stream TEXT NOT NULL,pk_hash TEXT NOT NULL,record_key TEXT NOT NULL,stamp_o INTEGER NOT NULL,stamp_r TEXT NOT NULL,rank INTEGER NOT NULL,position INTEGER NOT NULL,entry_order INTEGER NOT NULL)`,
+    `CREATE TABLE bootstrap_preview(connection_id TEXT NOT NULL,stream TEXT NOT NULL,pk_hash TEXT NOT NULL,PRIMARY KEY(connection_id,stream,pk_hash)) WITHOUT ROWID`,
+    ...["INSERT", "UPDATE", "DELETE"].map(
+      (
+        event,
+      ) => `CREATE TRIGGER records_bootstrap_${event.toLowerCase()} BEFORE ${event} ON records
+      WHEN EXISTS(SELECT 1 FROM bootstrap_load b WHERE b.connection_id <> ${event === "INSERT" ? "NEW" : "OLD"}.connection_id
+        ${event === "UPDATE" ? "OR b.connection_id <> NEW.connection_id" : ""}
+        OR (SELECT origin FROM write_ctx WHERE id=1) IS NOT 'remote')
+      BEGIN SELECT RAISE(ABORT,'bootstrap_busy'); END`,
+    ),
+  ],
+  [
+    // Selection is independent of declaration/scope data. Old runs stay legacy.
+    `ALTER TABLE runs ADD COLUMN selected_streams TEXT`,
+    `CREATE TABLE run_record_evidence (
+      run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+      stream TEXT NOT NULL, pk_hash TEXT NOT NULL, pk_values TEXT NOT NULL,
+      ever_deleted INTEGER NOT NULL, upsert_events INTEGER NOT NULL, delete_events INTEGER NOT NULL,
+      PRIMARY KEY(run_id,stream,pk_hash)) WITHOUT ROWID`,
+    // AFTER INSERT sees each accepted event, including REPLACE of a final row.
+    // It shares the intake transaction, key checks and last-batch replay guard.
+    `CREATE TRIGGER run_rows_evidence AFTER INSERT ON run_rows WHEN NEW.pk_values IS NOT NULL
+      BEGIN
+        INSERT OR REPLACE INTO run_record_evidence(run_id,stream,pk_hash,pk_values,ever_deleted,upsert_events,delete_events)
+        VALUES(NEW.run_id,NEW.stream,NEW.pk_hash,NEW.pk_values,
+          MAX(NEW.op='delete',COALESCE((SELECT ever_deleted FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0)),
+          (NEW.op='upsert')+COALESCE((SELECT upsert_events FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0),
+          (NEW.op='delete')+COALESCE((SELECT delete_events FROM run_record_evidence WHERE run_id=NEW.run_id AND stream=NEW.stream AND pk_hash=NEW.pk_hash),0));
+      END`,
+  ],
+  [`ALTER TABLE runs ADD COLUMN raw_end TEXT`],
+  [
+    `CREATE TABLE system_stream_instance(id INTEGER PRIMARY KEY CHECK(id=1), instance_id TEXT NOT NULL)`,
+    `CREATE TABLE system_stream_outbox(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT NOT NULL,sort_at TEXT NOT NULL,run_id TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(connection_id,stream,record_id)) WITHOUT ROWID`,
+    `CREATE TABLE system_stream_projection(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,sort_at TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(connection_id,stream,record_id)) WITHOUT ROWID`,
+    `CREATE INDEX system_stream_page ON system_stream_projection(connection_id,stream,sort_at DESC,record_id DESC)`,
+    `CREATE TABLE system_stream_checkpoint(connection_id TEXT NOT NULL,stream TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(connection_id,stream)) WITHOUT ROWID`,
+    `CREATE TABLE system_stream_quarantine(connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(connection_id,stream,record_id,body)) WITHOUT ROWID`,
+    `CREATE TRIGGER system_stream_outbox_capacity BEFORE INSERT ON system_stream_outbox
+      WHEN NOT EXISTS(SELECT 1 FROM system_stream_outbox WHERE connection_id=NEW.connection_id AND stream=NEW.stream AND record_id=NEW.record_id)
+      AND ((SELECT count(*) FROM system_stream_outbox)>=100000 OR (SELECT COALESCE(sum(length(CAST(body AS BLOB))),0) FROM system_stream_outbox)+length(CAST(NEW.body AS BLOB))>104857600)
+      BEGIN SELECT RAISE(ABORT,'system_stream_outbox_full'); END`,
+  ],
+  [
+    // A projection must survive publisher compaction of record_changes. This
+    // inbox is committed with each canonical change and consumed atomically.
+    `CREATE TABLE system_stream_changes(seq INTEGER PRIMARY KEY AUTOINCREMENT,connection_id TEXT NOT NULL,stream TEXT NOT NULL,record_id TEXT NOT NULL,body TEXT)`,
+    `CREATE INDEX system_stream_changes_by_stream ON system_stream_changes(connection_id,stream,seq)`,
+    // Table-local triggers survive the bootstrap table swap through its schema
+    // capture. An external trigger referencing records would refuse that swap.
+    ...["INSERT", "UPDATE", "DELETE"].map((event) => {
+      const row = event === "DELETE" ? "OLD" : "NEW";
+      return `CREATE TRIGGER system_stream_records_${event.toLowerCase()} AFTER ${event === "UPDATE" ? "UPDATE OF stamp_o,stamp_r,body_sha256" : event} ON records
+        WHEN ${row}.connection_id GLOB 'pdpp.vana-system-*~*'
+        BEGIN INSERT INTO system_stream_changes(connection_id,stream,record_id,body)
+        VALUES (${row}.connection_id,${row}.stream,${row}.record_key,${event === "DELETE" ? "NULL" : "NEW.body"}); END`;
+    }),
+  ],
+  [
+    // A device-local fact, never published: this device collected, or was
+    // asked and accepted, the connection. Begin asks before a first run of a
+    // connection that already exists. A device with a checkpoint or a run for
+    // a connection already collects it.
+    `CREATE TABLE connection_participation (
+  connection_id TEXT PRIMARY KEY, joined_at INTEGER NOT NULL) WITHOUT ROWID`,
+    `INSERT INTO connection_participation(connection_id, joined_at)
+  SELECT connection_id, CAST(strftime('%s','now') AS INTEGER) * 1000 FROM (
+    SELECT connection_id FROM runs
+    UNION SELECT connection_id FROM connections WHERE checkpoint IS NOT NULL)`,
+  ],
+  [
+    // A stream's connector cursor travels in the log with the rows it covers.
+    //   cursor_unpublished: the stream's checkpoint entry a run end saved and
+    //     no segment has carried yet, as {state, connectorVersion}.
+    //   cursor_seq: the stream's last record_changes seq when it was saved; a
+    //     segment that closes the stream through that seq may carry it.
+    //   cursor_children: the streams whose rows the cursor also claims (its
+    //     state descendants, read through it), as a JSON array; the cursor
+    //     travels only in a segment that closes them too.
+    //   cursor_version: the connector version that wrote the stream's local
+    //     checkpoint entry, here or on the device whose segment set it.
+    //   cursor_applied: the cursor of the last segment applied (or published
+    //     here) that carried one, as {state, connectorVersion}, until it is
+    //     folded into `connections.checkpoint` (cursor.ts). It is written in
+    //     the batch of the rows it covers; the fold is a JSON merge, done in JS.
+    `ALTER TABLE stream_state ADD COLUMN cursor_unpublished TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_seq INTEGER`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_children TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_version TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_applied TEXT`,
+    // Every path that drops the local checkpoint (a discarded or fenced run, a
+    // purge, a deleted connection) drops the cursors with it, so none of them
+    // can publish a cursor the device no longer resumes from.
+    `CREATE TRIGGER connections_checkpoint_cleared AFTER UPDATE OF checkpoint ON connections
+WHEN NEW.checkpoint IS NULL BEGIN
+  UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL, cursor_version = NULL, cursor_applied = NULL
+  WHERE connection_id = NEW.connection_id;
+END`,
+  ],
+  [
+    // Counts the writes of `cursor_unpublished`, never reset. A run end can
+    // write the same cursor again (its entry moved away and back), with more
+    // rows under it, while a segment that carried the earlier write waits to
+    // be acknowledged; the acknowledgement clears only the write it carried.
+    `ALTER TABLE stream_state ADD COLUMN cursor_write INTEGER NOT NULL DEFAULT 0`,
+  ],
+  [
+    // The newest stamp (`o`, then `r`) a connection's log tombstones hold, which a run's start
+    // stamp is raised above (`clampRunStart` in admit.ts). The tombstones of a
+    // connection are kept until it is purged, so without this the read is a
+    // scan of all of them at every begin.
+    `CREATE INDEX log_tombstones_by_stamp ON log_tombstones(connection_id, stamp_o, stamp_r)`,
+  ],
+];

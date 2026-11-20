@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -639,6 +640,7 @@ it("serves imported canonical records through the existing grant-relative HTTP r
     streams: [{ name: "messages", instance_ids: ["conn_a"], fields: ["text"] }],
   };
   const app = pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store: d.store,
     auth: createFixtureAuthorizationService({
       client: {
@@ -670,6 +672,7 @@ it("serves imported canonical records through the existing grant-relative HTTP r
   const denied = await app.request("/streams/messages/records");
   expect(denied.status).toBe(401);
   const restricted = pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store: d.store,
     auth: createFixtureAuthorizationService({
       client: {
@@ -3240,12 +3243,6 @@ it("account conflict keeps local tombstones, current-generation identity, and in
       .readStore({ reader: "owner" })
       .getRecord("conn_a", "messages", "a"),
   ).toBeUndefined();
-  d.store.resetInstanceBinding({
-    instance: "conn_a",
-    expectedMethod: "collector",
-    expectedGeneration: 1,
-    nextMethod: "collector",
-  });
   d.store.ingestBatch(
     [
       {
@@ -3258,7 +3255,7 @@ it("account conflict keeps local tombstones, current-generation identity, and in
     ],
     () => "mutable_state",
     () => ["id"],
-    { method: "collector", generation: 2 },
+    { method: "collector", generation: 1 },
   );
   const local = d.store.getRecord("conn_a", "messages", "b")!;
   d.db
@@ -4789,6 +4786,7 @@ it.each(["owner", "grant"] as const)(
         { name: "messages", instance_ids: ["conn_a"], fields: ["blob_ref"] },
       ],
     };
+    let quarantineCalls = 0;
     const app = pdppBlobsRoutes({
       store: d.store,
       reads: (mode) => {
@@ -4798,11 +4796,13 @@ it.each(["owner", "grant"] as const)(
           ...readStore,
           withReadSnapshot<T>(read: () => T) {
             snapshots++;
-            if (snapshots === 2)
+            if (snapshots === 2) {
+              quarantineCalls++;
               receiver.quarantineImported({
                 credential: "replica-secret",
                 envelope: batch([operation]),
               });
+            }
             return readStore.withReadSnapshot(read);
           },
         };
@@ -4835,26 +4835,29 @@ it.each(["owner", "grant"] as const)(
         },
       ]),
       instancesForSubject: () => ["conn_a"],
-      readBlobBytes: async (id) => {
-        receiver.quarantineImported({
-          credential: "replica-secret",
-          envelope: batch([operation]),
-        });
-        return d.store.getBlobBytes(id);
-      },
     });
 
     const response = await app.request(`/${blob.blobId}`, {
       headers: { Authorization: `Bearer ${reader}` },
     });
-    expect(response.status).not.toBe(200);
-    expect(await response.text()).not.toContain("10,20,30");
+    expect(quarantineCalls).toBe(1);
+    expect(response.status).toBe(500);
+    const received = new Uint8Array(await response.arrayBuffer());
+    expect(received).not.toEqual(bytes);
   },
 );
 
-it.each(["owner", "grant"] as const)(
-  "A6 race: HTTP blob stream aborts after quarantine for %s",
-  async (reader) => {
+// Static rationale at 7c71da83: pdpp-blobs.ts:219-224 checks and enqueues
+// synchronously per chunk. Client socket reads can include data authorized
+// before quarantine, so they cannot establish the producer's revocation boundary.
+it.each([
+  ["owner", true],
+  ["grant", true],
+  ["owner", false],
+  ["grant", false],
+] as const)(
+  "A6 race: producer-boundary blob stream for %s (quarantine=%s)",
+  async (reader, quarantine) => {
     const d = device();
     installBindingConflictFixture(d);
     const bytes = new Uint8Array(8 * 1024 * 1024).fill(0x6d);
@@ -4895,9 +4898,35 @@ it.each(["owner", "grant"] as const)(
         { name: "messages", instance_ids: ["conn_a"], fields: ["blob_ref"] },
       ],
     };
+    let quarantineCalls = 0;
+    let quarantined = false;
+    let chunkChecks = 0;
+    let allowedChunks = 0;
+    let deniedChunks = 0;
+    let allowedAfterQuarantine = 0;
     const app = pdppBlobsRoutes({
       store: d.store,
-      reads: (mode) => receiver.readStore({ reader: mode }),
+      reads: (mode) => {
+        const readStore = receiver.readStore({ reader: mode });
+        return {
+          ...readStore,
+          withReadSnapshot<T>(read: () => T): T {
+            const result = readStore.withReadSnapshot(read);
+            // The route's metadata and byte snapshots return objects/bytes.
+            // Only runIfReadable's per-chunk snapshot returns a boolean.
+            if (typeof result === "boolean") {
+              chunkChecks++;
+              if (result) {
+                allowedChunks++;
+                if (quarantined) allowedAfterQuarantine++;
+              } else {
+                deniedChunks++;
+              }
+            }
+            return result;
+          },
+        };
+      },
       auth: createFixtureAuthorizationService({
         [reader]:
           reader === "owner"
@@ -4926,47 +4955,184 @@ it.each(["owner", "grant"] as const)(
         },
       ]),
       instancesForSubject: () => ["conn_a"],
-      readBlobBytes: async (id) => d.store.getBlobBytes(id),
     });
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    }
+    async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(label + " did not settle")),
+              10_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+    const paused = deferred<void>();
+    const release = deferred<void>();
+    const producerDone = deferred<"eof" | "error" | "cancelled">();
+    let producerError: unknown;
+    let producedChunks = 0;
+    let producedBytes = 0;
     const { serve } = await import("@hono/node-server");
     const server = serve({
-      fetch: app.fetch,
+      // This transport adapter gates pulls from the REAL route body. It
+      // neither replaces its authorization nor changes the synchronous store
+      // snapshot contract. Both streams use HWM=0: no hidden source prefetch.
+      fetch: async (request) => {
+        const response = await app.fetch(request);
+        if (response.status !== 200 || !response.body) return response;
+        const source = response.body.getReader();
+        const body = new ReadableStream<Uint8Array>(
+          {
+            async pull(controller) {
+              try {
+                const next = await source.read();
+                if (next.done) {
+                  producerDone.resolve("eof");
+                  controller.close();
+                  return;
+                }
+                producedChunks++;
+                producedBytes += next.value.byteLength;
+                controller.enqueue(next.value);
+                if (producedChunks === 1) {
+                  // Exactly one chunk has passed the route's authorization
+                  // and been handed to transport. Do not request chunk two
+                  // until the test has quarantined (or chosen its control).
+                  paused.resolve(undefined);
+                  await release.promise;
+                }
+              } catch (error) {
+                producerError = error;
+                producerDone.resolve("error");
+                controller.error(error);
+              }
+            },
+            async cancel(reason) {
+              release.resolve(undefined);
+              await source.cancel(reason).catch(() => undefined);
+              producerDone.resolve("cancelled");
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        return new Response(body, {
+          status: response.status,
+          headers: response.headers,
+        });
+      },
       hostname: "127.0.0.1",
       port: 0,
     });
-    await new Promise<void>((resolve) => server.once("listening", resolve));
+    let body: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
+      await bounded(
+        new Promise<void>((resolve) => server.once("listening", resolve)),
+        "server",
+      );
       const address = server.address() as { port: number };
-      const response = await fetch(
+      const responsePromise = fetch(
         `http://127.0.0.1:${address.port}/${blob.blobId}`,
         { headers: { Authorization: `Bearer ${reader}` } },
       );
-      expect(response.status).toBe(200);
-      const body = response.body!.getReader();
-      const first = await body.read();
+      // Attach the response handler immediately, including failure handling
+      // if an assertion at the barrier fails before the response is consumed.
+      const responseResult = responsePromise.then(
+        (response) => ({ response }),
+        (error: unknown) => ({ error }),
+      );
+      await bounded(paused.promise, "first producer chunk");
+      expect(producedChunks).toBe(1);
+      expect(producedBytes).toBe(64 * 1024);
+      expect(chunkChecks).toBe(1);
+      expect(allowedChunks).toBe(1);
+      expect(deniedChunks).toBe(0);
+      const result = await bounded(responseResult, "HTTP response");
+      if ("error" in result) throw result.error;
+      expect(result.response.status).toBe(200);
+      body = result.response.body!.getReader();
+      const first = await bounded(body.read(), "first client bytes");
       expect(first.done).toBe(false);
-      receiver.quarantineImported({
-        credential: "replica-secret",
-        envelope: batch([operation]),
-      });
-      let receivedAfterQuarantine = 0;
+      const chunks: Uint8Array[] = [first.value!];
+      let receivedBytes = first.value!.byteLength;
+      if (quarantine) {
+        receiver.quarantineImported({
+          credential: "replica-secret",
+          envelope: batch([operation]),
+        });
+        quarantineCalls++;
+        quarantined = true;
+      }
+      release.resolve(undefined);
       let streamFailed = false;
       try {
         for (;;) {
-          const next = await body.read();
+          const next = await bounded(body.read(), "client stream");
           if (next.done) break;
-          receivedAfterQuarantine += next.value.byteLength;
+          chunks.push(next.value);
+          receivedBytes += next.value.byteLength;
         }
-      } catch {
+      } catch (error) {
+        // A test watchdog is not evidence of the expected stream abort.
+        if (error instanceof Error && error.message.endsWith(" did not settle"))
+          throw error;
         streamFailed = true;
       }
-      expect(streamFailed).toBe(true);
-      expect(receivedAfterQuarantine).toBeLessThan(bytes.byteLength / 2);
+      const end = await bounded(producerDone.promise, "producer completion");
+      expect(allowedAfterQuarantine).toBe(0);
+      if (quarantine) {
+        expect(quarantineCalls).toBe(1);
+        expect(end).toBe("error");
+        expect(producerError).toBeInstanceOf(Error);
+        expect((producerError as Error).message).toBe(
+          "blob visibility changed during read",
+        );
+        expect(streamFailed).toBe(true);
+        expect(chunkChecks).toBe(2);
+        expect(allowedChunks).toBe(1);
+        expect(deniedChunks).toBe(1);
+        expect(producedChunks).toBe(1);
+        expect(producedBytes).toBe(64 * 1024);
+        // Transport may split or discard part of the one allowed chunk. Its
+        // pre-quarantine bytes are permitted, but there is no arbitrary budget.
+        expect(receivedBytes).toBeLessThanOrEqual(producedBytes);
+      } else {
+        expect(quarantineCalls).toBe(0);
+        expect(end).toBe("eof");
+        expect(producerError).toBeUndefined();
+        expect(streamFailed).toBe(false);
+        expect(deniedChunks).toBe(0);
+        expect(chunkChecks).toBe(bytes.byteLength / (64 * 1024));
+        expect(allowedChunks).toBe(chunkChecks);
+        expect(producedBytes).toBe(bytes.byteLength);
+        const raw = new Uint8Array(receivedBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          raw.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        expect(raw).toEqual(bytes);
+      }
     } finally {
+      release.resolve(undefined);
+      await body?.cancel().catch(() => undefined);
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   },
+  120_000,
 );
 
 it("A6 epoch: a fresh visibility store starts at zero", () => {

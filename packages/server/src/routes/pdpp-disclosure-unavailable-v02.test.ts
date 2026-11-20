@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * 403 `disclosure_unavailable` — the refusal that keeps a projection honest.
  *
@@ -123,6 +124,7 @@ function buildApp(g: Grant) {
     () => ["id"],
   );
   return pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store,
     auth: createFixtureAuthorizationService(tokens),
     declarations,

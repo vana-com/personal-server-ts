@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * Conformance regressions for two suite failures against this Resource Server.
  *
@@ -58,6 +59,7 @@ function app() {
   a.route(
     "/v1",
     pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth: ownerAuth,
       declarations,
@@ -215,6 +217,7 @@ describe("RS-16: a REJECTED token is challenged, not just a missing one", () => 
     a.route(
       "/v1",
       pdppRecordsRoutes({
+        accountStorageMode: explicitLegacyStorageMode("unswitched"),
         store,
         auth: rejectingAuth,
         declarations,

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-test/
 *.tsbuildinfo
 .DS_Store
 coverage/
@@ -24,3 +25,10 @@ packages/server/bin/
 /RESULT-*.md
 /REVIEW-*.md
 /PREWARM-*.md
+
+# Rust build output for packages/lite/rust/*
+packages/lite/rust/*/target/
+
+# Python bytecode
+__pycache__/
+*.pyc

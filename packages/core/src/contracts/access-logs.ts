@@ -9,8 +9,17 @@ export async function listAccessLogsContract(input: {
   accessLogReader: AccessLogReader;
   limit?: string | null;
   offset?: string | null;
+  cursor?: string | null;
 }): Promise<ContractResult> {
   const limit = normalizeIntegerParam(input.limit, 50);
   const offset = normalizeIntegerParam(input.offset, 0);
-  return contractOk(await input.accessLogReader.read({ limit, offset }));
+  return contractOk(
+    await input.accessLogReader.read({
+      limit,
+      offset,
+      ...(input.cursor !== null && input.cursor !== undefined
+        ? { cursor: input.cursor }
+        : {}),
+    }),
+  );
 }

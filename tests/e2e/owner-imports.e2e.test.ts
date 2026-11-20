@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { initializeDatabase } from "../../packages/server/src/storage/index-schema.js";
 import { createIndexManager } from "../../packages/server/src/storage/index-manager.js";
 import { createNodeDataStorage } from "../../packages/server/src/storage/node-data-storage.js";
+import { openLegacyWriteSealForTests } from "../../packages/core/src/test-utils/legacy-write-seal.js";
 
 const operation = "a".repeat(64);
 const scope = "github.events";
@@ -30,8 +31,10 @@ function startImport(root: string, body: unknown, interrupt = false) {
     const { initializeDatabase } = await import("./packages/server/dist/storage/index-schema.js");
     const { createIndexManager } = await import("./packages/server/dist/storage/index-manager.js");
     const { dataRoutes } = await import("./packages/server/dist/routes/data.js");
+    const { openLegacyWriteSealForTests } = await import("./packages/core/dist/test-utils/legacy-write-seal.js");
+    const { fixedAccountStorageMode } = await import("./packages/core/dist/test-utils/account-mode.js");
     const index = createIndexManager(initializeDatabase(join(root, "index.db")));
-    const app = dataRoutes({ indexManager: index, hierarchyOptions: { dataDir: join(root, "data") }, logger: pino({ level: "silent" }), serverOrigin: "http://localhost:8080", serverOwner: "0x1111111111111111111111111111111111111111", devToken: "test-owner", gateway: {}, accessLogWriter: { write: async () => {} } });
+    const app = dataRoutes({ indexManager: index, legacyWriteSeal: openLegacyWriteSealForTests(), accountStorageMode: fixedAccountStorageMode("unswitched"), hierarchyOptions: { dataDir: join(root, "data") }, logger: pino({ level: "silent" }), serverOrigin: "http://localhost:8080", serverOwner: "0x1111111111111111111111111111111111111111", devToken: "test-owner", gateway: {}, accessLogWriter: { write: async () => {} } });
     process.stdout.write("ready\\n");
     for await (const chunk of process.stdin) { if (chunk.length) break; }
     const response = await app.request("/${scope}/imports/${operation}", { method: "PUT", headers: { Authorization: "Bearer test-owner", "Content-Type": "application/json" }, body: process.env.IMPORT_TEST_BODY });
@@ -175,6 +178,7 @@ describe("owner imports with independent processes", () => {
     const storage = createNodeDataStorage({
       indexManager: index,
       hierarchyOptions: { dataDir: join(root, "data") },
+      legacyWriteSeal: openLegacyWriteSealForTests(),
     });
     try {
       const interrupted = startImport(root, { value: "A" }, true);

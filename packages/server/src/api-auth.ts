@@ -386,10 +386,13 @@ export function createServerApiAuth(
       // identify this server's owner to bind the grant to.
       if (!deps.serverOwner) throw serverNotConfigured();
 
-      const selectedEntry = deps.dataStorage?.findEntry({
-        scope: input.scope,
-        fileId: input.fileId,
-      });
+      const selectedEntry =
+        input.metadataOnly || input.servedEntry
+          ? undefined
+          : deps.dataStorage?.findEntry({
+              scope: input.scope,
+              fileId: input.fileId,
+            });
       const grant = await verifyDataReadPolicy(
         {
           signer: result.auth.signer,

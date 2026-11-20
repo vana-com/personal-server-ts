@@ -15,7 +15,8 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import type { ServerContext } from "./bootstrap.js";
+import { createUnswitchedServer as createServer } from "./account-mode/unswitched-server.test-utils.js";
 import { listenHttpServer, type NodeServer } from "./listen.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 

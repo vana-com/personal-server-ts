@@ -3,11 +3,11 @@ import type {
   McpOwnerBinding,
   McpWakeupIdentity,
 } from "@opendatalabs/personal-server-ts-server/mcp/tee";
-import { recoverMessageAddress, toHex } from "viem";
+import { toHex } from "viem";
+import { recoverOwnerAddress } from "@opendatalabs/personal-server-ts-core/keys";
 import type { DstackClient } from "../dstack/client.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { unseal, type SealedEnvelope } from "../sealing/envelope.js";
-import { MASTER_KEY_MESSAGE } from "../agent/seal.js";
 
 export interface McpRollbackIdentityDeps {
   client: DstackClient;
@@ -103,10 +103,7 @@ export async function resolveMcpRollbackIdentity(
   );
   try {
     if (signature.length !== 65) throw invalid();
-    const signer = await recoverMessageAddress({
-      message: MASTER_KEY_MESSAGE,
-      signature: toHex(signature),
-    });
+    const signer = await recoverOwnerAddress(toHex(signature));
     if (!sameHex(signer, binding.owner)) throw invalid();
   } finally {
     signature.fill(0);

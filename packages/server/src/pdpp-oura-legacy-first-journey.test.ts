@@ -16,6 +16,7 @@
  * the view decided with the body.
  */
 
+import { createUnswitchedServer } from "./account-mode/unswitched-server.test-utils.js";
 import Database from "better-sqlite3";
 import { createServer as createHttpServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -41,11 +42,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import {
-  createServer,
-  type CreateServerOptions,
-  type ServerContext,
-} from "./bootstrap.js";
+import { type CreateServerOptions, type ServerContext } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 import type * as LegacyScopeViewModule from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 
@@ -212,7 +209,7 @@ async function boot(
     } satisfies Builder),
     getGrant: vi.fn().mockResolvedValue(grant()),
   } as unknown as GatewayClient;
-  return createServer(
+  return createUnswitchedServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
       payment: { enabled: false },
@@ -466,7 +463,7 @@ const ACTIVITY_CONTRIB = {
 
 /**
  * oura-playwright 3.1.2 (verified: mapReadiness / mapSleep / mapActivity at
- * /home/tnunamak/.t3/worktrees/data-connectors/t3-0a13df8d/artifacts/oura-playwright/oura-playwright-3.1.2/script.js:2397-2460,
+ * the data-connectors artifact oura-playwright/oura-playwright-3.1.2/script.js:2397-2460,
  * identical to 2.0.0 in unity-surfaces) emits `timestamp` on readiness/activity
  * days and on sleep dailyScores. `LEGACY_TS = false` models a collector
  * without it, to isolate that field's effect.

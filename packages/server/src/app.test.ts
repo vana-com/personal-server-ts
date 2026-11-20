@@ -15,12 +15,17 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import {
   createTestWallet,
   buildWeb3SignedHeader,
+  fixedModeAuthority,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import pino from "pino";
 import type { TokenStore } from "./token-store.js";
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
+import {
+  createMemoryModeRecordStore,
+  createModeAuthority,
+} from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const ownerWallet = createTestWallet(0);
@@ -102,6 +107,16 @@ function createMockTokenStore(tokens: string[] = []): TokenStore {
   };
 }
 
+async function switchedModeAuthority(owner: string) {
+  const authority = createModeAuthority({
+    store: createMemoryModeRecordStore(),
+    onWarning: () => undefined,
+  });
+  await authority.ready;
+  await authority.submitEvidence({ owner, state: "on" });
+  return authority;
+}
+
 describe("createApp", () => {
   let tempDir: string;
   let indexManager: IndexManager;
@@ -120,6 +135,7 @@ describe("createApp", () => {
   function makeApp() {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -136,6 +152,7 @@ describe("createApp", () => {
   function makeAppWithControlPlaneToken() {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -161,6 +178,7 @@ describe("createApp", () => {
   ) {
     const logger = pino({ level: "silent" });
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -219,8 +237,16 @@ describe("createApp", () => {
       accessToken: CONTROL_PLANE_TOKEN,
       jobWorker: vi.fn(),
     };
-    const standard = createApp({ ...common, profile: "standard" });
-    const enclave = createApp({ ...common, profile: "enclave" });
+    const standard = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      ...common,
+      profile: "standard",
+    });
+    const enclave = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      ...common,
+      profile: "enclave",
+    });
 
     const standardResponse = await standard.request(
       "/enclave/v1/jobs/execute",
@@ -232,6 +258,124 @@ describe("createApp", () => {
 
     expect(standardResponse.status).toBe(404);
     expect(enclaveResponse.status).toBe(401);
+  });
+
+  it("mounts the stream-sync run intake only when an intake is passed", async () => {
+    const common = {
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+    };
+    const intake = {
+      begin: vi.fn(),
+      batch: vi.fn(),
+      end: vi.fn(),
+      abort: vi.fn(),
+    };
+    const off = createApp(common);
+    const on = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      ...common,
+      streamSyncIntake: intake,
+    });
+    const put = (app: ReturnType<typeof createApp>, token?: string) =>
+      app.request("/v1/stream-sync/runs/r1", {
+        method: "PUT",
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        body: "{}",
+      });
+
+    // Flag off: the path does not exist, whoever asks.
+    expect((await put(off)).status).toBe(404);
+    expect((await put(off, CONTROL_PLANE_TOKEN)).status).toBe(404);
+    // Flag on: the owner token reaches the adapter and nobody else does.
+    expect((await put(on)).status).toBe(401);
+    intake.begin.mockRejectedValueOnce(new Error("reached the adapter"));
+    await put(on, CONTROL_PLANE_TOKEN);
+    expect(intake.begin).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers read-status 404 with reading off, without logging a warning per poll", async () => {
+    const warn = vi.fn();
+    const logger = {
+      ...pino({ level: "silent" }),
+      warn,
+    } as unknown as ReturnType<typeof pino>;
+    const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+    });
+    for (let i = 0; i < 3; i++) {
+      const res = await app.request("/v1/stream-sync/read-status", {
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({
+        error: { code: 404, errorCode: "STREAM_SYNC_READ_OFF" },
+      });
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("stops admitting stream-sync intake and seed requests once shutdown begins", async () => {
+    let admitting = true;
+    const intake = {
+      begin: vi.fn().mockResolvedValue({}),
+      batch: vi.fn(),
+      end: vi.fn(),
+      abort: vi.fn(),
+    };
+    const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
+      logger: pino({ level: "silent" }),
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accessToken: CONTROL_PLANE_TOKEN,
+      streamSyncIntake: intake,
+      streamSyncAdmitting: () => admitting,
+    });
+    const headers = { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` };
+    const put = () =>
+      app.request("/v1/stream-sync/runs/r1", {
+        method: "PUT",
+        headers,
+        body: "{}",
+      });
+    const seed = () => app.request("/v1/stream-sync/seed/c", { headers });
+
+    expect((await put()).status).toBe(200);
+    admitting = false;
+    intake.begin.mockClear();
+    const refused = await put();
+    expect(refused.status).toBe(503);
+    expect((await refused.json()).error.errorCode).toBe("STREAM_SYNC_CLOSING");
+    expect((await seed()).status).toBe(503);
+    expect(intake.begin).not.toHaveBeenCalled();
   });
 
   it("GET /v1/mcp/activity returns the owner activity snapshot", async () => {
@@ -344,6 +488,35 @@ describe("createApp", () => {
       scope: "test.scope",
       steps: { local: { status: "ok" } },
     });
+  });
+
+  it("DELETE /v1/data/:scope on a switched account → 409 USE_CONNECTOR_DELETE through the account-mode authority", async () => {
+    const logger = pino({ level: "silent" });
+    const app = createApp({
+      logger,
+      version: "0.0.1",
+      startedAt: new Date(),
+      indexManager,
+      hierarchyOptions: { dataDir: join(tempDir, "data") },
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+      accessLogReader: createMockAccessLogReader(),
+      accountModeAuthority: await switchedModeAuthority(ownerWallet.address),
+    });
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "DELETE",
+      uri: "/v1/data/test.scope",
+    });
+    const res = await app.request("/v1/data/test.scope", {
+      method: "DELETE",
+      headers: { authorization: auth },
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error.errorCode).toBe("USE_CONNECTOR_DELETE");
   });
 
   it("GET /v1/grants without auth → 401", async () => {
@@ -693,6 +866,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -727,6 +901,7 @@ describe("createApp", () => {
     const mockSyncManager = createMockSyncManager();
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -766,6 +941,7 @@ describe("createApp", () => {
   it("without syncManager — GET /v1/sync/status returns disabled", async () => {
     const logger = pino({ level: "silent" });
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -879,6 +1055,7 @@ describe("createApp", () => {
     );
 
     const app = createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger,
       version: "0.0.1",
       startedAt: new Date(),
@@ -1162,6 +1339,7 @@ describe("dev UI loopback gate", () => {
 
   function makeUiApp(localApprovalPort: number | undefined) {
     return createApp({
+      accountModeAuthority: fixedModeAuthority("unswitched"),
       logger: pino({ level: "silent" }),
       version: "0.0.1",
       startedAt: new Date(),

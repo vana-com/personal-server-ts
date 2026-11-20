@@ -4,6 +4,7 @@
  * owner-only stored view, and the bounded block reads MCP tools use.
  */
 
+import { fixedModeAuthority } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
@@ -72,6 +73,7 @@ function createRuntime(
   const storage = createMemoryPsLiteStorage();
   const accessLogStore = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
+    accountModeAuthority: fixedModeAuthority("unswitched"),
     ...options,
     storage,
     gateway: createMockPsLiteGateway(),

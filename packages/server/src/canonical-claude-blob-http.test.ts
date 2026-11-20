@@ -15,7 +15,8 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as canonicalReader from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import type { ServerContext } from "./bootstrap.js";
+import { createUnswitchedServer as createServer } from "./account-mode/unswitched-server.test-utils.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const SIGNATURE =

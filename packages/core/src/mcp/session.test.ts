@@ -96,6 +96,126 @@ describe("createMcpSession", () => {
     ).rejects.toThrow();
   });
 
+  it("refuses a grant whose scopes include a bare wildcard, storing nothing and keeping the proof", async () => {
+    const store = createInMemoryMcpSessionStore();
+    const replayStore = createInMemoryMcpProofReplayStore();
+    const gw = fakeGateway(grant({ scopes: ["*"] }));
+    const proof = { id: "proof-wild", expiresAtMs: Date.now() + 60_000 };
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1", proof },
+        {
+          store,
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          serverOwner: OWNER,
+          randomToken: () => "tok_wild",
+          replayStore,
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "invalid_scope", code: 400 });
+    expect(
+      await store.getByTokenHash(await hashConnectionToken("tok_wild")),
+    ).toBeNull();
+    // The proof was never reserved.
+    expect(await replayStore.consume(proof.id, proof.expiresAtMs)).toBe(false);
+  });
+
+  it("fails the mint within the bound when the gateway grant lookup never answers, storing nothing", async () => {
+    const store = createInMemoryMcpSessionStore();
+    const replayStore = createInMemoryMcpProofReplayStore();
+    const gw = {
+      getBuilder: async () => ({ id: BUILDER }),
+      getGrant: () => new Promise(() => {}),
+    } as unknown as AuthSessionVerifierPort & GrantVerifierPort;
+    const proof = { id: "proof-hang", expiresAtMs: Date.now() + 60_000 };
+    const started = Date.now();
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1", proof },
+        {
+          store,
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          serverOwner: OWNER,
+          randomToken: () => "tok_hang",
+          replayStore,
+          lookupTimeoutMs: 50,
+        },
+      ),
+    ).rejects.toThrow(/timed out/);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(
+      await store.getByTokenHash(await hashConnectionToken("tok_hang")),
+    ).toBeNull();
+    expect(await replayStore.consume(proof.id, proof.expiresAtMs)).toBe(false);
+  });
+
+  it.each([
+    ["the gateway flags it expired", { expired: true }],
+    ["its expiresAt is in the past", { expired: false, expiresAt: "1000" }],
+  ])(
+    "mints no session for an expired grant (%s), stores nothing and keeps the proof",
+    async (_label, overrides) => {
+      const store = createInMemoryMcpSessionStore();
+      const replayStore = createInMemoryMcpProofReplayStore();
+      const gw = fakeGateway(grant(overrides));
+      const proof = { id: "proof-exp", expiresAtMs: Date.now() + 60_000 };
+      await expect(
+        createMcpSession(
+          { builderAddress: BUILDER, grantId: "grant_1", proof },
+          {
+            store,
+            authSessionVerifier: gw,
+            grantVerifier: gw,
+            serverOwner: OWNER,
+            randomToken: () => "tok_exp",
+            replayStore,
+          },
+        ),
+      ).rejects.toMatchObject({ errorCode: "GRANT_REVOKED", code: 403 });
+      expect(
+        await store.getByTokenHash(await hashConnectionToken("tok_exp")),
+      ).toBeNull();
+      expect(await replayStore.consume(proof.id, proof.expiresAtMs)).toBe(
+        false,
+      );
+    },
+  );
+
+  it("fails the mint when the grant expires after the lookups but before the proof is reserved", async () => {
+    const store = createInMemoryMcpSessionStore();
+    const replayStore = createInMemoryMcpProofReplayStore();
+    let clockMs = 1_800_000_000_000;
+    const gw = fakeGateway(
+      grant({ expiresAt: String(clockMs / 1000 + 1), expired: false }),
+    );
+    const proof = { id: "proof-late", expiresAtMs: clockMs + 60_000 };
+    await expect(
+      createMcpSession(
+        { builderAddress: BUILDER, grantId: "grant_1", proof },
+        {
+          store,
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          serverOwner: OWNER,
+          now: () => clockMs,
+          // Preparing the token is the work between the check and the
+          // reservation; the clock passes the expiry meanwhile.
+          randomToken: () => {
+            clockMs += 5000;
+            return "tok_late";
+          },
+          replayStore,
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_REVOKED", code: 403 });
+    expect(
+      await store.getByTokenHash(await hashConnectionToken("tok_late")),
+    ).toBeNull();
+    expect(await replayStore.consume(proof.id, proof.expiresAtMs)).toBe(false);
+  });
+
   it("rejects a revoked grant", async () => {
     const gw = fakeGateway(grant({ revokedAt: "2020-01-01T00:00:00Z" }));
     await expect(

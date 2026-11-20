@@ -359,6 +359,31 @@ describe("decryption", () => {
     await expect(port.decrypt(scope, encrypted)).resolves.toEqual(plaintext);
   });
 
+  it("hashes each blob's S2K input on WebCrypto, and a wrong key still fails", async () => {
+    const { port } = transport(new Map(), true);
+    const plaintext = new TextEncoder().encode("manifest".repeat(1000));
+    const encrypted = await port.encrypt(scope, plaintext);
+    const digest = vi.spyOn(crypto.subtle, "digest");
+    try {
+      await expect(port.decrypt(scope, encrypted)).resolves.toEqual(plaintext);
+      await expect(
+        port.decrypt(scope, fromBase64(desktopSdkCiphertext)),
+      ).resolves.toEqual(
+        new TextEncoder().encode("Desktop SDK 4.1.0 manifest"),
+      );
+      // One 16 MiB iterated-S2K input per blob, not hashed in JavaScript.
+      const s2kInputs = digest.mock.calls.filter(
+        ([, data]) => (data as Uint8Array).byteLength >= 1 << 20,
+      );
+      expect(s2kInputs).toHaveLength(2);
+      await expect(
+        port.decrypt("other-scope", encrypted),
+      ).rejects.toBeInstanceOf(Error);
+    } finally {
+      digest.mockRestore();
+    }
+  });
+
   it("refuses a compressed message before it inflates", async () => {
     const { port } = transport(new Map(), true);
     // 4 MiB of zeros with zlib, under the scope password the port derives.

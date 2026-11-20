@@ -106,7 +106,12 @@ export async function psLitePersistenceRuntimeOptions(
  * TypeScript's required properties are not enforced.
  */
 export function assertCompletePsLitePersistenceBundle(
-  bundle: PsLitePersistenceBundle | null | undefined,
+  bundle:
+    | (Omit<PsLitePersistenceBundle, "storage"> &
+        Partial<Pick<PsLitePersistenceBundle, "storage">>)
+    | null
+    | undefined,
+  hasStorageFactory = false,
 ): void {
   if (!bundle || typeof bundle !== "object") {
     throw new Error("PS Lite persistence bundle must be a complete object");
@@ -120,7 +125,9 @@ export function assertCompletePsLitePersistenceBundle(
     "mcpOAuthAuthorizations",
     "relayTlsIdentity",
   ];
-  const missing = required.filter((key) => bundle[key] == null);
+  const missing = required.filter(
+    (key) => bundle[key] == null && !(key === "storage" && hasStorageFactory),
+  );
   if (missing.length > 0) {
     throw new Error(
       `PS Lite persistence bundle must be complete; missing ${missing.join(", ")}`,

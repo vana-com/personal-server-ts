@@ -136,7 +136,7 @@ it("opens a real-source runtime without process fetch hooks and refuses fixture 
     expect(runtime.snapshot().ownerRows).toEqual([]);
     expect(runtime.snapshot().appRows).toEqual([]);
     expect(runtime.snapshot().canonicalRows).toEqual([]);
-    for (const command of ["put", "blob", "delete", "reset"]) {
+    for (const command of ["put", "blob", "delete"]) {
       await expect(
         runtime.call(command, { id: "never-stored", size: 1 }),
       ).rejects.toThrow(/Real-source runtime refuses synthetic/);
@@ -190,7 +190,7 @@ it("runs the source descriptor through Device IPC and exposes only the separated
         )
       ).status,
     ).toBe(401);
-    for (const command of ["put", "blob", "delete", "reset"])
+    for (const command of ["put", "blob", "delete"])
       await expect(device.call(command)).rejects.toThrow(
         /Real-source runtime refuses synthetic/,
       );

@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode } from "../test-utils/account-mode.js";
 import { expect, it, vi } from "vitest";
 import {
   ScopeSchema,
@@ -8,6 +9,7 @@ import { verifyDataReadPolicy } from "../policy/data-read.js";
 import { scopeCoveredByWriteGrant } from "../policy/data-write.js";
 import { resolveGrantForRawScopeResource } from "../mcp/resources.js";
 import { replicaScope, fragmentReplicaPayload } from "./transport.js";
+import { fixedAccountStorageMode } from "../test-utils/account-mode.js";
 import { downloadOne } from "../sync/workers/download.js";
 import { uploadOne } from "../sync/workers/upload.js";
 const scope = replicaScope("a".repeat(32), "b".repeat(32), 0);
@@ -112,6 +114,7 @@ it("omits internal transport addresses from the actual inventory API even with w
   const response = await handlePersonalServerDataRequest(
     new Request("http://ps/"),
     {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       storage,
       auth: {
         authorizeOwner: vi.fn(),
@@ -141,6 +144,7 @@ it("rejects ordinary owner writes into a reserved replica address before indexin
       body: JSON.stringify({ poison: true }),
     }),
     {
+      accountStorageMode: fixedOwnedAccountStorageMode("unswitched"),
       storage,
       auth: {
         authorizeOwner: vi.fn(),
@@ -148,6 +152,7 @@ it("rejects ordinary owner writes into a reserved replica address before indexin
         authorizeBuilderList: vi.fn(),
       },
       accessLogWriter: { write: vi.fn() },
+      accountStorageMode: fixedAccountStorageMode("unswitched"),
     } as never,
   );
   expect(response.status).toBe(400);

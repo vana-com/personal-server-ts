@@ -2,10 +2,12 @@ import { z } from "zod";
 import { keccak256, stringToHex } from "viem";
 import {
   DataFileEnvelopeSchema,
-  deriveMasterKey,
   deriveScopeKey,
-  recoverServerOwner,
 } from "@opendatalabs/vana-sdk/browser";
+import {
+  legacyMasterKey,
+  recoverOwnerAddress,
+} from "@opendatalabs/personal-server-ts-core/keys";
 import {
   AdditionsBudget,
   AdditionsBudgetExceeded,
@@ -86,11 +88,11 @@ worker.onmessage = async ({ data }) => {
     const owner = input.ownerAddress.toLowerCase();
     if (
       (
-        await recoverServerOwner(input.ownerSignature as `0x${string}`)
+        await recoverOwnerAddress(input.ownerSignature as `0x${string}`)
       ).toLowerCase() !== owner
     )
       throw new Error();
-    master = deriveMasterKey(input.ownerSignature as `0x${string}`);
+    master = legacyMasterKey(input.ownerSignature as `0x${string}`);
     const budget = new AdditionsBudget(32 * 1024 * 1024, 120_000);
     let inspected = 0;
     outer: for (const candidate of input.candidates) {

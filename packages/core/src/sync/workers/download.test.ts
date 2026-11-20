@@ -503,6 +503,43 @@ describe("download worker", () => {
     });
   });
 
+  describe("stream-sync physical rows (ruling Q7)", () => {
+    const STREAM = "pdpp.chatgpt~0123456789abcdef.conversations";
+    const CONTROL = "pdpp.chatgpt~0123456789abcdef";
+
+    it("downloadOne routes a physical row away without touching storage", async () => {
+      const deps = makeMockDeps();
+      await expect(
+        downloadOne(deps, makeDataPointRecord({ scope: STREAM })),
+      ).resolves.toBeNull();
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+    });
+
+    it("downloadAll skips physical rows, live or deleted, and advances the cursor", async () => {
+      const deps = makeMockDeps();
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          makeDataPointRecord({ id: "0x01", scope: STREAM }),
+          makeDataPointRecord({ id: "0x02", scope: CONTROL }),
+          {
+            ...makeDataPointRecord({ id: "0x03", scope: STREAM }),
+            deletedAt: "2026-01-22T10:00:00Z",
+          },
+        ],
+        cursor: "after-physical",
+      });
+
+      await expect(downloadAll(deps)).resolves.toBeDefined();
+
+      expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+      expect(deps.cursor.write).toHaveBeenCalledWith("after-physical");
+    });
+  });
+
   describe("downloadAll", () => {
     it("polls gateway with cursor from config", async () => {
       const deps = makeMockDeps();

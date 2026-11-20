@@ -1,0 +1,59 @@
+name: TLS wasm
+
+# Rebuild the PS Lite TLS server from source and compare it with the committed
+# binary. Only runs when the crate, its output or this check changes.
+on:
+  pull_request:
+    branches: [main, develop, feat/stream-sync]
+    paths:
+      - packages/lite/rust/browser-tls-rustls/**
+      - packages/lite/src/browser-tls-rustls/**
+      - packages/lite/scripts/build-tls-wasm.sh
+      - scripts/check-binary-home-paths.sh
+      - .cargo/**
+      - rust-toolchain*
+      - .github/workflows/tls-wasm.yml
+  push:
+    branches: [main, develop]
+    paths:
+      - packages/lite/rust/browser-tls-rustls/**
+      - packages/lite/src/browser-tls-rustls/**
+      - packages/lite/scripts/build-tls-wasm.sh
+      - scripts/check-binary-home-paths.sh
+      - .cargo/**
+      - rust-toolchain*
+      - .github/workflows/tls-wasm.yml
+
+jobs:
+  reproducible:
+    name: Committed wasm matches its source
+    runs-on: ubuntu-latest
+    env:
+      # Must equal the wasm-bindgen crate version in Cargo.lock; the build
+      # script fails if it does not.
+      WASM_BINDGEN_VERSION: 0.2.120
+      WASM_BINDGEN_SHA256: ceb6f0b9fea9d2868f258215a1d7f86a4c28330a0d64432cc7d53674618772d6
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        working-directory: packages/lite/rust/browser-tls-rustls
+        run: rustup toolchain install --profile minimal
+      - name: Install the wasm-bindgen CLI (prebuilt release)
+        run: |
+          name="wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL -o "$RUNNER_TEMP/wbg.tar.gz" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/${name}.tar.gz"
+          echo "${WASM_BINDGEN_SHA256}  $RUNNER_TEMP/wbg.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/wbg.tar.gz" -C "$RUNNER_TEMP"
+          echo "WASM_BINDGEN=$RUNNER_TEMP/${name}/wasm-bindgen" >> "$GITHUB_ENV"
+      - name: Rebuild
+        working-directory: packages/lite
+        run: bash scripts/build-tls-wasm.sh
+      - name: Fail if the rebuild differs from the committed files
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "The rebuild changed or added files:" >&2
+            git status --short >&2
+            git diff --stat >&2
+            exit 1
+          fi

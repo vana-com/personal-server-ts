@@ -1,0 +1,77 @@
+Error: Invariant NoSilentStale is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ nextK = <<1, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 2: <Collect line 85, col 3 to line 89, col 82 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 3: <PubRead line 118, col 3 to line 126, col 76 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<0, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{1}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, FALSE>>
+/\ heads = {}
+/\ logFmt = 0
+
+State 4: <PubCommit line 133, col 3 to line 161, col 41 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, TRUE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+State 5: <Read line 96, col 3 to line 108, col 80 of module MixedFleet>
+/\ nextK = <<2, 1, 1>>
+/\ seen = <<-1, -1, -1>>
+/\ view = <<{1}, {}, {}>>
+/\ late = {}
+/\ status = <<"ok", "ok", "ok">>
+/\ pend = <<{}, {}, {}>>
+/\ log1 = {}
+/\ log2 = {1}
+/\ seenHeads = <<{}, {}, {}>>
+/\ stale = <<FALSE, FALSE, TRUE>>
+/\ heads = {}
+/\ logFmt = 2
+
+124 states generated, 48 distinct states found, 20 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 4 and the 95th percentile is 4).
+Finished in 00s at (2026-11-15 23:52:29)
+EXIT=12

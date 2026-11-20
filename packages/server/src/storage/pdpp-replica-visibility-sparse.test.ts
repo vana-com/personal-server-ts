@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import Database from "better-sqlite3";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -399,6 +400,7 @@ async function maskedReaderWork(masked: number) {
     ),
   });
   const app = pdppRecordsRoutes({
+    accountStorageMode: explicitLegacyStorageMode("unswitched"),
     store,
     reads: (reader) => replica.readStore({ reader }),
     auth: createFixtureAuthorizationService({

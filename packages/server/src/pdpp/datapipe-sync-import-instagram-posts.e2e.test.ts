@@ -9,6 +9,7 @@
  * `buildPdppSyncAnnotatedData`, not hand-authored.
  */
 
+import { fixedLegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -216,6 +217,7 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read (instagram.posts
     expect(document).toBe(DECLARATION_DOCUMENT);
 
     return createPdppImporter({
+      legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
       store: target,
       declarations: [
         {

@@ -1,3 +1,4 @@
+import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 /**
  * Frozen field disclosure on the current, candidate and private-v0.2 read paths.
  * Core resolves schema-required fields at issuance; a later declaration cannot
@@ -109,6 +110,7 @@ function buildApp(grant: Grant) {
   return {
     store,
     app: pdppRecordsRoutes({
+      accountStorageMode: explicitLegacyStorageMode("unswitched"),
       store,
       auth: createFixtureAuthorizationService(tokens),
       declarations,
