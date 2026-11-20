@@ -7,18 +7,22 @@
  *   It follows the saved record only, so the person's data stays readable
  *   while the Account cannot be reached.
  * - `legacyWriteDecision` is what a legacy write gets. It is `read`, except
- *   that an Off authorizes a write only after a verified answer obtained in
- *   this process, and only while that answer is still the latest evidence.
- *   A saved Off is history, not permission: a restart starts with none, and a
- *   failed read (the host posts `unknown`) takes it away. Either way legacy
- *   writes get a retryable 503 until the next verified, current answer (its
- *   generation not below the record's), and nothing is erased: the record, its
- *   generation and an On stay as they were. A device that kept writing on a
- *   remembered Off could not tell that another device had switched the
- *   Account.
- * - Evidence is numbered per owner when it arrives, before any await. A
- *   verified answer takes effect only if no later evidence was submitted, so a
- *   slow save cannot undo a failed read that finished first.
+ *   while an answer is waiting to be applied (below) or after an answer that
+ *   did not take effect (a save that failed, or a generation older than the
+ *   record's). The saved Off is the Account's last word, and it authorizes
+ *   legacy writes after a restart and while the Account cannot be read: a
+ *   failed read (the host posts `unknown`) changes nothing, so a person who
+ *   never switched keeps importing when the Account is slow or down. Before
+ *   any answer there is no record and no permission: `unknown`, as before.
+ *   The remembered Off is not the registry's view of the Account: if the
+ *   person switched on another device, this device keeps writing legacy data
+ *   until its next fresh answer; only the registry can refuse that write
+ *   (see the last point). Nothing here erases or lowers a record: an On stays On, a fresh answer always replaces
+ *   the remembered one by the generation rule in `record.ts`.
+ * - Answers are numbered per owner when they arrive, before any await. An
+ *   answer takes effect only if no later answer was submitted, so a slow save
+ *   cannot undo a newer answer that finished first. A failed read is not an
+ *   answer and takes no number.
  * - An answer that has arrived and is not applied yet suspends the permission
  *   from its arrival: `legacyWriteDecision` is `unknown` for that owner, and a
  *   `commitLegacy` that has not started waits once for the answers pending
@@ -28,16 +32,16 @@
  *   write starts on a permission that an arrived answer may contradict, and
  *   an Off poll that applies unchanged only delays a write. Only a write
  *   already running keeps its hold; the On waits for it.
- *   When the answer settles, the permission is back only if the answer was
- *   applied, is the latest, and is current (its generation is not below the
- *   record's). An answer that fails to apply, or is older than the record,
- *   leaves the owner without permission until a later current answer. This
+ *   When the answer settles, the permission is back unless the answer failed
+ *   to apply, is not the latest, or is older than the record (its generation
+ *   is below the record's). Such an answer leaves the owner without permission
+ *   until a later current answer, and a failed read does not give it back. This
  *   is a change to the in-memory write permission only: the saved record and
  *   what reads follow stay as they were.
  * - This is a local guarantee. It cannot make a switch on another device
- *   atomic with this device's storage: a write between the last verified read
- *   and the next one is detected afterwards, not prevented. Preventing it needs
- *   the registry to refuse legacy-protocol writes.
+ *   atomic with this device's storage: a write between the last answer and the
+ *   next one is detected afterwards, not prevented. Preventing it needs the
+ *   registry to refuse legacy-protocol writes.
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence.
@@ -71,8 +75,8 @@ export interface ModeEvidenceInput {
   owner: string;
   /**
    * `unknown` (or anything else): the host could not read the Account. It
-   * changes no record; it pauses legacy writes for an Off until a verified,
-   * current answer, and returns the decision.
+   * changes nothing, neither the record nor the permission it gives, and
+   * returns the decision the remembered answer gives (`unknown` with none).
    */
   state: "on" | "off" | "unknown";
   /** Absent means 0. */
@@ -118,16 +122,17 @@ export function createModeAuthority(
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
   /**
-   * Owners whose latest evidence in this process was a verified answer that
-   * is current (its generation is not older than the record's). In memory
-   * only: a record is history and survives a restart, this is what the host
-   * saw since this process started, so a restart starts empty.
+   * Owners whose latest answer did not take effect: it could not be saved, or
+   * its generation is older than the record's. The remembered Off must not
+   * keep authorizing writes against an answer the Account just gave and this
+   * process could not keep. In memory only; a later answer that applies and is
+   * current removes the owner. A failed read does not add or remove anyone.
    */
-  const verified = new Set<string>();
+  const withdrawn = new Set<string>();
   /**
-   * The number of the latest evidence submitted for each owner, taken before
-   * the first await. A verified answer ends a pause only while it is still the
-   * latest: one asked before a later submission cannot speak for the Account's
+   * The number of the latest answer submitted for each owner, taken before
+   * the first await. An answer lifts a withdrawal only while it is still the
+   * latest: one submitted before a later answer cannot speak for the Account's
    * state after it.
    */
   const latest = new Map<string, number>();
@@ -190,7 +195,7 @@ export function createModeAuthority(
     const decision = read(owner);
     if (decision.kind !== "legacy") return decision;
     const key = typeof owner === "string" ? normalizeOwner(owner) : null;
-    return key !== null && verified.has(key) && !unsettled.has(key)
+    return key !== null && !withdrawn.has(key) && !unsettled.has(key)
       ? decision
       : UNKNOWN_DECISION;
   }
@@ -230,14 +235,13 @@ export function createModeAuthority(
     read,
     legacyWriteDecision,
     async submitEvidence(input) {
-      // Before the first await, so a failed read takes effect at once and not
-      // behind an earlier answer that is still waiting on its save.
+      // Before the first await, so an answer is counted as pending from its
+      // arrival. A failed read is not an answer: it takes no number.
       const owner = normalizeOwner(input.owner);
-      const ticket = (submissions += 1);
-      latest.set(owner, ticket);
       const answered = input.state === "on" || input.state === "off";
-      if (!answered) verified.delete(owner);
-      else {
+      const ticket = answered ? (submissions += 1) : 0;
+      if (answered) {
+        latest.set(owner, ticket);
         const pending = unsettled.get(owner) ?? new Set<number>();
         pending.add(ticket);
         unsettled.set(owner, pending);
@@ -269,16 +273,16 @@ export function createModeAuthority(
             await options.store.save(owner, next);
             records.set(owner, next);
           }
-          // Permission for this process only when the answer was applied,
-          // nothing was submitted after it, and it is not older than the
-          // record. Any other end takes the earlier permission back.
+          // The answer takes effect only when it was applied, no later answer
+          // was submitted, and it is not older than the record. Any other end
+          // withdraws the permission the remembered Off gave.
           eligible =
             latest.get(owner) === ticket && generation >= next.generation;
         } finally {
           // The release comes last, whatever the bookkeeping does.
           try {
-            if (eligible) verified.add(owner);
-            else verified.delete(owner);
+            if (eligible) withdrawn.delete(owner);
+            else withdrawn.add(owner);
             settle(owner, ticket);
           } finally {
             release?.();
@@ -287,9 +291,7 @@ export function createModeAuthority(
       } else {
         await ready;
         await retryLoadIfFailed();
-        // Nothing to add: the pause was set above, with no lock. A legacy
-        // write already running keeps its shared hold, and every write that
-        // starts later reads it inside its own hold.
+        // Nothing to add: a failed read changes no record and no permission.
       }
       const decision = legacyWriteDecision(owner);
       if (decision.kind === "streams") {

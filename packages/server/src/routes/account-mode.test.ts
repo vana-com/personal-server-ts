@@ -146,26 +146,26 @@ describe("POST /v1/account-mode/evidence", () => {
     expect((await legacyWrite()).status).toBe(503);
   });
 
-  // UNKNOWN_AS_OFF: a failed read after an Off is not an Off.
-  it("pauses legacy writes at a failed read after an Off, and resumes at the next verified answer", async () => {
+  // A failed read of the Account changes nothing: the last answer stands.
+  it("keeps legacy writes open at a failed read after an Off, and a fresh On refuses them", async () => {
     await post(evidence("off"));
     expect((await legacyWrite()).status).toBe(201);
     const failed = await post(evidence("unknown"));
-    expect(failed.status).toBe(503);
-    expect(failed.headers.get("retry-after")).toBe("5");
-    expect(await failed.json()).toEqual({
-      decision: "refuse",
-      code: "ACCOUNT_MODE_UNKNOWN",
-      status: 503,
-    });
+    expect(failed.status).toBe(200);
+    expect(await failed.json()).toEqual({ decision: "legacy" });
     // The same answer from a host that sends what it saw instead of a state.
-    expect((await post({ owner: owner.address, rawStatus: 502 })).status).toBe(
-      503,
-    );
-    expect((await legacyWrite()).status).toBe(503);
-    const resumed = await post(evidence("off"));
-    expect(await resumed.json()).toEqual({ decision: "legacy" });
+    const sawFailure = await post({ owner: owner.address, rawStatus: 502 });
+    expect(sawFailure.status).toBe(200);
+    expect(await sawFailure.json()).toEqual({ decision: "legacy" });
     expect((await legacyWrite()).status).toBe(201);
+    const switched = await post(evidence("on"));
+    expect(await switched.json()).toEqual({ decision: "streams" });
+    expect((await legacyWrite()).status).toBe(426);
+    // A failed read never lowers it again.
+    expect(await (await post(evidence("unknown"))).json()).toEqual({
+      decision: "streams",
+    });
+    expect((await legacyWrite()).status).toBe(426);
   });
 
   it("accepts and ignores the fetchStartedAt and rawStatus fields older hosts send", async () => {

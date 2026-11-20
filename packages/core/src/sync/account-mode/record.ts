@@ -7,8 +7,8 @@
  * - A higher generation (a Dev reset) replaces the record, On or Off.
  * - A lower generation is stale and ignored.
  * - After the first answer an owner's reads are never unknown again. A failed
- *   read of the Account pauses legacy writes and leaves the record alone
- *   (`authority.ts`).
+ *   read of the Account leaves the record, and what it allows, alone: the last
+ *   answer stands until a fresh one replaces it (`authority.ts`).
  */
 
 export type ModeAnswer = "on" | "off";

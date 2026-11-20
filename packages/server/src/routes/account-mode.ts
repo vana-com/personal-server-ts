@@ -10,14 +10,13 @@
  *
  * Only the owner may call it, and only about the owner: a body that names any
  * other owner is answered 403 before the module is asked anything. A host that
- * could not read the Account posts `state: "unknown"` (or `rawStatus: null`):
- * no record changes, an On stays On, and an Off stops allowing legacy writes
- * until the host's next verified answer, so a device that cannot tell whether
- * another device switched the Account does not keep writing legacy data. The
- * decision is returned, so a post doubles as a read. Fields the first hosts
- * also send (fetchStartedAt) are ignored. The HTTP status is the decision's
- * own: 200 for streams and legacy, and 503 (retryable, `Retry-After: 5`)
- * before the owner's first answer and after a failed read of an Off.
+ * could not read the Account posts `state: "unknown"` (or `rawStatus: null`).
+ * Nothing changes: the owner's last answer stands (an On stays On, an Off keeps
+ * allowing legacy writes), so a person who never switched keeps importing
+ * while the Account is slow or down. The decision is returned, so a post
+ * doubles as a read. Fields the first hosts also send (fetchStartedAt) are
+ * ignored. The HTTP status is the decision's own: 200 for streams and legacy,
+ * and 503 (retryable, `Retry-After: 5`) before the owner's first answer.
  *
  * POST only (405 otherwise, with `Allow: POST`), a body of at most 16 KiB
  * (413 above it), and a flat JSON object of at most 8 plain values (400
