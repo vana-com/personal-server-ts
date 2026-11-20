@@ -272,7 +272,12 @@ export async function discardFencedRuns(
     );
   }
   if (statements.length === 0) return false;
-  statements.push(dropUnpublishedCursors(id));
+  // The run end saved its checkpoint with the rows it has now lost. A parent's
+  // entry may cover the stream's rows too, so the next run collects in full.
+  statements.push(dropUnpublishedCursors(id), {
+    sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
+    params: [id],
+  });
   await deps.db.batch(withOrigin("purge", statements));
   return true;
 }

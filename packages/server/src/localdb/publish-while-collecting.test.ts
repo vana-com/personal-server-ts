@@ -357,7 +357,6 @@ it("a failed run keeps its admitted upserts and moves nothing else", async () =>
   const { a } = await world(true);
   await a.run("seed", ["old"], { observedAt: 1100, checkpoint: "c1" });
   await a.publish();
-  const cursor = await a.checkpoint();
   await a.begin("failing", { observedAt: 1500 });
   await a.batch("failing", 0, ["partial"]);
   await a.end("failing", 0, {
@@ -367,7 +366,9 @@ it("a failed run keeps its admitted upserts and moves nothing else", async () =>
   });
   await a.publish();
   expect(await a.keys()).toEqual(["old", "partial"]);
-  expect(await a.checkpoint()).toBe(cursor);
+  // The seed run's cursor travelled with its publication; the failed run's
+  // `c2` moved nothing.
+  expect(await a.checkpoint()).toBe('{"items":"c1"}');
 });
 
 it("a connection delete after a batch purges the batch's rows and fences the run", async () => {

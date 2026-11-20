@@ -219,4 +219,23 @@ describe("begin join gate", () => {
       code: "join_required",
     });
   });
+
+  it("asks a device whose begin is the first to see the connection recreated elsewhere", async () => {
+    const w = await world({ streams: 1 });
+    const d1 = await w.device("d1");
+    await d1.begin("r1");
+    await d1.cycle();
+    const d2 = await w.device("d2");
+    await d2.begin("r2", { join: true });
+    expect(await count(d2, "connection_participation")).toBe(1);
+    await d1.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await d1.sync.deleter.resumeDeletes();
+    await d1.run("r3", [{ stream: "s0", id: "c" }], { connect: true });
+    await d1.cycle();
+    // No cycle on d2: its begin is the first to learn of the new lifetime.
+    await expect(d2.sync.intake.begin("r4", request())).rejects.toMatchObject({
+      code: "join_required",
+    });
+    expect(await count(d2, "connection_participation")).toBe(0);
+  });
 });
