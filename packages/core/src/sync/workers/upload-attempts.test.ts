@@ -269,18 +269,42 @@ describe("uploadAll — durable attempt markers", () => {
 
   describe("automatic retry of a quarantined entry", () => {
     const HOUR = 3_600_000;
-    const at = (base: number, ms: number) => ({
-      now: () => new Date(base + ms),
-    });
+
+    /** One clock for the ledger (quarantine times) and the worker (probe time). */
+    function clockAt(start: number) {
+      let ms = start;
+      return {
+        set: (to: number) => void (ms = to),
+        ms: () => ms,
+        date: () => new Date(ms),
+      };
+    }
+    type Clock = ReturnType<typeof clockAt>;
+
+    const bootOn = (
+      index: ReturnType<typeof makeIndex>,
+      store: UploadAttemptStore,
+      clock: Clock,
+    ) =>
+      boot(index, store, {
+        uploadAttempts: createUploadAttemptLedger(restartable(store), OWNER, {
+          now: clock.ms,
+        }),
+      });
+    const run = (host: ReturnType<typeof boot>, clock: Clock) =>
+      uploadAll(host.deps, { now: clock.date });
 
     async function quarantine(
       index: ReturnType<typeof makeIndex>,
       store: UploadAttemptStore,
+      clock: Clock,
     ) {
       for (let boots = 0; boots < 2; boots++) {
-        void uploadAll(boot(index, store).deps);
+        void run(bootOn(index, store, clock), clock);
         await flush();
       }
+      // The next boot's recovery is what quarantines the entry, at `clock`.
+      await run(bootOn(index, store, clock), clock);
     }
 
     it("retries once after the backoff, and uploads when the cause is gone", async () => {
@@ -288,16 +312,19 @@ describe("uploadAll — durable attempt markers", () => {
       const index = makeIndex([a]);
       index.dies.add(a.path);
       const store = createMemoryUploadAttemptStore();
-      await quarantine(index, store);
+      const base = 1_000_000_000_000;
+      const clock = clockAt(base);
+      await quarantine(index, store, clock);
 
-      const base = Date.now();
-      const host = boot(index, store);
-      expect(await uploadAll(host.deps, at(base, 30 * 60_000))).toEqual([]);
+      const host = bootOn(index, store, clock);
+      clock.set(base + HOUR - 1);
+      expect(await run(host, clock)).toEqual([]);
       expect(host.uploadState.snapshot().stopped).toHaveLength(1);
       expect(index.reads).toHaveLength(2);
 
       index.dies.clear();
-      const results = await uploadAll(host.deps, at(base, HOUR + 60_000));
+      clock.set(base + HOUR);
+      const results = await run(host, clock);
       expect(results.map((r) => r.path)).toEqual([a.path]);
       expect(host.uploadState.snapshot().stopped).toEqual([]);
     });
@@ -307,26 +334,59 @@ describe("uploadAll — durable attempt markers", () => {
       const index = makeIndex([a]);
       index.dies.add(a.path);
       const store = createMemoryUploadAttemptStore();
-      await quarantine(index, store);
+      const base = 1_000_000_000_000;
+      const clock = clockAt(base);
+      await quarantine(index, store, clock);
 
-      const base = Date.now();
-      const retry = boot(index, store);
-      void uploadAll(retry.deps, at(base, HOUR + 60_000));
+      clock.set(base + HOUR);
+      void run(bootOn(index, store, clock), clock);
       await flush();
       expect(index.reads).toHaveLength(3);
 
-      // The retry died: the next boot quarantines the entry again at once.
-      const after = boot(index, store);
-      await uploadAll(after.deps, at(base, HOUR + 120_000));
+      // The retry died: the next boot quarantines the entry again at once, at
+      // `second`, so it is due 2 h after that, not 1 h.
+      const second = base + HOUR + 60_000;
+      clock.set(second);
+      const after = bootOn(index, store, clock);
+      await run(after, clock);
       expect(index.reads).toHaveLength(3);
       expect(after.uploadState.snapshot().stopped).toHaveLength(1);
 
-      // Not due after one more hour, due after two.
-      await uploadAll(after.deps, at(base, 2 * HOUR));
+      clock.set(second + 2 * HOUR - 1);
+      await run(after, clock);
       expect(index.reads).toHaveLength(3);
-      void uploadAll(after.deps, at(base, 3 * HOUR + 180_000));
+      clock.set(second + 2 * HOUR);
+      void run(after, clock);
       await flush();
       expect(index.reads).toHaveLength(4);
+    });
+
+    it("treats a quarantine from an older ledger, with no time, as due at once", async () => {
+      const a = makeEntry(1);
+      const index = makeIndex([a]);
+      const store = createMemoryUploadAttemptStore();
+      // The shape an older ledger wrote: quarantined, no time, no count.
+      await store.write({
+        version: 1,
+        records: [
+          {
+            key: uploadAttemptKey(OWNER, a),
+            owner: OWNER.toLowerCase(),
+            scope: a.scope,
+            path: a.path,
+            rowId: a.id,
+            interrupted: 2,
+            inFlight: false,
+            quarantined: true,
+          },
+        ],
+      });
+
+      // The clock sits at the Unix epoch: no backoff can have passed.
+      const clock = clockAt(0);
+      const host = bootOn(index, store, clock);
+      const results = await run(host, clock);
+      expect(results.map((r) => r.path)).toEqual([a.path]);
     });
   });
 

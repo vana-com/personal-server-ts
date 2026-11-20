@@ -762,10 +762,14 @@ export function createUploadAttemptLedger(
         const released: string[] = [];
         for (const [key, record] of next) {
           if (!mine(record) || !record.quarantined || live.has(key)) continue;
-          const due =
-            (record.quarantinedAt ?? 0) +
-            quarantineBackoffMs(record.quarantines ?? 1);
-          if (nowMs < due) continue;
+          // A record from an older ledger has no time: it is due at once.
+          if (
+            record.quarantinedAt !== undefined &&
+            nowMs <
+              record.quarantinedAt +
+                quarantineBackoffMs(record.quarantines ?? 1)
+          )
+            continue;
           // One attempt: a crash during it quarantines the entry again.
           record.quarantined = false;
           record.interrupted = Math.max(0, maxInterrupted - 1);
