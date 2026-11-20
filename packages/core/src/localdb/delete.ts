@@ -56,6 +56,12 @@ export interface DeleteIntent {
   /** The version each namespace's control row held when the delete was planned. */
   readonly pins: readonly { readonly ns: string; readonly version: number }[];
   /**
+   * The delete named a lifetime: its purge reaches the connections of these
+   * pins and no other, here or on resume. Absent: the connector's delete as it
+   * always was, which ends every local connection of it.
+   */
+  readonly pinned?: true;
+  /**
    * The control tombstones this delete confirmed, one per namespace. `version`
    * is the tombstone's registry version, always its pin + 1.
    */
@@ -214,7 +220,12 @@ export function createConnectionDeleter(
         throw new Error("invalid stored delete intent");
     }
     for (const pin of intent.pins) controlScope(connector, pin.ns);
-    return { pins: intent.pins, fences: intent.fences, id: row.delete_id };
+    return {
+      pins: intent.pins,
+      fences: intent.fences,
+      ...(intent.pinned && { pinned: true as const }),
+      id: row.delete_id,
+    };
   };
   const save = (connector: string, intent: DeleteIntent) =>
     deps.db.batch([
@@ -276,7 +287,10 @@ export function createConnectionDeleter(
     stop.signal.throwIfAborted();
     controlScope(connector, "");
     const { intent } = await plan(connector);
-    return formatLifetime(new Map(intent.pins.map((p) => [p.ns, p.version])));
+    return formatLifetime(
+      connector,
+      new Map(intent.pins.map((p) => [p.ns, p.version])),
+    );
   }
   function samePlan(a: DeleteIntent, b: DeleteIntent) {
     return (
@@ -340,6 +354,8 @@ export function createConnectionDeleter(
     );
     for (const connection of connections) {
       const pin = intent.pins.find((p) => p.ns === connection.ns);
+      // A delete that named a lifetime ends what its pins name, nothing else.
+      if (!pin && intent.pinned) continue;
       if (pin && connection.generation > pin.version) continue;
       const inQueue = held.has(connection.connection_id)
         ? (work: () => Promise<void>) => work()
@@ -598,7 +614,9 @@ export function createConnectionDeleter(
     controlScope(connector, "");
     // A token this server did not write is refused before anything is planned.
     const named =
-      request.lifetime === undefined ? null : parseLifetime(request.lifetime);
+      request.lifetime === undefined
+        ? null
+        : parseLifetime(connector, request.lifetime);
     const intent = await deps.queue.run(
       `delete:${connector}`,
       "purge",
@@ -621,16 +639,27 @@ export function createConnectionDeleter(
             throw new ConnectionLifetimeChanged(connector);
           const open = await readIntent(connector);
           const empty = planned.intent.pins.length === 0;
+          // The lifetime it names has ended: nothing of it is left to delete,
+          // and what is local now is not that connection's. Only the delete
+          // already recorded for this very lifetime is resumed.
+          if (named && empty)
+            return open &&
+              open.pins.every((pin) => named.get(pin.ns) === pin.version)
+              ? open
+              : null;
           if (open && (empty || samePlan(open, planned.intent))) return open;
           if (empty) {
             await purgeLocal(connector, planned.intent, held);
             await options.eraseLegacy?.(connector);
             return null;
           }
-          await save(connector, planned.intent);
-          listings.set(planned.intent.id!, planned.listing);
-          await purgeLocal(connector, planned.intent, held);
-          return planned.intent;
+          const next = named
+            ? { ...planned.intent, pinned: true as const }
+            : planned.intent;
+          await save(connector, next);
+          listings.set(next.id!, planned.listing);
+          await purgeLocal(connector, next, held);
+          return next;
         };
         const planned = await plan(connector);
         // A local connection with no control row in the listing may be

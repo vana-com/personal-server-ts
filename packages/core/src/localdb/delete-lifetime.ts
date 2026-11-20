@@ -10,9 +10,12 @@
 // after the person chose to delete.
 //
 // The token is the server's: clients store it and send it back unread.
-//   v1:<ns>@<generation>,<ns>@<generation>...      sorted by namespace
-// `<ns>` is empty (the default namespace) or 16 lowercase hex characters.
-// Only live rows are named; `v1:` names none.
+//   v2:<connector>:<ns>@<generation>,<ns>@<generation>...   sorted by namespace
+// `<connector>` is the connector id, percent-encoded (the encoding never
+// writes `:`), so a token read for one connector names no lifetime of
+// another: the same namespace and version on two connectors are two
+// connections. `<ns>` is empty (the default namespace) or 16 lowercase hex
+// characters. Only live rows are named; `v2:<connector>:` names none.
 
 /** The delete names a lifetime the connector no longer holds. */
 export class ConnectionLifetimeChanged extends Error {
@@ -35,12 +38,12 @@ export class InvalidConnectionLifetime extends Error {
 /** Generation by namespace: the live control rows of one connector. */
 export type Lifetime = ReadonlyMap<string, number>;
 
-const PREFIX = "v1:";
+const PREFIX = "v2:";
 const ENTRY = /^([0-9a-f]{16})?@([1-9][0-9]{0,15})$/;
 
-export function formatLifetime(live: Lifetime): string {
+export function formatLifetime(connector: string, live: Lifetime): string {
   return (
-    PREFIX +
+    `${PREFIX}${encodeURIComponent(connector)}:` +
     [...live]
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([ns, generation]) => `${ns}@${generation}`)
@@ -48,9 +51,11 @@ export function formatLifetime(live: Lifetime): string {
   );
 }
 
-export function parseLifetime(token: string): Lifetime {
-  if (!token.startsWith(PREFIX)) throw new InvalidConnectionLifetime();
-  const body = token.slice(PREFIX.length);
+/** The lifetime `token` names for `connector`; a token read for another connector is refused. */
+export function parseLifetime(connector: string, token: string): Lifetime {
+  const head = `${PREFIX}${encodeURIComponent(connector)}:`;
+  if (!token.startsWith(head)) throw new InvalidConnectionLifetime();
+  const body = token.slice(head.length);
   const lifetime = new Map<string, number>();
   if (body === "") return lifetime;
   for (const entry of body.split(",")) {
@@ -62,7 +67,8 @@ export function parseLifetime(token: string): Lifetime {
     lifetime.set(ns, generation);
   }
   // One spelling per lifetime: a token the server did not write is refused.
-  if (formatLifetime(lifetime) !== token) throw new InvalidConnectionLifetime();
+  if (formatLifetime(connector, lifetime) !== token)
+    throw new InvalidConnectionLifetime();
   return lifetime;
 }
 

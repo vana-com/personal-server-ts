@@ -7,40 +7,63 @@ import {
 } from "./delete-lifetime.js";
 
 const WORK = "a".repeat(16);
+const C = "fixture-source";
 
 describe("the lifetime token", () => {
   it("round-trips, sorted by namespace, and names no row as `v1:`", () => {
     const token = formatLifetime(
+      C,
       new Map([
         [WORK, 3],
         ["", 1],
       ]),
     );
-    expect(token).toBe(`v1:@1,${WORK}@3`);
-    expect(parseLifetime(token)).toEqual(
+    expect(token).toBe(`v2:${C}:@1,${WORK}@3`);
+    expect(parseLifetime(C, token)).toEqual(
       new Map([
         ["", 1],
         [WORK, 3],
       ]),
     );
-    expect(parseLifetime("v1:")).toEqual(new Map());
+    expect(parseLifetime(C, `v2:${C}:`)).toEqual(new Map());
   });
 
   it("refuses what the server did not write", () => {
     for (const token of [
       "",
       "v1",
-      "v2:@1",
-      "v1:@0",
-      "v1:@01",
-      "v1:@1,@2",
-      `v1:${WORK}@3,@1`,
-      "v1:abc@1",
-      "v1:@1,",
+      "v1:@1",
+      `v2:${C}`,
+      `v2:${C}:@0`,
+      `v2:${C}:@01`,
+      `v2:${C}:@1,@2`,
+      `v2:${C}:${WORK}@3,@1`,
+      `v2:${C}:abc@1`,
+      `v2:${C}:@1,`,
+      `v3:${C}:@1`,
     ])
-      expect(() => parseLifetime(token), token).toThrow(
+      expect(() => parseLifetime(C, token), token).toThrow(
         InvalidConnectionLifetime,
       );
+  });
+
+  it("names one connector: a token read for another is refused", () => {
+    const token = formatLifetime("other-source", new Map([["", 1]]));
+    expect(() => parseLifetime(C, token)).toThrow(InvalidConnectionLifetime);
+    // A connector id that is a prefix of another's does not match it either.
+    expect(() =>
+      parseLifetime(C, formatLifetime(`${C}-2`, new Map([["", 1]]))),
+    ).toThrow(InvalidConnectionLifetime);
+    expect(() =>
+      parseLifetime(`${C}-2`, formatLifetime(C, new Map([["", 1]]))),
+    ).toThrow(InvalidConnectionLifetime);
+  });
+
+  it("round-trips a connector id with separators in it", () => {
+    const id = "a:b,c/d@e%f";
+    const token = formatLifetime(id, new Map([["", 2]]));
+    expect(parseLifetime(id, token)).toEqual(new Map([["", 2]]));
+    expect(() => parseLifetime("a", token)).toThrow(InvalidConnectionLifetime);
   });
 });
 
