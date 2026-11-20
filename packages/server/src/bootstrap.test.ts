@@ -304,7 +304,7 @@ describe("createServer", () => {
       await second.cleanup();
     });
 
-    it("after a restart, refuses a legacy write on a saved Off until this process has a verified Off", async () => {
+    it("after a restart, lets a legacy write run on a saved Off while the Account has not answered, and a fresh On refuses it", async () => {
       const options = {
         serverDir: tempDir,
         dataDir: join(tempDir, "data"),
@@ -315,13 +315,9 @@ describe("createServer", () => {
       await first.cleanup();
 
       const second = await createServer(makeDefaultConfig(), options);
-      // The saved Off is history, not permission: no answer in this process yet.
-      const refused = await write(second);
-      expect(refused.status).toBe(503);
-      expect(refused.headers.get("Retry-After")).toBe("5");
-      expect(await refused.json()).toMatchObject({
-        error: { errorCode: "ACCOUNT_MODE_UNKNOWN" },
-      });
+      // The saved Off is the Account's last answer: it stands while this
+      // process has no answer yet.
+      expect((await write(second)).status).toBe(201);
       // Reads follow the saved record: the person's data stays readable.
       expect(
         second.accountModeAuthority.read(second.serverOwner ?? ""),
@@ -330,9 +326,9 @@ describe("createServer", () => {
         headers: { Authorization: `Bearer ${second.devToken}` },
       });
       expect(read.status).toBe(200);
-      // A verified Off in this process reopens the same write.
-      await declareAccountMode(second, "off");
-      expect((await write(second)).status).toBe(201);
+      // A fresh answer replaces the remembered one: another device switched.
+      await declareAccountMode(second, "on");
+      expect((await write(second)).status).toBe(426);
       await second.cleanup();
     });
   });

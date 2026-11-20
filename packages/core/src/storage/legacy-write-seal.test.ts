@@ -260,10 +260,23 @@ describe("verdict", () => {
 });
 
 describe("a failed read of the Account after an Off", () => {
-  // UNKNOWN_AS_OFF: the seal, the early refusal and the workers' verdict
-  // answer from one place, so none of them keeps writing on the old Off.
-  it("is a retryable 503 at commit, admit and verdict, until the next verified answer", async () => {
+  // The seal, the early refusal and the workers' verdict answer from one
+  // place, and a failed read changes none of them: the remembered Off stands.
+  it("keeps commit, admit and verdict open on the remembered Off", async () => {
     const { authority, seal } = await sealOver("off");
+    await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+    expect(seal.admit()).toBeNull();
+    expect(seal.verdict()).toBe("allow");
+    expect(await seal.commit(() => "stored")).toBe("stored");
+    expect(await seal.remove(() => "removed")).toBe("removed");
+  });
+
+  it("stays a retryable 503 for an owner with no remembered answer", async () => {
+    const authority = createModeAuthority({
+      store: createMemoryModeRecordStore(),
+    });
+    await authority.ready;
+    const seal = createLegacyWriteSeal({ authority, owner: OWNER });
     await authority.submitEvidence({ owner: OWNER, state: "unknown" });
     let ran = 0;
     const refused = await seal
@@ -278,11 +291,6 @@ describe("a failed read of the Account after an Off", () => {
     expect(seal.verdict()).toBe("unknown");
     // A removal is admitted in every mode.
     expect(await seal.remove(() => "removed")).toBe("removed");
-
-    await authority.submitEvidence(evidence("off"));
-    expect(seal.admit()).toBeNull();
-    expect(seal.verdict()).toBe("allow");
-    expect(await seal.commit(() => "stored")).toBe("stored");
   });
 
   it("refuses at commit, admit and verdict after an On whose save failed, until a later answer applies", async () => {
