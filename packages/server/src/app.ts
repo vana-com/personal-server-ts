@@ -429,6 +429,10 @@ export function createApp(deps: AppDeps): Hono {
           async *streamRecords(connection, stream) {
             yield* (await linkedQuery()).streamRecords(connection, stream);
           },
+          streamStats: async (connection, stream) =>
+            (await linkedQuery()).streamStats(connection, stream),
+          recordsByHash: async (connection, stream, pkHashes) =>
+            (await linkedQuery()).recordsByHash(connection, stream, pkHashes),
         }
       : undefined;
   const streamSyncRead: StreamSyncReadPort | undefined = localSync

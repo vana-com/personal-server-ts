@@ -6,12 +6,12 @@ import { readerOf } from "./driver.js";
 import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { SEEN_O } from "./merge.js";
 import { streamDigest } from "./stream-digest.js";
+import { projectAlias } from "./alias-projection.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
   effectiveControl,
   loadStreams,
-  projectAlias,
   selectForTarget,
   servedStreamOf,
   targetsForScope,
@@ -314,6 +314,7 @@ export function createLocalListing(
       chosen,
       createRecordQuery(reads.db),
       new Date(deps.now()).toISOString(),
+      { db: deps.db, memory: deps.blobs },
     );
     return projected.kind === "ok";
   }

@@ -108,6 +108,10 @@ export function legacyAliasScopes(scope: string) {
       requiredStreams: required,
       servedStream: binding.window?.parentStream,
       windowed: Boolean(binding.window),
+      window: binding.window && {
+        ...binding.window,
+        parentKey: binding.primaryKey[binding.window.parentStream]![0]!,
+      },
       project: (
         records: readonly PdppRecord[],
         now: string,

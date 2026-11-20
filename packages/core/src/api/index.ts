@@ -872,12 +872,6 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
         },
         { status: 503 },
       );
-    case "too_large":
-      return errorResponse(
-        503,
-        "TOO_LARGE",
-        "This legacy view is larger than this server can build; read its streams instead",
-      );
     default:
       return null;
   }

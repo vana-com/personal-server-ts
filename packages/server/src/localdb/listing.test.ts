@@ -6,6 +6,10 @@ import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import type { AliasTargets } from "../../../core/src/localdb/resolve.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "../../../core/src/stream-sync/storage-retry.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { addConnection, addStream } from "./local-state-fixture.js";
 
@@ -34,6 +38,7 @@ async function fresh(
     db,
     logger: { info: vi.fn(), warn },
     ownerAddress: "0xabc",
+    blobs: { governor: createStorageAccess(DEFAULT_STORAGE_ACCESS_POLICY) },
     now: () => 2000,
     newOp: () => "listing-op",
   } as unknown as LocalSyncDeps;

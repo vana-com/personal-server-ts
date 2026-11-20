@@ -8,6 +8,10 @@ import {
 } from "../../../core/src/localdb/listing.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "../../../core/src/stream-sync/storage-retry.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { addConnection, addStream } from "./local-state-fixture.js";
 import { referenceListScopes } from "./listing-reference.test-utils.js";
@@ -70,7 +74,8 @@ async function fixture() {
     queue,
     ownerAddress: "0xabc",
     registry: forbidden("registry", portCalls),
-    blobs: forbidden("blobs", portCalls),
+    // Memory is a budget, not a port: alias projections reserve from it.
+    blobs: { governor: createStorageAccess(DEFAULT_STORAGE_ACCESS_POLICY) },
     keys: forbidden("keys", portCalls),
     signer: forbidden("signer", portCalls),
     logger: { info: vi.fn(), warn },

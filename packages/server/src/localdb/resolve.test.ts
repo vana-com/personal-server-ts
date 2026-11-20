@@ -3,6 +3,10 @@ import {
   handlePersonalServerDataRequest,
   type PersonalServerDataApiDeps,
 } from "../../../core/src/api/index.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "../../../core/src/stream-sync/storage-retry.js";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   dataRegistryDomain,
@@ -25,7 +29,10 @@ import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { RecordQuery } from "../../../core/src/localdb/query.js";
+import {
+  createRecordQuery,
+  type RecordQuery,
+} from "../../../core/src/localdb/query.js";
 import { COMPLETE_PAGE_SIZE } from "../../../core/src/localdb/complete-read.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -134,6 +141,11 @@ async function fixture() {
     listRecords: vi.fn(),
     getRecord: vi.fn(),
     changesSince: vi.fn(),
+    // The alias read sizes and pages its rows with the real queries.
+    streamStats: (connectionId, stream) =>
+      createRecordQuery(db).streamStats(connectionId, stream),
+    recordsByHash: (connectionId, stream, hashes) =>
+      createRecordQuery(db).recordsByHash(connectionId, stream, hashes),
     async *streamRecords(connectionId, stream) {
       visited(connectionId, stream);
       const records = await db.query<{
@@ -157,7 +169,10 @@ async function fixture() {
     queue: connectionQueue(),
     ownerAddress: "0x1234",
     registry: {},
-    blobs: { get: async (key: string) => blobs.get(key) ?? null },
+    blobs: {
+      get: async (key: string) => blobs.get(key) ?? null,
+      governor: createStorageAccess(DEFAULT_STORAGE_ACCESS_POLICY),
+    },
     keys: {
       namespaceHmac: async () => new Uint8Array(32),
       decrypt: async (_scope: string, bytes: Uint8Array) => bytes,

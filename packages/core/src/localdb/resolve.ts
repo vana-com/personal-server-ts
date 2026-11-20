@@ -16,6 +16,8 @@ import { applyConnection } from "./apply.js";
 import { nextApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
+import { pinAliasStreams } from "./alias-view.js";
+import { projectAlias } from "./alias-projection.js";
 import { completeBody, pinStream } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
 import type { RecordQuery } from "./query.js";
@@ -25,7 +27,6 @@ import {
   complete,
   connectionsOf,
   loadStreams,
-  projectAlias,
   readability,
   selectForTarget,
   servedStreamOf,
@@ -62,6 +63,12 @@ export interface LocalAliasTarget {
   readonly servedStream?: string;
   readonly windowed?: boolean;
   /**
+   * How a read of this alias pages its projection, when the binding builds one
+   * output element per parent row (the host's `LegacyProjectionWindow`). Absent:
+   * the read projects every row in one call.
+   */
+  readonly window?: AliasWindow;
+  /**
    * `fetched` names the streams the read served, whether or not they had
    * rows: a stream left out of it was never read.
    */
@@ -77,6 +84,26 @@ export interface LocalAliasTarget {
         readonly diagnostics?: readonly AliasDiagnostic[];
       }
     | { readonly ok: false; readonly error: { readonly kind: string } };
+}
+/**
+ * A binding whose payload holds one element of `arrayKey` for each row of
+ * `parentStream`, built from that row, the `childStream` rows whose `childKey`
+ * holds its `parentKey`, and whole copies of the other streams. The payload's
+ * other keys are the same however the parents are cut into windows, except
+ * `sumKeys`, which add up. `parentOrder` is the order of the array.
+ */
+export interface AliasWindow {
+  readonly parentStream: string;
+  /** The one field of the parent's primary key that its children name. */
+  readonly parentKey: string;
+  readonly childStream: string;
+  readonly childKey: string;
+  readonly arrayKey: string;
+  readonly sumKeys: readonly string[];
+  readonly parentOrder: (
+    a: Record<string, unknown>,
+    b: Record<string, unknown>,
+  ) => number;
 }
 /**
  * A projection's report on its own payload. Only `records_dropped` and
@@ -188,10 +215,6 @@ async function* envelope(
   yield `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},"data":`;
   yield* payload;
   yield "}";
-}
-
-async function* single(text: string): AsyncGenerator<string> {
-  yield text;
 }
 
 export function createLocalResolver(
@@ -361,14 +384,24 @@ export function createLocalResolver(
     candidate: Candidate,
   ): Promise<ReadDecision> {
     // A body of the database is pinned before the head is read: see
-    // `pinStream`. An alias is built in memory below and needs no pin.
-    const pin = candidate.target.alias
+    // `pinStream`. An alias projected in one call is built here, under the
+    // queue, and needs no pin; a paged one is read after the queue is
+    // released, and pins every stream it reads.
+    const alias = candidate.target.alias;
+    const pin = alias
       ? 0
       : await pinStream(
           deps.db,
           candidate.connection.connection_id,
           candidate.target.streams[0]!,
         );
+    const epochs = alias?.window
+      ? await pinAliasStreams(
+          deps.db,
+          candidate.connection.connection_id,
+          candidate.target.streams,
+        )
+      : undefined;
     const [connection] = (await connections(candidate.target.connector)).filter(
       (c) => c.connection_id === candidate.connection.connection_id,
     );
@@ -429,16 +462,18 @@ export function createLocalResolver(
         current,
         parts.query,
         new Date(deps.now()).toISOString(),
+        { db: deps.db, memory: deps.blobs, epochs },
       );
-      if (projected.kind === "too_large") {
-        return { kind: "too_large", bytes: projected.bytes };
-      }
       if (projected.kind === "invalid_binding") return projected;
       if (projected.kind === "incomplete") {
         return { kind: "incomplete", diagnostics: projected.diagnostics };
       }
+      // The rows changed while the read was checked: ask again.
+      if (projected.kind === "moved") {
+        return { kind: "busy", retryAfterSeconds: 5 };
+      }
       if (projected.kind === "no_data") return noData();
-      payload = single(JSON.stringify(projected.payload));
+      payload = projected.body();
     }
     const servedStream = servedStreamOf(candidate.target);
     const head = installed.find((s) => s.stream === servedStream)!;

@@ -3,14 +3,7 @@ import {
   streamReadScope,
 } from "../stream-sync-read/routing.js";
 import type { SqlReader } from "./driver.js";
-import type { RecordQuery } from "./query.js";
-import type {
-  AliasTargets,
-  AliasDiagnostic,
-  IncompleteAliasDiagnostic,
-  LocalAliasRecord,
-  LocalAliasTarget,
-} from "./resolve.js";
+import type { AliasTargets, LocalAliasTarget } from "./resolve.js";
 
 /**
  * The rule that decides which connection and head a read serves, shared by
@@ -435,92 +428,4 @@ export function chooseCandidate(
       b.registered - a.registered ||
       a.target.connector.localeCompare(b.target.connector),
   )[0];
-}
-
-export const ARRAY_BUDGET = 64 * 1024 * 1024;
-const encoder = new TextEncoder();
-
-/**
- * Project the installed records of an alias scope, or say why it has no body.
- * Reads the local database only; `query` may be wrapped by the caller to
- * substitute retained heads.
- */
-export async function projectAlias(
-  binding: LocalAliasTarget,
-  candidate: Candidate,
-  query: RecordQuery,
-  now: string,
-): Promise<
-  | { readonly kind: "ok"; readonly payload: unknown }
-  | { readonly kind: "no_data" }
-  | { readonly kind: "invalid_binding" }
-  | { readonly kind: "too_large"; readonly bytes: number }
-  | {
-      readonly kind: "incomplete";
-      readonly diagnostics: readonly IncompleteAliasDiagnostic[];
-    }
-> {
-  if (invalidAliasBinding(binding)) return { kind: "invalid_binding" };
-  // Check all input heads, before reading even one record or creating a body.
-  if (
-    candidate.streams.some((s) => s.profile_key !== candidate.target.connector)
-  ) {
-    return { kind: "no_data" };
-  }
-  const fetched = candidate.streams.map((s) => s.stream);
-  if (binding.windowed) {
-    const probe = binding.project([], now, fetched);
-    if (!probe.ok && probe.error.kind === "invalid_binding")
-      return { kind: "invalid_binding" };
-    if (!probe.ok && probe.error.kind.includes("profile")) {
-      return { kind: "no_data" };
-    }
-  }
-  const records: LocalAliasRecord[] = [];
-  let bytes = 0;
-  for (const stream of fetched) {
-    for await (const record of query.streamRecords(
-      candidate.connection.connection_id,
-      stream,
-    )) {
-      bytes += encoder.encode(record.body).byteLength;
-      if (bytes > ARRAY_BUDGET) return { kind: "too_large", bytes };
-      records.push({
-        stream,
-        data: JSON.parse(record.body) as Record<string, unknown>,
-      });
-    }
-  }
-  const projected = binding.project(records, now, fetched);
-  if (!projected.ok && projected.error.kind === "invalid_binding")
-    return { kind: "invalid_binding" };
-  if (!projected.ok) return { kind: "no_data" };
-  // A payload that leaves rows out is not the data: refuse it, as the
-  // flag-off path does (`canonical_view_incomplete`), never serve it short.
-  const incomplete = incompleteDiagnostics(projected.diagnostics);
-  return incomplete.length > 0
-    ? { kind: "incomplete", diagnostics: incomplete }
-    : { kind: "ok", payload: projected.payload };
-}
-
-function incompleteDiagnostics(
-  diagnostics: readonly AliasDiagnostic[] | undefined,
-): IncompleteAliasDiagnostic[] {
-  return (diagnostics ?? []).flatMap((d) => {
-    const kind =
-      d.kind === "records_dropped"
-        ? "dropped"
-        : d.kind === "records_partial"
-          ? "partial"
-          : null;
-    return kind === null
-      ? []
-      : [
-          {
-            stream: d.stream ?? "",
-            kind,
-            detail: `${d.count ?? 0} rows: ${(d.reasons ?? []).join("; ")}`,
-          },
-        ];
-  });
 }

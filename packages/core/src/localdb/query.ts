@@ -81,6 +81,24 @@ export interface RecordQuery {
     connectionId: string,
     stream: string,
   ): AsyncIterable<StoredRecord>;
+  /**
+   * How many records a stream holds and how many bytes their bodies take, from
+   * one statement over the stored sizes: no body is read. A caller sizes its
+   * memory with it before it reads.
+   */
+  streamStats(
+    connectionId: string,
+    stream: string,
+  ): Promise<{ readonly rows: number; readonly bytes: number }>;
+  /**
+   * The records of a stream with these key hashes, in `pk_hash` order. A hash
+   * the stream no longer holds is absent from the answer.
+   */
+  recordsByHash(
+    connectionId: string,
+    stream: string,
+    pkHashes: readonly string[],
+  ): Promise<StoredRecord[]>;
 }
 
 type RecordRow = {
@@ -93,6 +111,8 @@ type RecordRow = {
 
 const RECORD_COLUMNS = `stream, record_key, pk_hash, body, ${SEEN_O} AS stamp_o`;
 const STREAM_PAGE_SIZE = 100;
+/** Hashes per statement: SQLite before 3.32 allows 999 bound parameters. */
+const HASHES_PER_STATEMENT = 500;
 
 const LIST_CURSOR_PREFIX = "v2.";
 
@@ -291,6 +311,32 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
         if (page.length < STREAM_PAGE_SIZE) return;
         cursor = page[page.length - 1]!.pk_hash;
       }
+    },
+
+    async streamStats(connectionId, stream) {
+      // A row written before `body_bytes` was kept has none: size its body.
+      const [row] = await db.query<{ rows: number; bytes: number | null }>(
+        `SELECT COUNT(*) AS rows,
+                SUM(COALESCE(body_bytes, LENGTH(CAST(body AS BLOB)))) AS bytes
+         FROM records WHERE connection_id = ? AND stream = ?`,
+        [connectionId, stream],
+      );
+      return { rows: Number(row?.rows ?? 0), bytes: Number(row?.bytes ?? 0) };
+    },
+
+    async recordsByHash(connectionId, stream, pkHashes) {
+      const out: StoredRecord[] = [];
+      for (let i = 0; i < pkHashes.length; i += HASHES_PER_STATEMENT) {
+        const group = pkHashes.slice(i, i + HASHES_PER_STATEMENT);
+        const rows = await db.query<RecordRow>(
+          `SELECT ${RECORD_COLUMNS} FROM records
+           WHERE connection_id = ? AND stream = ?
+             AND pk_hash IN (${group.map(() => "?").join(",")})`,
+          [connectionId, stream, ...group],
+        );
+        for (const row of rows) out.push(stored(row));
+      }
+      return out.sort((a, b) => (a.pkHash < b.pkHash ? -1 : 1));
     },
   };
 }

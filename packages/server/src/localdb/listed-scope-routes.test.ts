@@ -12,6 +12,10 @@ import type {
   LocalAliasTarget,
 } from "../../../core/src/localdb/resolve.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "../../../core/src/stream-sync/storage-retry.js";
 import { createMemoryDataStorage } from "../../../core/src/test-utils/memory-storage.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
@@ -107,7 +111,8 @@ async function switchedFixture(
       queue: connectionQueue(),
       ownerAddress: "0xabc",
       registry: poison,
-      blobs: poison,
+      // Alias reads take their memory from the governor; nothing else is used.
+      blobs: { governor: createStorageAccess(DEFAULT_STORAGE_ACCESS_POLICY) },
       keys: poison,
       signer: poison,
       logger: { info() {}, warn() {} },
