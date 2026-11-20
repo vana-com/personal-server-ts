@@ -14,7 +14,10 @@ import {
   mergeIncoming,
   withOrigin,
 } from "../../../core/src/localdb/merge.js";
-import { streamDigest } from "../../../core/src/localdb/stream-digest.js";
+import {
+  STREAM_DIGEST_PAGE_ROWS,
+  streamDigest,
+} from "../../../core/src/localdb/stream-digest.js";
 import { liveStreamCounts } from "../../../core/src/stream-sync-read/service.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { addConnection, addStream } from "./local-state-fixture.js";
@@ -270,6 +273,112 @@ describe("status reporting", () => {
       now: () => 9000,
     } as unknown as LocalSyncDeps);
   }
+
+  /**
+   * The database, with one write committed the first time a query matches
+   * `when` returns: a write that lands between the audit's reads.
+   */
+  function interleaved(
+    db: SqlDriver,
+    when: (sql: string) => boolean,
+    write: () => Promise<unknown>,
+  ): SqlDriver {
+    let fired = false;
+    return {
+      info: db.info,
+      batch: (statements) => db.batch(statements),
+      close: () => db.close(),
+      query: async (sql, params) => {
+        const rows = await db.query(sql, params);
+        if (!fired && when(sql)) {
+          fired = true;
+          await write();
+        }
+        return rows as never;
+      },
+    };
+  }
+
+  it("reports the state before or after a write that lands between its reads, never a mix", async () => {
+    // The write lands after the stream's state is read and before its rows are.
+    const db = await device("between");
+    await arrive(db, records(3), { chunk: 3, stampO: 1, stampR: "r" });
+    const before = await streamDigest(db, CONNECTION, STREAM);
+    const listing = await listingOf(
+      interleaved(
+        db,
+        (sql) => sql.includes("FROM stream_state"),
+        () => arrive(db, [record(50)], { chunk: 1, stampO: 2, stampR: "r2" }),
+      ),
+    );
+    const [row] = liveStreamCounts(await listing.status({ audit: true }));
+    const after = await streamDigest(db, CONNECTION, STREAM);
+    expect(after.rows).toBe(4);
+    expect([before.fingerprint, after.fingerprint]).toContain(row!.digest);
+    // The count and the digest are of the same state.
+    expect(row!.digest).toBe(
+      row!.records === 3 ? before.fingerprint : after.fingerprint,
+    );
+  });
+
+  it("reports the state before or after a write that lands between two pages of one stream", async () => {
+    const all = records(STREAM_DIGEST_PAGE_ROWS + 20);
+    const db = await device("pages");
+    await arrive(db, all, { chunk: 500, stampO: 1, stampR: "r" });
+    const before = await streamDigest(db, CONNECTION, STREAM);
+    // One row in the first page and one in the last change: a digest read
+    // from the first page before them and the second after them is neither.
+    const byKey = [...all].sort((a, b) => (a.pkHash < b.pkHash ? -1 : 1));
+    const changed = [byKey[0]!, byKey[byKey.length - 1]!].map((r) =>
+      record(Number(r.key.slice(1)), 2),
+    );
+    const listing = await listingOf(
+      interleaved(
+        db,
+        (sql) => sql.includes("ORDER BY pk_hash LIMIT"),
+        () => arrive(db, changed, { chunk: 2, stampO: 5, stampR: "r2" }),
+      ),
+    );
+    const [row] = liveStreamCounts(await listing.status({ audit: true }));
+    const after = await streamDigest(db, CONNECTION, STREAM);
+    expect(after.fingerprint).not.toBe(before.fingerprint);
+    expect([before.fingerprint, after.fingerprint]).toContain(row!.digest);
+  });
+
+  it("reports no digest for a connection that keeps changing, and says so", async () => {
+    const db = await device("busy");
+    await arrive(db, records(3), { chunk: 3, stampO: 1, stampR: "r" });
+    let n = 100;
+    const warn = vi.fn();
+    const busy: SqlDriver = {
+      info: db.info,
+      batch: (statements) => db.batch(statements),
+      close: () => db.close(),
+      query: async (sql, params) => {
+        const rows = await db.query(sql, params);
+        if (sql.includes("FROM stream_state"))
+          await arrive(db, [record(n++)], {
+            chunk: 1,
+            stampO: n,
+            stampR: "busy",
+          });
+        return rows as never;
+      },
+    };
+    const listing = createLocalListing({
+      db: busy,
+      queue: connectionQueue(),
+      ownerAddress: "0xabc",
+      logger: { info: vi.fn(), warn },
+      now: () => 9000,
+    } as unknown as LocalSyncDeps);
+    const [row] = liveStreamCounts(await listing.status({ audit: true }));
+    expect(row!.digest).toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("kept changing"),
+    );
+  });
 
   it("carries no digest unless an audit is asked for", async () => {
     const db = await device("plain");

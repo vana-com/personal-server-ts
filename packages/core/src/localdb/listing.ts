@@ -120,6 +120,9 @@ interface Entry {
   readonly bodyBuilds: () => Promise<boolean>;
 }
 
+/** Reads of one connection's state and digests before the audit gives up on it. */
+const AUDIT_ATTEMPTS = 4;
+
 type Count = { records: number; stampedAt: number | null };
 
 export function createLocalListing(
@@ -314,6 +317,19 @@ export function createLocalListing(
     return projected.kind === "ok";
   }
 
+  /** What a stream's head says about it, given its connection's control state. */
+  const streamFacts = (row: Connection, state: StreamState) => {
+    const tombstoned =
+      state.last_delete_version > 0 &&
+      state.head_version <= state.last_delete_version;
+    const live =
+      row.control_state === "active" &&
+      state.head_generation === row.generation &&
+      state.head_version > state.last_delete_version &&
+      state.head_blob !== null;
+    return { tombstoned, live, complete: live && state.complete === 1 };
+  };
+
   /** The stream's digest; `null` when a stored hash is not a SHA-256 hex digest. */
   async function digestOf(connectionId: string, stream: string) {
     try {
@@ -331,6 +347,62 @@ export function createLocalListing(
       }
       throw error;
     }
+  }
+
+  /** The connection's change counter (`view_versions`): it moves on every write a read can see. */
+  async function viewVersion(connectionId: string): Promise<number> {
+    const [row] = await reads.db.query<{ version: number }>(
+      "SELECT version FROM view_versions WHERE connection_id = ?",
+      [connectionId],
+    );
+    return row?.version ?? 0;
+  }
+
+  /** The stream rows of one connection, each with its live record count. */
+  const stateSql = `SELECT s.*, (SELECT COUNT(*) FROM records r WHERE r.connection_id = s.connection_id AND r.stream = s.stream) AS records FROM stream_state s`;
+
+  /**
+   * One connection's state and the digests of its complete streams, from one
+   * state of the database. Each digest reads the stream's rows page by page
+   * with a write able to commit between pages, and the state is read before
+   * them: read alone, they could be of two different states. So the
+   * connection's change counter is read before and after, and a read that saw
+   * a write is read again. A connection that keeps changing through every
+   * attempt reports no digest (`null`: not comparable) beside the state of its
+   * last read, and is logged.
+   */
+  async function auditedConnection(connectionId: string): Promise<{
+    readonly row: Connection;
+    readonly states: readonly StreamState[];
+    readonly digests: ReadonlyMap<string, string | null>;
+  } | null> {
+    let last: { row: Connection; states: readonly StreamState[] } | null = null;
+    for (let attempt = 0; attempt < AUDIT_ATTEMPTS; attempt++) {
+      const before = await viewVersion(connectionId);
+      const [row] = await reads.db.query<Connection>(
+        `SELECT connection_id, connector, ns, generation,
+         ${effectiveControl("connections")} AS control_state
+         FROM connections WHERE connection_id = ?`,
+        [connectionId],
+      );
+      if (!row) return null;
+      const states = await reads.db.query<StreamState>(
+        `${stateSql} WHERE s.connection_id = ? ORDER BY s.stream`,
+        [connectionId],
+      );
+      const digests = new Map<string, string | null>();
+      for (const state of states)
+        if (streamFacts(row, state).complete)
+          digests.set(state.stream, await digestOf(connectionId, state.stream));
+      if ((await viewVersion(connectionId)) === before)
+        return { row, states, digests };
+      last = { row, states };
+    }
+    deps.logger.warn(
+      { attempts: AUDIT_ATTEMPTS },
+      "localdb status: a connection kept changing during the audit; no digest",
+    );
+    return last && { ...last, digests: new Map() };
   }
 
   // Overlapping calls share one read of local state; the next call after it
@@ -370,9 +442,13 @@ export function createLocalListing(
     async status(options) {
       const audit = options?.audit === true;
       const rows = await connections();
-      const states = await reads.db.query<StreamState>(
-        "SELECT s.*, (SELECT COUNT(*) FROM records r WHERE r.connection_id = s.connection_id AND r.stream = s.stream) AS records FROM stream_state s ORDER BY s.connection_id, s.stream",
-      );
+      // An audit reads each connection's state with its digests (see
+      // `auditedConnection`); a plain status reads every state at once.
+      const states = audit
+        ? []
+        : await reads.db.query<StreamState>(
+            `${stateSql} ORDER BY s.connection_id, s.stream`,
+          );
       // A first load in progress, for the owner's diagnostics. Only when the
       // host serves them: with the flag off a stream with no complete head
       // reports as it always did.
@@ -413,34 +489,28 @@ export function createLocalListing(
         }
       }
       const result: StreamSyncReadStatus["connections"][number][] = [];
-      for (const row of rows) {
+      for (const listed of rows) {
+        const audited = audit
+          ? await auditedConnection(listed.connection_id)
+          : null;
+        // A connection deleted since the listing has no state left to audit.
+        if (audit && !audited) continue;
+        const row = audited?.row ?? listed;
         const streams: Record<
           string,
           StreamSyncReadStatus["connections"][number]["streams"][string]
         > = {};
-        for (const state of states) {
+        for (const state of audited?.states ?? states) {
           if (state.connection_id !== row.connection_id) continue;
-          const tombstoned =
-            state.last_delete_version > 0 &&
-            state.head_version <= state.last_delete_version;
-          const live =
-            row.control_state === "active" &&
-            state.head_generation === row.generation &&
-            state.head_version > state.last_delete_version &&
-            state.head_blob !== null;
-          const complete = live && state.complete === 1;
+          const { tombstoned, live, complete } = streamFacts(row, state);
           streams[state.stream] = {
             tombstoned,
             live,
             complete,
             version: live ? state.head_version : null,
             records: live ? state.records : null,
-            ...(audit
-              ? {
-                  digest: complete
-                    ? await digestOf(row.connection_id, state.stream)
-                    : null,
-                }
+            ...(audited
+              ? { digest: audited.digests.get(state.stream) ?? null }
               : {}),
             ...(partials.has(
               JSON.stringify([row.connection_id, state.stream]),
