@@ -58,6 +58,7 @@ const declaration: IntakeDeclarations = {
 const beginRequest: BeginRequest = {
   connector: declaration.connector,
   artifactDigest: "fixture-artifact",
+  join: true,
   owner: { address: owner, leaseId: null },
 };
 

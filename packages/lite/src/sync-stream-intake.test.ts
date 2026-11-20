@@ -118,6 +118,7 @@ async function fixture(
 const request = (observedAt: number) => ({
   connector: "fixture",
   artifactDigest: "fixture",
+  join: true,
   owner: { address: account.address, leaseId: null },
   observedAt,
 });

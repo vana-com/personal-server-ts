@@ -22,6 +22,7 @@ import {
   type SignedRegistryBatch,
   type StreamSyncRegistry,
 } from "../stream-sync/ports.js";
+import { dropUnpublishedCursors } from "./cursor.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { dropRunRows, withOrigin } from "./merge.js";
@@ -271,6 +272,7 @@ export async function discardFencedRuns(
     );
   }
   if (statements.length === 0) return false;
+  statements.push(dropUnpublishedCursors(id));
   await deps.db.batch(withOrigin("purge", statements));
   return true;
 }

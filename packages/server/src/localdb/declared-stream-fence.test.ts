@@ -26,6 +26,7 @@ const NEVER_PUBLISHED = sName(1);
 const connect = (observedAt: number) => ({
   connector: CONNECTOR,
   artifactDigest: CONNECTOR,
+  join: true,
   connect: true,
   observedAt,
   owner: { address: OWNER, leaseId: null },
@@ -33,6 +34,7 @@ const connect = (observedAt: number) => ({
 const request = (observedAt: number) => ({
   connector: CONNECTOR,
   artifactDigest: CONNECTOR,
+  join: true,
   wantFull: true,
   observedAt,
   owner: { address: OWNER, leaseId: null },

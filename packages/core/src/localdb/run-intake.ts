@@ -33,6 +33,8 @@ import {
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
+import { foldAppliedCursors } from "./cursor.js";
+import { compareSemver } from "../stream-sync/semver.js";
 import type { ConnectionRow } from "./deps.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -304,9 +306,20 @@ export function createRunIntakeStore(
           ).length
         )
           throw new RunIntakeError("connection_stopped");
+        // A device without a participation row must learn from the registry
+        // whether the connection exists; the local connect shortcut cannot.
+        const joined =
+          !!systemStream ||
+          (
+            await db.query(
+              "SELECT 1 FROM connection_participation WHERE connection_id=?",
+              [id],
+            )
+          ).length > 0;
         let synced = await collectionBasis(
           deps,
           systemStream ? { ...req, connect: true } : req,
+          !joined,
         );
         // Another key's control row: this owner cannot publish what a run
         // would collect. Nothing is written for it (`syncBeforeBegin`).
@@ -323,6 +336,7 @@ export function createRunIntakeStore(
             throw new RunIntakeError("control_basis_mismatch");
         }
         let admittedControlVersion = synced.connection?.controlVersion ?? 0;
+        let reconnected = false;
         if (
           synced.connection?.controlState === "deleted" &&
           req.connect === true &&
@@ -357,6 +371,7 @@ export function createRunIntakeStore(
             throw error;
           }
           admittedControlVersion = version;
+          reconnected = true;
           // The successful compare-and-set is the control observation. Reuse
           // it while applying the log; a second GET adds no admission safety.
           synced = await syncBeforeBegin(deps, req.connector, {
@@ -376,6 +391,24 @@ export function createRunIntakeStore(
             throw new RunIntakeError("control_basis_mismatch");
         }
         if (await stopped(id)) throw new RunIntakeError("connection_stopped");
+        // The join gate. An absent control row, read from the registry, means
+        // this device creates the connection; an explicit reconnect of a
+        // connection this device saw deleted starts a new lifetime it creates.
+        // An active row is another device's connection: ask first.
+        if (!joined) {
+          // `unreachable` also covers a log apply that could not finish after
+          // the control row was read: then the row is known, and decides.
+          if (synced.control === null)
+            throw new RunIntakeError("control_basis_unavailable");
+          if (
+            !reconnected &&
+            synced.control?.kind === "active" &&
+            req.join !== true
+          )
+            throw new RunIntakeError("join_required");
+        }
+        // The cursors of the segments just applied are the stream's entries.
+        await foldAppliedCursors(db, id);
         const [cached] = await db.query<{
           checkpoint: string | null;
           needs_full: number;
@@ -398,6 +431,33 @@ export function createRunIntakeStore(
               : ("incremental" as const),
           ]),
         );
+        // Each stream's cursor carries the version of the connector that
+        // wrote it, here or on another device. An older connector than that
+        // may misread it: refused, before anything is written. A version
+        // order that is unknown (either is not semver) reads the stream in full.
+        if (!full) {
+          const written = await db.query<{
+            stream: string;
+            cursor_version: string;
+          }>(
+            "SELECT stream, cursor_version FROM stream_state WHERE connection_id=? AND cursor_version IS NOT NULL",
+            [id],
+          );
+          for (const { stream, cursor_version } of written) {
+            if (
+              modes.get(stream) !== "incremental" ||
+              cursor_version === declarations.version
+            )
+              continue;
+            const order = compareSemver(cursor_version, declarations.version);
+            if (order === 1)
+              throw new RunIntakeError(
+                "connector_update_required",
+                `stream ${stream}: its cursor was written by connector ${cursor_version}, newer than ${declarations.version}`,
+              );
+            if (order === null) modes.set(stream, "full_refresh");
+          }
+        }
         let state: JsonValue | null = cached?.checkpoint
           ? JSON.parse(cached.checkpoint)
           : null;
@@ -511,6 +571,11 @@ export function createRunIntakeStore(
             },
           );
         }
+        if (!joined)
+          statements.push({
+            sql: "INSERT OR IGNORE INTO connection_participation(connection_id,joined_at) VALUES (?,?)",
+            params: [id, deps.now()],
+          });
         if (deps.publishWhileCollecting === true) {
           // The run keeps this mode to its end. Compaction counts the new run.
           statements.push(
@@ -765,13 +830,16 @@ export function createRunIntakeStore(
  * the immutable replacement basis; publish compares that log position and
  * control lifetime atomically. A competing commit applies the winner and
  * replans without replacing rows this collector never observed.
- * Retry admission, reconnect and repair still need an authoritative read.
+ * Retry admission, reconnect and repair still need an authoritative read, and
+ * so does a device that has not joined the connection (`authoritative`).
  */
 async function collectionBasis(
   deps: LocalSyncDeps,
   request: BeginRequest,
+  authoritative: boolean,
 ): Promise<Awaited<ReturnType<typeof syncBeforeBegin>>> {
   if (
+    !authoritative &&
     request.connect === true &&
     request.expectedControlVersion === undefined
   ) {

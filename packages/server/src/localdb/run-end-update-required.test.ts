@@ -261,6 +261,62 @@ describe("run end update required", () => {
     }
   });
 
+  it("mixed-retry-refused-child-keeps-parent-cursor", async () => {
+    // As mixed-safe, but the refused stream reads through the accepted one
+    // (state_parents): the parent's new cursor claims the child's rows the
+    // refusal dropped, so it neither saves nor waits to publish.
+    const f = await versionedFixture();
+    await f.db.batch([
+      {
+        sql: "INSERT INTO stream_state (connection_id, stream, primary_key, semantics, incremental) VALUES (?, ?, ?, 'mutable_state', 1)",
+        params: ["connection", "accepted", '["id"]'],
+      },
+    ]);
+    const stored = await f.checkpoint();
+    const runId = "mixed-child";
+    await f.stage(runId, "1", 300);
+    await f.db.batch([
+      {
+        sql: "INSERT INTO run_streams (run_id, stream, delete_snapshot, primary_key, profile_key, profile_version) SELECT run_id, ?, delete_snapshot, primary_key, profile_key, profile_version FROM run_streams WHERE run_id = ? AND stream = ?",
+        params: ["accepted", runId, "items"],
+      },
+      { sql: "DELETE FROM run_rows WHERE run_id = ?", params: [runId] },
+      {
+        sql: "UPDATE runs SET begin_response = ? WHERE run_id = ?",
+        params: [
+          JSON.stringify({
+            streams: [
+              { name: "accepted", mode: "incremental" },
+              {
+                name: "items",
+                mode: "incremental",
+                stateParents: ["accepted"],
+              },
+            ],
+          }),
+          runId,
+        ],
+      },
+    ]);
+    await f.end(runId, {
+      live: [],
+      streams: ["items", "accepted"],
+      retry: true,
+      checkpoints: { items: "stored", accepted: "advanced" },
+    });
+    expect(await f.decision(runId)).toEqual(
+      expect.arrayContaining([
+        { decision: "refused", reason: "connector_update_required" },
+      ]),
+    );
+    expect(await f.checkpoint()).toBe(stored);
+    expect(
+      await f.db.query(
+        "SELECT stream FROM stream_state WHERE cursor_unpublished IS NOT NULL",
+      ),
+    ).toEqual([]);
+  });
+
   it("current-version-deferrals-still-merge", async () => {
     for (const reason of ["seed_unresolved", "generation_unbound"] as const) {
       const f = await versionedFixture();

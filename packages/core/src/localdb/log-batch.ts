@@ -20,6 +20,7 @@ import {
   type LogStreamMeta,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
+import { cursorApplied } from "./cursor.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import type { LogState } from "./log-state.js";
@@ -446,7 +447,8 @@ export function mergeStaged(
 
 /**
  * Each stream a batch touched now reads from it: a local version and its
- * head columns, which hold the batch's segment name.
+ * head columns, which hold the batch's segment name. A meta that carries the
+ * stream's cursor stages it with the rows it covers.
  */
 export function streamHeadStatements(
   connectionId: string,
@@ -500,6 +502,9 @@ export function streamHeadStatements(
           meta.stream,
         ],
       },
+      ...(meta.cursor
+        ? [cursorApplied(connectionId, meta.stream, meta.cursor)]
+        : []),
     );
   return statements;
 }

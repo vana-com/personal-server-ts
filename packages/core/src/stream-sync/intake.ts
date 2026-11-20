@@ -39,6 +39,17 @@ export const RUN_INTAKE_ERROR_STATUS = {
    * owner key cannot publish a run. Refused before anything is written locally.
    */
   control_foreign: 409,
+  /**
+   * The connection exists (its control row is active) and this device has not
+   * joined it. Nothing is written locally. A host asks the user and begins
+   * again with `join: true`; a background run does not ask.
+   */
+  join_required: 409,
+  /**
+   * A stream's cursor was written by a newer version of the connector than
+   * the run's. The run may start once this device's connector is updated.
+   */
+  connector_update_required: 409,
 } as const;
 
 export type RunIntakeErrorName = keyof typeof RUN_INTAKE_ERROR_STATUS;
@@ -121,6 +132,12 @@ export interface BeginRequest {
    * starts a connection the device saw deleted (§2.4 `stopped`).
    */
   readonly connect?: boolean;
+  /**
+   * Sent only after the user accepted the join prompt in this run. It joins a
+   * device that has not collected the connection; on the creator or a device
+   * that already joined it is accepted and ignored.
+   */
+  readonly join?: true;
   /** Control-row version observed by a retry caller; 0 means authoritative absence. */
   readonly expectedControlVersion?: number;
   readonly observedAt?: number;

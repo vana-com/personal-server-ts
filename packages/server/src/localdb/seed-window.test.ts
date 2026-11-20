@@ -110,6 +110,7 @@ async function openDevice(
       await sync.intake.begin(id, {
         connector: "fixture",
         artifactDigest: "fixture",
+        join: true,
         streams: [{ name: stream }],
         wantFull: !options.remove,
         observedAt: options.observedAt,
@@ -502,6 +503,7 @@ it("an accepted run that declared a stream but wrote nothing to it closes the wi
   await a.sync.intake.begin("empty", {
     connector: "fixture",
     artifactDigest: "fixture",
+    join: true,
     streams: [{ name: "items" }],
     wantFull: true,
     owner: { address: owner, leaseId: null },

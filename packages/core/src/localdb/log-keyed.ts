@@ -91,6 +91,7 @@
 
 import { sha256 } from "@noble/hashes/sha2";
 import {
+  followMeta,
   toHex,
   type LogStreamMeta,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -616,7 +617,10 @@ export async function loadKeyed(
     for (const info of infos.slice(0, staged))
       for (const meta of info!.streams) {
         if (!primaryKeys.has(meta.stream)) primaryKeys.set(meta.stream, meta);
-        heads.set(meta.stream, { ...info!, meta });
+        heads.set(meta.stream, {
+          ...info!,
+          meta: followMeta(heads.get(meta.stream)?.meta, meta),
+        });
       }
     const last = sources[staged - 1]!.state;
     // What an unfinished load of this connection wrote must lie inside the

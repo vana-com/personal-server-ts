@@ -31,6 +31,9 @@ const request: BeginRequest = {
   artifactDigest: "fixture-artifact",
   owner: { address: owner, leaseId: null },
   observedAt: 40,
+  // The host's accepted join prompt: these runs collect connections that
+  // the fixture's registry already holds. The join gate has its own tests.
+  join: true,
 };
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -254,6 +257,14 @@ it("replays a live begin, refuses a changed request and a replay after restart",
 
 it("retains offline collection as collecting, with a fresh run generation-unbound", async () => {
   const f = await fixture();
+  // A device that already joined collects offline; one that never did is
+  // refused (`join-gate.test.ts`).
+  await f.db.batch([
+    {
+      sql: "INSERT INTO connection_participation(connection_id,joined_at) VALUES (?,1)",
+      params: [`pdpp.${declaration.connector}~`],
+    },
+  ]);
   f.registry.read = async () => {
     throw new RegistryUnavailableError("offline fixture");
   };

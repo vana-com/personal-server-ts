@@ -52,6 +52,7 @@ import { resolveBodies } from "./log-bodies.js";
 import { rebaseOnLog } from "./log-rebase.js";
 import { seedFromRecords } from "./log-seed.js";
 import { announceApplied } from "./apply-progress.js";
+import { cursorApplied } from "./cursor.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import {
@@ -1000,6 +1001,12 @@ async function loadProgressively(
     string,
     { index: number; meta: LogStreamMeta; batch: OperationBatch }
   >();
+  // The newest cursor each stream's batches carry: a later batch that names
+  // the stream without one leaves it (`followMeta`).
+  const lastCursor = new Map<
+    string,
+    { index: number; cursor: NonNullable<LogStreamMeta["cursor"]> }
+  >();
   const stepsFor = (
     index: number,
     batch: OperationBatch,
@@ -1011,6 +1018,9 @@ async function loadProgressively(
       const seen = lastNaming.get(meta.stream);
       if (!seen || seen.index < index)
         lastNaming.set(meta.stream, { index, meta, batch });
+      const carried = lastCursor.get(meta.stream);
+      if (meta.cursor && (!carried || carried.index < index))
+        lastCursor.set(meta.stream, { index, cursor: meta.cursor });
       steps.set(meta.stream, {
         begin: !resumed.has(meta.stream),
         final,
@@ -1137,6 +1147,11 @@ async function loadProgressively(
           params: [connectionId, stream],
         });
     }
+    // Every row of the pass is in: each stream takes the newest cursor its
+    // batches carried, after any head above staged an older one.
+    for (const [stream, { cursor }] of lastCursor)
+      if (named.has(stream))
+        out.push(cursorApplied(connectionId, stream, cursor));
     return out;
   };
   const items: PassItem[] = identities.map((_, index) => ({

@@ -901,9 +901,17 @@ it("a scheduled run observes a reconnect made on another device", async () => {
     { ...request, connect: true },
     decl,
   );
+  // A new lifetime made elsewhere is a connection this device must join.
+  await expect(
+    createRunIntakeStore(f.b.deps).begin(
+      "scheduled-after-peer-connect",
+      request,
+      decl,
+    ),
+  ).rejects.toMatchObject({ code: "join_required" });
   const begun = await createRunIntakeStore(f.b.deps).begin(
     "scheduled-after-peer-connect",
-    request,
+    { ...request, join: true },
     decl,
   );
   expect(begun.status).toBe("collecting");
@@ -944,6 +952,13 @@ it("an absent registry answer never clears a local-only delete, but explicit con
     owner: { address: owner, leaseId: null },
     observedAt: 2000,
   };
+  // A device that joined earlier collects offline; one that never did is
+  // refused (`join-gate.test.ts`).
+  await db.batch([
+    {
+      sql: "INSERT INTO connection_participation(connection_id,joined_at) VALUES ('pdpp.fixture-source~',1)",
+    },
+  ]);
   registry.beforeRead = async () => {
     throw new RegistryUnavailableError("offline fixture");
   };
