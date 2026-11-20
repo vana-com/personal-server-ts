@@ -8,7 +8,8 @@
  *   while the Account cannot be reached.
  * - `legacyWriteDecision` is what a legacy write gets. It is `read`, except
  *   while an answer is waiting to be applied (below) or after an answer that
- *   did not take effect (a save that failed, or a generation older than the
+ *   did not take effect (an On that could not be judged because the records
+ *   would not load, a save that failed, or a generation older than the
  *   record's). The saved Off is the Account's last word, and it authorizes
  *   legacy writes after a restart and while the Account cannot be read: a
  *   failed read (the host posts `unknown`) changes nothing, so a person who
@@ -32,12 +33,21 @@
  *   write starts on a permission that an arrived answer may contradict, and
  *   an Off poll that applies unchanged only delays a write. Only a write
  *   already running keeps its hold; the On waits for it.
- *   When the answer settles, the permission is back unless the answer failed
- *   to apply, is not the latest, or is older than the record (its generation
- *   is below the record's). Such an answer leaves the owner without permission
- *   until a later current answer, and a failed read does not give it back. This
- *   is a change to the in-memory write permission only: the saved record and
- *   what reads follow stay as they were.
+ *   When the answer settles, what it does to the permission is one of three
+ *   effects (`PermissionEffect`):
+ *   - lift: it was applied, is the latest, and is not older than the record.
+ *   - withdraw: it failed to apply (a save that threw), is not the latest, is
+ *     older than the record, or is an On that could not be judged because the
+ *     records would not load (a later load may bring back an Off that this On
+ *     contradicts). The owner stays without permission until a later current
+ *     answer lifts it; a failed read does not give it back.
+ *   - keep: an Off that could not be judged because the records would not
+ *     load. It cannot contradict a saved Off and gives no permission, so it
+ *     changes nothing, like a failed read.
+ *   A load failure is therefore not a withdrawal by itself: if only Offs and
+ *   failed reads arrive while the load fails, the next successful load of a
+ *   saved Off restores the permission. This is a change to the in-memory write
+ *   permission only: the saved record and what reads follow stay as they were.
  * - This is a local guarantee. It cannot make a switch on another device
  *   atomic with this device's storage: a write between the last answer and the
  *   next one is detected afterwards, not prevented. Preventing it needs the
@@ -48,14 +58,12 @@
  * - `submitEvidence` takes the lock exclusively, saves the new record, then
  *   publishes it. A save that fails throws; the record in memory stays as it
  *   was, and legacy-write permission is withdrawn for that owner (above).
- *   The withdrawal lives in memory only. A restart reads the record the store
- *   kept, which a failed save leaves unchanged (the file store replaces by
- *   rename, the IndexedDB store by one transaction), so after a failed On save
- *   and a restart the saved Off authorizes legacy writes again while the
- *   Account cannot be read. No durable mark can close that: the store that
- *   failed to save the On is the only durable place, and a second write to it
- *   fails for the same cause. It ends at the first answer the Account gives,
- *   and the registry refuses legacy-protocol writes once the owner is On.
+ *   The withdrawal is held in memory only, so a restart restores the saved
+ *   Off: the store keeps the record it had (a failed save leaves it unchanged:
+ *   the file store replaces by rename, the IndexedDB store by one transaction),
+ *   and that Off authorizes legacy writes again while the Account cannot be
+ *   read. The next answer the Account gives replaces it, and the registry
+ *   refuses legacy-protocol writes once the owner is On.
  * - `commitLegacy` takes the lock shared and reads the record inside it with no
  *   await before the write starts. An On therefore waits for every legacy
  *   write already running, and no legacy write starts after it. This is the
@@ -75,6 +83,9 @@ import {
   type RefuseDecision,
 } from "./record.js";
 import { createRwLock } from "./rw-lock.js";
+
+/** What an answer does to its owner's write permission when it settles. */
+type PermissionEffect = "lift" | "withdraw" | "keep";
 
 export type CommitResult<T> =
   { ok: true; value: T } | { ok: false; decision: RefuseDecision };
@@ -131,13 +142,15 @@ export function createModeAuthority(
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
   /**
-   * Owners whose latest answer did not take effect: it could not be saved, or
-   * its generation is older than the record's. The remembered Off must not
-   * keep authorizing writes against an answer the Account just gave and this
-   * process could not keep. In memory only, so it does not survive a restart
-   * (see `submitEvidence` above for why no store write can carry it); a later
-   * answer that applies and is current removes the owner. A failed read does
-   * not add or remove anyone.
+   * Owners whose latest answer did not take effect: it could not be saved, its
+   * generation is older than the record's, it was superseded, or it is an On
+   * that could not be judged because the records would not load. The
+   * remembered Off must not keep authorizing writes against an answer the
+   * Account just gave and this process could not keep. In memory only, so a
+   * restart clears it (see `submitEvidence` above); a later answer that
+   * applies and is current removes the owner. A failed read, and an Off that
+   * could not be judged because the records would not load, add or remove
+   * no one.
    */
   const withdrawn = new Set<string>();
   /**
@@ -260,7 +273,9 @@ export function createModeAuthority(
       if (answered) {
         // Settled in the `finally`, under the lock, whatever happens.
         let release: (() => void) | undefined;
-        let eligible = false;
+        // Withdraw until the answer is judged: a throw anywhere before that
+        // (a save that failed) leaves the owner without permission.
+        let effect: PermissionEffect = "withdraw";
         try {
           await ready;
           release = await lock.exclusive();
@@ -269,7 +284,10 @@ export function createModeAuthority(
           // and no legacy write starts after it.
           await retryLoadIfFailed();
           if (loadFailed) {
-            // Still no records to judge against: save nothing, change nothing.
+            // Still no records to judge against: save nothing, change no record.
+            // An On that was never applied could contradict the Off a later
+            // load brings back, so it withdraws; an Off cannot, so it keeps.
+            effect = input.state === "on" ? "withdraw" : "keep";
             return read(owner);
           }
           const prev = records.get(owner);
@@ -287,13 +305,15 @@ export function createModeAuthority(
           // The answer takes effect only when it was applied, no later answer
           // was submitted, and it is not older than the record. Any other end
           // withdraws the permission the remembered Off gave.
-          eligible =
-            latest.get(owner) === ticket && generation >= next.generation;
+          effect =
+            latest.get(owner) === ticket && generation >= next.generation
+              ? "lift"
+              : "withdraw";
         } finally {
           // The release comes last, whatever the bookkeeping does.
           try {
-            if (eligible) withdrawn.delete(owner);
-            else withdrawn.add(owner);
+            if (effect === "lift") withdrawn.delete(owner);
+            else if (effect === "withdraw") withdrawn.add(owner);
             settle(owner, ticket);
           } finally {
             release?.();

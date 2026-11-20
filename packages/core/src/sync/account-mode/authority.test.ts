@@ -327,9 +327,9 @@ describe("the account-mode record", () => {
     });
 
     it("lets the saved Off authorize again after a restart that follows a failed On save (the withdrawal is in memory only)", async () => {
-      // Pins a known limit: a failed save leaves the store's old record, and
-      // the store is the only durable place, so nothing durable can say that
-      // an On arrived. See `submitEvidence` in authority.ts.
+      // The withdrawal is held in memory: a failed save leaves the store's old
+      // record, so a restart restores the saved Off. See `submitEvidence` in
+      // authority.ts.
       const memory = createMemoryModeRecordStore();
       let failSaves = false;
       const store: ModeRecordStore = {
@@ -850,6 +850,103 @@ describe("the account-mode record", () => {
     expect(authority.read(OWNER)).toEqual({ kind: "streams" });
     expect(saves).toEqual([]);
     expect(loads).toBe(3);
+  });
+
+  describe("an answer that arrives while the records will not load", () => {
+    const UNKNOWN = {
+      kind: "refuse",
+      code: "ACCOUNT_MODE_UNKNOWN",
+      status: 503,
+    };
+
+    /** A store that fails its first `failures` loads, then holds a saved Off. */
+    function offStoreFailing(failures: number) {
+      const durable = new Map([
+        ["0xabc", { answer: "off" as const, generation: 0, receivedAt: 1 }],
+      ]);
+      const saves: unknown[] = [];
+      let loads = 0;
+      const store: ModeRecordStore = {
+        load: async () => {
+          loads += 1;
+          if (loads <= failures) throw new Error("unreadable");
+          return durable;
+        },
+        save: async (_owner, record) => {
+          saves.push(record);
+        },
+      };
+      return { store, saves, loads: () => loads };
+    }
+
+    it("lets a later load of the saved Off restore legacy writes when only an Off and a failed read arrived", async () => {
+      // Startup load fails, the reload for the Off fails, the reload for the
+      // failed read succeeds. No save was attempted, so nothing was lost.
+      const { store, saves, loads } = offStoreFailing(2);
+      const authority = createModeAuthority({ store, onWarning: () => {} });
+      await authority.ready;
+      expect(
+        (await authority.submitEvidence({ owner: OWNER, state: "off" })).kind,
+      ).toBe("refuse");
+      expect(loads()).toBe(2);
+      expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
+        ok: false,
+        decision: { status: 503 },
+      });
+
+      expect(
+        await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+      ).toEqual({ kind: "legacy" });
+      expect(loads()).toBe(3);
+      expect(authority.legacyWriteDecision(OWNER)).toEqual({ kind: "legacy" });
+      expect(await authority.commitLegacy(OWNER, () => 2)).toEqual({
+        ok: true,
+        value: 2,
+      });
+      expect(saves).toEqual([]);
+    });
+
+    it("keeps refusing legacy writes after an On that was never applied, even once the saved Off loads", async () => {
+      const { store, saves } = offStoreFailing(2);
+      const authority = createModeAuthority({ store, onWarning: () => {} });
+      await authority.ready;
+      expect(
+        (await authority.submitEvidence({ owner: OWNER, state: "on" })).kind,
+      ).toBe("refuse");
+
+      // The saved Off loads; the On it may contradict was not applied.
+      expect(
+        await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+      ).toEqual(UNKNOWN);
+      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
+        ok: false,
+        decision: { status: 503 },
+      });
+      expect(saves).toEqual([]);
+
+      // A later Off that applies and is current is the Account's word again.
+      expect(
+        await authority.submitEvidence({ owner: OWNER, state: "off" }),
+      ).toEqual({ kind: "legacy" });
+      expect(await authority.commitLegacy(OWNER, () => 2)).toEqual({
+        ok: true,
+        value: 2,
+      });
+    });
+
+    it("does not let an Off that could not be judged lift the block an unapplied On left", async () => {
+      const { store } = offStoreFailing(3);
+      const authority = createModeAuthority({ store, onWarning: () => {} });
+      await authority.ready;
+      await authority.submitEvidence({ owner: OWNER, state: "on" });
+      await authority.submitEvidence({ owner: OWNER, state: "off" });
+      // The third load succeeds here, on a failed read: still blocked.
+      await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+    });
   });
 
   it("applyAnswer never lowers an On at the same generation", () => {
