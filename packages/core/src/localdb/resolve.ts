@@ -70,8 +70,29 @@ export interface LocalAliasTarget {
     now: string,
     fetched: readonly string[],
   ) =>
-    | { readonly ok: true; readonly payload: unknown }
+    | {
+        readonly ok: true;
+        readonly payload: unknown;
+        /** Rows the payload leaves out or serves short of detail. */
+        readonly diagnostics?: readonly AliasDiagnostic[];
+      }
     | { readonly ok: false; readonly error: { readonly kind: string } };
+}
+/**
+ * A projection's report on its own payload. Only `records_dropped` and
+ * `records_partial` make a read incomplete; the rest are carried unread.
+ */
+export interface AliasDiagnostic {
+  readonly kind: string;
+  readonly stream?: string;
+  readonly count?: number;
+  readonly reasons?: readonly string[];
+}
+/** What a refused-as-incomplete read names: one entry per affected stream. */
+export interface IncompleteAliasDiagnostic {
+  readonly stream: string;
+  readonly kind: "dropped" | "partial";
+  readonly detail: string;
 }
 export interface LocalAliasRecord {
   readonly stream: string;
@@ -413,6 +434,9 @@ export function createLocalResolver(
         return { kind: "too_large", bytes: projected.bytes };
       }
       if (projected.kind === "invalid_binding") return projected;
+      if (projected.kind === "incomplete") {
+        return { kind: "incomplete", diagnostics: projected.diagnostics };
+      }
       if (projected.kind === "no_data") return noData();
       payload = single(JSON.stringify(projected.payload));
     }

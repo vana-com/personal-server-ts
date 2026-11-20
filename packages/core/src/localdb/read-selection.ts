@@ -6,6 +6,8 @@ import type { SqlReader } from "./driver.js";
 import type { RecordQuery } from "./query.js";
 import type {
   AliasTargets,
+  AliasDiagnostic,
+  IncompleteAliasDiagnostic,
   LocalAliasRecord,
   LocalAliasTarget,
 } from "./resolve.js";
@@ -453,6 +455,10 @@ export async function projectAlias(
   | { readonly kind: "no_data" }
   | { readonly kind: "invalid_binding" }
   | { readonly kind: "too_large"; readonly bytes: number }
+  | {
+      readonly kind: "incomplete";
+      readonly diagnostics: readonly IncompleteAliasDiagnostic[];
+    }
 > {
   if (invalidAliasBinding(binding)) return { kind: "invalid_binding" };
   // Check all input heads, before reading even one record or creating a body.
@@ -488,7 +494,33 @@ export async function projectAlias(
   const projected = binding.project(records, now, fetched);
   if (!projected.ok && projected.error.kind === "invalid_binding")
     return { kind: "invalid_binding" };
-  return projected.ok
-    ? { kind: "ok", payload: projected.payload }
-    : { kind: "no_data" };
+  if (!projected.ok) return { kind: "no_data" };
+  // A payload that leaves rows out is not the data: refuse it, as the
+  // flag-off path does (`canonical_view_incomplete`), never serve it short.
+  const incomplete = incompleteDiagnostics(projected.diagnostics);
+  return incomplete.length > 0
+    ? { kind: "incomplete", diagnostics: incomplete }
+    : { kind: "ok", payload: projected.payload };
+}
+
+function incompleteDiagnostics(
+  diagnostics: readonly AliasDiagnostic[] | undefined,
+): IncompleteAliasDiagnostic[] {
+  return (diagnostics ?? []).flatMap((d) => {
+    const kind =
+      d.kind === "records_dropped"
+        ? "dropped"
+        : d.kind === "records_partial"
+          ? "partial"
+          : null;
+    return kind === null
+      ? []
+      : [
+          {
+            stream: d.stream ?? "",
+            kind,
+            detail: `${d.count ?? 0} rows: ${(d.reasons ?? []).join("; ")}`,
+          },
+        ];
+  });
 }

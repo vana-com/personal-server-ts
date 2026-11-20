@@ -3,6 +3,7 @@ import type {
   ControlState,
   StreamHeadView,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { IncompleteAliasDiagnostic } from "../localdb/resolve.js";
 import type {
   RefusedReason,
   DeferredReason,
@@ -157,6 +158,14 @@ export type ReadDecision =
   | { readonly kind: "invalid_cursor" }
   | { readonly kind: "invalid_connection" }
   | { readonly kind: "too_large"; readonly bytes: number }
+  /**
+   * The projection left rows out or served them short of detail. Nothing is
+   * served: the flag-off path refuses the same way.
+   */
+  | {
+      readonly kind: "incomplete";
+      readonly diagnostics: readonly IncompleteAliasDiagnostic[];
+    }
   /**
    * Imports or writer publications into the streams this read touched kept
    * changing under it. Nothing is wrong with the data: ask again.
