@@ -62,6 +62,17 @@ export function createLinkedRecordQuery(
         ? page
         : { records: [], nextCursor: null };
     },
+    async countRecords(input) {
+      const selected = await target(input.connectionId, input.stream);
+      if (!selected) return 0;
+      const total = await query.countRecords({
+        ...input,
+        connectionId: selected.id,
+      });
+      return (await valid(selected, input.connectionId, input.stream))
+        ? total
+        : 0;
+    },
     async getRecord(input) {
       const selected = await target(input.connectionId, input.stream);
       if (!selected) return null;

@@ -1209,7 +1209,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           requireRegisteredConnections,
           legacy: (plan) => Promise.resolve(legacyRecordList(context!, plan)),
         },
-        { url: c.req.url, stream, context: context! },
+        {
+          url: c.req.url,
+          stream,
+          context: context!,
+          prefer: c.req.header("prefer"),
+        },
       );
       const response = c.json(result.body, 200, {
         "Request-Id": reqId,

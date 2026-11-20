@@ -58,6 +58,11 @@ export interface RecordQuery {
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<RecordPage>;
+  /** How many records `listRecords` pages through for this connection and stream. */
+  countRecords(input: {
+    readonly connectionId: string;
+    readonly stream: string;
+  }): Promise<number>;
   getRecord(input: {
     readonly connectionId: string;
     readonly stream: string;
@@ -174,6 +179,14 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
         records: page.map(stored),
         nextCursor: more ? listCursor(last!.record_key, last!.pk_hash) : null,
       };
+    },
+
+    async countRecords({ connectionId, stream }) {
+      const [row] = await db.query<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM records WHERE connection_id = ? AND stream = ?",
+        [connectionId, stream],
+      );
+      return Number(row?.total ?? 0);
     },
 
     async getRecord({ connectionId, stream, recordKey }) {

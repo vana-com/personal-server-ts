@@ -25,7 +25,7 @@ import type {
   StreamDeclaration,
   StreamDeclarationRegistry,
 } from "../storage/pdpp-records/stream-declaration.js";
-import { parseRecordQuery } from "./pdpp-record-query.js";
+import { parseRecordQuery, requestedCountGrade } from "./pdpp-record-query.js";
 
 export interface LocalRecord {
   readonly instance: string;
@@ -393,6 +393,8 @@ export async function listPdppRecords(
     readonly url: string;
     readonly stream: string;
     readonly context: PdppTokenContext;
+    /** The request's `Prefer` header, where it may ask for a `count`. */
+    readonly prefer?: string | null;
   },
 ): Promise<RecordListResult> {
   const { context, stream } = input;
@@ -424,11 +426,32 @@ export async function listPdppRecords(
   }
 
   const candidate = grantIsCandidate(context.grant);
-  const warnings = query.clamped
-    ? { warnings: [{ code: "limit_clamped", message: "limit clamped to 100" }] }
-    : undefined;
+  const warnings: { code: string; message: string; param?: string }[] = [];
+  if (query.clamped)
+    warnings.push({ code: "limit_clamped", message: "limit clamped to 100" });
 
   if (localQuery) {
+    // A count is the whole stream across the read's connections, never the
+    // page. Only the owner's plain listing has that one filter to count over;
+    // a grant's visibility and a change feed have no such total.
+    let count: { kind: "exact"; value: number } | undefined;
+    if (requestedCountGrade(input.prefer) !== "none") {
+      if (owner && query.changesSince === undefined) {
+        let value = 0;
+        for (const instance of new Set(instanceIds))
+          value += await localQuery.countRecords({
+            connectionId: instance,
+            stream,
+          });
+        count = { kind: "exact", value };
+      } else {
+        warnings.push({
+          code: "count_downgraded",
+          message: "No exact count is available for this read",
+          param: "count",
+        });
+      }
+    }
     const page = await localRecordPage(
       localQuery,
       stream,
@@ -452,7 +475,12 @@ export async function listPdppRecords(
         data: page.data.map((row) =>
           localRecordJson(stream, row, scope.fields, candidate),
         ),
-        ...(warnings && { meta: warnings }),
+        ...((count || warnings.length > 0) && {
+          meta: {
+            ...(count && { count }),
+            ...(warnings.length > 0 && { warnings }),
+          },
+        }),
       },
     };
   }

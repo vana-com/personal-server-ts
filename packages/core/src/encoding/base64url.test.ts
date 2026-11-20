@@ -142,6 +142,7 @@ describe("portable base64url", () => {
         ],
         nextCursor: null,
       }),
+      countRecords: vi.fn(),
       getRecord: vi.fn(),
       changesSince: vi.fn(),
       streamRecords: vi.fn(),
