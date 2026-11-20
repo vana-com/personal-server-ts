@@ -104,8 +104,9 @@ async function purgeDeleted(deps: LocalSyncDeps, row: ConnectionRow) {
                  WHERE r.connection_id = ?)
       OR EXISTS (SELECT 1 FROM blob_refs WHERE connection_id = ?)
       OR EXISTS (SELECT 1 FROM connections
-                 WHERE connection_id = ? AND checkpoint IS NOT NULL)`,
-    Array(4).fill(row.connectionId),
+                 WHERE connection_id = ? AND checkpoint IS NOT NULL)
+      OR EXISTS (SELECT 1 FROM connection_participation WHERE connection_id = ?)`,
+    Array(5).fill(row.connectionId),
   );
   if (present.length > 0) {
     await purgeConnection(deps, row.connectionId, {
@@ -123,7 +124,8 @@ export type OwnerRows = readonly {
 /**
  * C.0 step 1: list the registry's control rows and upsert one `connections`
  * row per control scope (classification is `classifyControl`). A deleted
- * control row whose connection still has rows runs the local purge (F.5).
+ * control row whose connection still has rows, a checkpoint or this device's
+ * participation row runs the local purge (F.5).
  * Returns the connections now known. Spec: C.0.
  */
 export async function bootstrapConnections(

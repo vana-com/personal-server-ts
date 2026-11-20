@@ -190,6 +190,39 @@ describe("local database bootstrap", () => {
     expect(registry.listControlRows).toHaveBeenCalledTimes(3);
   });
 
+  it("purges a remote delete for a device that joined and collected nothing, so a later lifetime is not read as joined", async () => {
+    const control = await controlHashes(
+      streamSyncHashes.keccak256,
+      "0707070707070707",
+    );
+    const registry = registryWith({
+      found: true,
+      version: 4,
+      deleted: false,
+      dataHash: control.tombstoneData,
+      metadataHash: control.tombstoneMetadata,
+    });
+    const db = await fresh();
+    // Joined, then stopped before the first batch: only the participation row.
+    await db.batch([
+      {
+        sql: "INSERT INTO connections (connection_id, connector, ns) VALUES (?, ?, '')",
+        params: [scope, connector],
+      },
+      {
+        sql: "INSERT INTO connection_participation(connection_id, joined_at) VALUES (?, 1)",
+        params: [scope],
+      },
+    ]);
+    await bootstrapConnections(deps(db, registry));
+    expect(purgeConnection).toHaveBeenCalledTimes(1);
+    expect(purgeConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ db }),
+      scope,
+      { controlVersion: 4 },
+    );
+  });
+
   it("uses the cached control when begin is offline and leaves a fresh run generation-unbound", async () => {
     const control = await controlHashes(
       streamSyncHashes.keccak256,

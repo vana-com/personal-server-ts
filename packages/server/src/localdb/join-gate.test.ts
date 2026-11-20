@@ -174,4 +174,29 @@ describe("begin join gate", () => {
       code: "join_required",
     });
   });
+
+  it("asks a device that joined but stopped before its first batch when the connection was deleted and recreated elsewhere", async () => {
+    // d1 created the connection but published no data yet.
+    const w = await world({ streams: 1 });
+    const d1 = await w.device("d1");
+    await d1.begin("r1");
+    await d1.cycle();
+    const d2 = await w.device("d2");
+    // Join, then stop: a participation row, but no records, run rows, blob
+    // refs or checkpoint for the purge to find.
+    await d2.begin("r2", { join: true });
+    for (const table of ["records", "run_rows", "blob_refs"])
+      expect(await count(d2, table)).toBe(0);
+    expect(await count(d2, "connection_participation")).toBe(1);
+    await d1.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await d1.sync.deleter.resumeDeletes();
+    await d2.cycle(); // sees the deletion
+    expect(await count(d2, "connection_participation")).toBe(0);
+    await d1.run("r3", [{ stream: "s0", id: "c" }], { connect: true });
+    await d1.cycle();
+    await d2.cycle(); // sees the new lifetime
+    await expect(d2.sync.intake.begin("r4", request())).rejects.toMatchObject({
+      code: "join_required",
+    });
+  });
 });
