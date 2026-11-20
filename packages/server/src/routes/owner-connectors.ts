@@ -2,6 +2,7 @@
  * Owner connector routes (stream sync):
  *
  *   DELETE /v1/owner/connectors/:connectorId   delete one source's data
+ *   GET    /v1/owner/connectors/:connectorId   the lifetime a delete of it would end
  *
  * Only the owner may call it. The behaviour is `handleOwnerConnectorDelete`
  * in core, which the Lite runtime also answers, so both hosts share one rule.
@@ -10,6 +11,7 @@
 import { Hono } from "hono";
 import {
   handleOwnerConnectorDelete,
+  handleOwnerConnectorLifetime,
   ownerConnectorRefusal,
   type ConnectionDeletePort,
   type StorageModeRead,
@@ -57,16 +59,28 @@ export function ownerConnectorsRoutes(deps: OwnerConnectorsRouteDeps): Hono {
     tokenStore: deps.tokenStore,
   });
 
+  const handlerDeps = {
+    authorizeOwner: async (request: Request) => {
+      await auth.authorizeOwner(request);
+      deps.assertAdmitting?.();
+    },
+    mode: deps.mode,
+    owner: deps.serverOwner,
+    connectionDelete: deps.connectionDelete,
+  };
   app.delete("/:connectorId", (c) =>
-    handleOwnerConnectorDelete(c.req.raw, decodeSegment(c.req.raw), {
-      authorizeOwner: async (request) => {
-        await auth.authorizeOwner(request);
-        deps.assertAdmitting?.();
-      },
-      mode: deps.mode,
-      owner: deps.serverOwner,
-      connectionDelete: deps.connectionDelete,
-    }),
+    handleOwnerConnectorDelete(
+      c.req.raw,
+      decodeSegment(c.req.raw),
+      handlerDeps,
+    ),
+  );
+  app.get("/:connectorId", (c) =>
+    handleOwnerConnectorLifetime(
+      c.req.raw,
+      decodeSegment(c.req.raw),
+      handlerDeps,
+    ),
   );
   // Any other method: the owner learns it is not allowed; a stranger learns
   // nothing (the same order as the Lite runtime).

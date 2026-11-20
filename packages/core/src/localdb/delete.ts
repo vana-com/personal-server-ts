@@ -24,6 +24,16 @@ import { RegistryRefusedError } from "../stream-sync/ports.js";
 import { commitFences } from "./delete-batch.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { purgeConnection } from "./purge.js";
+import {
+  ConnectionLifetimeChanged,
+  formatLifetime,
+  holdsLifetime,
+  parseLifetime,
+} from "./delete-lifetime.js";
+export {
+  ConnectionLifetimeChanged,
+  InvalidConnectionLifetime,
+} from "./delete-lifetime.js";
 
 export class ConnectionStoppedError extends Error {
   constructor(readonly connector: string) {
@@ -71,7 +81,18 @@ export interface ConnectionDeleteRequest {
   readonly fenced: boolean;
 }
 export interface ConnectionDeleter {
-  requestConnectionDelete(connector: string): Promise<ConnectionDeleteRequest>;
+  /**
+   * `lifetime` is what `readConnectionLifetime` answered when the person chose
+   * to delete: the delete then ends that connection and no other. A connection
+   * made since refuses it (`ConnectionLifetimeChanged`), and one this delete
+   * already ended is done. Absent: the delete ends whatever is connected now.
+   */
+  requestConnectionDelete(
+    connector: string,
+    options?: { readonly lifetime?: string },
+  ): Promise<ConnectionDeleteRequest>;
+  /** The lifetime the connector's live control rows hold now (see `delete-lifetime.ts`). */
+  readConnectionLifetime(connector: string): Promise<string>;
   resumeDeletes(): Promise<readonly PendingDelete[]>;
 }
 /** One running landing: when its fences ended, and when all of it did. */
@@ -219,6 +240,7 @@ export function createConnectionDeleter(
   async function plan(connector: string): Promise<{
     intent: DeleteIntent;
     listing: Map<string, ControlRead>;
+    ended: Map<string, number>;
   }> {
     const [hashes, entries] = await Promise.all([
       hashesOf(),
@@ -230,12 +252,15 @@ export function createConnectionDeleter(
     ]);
     const pins: { ns: string; version: number }[] = [];
     const listing = new Map<string, ControlRead>();
+    // The control rows already tombstoned, by namespace: the end of a lifetime.
+    const ended = new Map<string, number>();
     for (const entry of entries) {
       const parsed = parseScope(entry.scope);
       if (parsed?.kind !== "control" || parsed.connector !== connector)
         continue;
       const current = classifyControl(entry.read, hashes);
       listing.set(entry.scope, { ...entry.read });
+      if (current.kind === "deleted") ended.set(parsed.ns, current.version);
       // A control row of another key ends the same way: its tombstone is the
       // same for every key.
       if (current.kind === "active" || current.kind === "foreign")
@@ -245,7 +270,13 @@ export function createConnectionDeleter(
             current.kind === "active" ? current.generation : current.version,
         });
     }
-    return { intent: { id: deps.newOp(), pins }, listing };
+    return { intent: { id: deps.newOp(), pins }, listing, ended };
+  }
+  async function readConnectionLifetime(connector: string): Promise<string> {
+    stop.signal.throwIfAborted();
+    controlScope(connector, "");
+    const { intent } = await plan(connector);
+    return formatLifetime(new Map(intent.pins.map((p) => [p.ns, p.version])));
   }
   function samePlan(a: DeleteIntent, b: DeleteIntent) {
     return (
@@ -559,9 +590,15 @@ export function createConnectionDeleter(
       return { connector, why: error instanceof Error ? error.name : "Error" };
     }
   }
-  async function requestConnectionDelete(connector: string) {
+  async function requestConnectionDelete(
+    connector: string,
+    request: { readonly lifetime?: string } = {},
+  ) {
     stop.signal.throwIfAborted();
     controlScope(connector, "");
+    // A token this server did not write is refused before anything is planned.
+    const named =
+      request.lifetime === undefined ? null : parseLifetime(request.lifetime);
     const intent = await deps.queue.run(
       `delete:${connector}`,
       "purge",
@@ -570,6 +607,18 @@ export function createConnectionDeleter(
           planned: Awaited<ReturnType<typeof plan>>,
           held: ReadonlySet<string>,
         ) => {
+          // The connection the person deleted, not whatever is connected now:
+          // checked on the plan this delete would act on, before it saves or
+          // purges anything.
+          if (
+            named &&
+            !holdsLifetime(
+              named,
+              new Map(planned.intent.pins.map((p) => [p.ns, p.version])),
+              planned.ended,
+            )
+          )
+            throw new ConnectionLifetimeChanged(connector);
           const open = await readIntent(connector);
           const empty = planned.intent.pins.length === 0;
           if (open && (empty || samePlan(open, planned.intent))) return open;
@@ -624,8 +673,11 @@ export function createConnectionDeleter(
     };
   }
   return {
-    requestConnectionDelete(connector: string) {
-      const request = requestConnectionDelete(connector);
+    requestConnectionDelete(
+      connector: string,
+      lifetime?: { readonly lifetime?: string },
+    ) {
+      const request = requestConnectionDelete(connector, lifetime);
       requests.add(request);
       void request.then(
         () => requests.delete(request),
@@ -633,6 +685,7 @@ export function createConnectionDeleter(
       );
       return request;
     },
+    readConnectionLifetime,
     async resumeDeletes() {
       const rows = await deps.db.query<{ connector: string }>(
         "SELECT connector FROM delete_intents ORDER BY connector",

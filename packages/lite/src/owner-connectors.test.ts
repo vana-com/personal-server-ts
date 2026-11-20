@@ -28,6 +28,7 @@ async function runtimeWith(opts: {
     requestConnectionDelete: (
       c: string,
     ) => Promise<{ deleteId: string; fenced: boolean }>;
+    readConnectionLifetime?: (c: string) => Promise<string>;
   } | null;
 }) {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
@@ -59,6 +60,7 @@ async function runtimeWith(opts: {
               deleteId: `delete-${c}`,
               fenced: true,
             }),
+            readConnectionLifetime: async (c) => `v1:@${c.length}`,
           }
         : opts.connectionDelete,
   });
@@ -175,12 +177,29 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
     expect(response.status).toBeLessThanOrEqual(403);
   });
 
-  it("answers a wrong method only to the owner (mutant: PRE_AUTH_REFUSAL)", async () => {
+  it("answers the lifetime a connector holds to the owner on GET (mutant: LIFETIME_BEFORE_AUTH)", async () => {
     const runtime = await runtimeWith({ switched: true });
     const request = (headers: Record<string, string>) =>
       runtime.fetch(
         new Request("http://localhost/v1/owner/connectors/github", {
           method: "GET",
+          headers,
+        }),
+      );
+    const stranger = await request({});
+    expect(stranger.status).toBeGreaterThanOrEqual(401);
+    expect(stranger.status).toBeLessThanOrEqual(403);
+    const owner = await request(ownerAuth);
+    expect(owner.status).toBe(200);
+    expect(await owner.json()).toEqual({ lifetime: "v1:@6" });
+  });
+
+  it("answers a wrong method only to the owner (mutant: PRE_AUTH_REFUSAL)", async () => {
+    const runtime = await runtimeWith({ switched: true });
+    const request = (headers: Record<string, string>) =>
+      runtime.fetch(
+        new Request("http://localhost/v1/owner/connectors/github", {
+          method: "PATCH",
           headers,
         }),
       );
@@ -223,7 +242,7 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
           await runtimeWith({ switched: true })
         ).fetch(
           new Request("http://localhost/v1/owner/connectors/github", {
-            method: "GET",
+            method: "PATCH",
             headers: ownerAuth,
           }),
         ),

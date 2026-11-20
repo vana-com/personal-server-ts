@@ -301,8 +301,13 @@ export function createLocalSync(
     return rows;
   };
   const deleter: ConnectionDeleter = {
-    async requestConnectionDelete(connector) {
-      const result = await deletes().requestConnectionDelete(connector);
+    readConnectionLifetime: (connector) =>
+      deletes().readConnectionLifetime(connector),
+    async requestConnectionDelete(connector, request) {
+      const result = await deletes().requestConnectionDelete(
+        connector,
+        request,
+      );
       // Its landing runs in the background; check back whether it landed.
       armRetry();
       return result;
