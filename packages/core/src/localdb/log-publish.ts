@@ -2368,14 +2368,23 @@ async function candidateAcknowledgements(
           runIds: p.runIds,
         })),
       );
-    // The cursor this segment carried is published; a newer one a run end
-    // saved since (it changed the basis, so not before this commit) stays.
+    // The cursor this segment carried is published, and is the log's cursor
+    // for the stream: this device's entry takes it, as if it applied its own
+    // segment. A newer one a run end saved since (it changed the basis, so not
+    // before this commit) stays, and so does the entry that run wrote.
     if (p.included && p.cursor !== null)
-      statements.push({
-        sql: `UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL
-               WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
-        params: [connectionId, p.stream, p.cursor],
-      });
+      statements.push(
+        {
+          sql: `UPDATE stream_state SET cursor_applied = cursor_unpublished
+                 WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
+          params: [connectionId, p.stream, p.cursor],
+        },
+        {
+          sql: `UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL
+                 WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
+          params: [connectionId, p.stream, p.cursor],
+        },
+      );
     if (p.included || !p.rest)
       statements.push(
         {

@@ -70,7 +70,7 @@ const dropRawEndSchema = [
   { sql: "ALTER TABLE runs DROP COLUMN raw_end" },
   // The stream cursor on its way into the log came after.
   { sql: "DROP TRIGGER IF EXISTS connections_checkpoint_cleared" },
-  ...["unpublished", "seq", "children", "version"].map((column) => ({
+  ...["unpublished", "seq", "children", "version", "applied"].map((column) => ({
     sql: `ALTER TABLE stream_state DROP COLUMN cursor_${column}`,
   })),
 ];

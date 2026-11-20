@@ -659,16 +659,21 @@ END`,
     //     travels only in a segment that closes them too.
     //   cursor_version: the connector version that wrote the stream's local
     //     checkpoint entry, here or on the device whose segment set it.
+    //   cursor_applied: the cursor of the last segment applied (or published
+    //     here) that carried one, as {state, connectorVersion}, until it is
+    //     folded into `connections.checkpoint` (cursor.ts). It is written in
+    //     the batch of the rows it covers; the fold is a JSON merge, done in JS.
     `ALTER TABLE stream_state ADD COLUMN cursor_unpublished TEXT`,
     `ALTER TABLE stream_state ADD COLUMN cursor_seq INTEGER`,
     `ALTER TABLE stream_state ADD COLUMN cursor_children TEXT`,
     `ALTER TABLE stream_state ADD COLUMN cursor_version TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_applied TEXT`,
     // Every path that drops the local checkpoint (a discarded or fenced run, a
     // purge, a deleted connection) drops the cursors with it, so none of them
     // can publish a cursor the device no longer resumes from.
     `CREATE TRIGGER connections_checkpoint_cleared AFTER UPDATE OF checkpoint ON connections
 WHEN NEW.checkpoint IS NULL BEGIN
-  UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL, cursor_version = NULL
+  UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL, cursor_version = NULL, cursor_applied = NULL
   WHERE connection_id = NEW.connection_id;
 END`,
   ],

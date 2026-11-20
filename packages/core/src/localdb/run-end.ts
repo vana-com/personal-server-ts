@@ -29,7 +29,7 @@ import {
   tombstoneRunDeletes,
 } from "./admit.js";
 import type { SqlStatement } from "./driver.js";
-import { cursorSaved, stateDescendants } from "./cursor.js";
+import { cursorSaved, foldAppliedCursors, stateDescendants } from "./cursor.js";
 import { checkRunFence } from "./fence.js";
 import { planInputs } from "./plan-inputs.js";
 import { deleteRunRecords, mergeIncoming, withOrigin } from "./merge.js";
@@ -333,6 +333,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           ]);
           return fenced;
         }
+        // A cursor applied during the run is the entry this run's own merges onto.
+        await foldAppliedCursors(db, run.connection_id);
         const [connection] = await db.query<{
           connector: string;
           generation: number;

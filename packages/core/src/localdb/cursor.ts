@@ -1,10 +1,16 @@
 /**
- * A stream's connector cursor on its way into the log (see the
+ * A stream's connector cursor on its way into and out of the log (see the
  * `stream_state.cursor_*` migration in schema.ts). A run end saves it as
  * unpublished; the publisher carries it in the segment that closes the rows
- * it covers; a path that drops the run's rows drops it.
+ * it covers; a path that drops the run's rows drops it. A device that applies
+ * the segment takes the cursor with its rows.
  */
-import type { SqlStatement } from "./driver.js";
+import {
+  isPlainObject,
+  type JsonValue,
+  type LogCursor,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+import type { SqlDriver, SqlStatement } from "./driver.js";
 
 /**
  * A checkpoint entry a run end wrote waits to travel in the log. It runs
@@ -76,4 +82,129 @@ export function dropUnpublishedCursors(connectionId: string): SqlStatement {
     sql: "UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL WHERE connection_id = ?",
     params: [connectionId],
   };
+}
+
+/**
+ * A segment that carried `cursor` for `stream` is applied (or was published by
+ * this device): written in the batch of the rows the cursor covers. The
+ * stream's checkpoint entry takes it at the next fold.
+ */
+export function cursorApplied(
+  connectionId: string,
+  stream: string,
+  cursor: LogCursor,
+): SqlStatement {
+  return {
+    sql: "UPDATE stream_state SET cursor_applied = ? WHERE connection_id = ? AND stream = ?",
+    params: [JSON.stringify(cursor), connectionId, stream],
+  };
+}
+
+/**
+ * Move the applied cursors into `connections.checkpoint`, each as its stream's
+ * entry, whatever the entry held: the device holds the rows the log's cursor
+ * covers. Run before every read of the checkpoint. The write is conditional
+ * on the checkpoint it read; a fold that loses that race leaves the cursors
+ * staged for the next one, and the reader resumes from what the checkpoint
+ * held, which reads more, never less.
+ */
+export async function foldAppliedCursors(
+  db: SqlDriver,
+  connectionId: string,
+): Promise<void> {
+  const applied = await db.query<{ stream: string; cursor_applied: string }>(
+    "SELECT stream, cursor_applied FROM stream_state WHERE connection_id = ? AND cursor_applied IS NOT NULL",
+    [connectionId],
+  );
+  if (applied.length === 0) return;
+  const [connection] = await db.query<{ checkpoint: string | null }>(
+    "SELECT checkpoint FROM connections WHERE connection_id = ?",
+    [connectionId],
+  );
+  if (!connection) return;
+  const stored: unknown =
+    connection.checkpoint === null ? null : JSON.parse(connection.checkpoint);
+  const next: Record<string, JsonValue> = isPlainObject(stored)
+    ? { ...(stored as Record<string, JsonValue>) }
+    : {};
+  const cursors = applied.map((row) => ({
+    ...row,
+    cursor: JSON.parse(row.cursor_applied) as LogCursor,
+  }));
+  for (const { stream, cursor } of cursors) next[stream] = cursor.state;
+  const checkpoint = JSON.stringify(next);
+  await db.batch([
+    {
+      sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ? AND checkpoint IS ?",
+      params: [checkpoint, connectionId, connection.checkpoint],
+    },
+    ...cursors.map(({ stream, cursor_applied, cursor }) => ({
+      sql: `UPDATE stream_state SET cursor_version = ?, cursor_applied = NULL
+             WHERE connection_id = ? AND stream = ? AND cursor_applied = ?
+               AND (SELECT checkpoint FROM connections WHERE connection_id = ?) = ?`,
+      params: [
+        cursor.connectorVersion,
+        connectionId,
+        stream,
+        cursor_applied,
+        connectionId,
+        checkpoint,
+      ],
+    })),
+  ]);
+}
+
+/**
+ * After a rebase queues again the rows that only the lost segments held: each
+ * stream whose lost segments carried a cursor queues its checkpoint entry
+ * again, and every cursor waiting to publish waits for the queued rows. The
+ * device does not know which streams a re-queued cursor reads through, so it
+ * waits for every other stream of the connection to close.
+ */
+export async function cursorsRequeued(
+  db: SqlDriver,
+  connectionId: string,
+  carried: readonly string[],
+): Promise<SqlStatement[]> {
+  const statements: SqlStatement[] = [];
+  const [connection] = await db.query<{ checkpoint: string | null }>(
+    "SELECT checkpoint FROM connections WHERE connection_id = ?",
+    [connectionId],
+  );
+  const stored: unknown =
+    connection?.checkpoint == null ? null : JSON.parse(connection.checkpoint);
+  if (carried.length > 0 && isPlainObject(stored)) {
+    const rows = await db.query<{
+      stream: string;
+      cursor_version: string | null;
+    }>(
+      "SELECT stream, cursor_version FROM stream_state WHERE connection_id = ?",
+      [connectionId],
+    );
+    for (const stream of carried) {
+      const state = (stored as Record<string, JsonValue>)[stream];
+      const version = rows.find((r) => r.stream === stream)?.cursor_version;
+      if (state === undefined || version == null) continue;
+      statements.push({
+        sql: `UPDATE stream_state SET cursor_unpublished = ?, cursor_children = ?
+               WHERE connection_id = ? AND stream = ? AND cursor_unpublished IS NULL`,
+        params: [
+          JSON.stringify({ state, connectorVersion: version }),
+          JSON.stringify(
+            rows.map((r) => r.stream).filter((other) => other !== stream),
+          ),
+          connectionId,
+          stream,
+        ],
+      });
+    }
+  }
+  statements.push({
+    sql: `UPDATE stream_state SET cursor_seq = (
+            SELECT COALESCE(MAX(seq), 0) FROM record_changes c
+             WHERE c.connection_id = stream_state.connection_id AND c.stream = stream_state.stream)
+           WHERE connection_id = ? AND cursor_unpublished IS NOT NULL`,
+    params: [connectionId],
+  });
+  return statements;
 }

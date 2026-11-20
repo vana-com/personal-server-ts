@@ -33,6 +33,7 @@ import {
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
+import { foldAppliedCursors } from "./cursor.js";
 import type { ConnectionRow } from "./deps.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
@@ -405,6 +406,8 @@ export function createRunIntakeStore(
           )
             throw new RunIntakeError("join_required");
         }
+        // The cursors of the segments just applied are the stream's entries.
+        await foldAppliedCursors(db, id);
         const [cached] = await db.query<{
           checkpoint: string | null;
           needs_full: number;

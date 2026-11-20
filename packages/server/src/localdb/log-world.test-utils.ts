@@ -239,6 +239,33 @@ export async function world(options: {
         })),
       }),
     });
+    /** A run's begin: the mode and state the connector starts from. */
+    const begin = (
+      runId: string,
+      opts: {
+        full?: boolean;
+        observedAt?: number;
+        connect?: boolean;
+        connector?: string;
+        version?: string;
+        join?: boolean;
+      } = {},
+    ) => {
+      clock++;
+      const connector = opts.connector ?? CONNECTOR;
+      return sync.intake.begin(runId, {
+        connector,
+        artifactDigest:
+          opts.version === undefined
+            ? connector
+            : `${connector}@${opts.version}`,
+        wantFull: opts.full ?? true,
+        ...(opts.connect ? { connect: true } : {}),
+        ...(opts.join === false ? {} : { join: true as const }),
+        observedAt: opts.observedAt,
+        owner: { address: OWNER, leaseId: null },
+      });
+    };
     /** One run that writes `records` and ends covering `covered`. */
     const run = async (
       runId: string,
@@ -273,22 +300,11 @@ export async function world(options: {
         join?: boolean;
         /** The connector cursor the run ends with, per stream. */
         checkpoints?: Readonly<Record<string, JsonValue>>;
+        /** What happens on the device while the run collects, before it ends. */
+        during?: () => Promise<unknown>;
       } = {},
     ) => {
-      clock++;
-      const connector = opts.connector ?? CONNECTOR;
-      await sync.intake.begin(runId, {
-        connector,
-        artifactDigest:
-          opts.version === undefined
-            ? connector
-            : `${connector}@${opts.version}`,
-        wantFull: opts.full ?? true,
-        ...(opts.connect ? { connect: true } : {}),
-        ...(opts.join === false ? {} : { join: true as const }),
-        observedAt: opts.observedAt,
-        owner: { address: OWNER, leaseId: null },
-      });
+      await begin(runId, opts);
       await sync.intake.batch(runId, {
         batch: 0,
         records: records.map(({ stream, id, v, pad, blobId, remove }) => ({
@@ -309,6 +325,7 @@ export async function world(options: {
           mimeType: "application/octet-stream",
           bytes: opts.blob.bytes,
         });
+      await opts.during?.();
       const selected = opts.selected ?? names;
       const covered = opts.covered ?? selected;
       await sync.intake.end(
@@ -362,7 +379,19 @@ export async function world(options: {
           [CONNECTION_ID],
         )
       )[0]?.position ?? 0;
-    return { db, deps, sync, run, cycle, records, rows, position, puts, gets };
+    return {
+      db,
+      deps,
+      sync,
+      begin,
+      run,
+      cycle,
+      records,
+      rows,
+      position,
+      puts,
+      gets,
+    };
   }
 
   /** The decoded segments in the blob store, by position. */
