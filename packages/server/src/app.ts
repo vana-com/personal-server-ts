@@ -13,7 +13,10 @@ import {
   type StreamSyncSeedRouteDeps,
 } from "./routes/stream-sync-seed.js";
 import { streamSyncRunsRoutes } from "./routes/stream-sync-runs.js";
-import { streamSyncReadStatusRoutes } from "./routes/stream-sync-read-status.js";
+import {
+  streamSyncReadStatusRoutes,
+  type StreamSyncReadStatusRouteDeps,
+} from "./routes/stream-sync-read-status.js";
 import { ownerConnectorsRoutes } from "./routes/owner-connectors.js";
 import { accountModeRoutes } from "./routes/account-mode.js";
 import { randomUUID } from "node:crypto";
@@ -180,6 +183,8 @@ export interface AppDeps {
   syncManager?: SyncManager | null;
   /** Desktop seed intake (§2.9); Account mode gates the host database capability. */
   streamSyncSeed?: StreamSyncSeedRouteDeps["streamSyncSeed"];
+  /** Last finished legacy store import report, for `read-status?audit=1`. */
+  legacyStoreImport?: StreamSyncReadStatusRouteDeps["legacyStoreImport"];
   /** Run intake (V2 §2); absent when stream sync writing is off. */
   streamSyncIntake?: RunIntake;
   localSync?: () => Promise<LocalSync>;
@@ -743,6 +748,7 @@ export function createApp(deps: AppDeps): Hono {
       streamSyncRead,
       localSync,
       accountStorageMode,
+      legacyStoreImport: deps.legacyStoreImport,
     }),
   );
 

@@ -339,8 +339,8 @@ export function createLocalSync(
     }),
     listing: {
       ...listing,
-      async status() {
-        return { ...(await listing.status()), accountHydrated };
+      async status(options) {
+        return { ...(await listing.status(options)), accountHydrated };
       },
     },
     query,

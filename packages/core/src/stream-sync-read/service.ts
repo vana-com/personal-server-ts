@@ -218,6 +218,14 @@ export interface StreamSyncConnectionStatus {
       StreamHeadView & {
         readonly version: number | null;
         readonly records: number | null;
+        /**
+         * Present only when the status was asked for with `audit`. SHA-256
+         * over the stream's live `(pk_hash, body_sha256)` pairs in `pk_hash`
+         * order: equal on two devices that hold the same live records, in
+         * whatever order they arrived. `null` unless the head is live and
+         * complete (a stream still loading holds a subset by design).
+         */
+        readonly digest?: string | null;
         /** Set while a first load serves its applied parts; owner diagnostics. */
         readonly partial?: PartialView & { readonly version: number };
       }
@@ -231,6 +239,16 @@ export interface StreamSyncReadStatus {
   readonly listed: boolean;
   readonly connections: readonly StreamSyncConnectionStatus[];
   readonly issues: readonly ImportIssue[];
+  /**
+   * Present only when the status was asked for with `audit`. The seed imports
+   * this database refused for good, from its import ledger: one entry per
+   * reason, counting the streams (`seed_window_closed`: a real write already
+   * owned the stream, so the old data was skipped). Durable across restarts.
+   */
+  readonly importExclusions?: readonly {
+    readonly reason: string;
+    readonly streams: number;
+  }[];
 }
 
 /**
@@ -246,6 +264,8 @@ export function liveStreamCounts(status: StreamSyncReadStatus): {
   readonly ns: string;
   readonly stream: string;
   readonly records: number | null;
+  /** Only for an audited status; see `StreamSyncConnectionStatus`. */
+  readonly digest?: string | null;
 }[] {
   return status.connections.flatMap((connection) =>
     Object.entries(connection.streams).map(([stream, head]) => ({
@@ -253,6 +273,7 @@ export function liveStreamCounts(status: StreamSyncReadStatus): {
       ns: connection.ns,
       stream,
       records: head.live ? head.records : null,
+      ...(head.digest === undefined ? {} : { digest: head.digest }),
     })),
   );
 }

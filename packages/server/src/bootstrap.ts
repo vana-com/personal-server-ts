@@ -12,7 +12,10 @@ import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api
 import { accountStorageModeOf } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import { createServerLocalSync } from "./localdb/sync.js";
 import { createKeepAliveFetch } from "./outbound-fetch.js";
-import { createLegacyStoreRunner } from "./localdb/legacy-store-import.js";
+import {
+  createLegacyStoreRunner,
+  type LegacyStoreRunner,
+} from "./localdb/legacy-store-import.js";
 import { createLocalSeed } from "./localdb/seed.js";
 import { createSeedStaging } from "./stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
@@ -1617,27 +1620,29 @@ async function bootstrapServer(
   // The server's own legacy store is a one-time seed for a switched owner.
   // The waker runs the import, then the retirement, when the Account answers
   // On and once at boot for an owner already switched. No host supplies a port.
+  let legacyStoreRunner: LegacyStoreRunner | undefined;
   if (localSyncSource && serverOwner) {
+    legacyStoreRunner = createLegacyStoreRunner({
+      db,
+      root: storageRoot,
+      dataDir,
+      owner: serverOwner,
+      network: streamSyncNetwork(config.gateway),
+      legacyWriteSeal,
+      getDeps: async () => {
+        await localSyncSource();
+        return localSyncDeps!;
+      },
+      declarations: () => pdppAuth?.retainedDeclarations ?? [],
+      methods: () => pdppAuth?.configuredMethods ?? [],
+      manifests: () => pdppAuth?.retainedManifests ?? [],
+      streamSync: () => config.streamSync,
+      logger,
+    });
     importWaker = createImportWaker({
       authority: accountModeAuthority,
       owner: serverOwner,
-      importer: createLegacyStoreRunner({
-        db,
-        root: storageRoot,
-        dataDir,
-        owner: serverOwner,
-        network: streamSyncNetwork(config.gateway),
-        legacyWriteSeal,
-        getDeps: async () => {
-          await localSyncSource();
-          return localSyncDeps!;
-        },
-        declarations: () => pdppAuth?.retainedDeclarations ?? [],
-        methods: () => pdppAuth?.configuredMethods ?? [],
-        manifests: () => pdppAuth?.retainedManifests ?? [],
-        streamSync: () => config.streamSync,
-        logger,
-      }),
+      importer: legacyStoreRunner,
       onWarning: (message, detail) => logger.warn({ detail }, message),
     });
   }
@@ -1794,6 +1799,7 @@ async function bootstrapServer(
     configPath,
     syncManager,
     streamSyncSeed,
+    legacyStoreImport: () => legacyStoreRunner?.report() ?? null,
     streamSyncIntake,
     streamSyncConnectionDelete: localSyncSource
       ? {

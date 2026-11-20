@@ -18,6 +18,8 @@ export interface ImportSource {
   readonly target: ImportTarget;
   /** Exclusions are counted and not imported; they never delay removal. */
   readonly exclusions: readonly { reason: string; rows: number }[];
+  /** Rows the source inventory counted for this stream; diagnostic, not proof. */
+  readonly rows?: number;
   /** Replayable data objects, NOT PDPP envelopes. Use computeRecordKeyFromData
    * (storage/pdpp-records) for record_key, stream-sync pkHash for typed pk_hash,
    * and SHA-256(UTF-8 canonicalJson(record)) for body_sha256. Never stringify
