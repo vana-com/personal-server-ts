@@ -57,6 +57,7 @@ export interface PublishResult {
     | "refused"
     | "discarded"
     | "purged"
+    | "replaced"
     | "backoff";
   readonly watermark: number | null; // max(seq) read in step 1; new publish_watermark on success
 }
@@ -68,6 +69,10 @@ export interface PublishResult {
  * is owed and nothing of it may be published. The caller reads the fate of its
  * own runs with `publicationStatus` (`superseded`, `connection_deleted`); a
  * deleted connection never fails the publication of another.
+ *
+ * `replaced` does: the work belonged to a local lifetime that a newer, live
+ * generation of the connection has since replaced. The connection was not
+ * deleted, and the caller's work was neither published nor settled.
  */
 export function leavesUnconfirmed(outcome: PublishResult["outcome"]): boolean {
   return outcome !== "published" && outcome !== "noop" && outcome !== "purged";

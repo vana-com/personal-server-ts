@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { afterEach, expect, it } from "vitest";
 import { StorageDeferredError } from "../../../core/src/stream-sync/storage-retry.js";
 import { publishLog } from "../../../core/src/localdb/log-publish.js";
+import { leavesUnconfirmed } from "../../../core/src/localdb/publish.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import {
   CONNECTION_ID,
@@ -228,7 +229,7 @@ it("reports the latest fence refusal after storage backoff recovers", async () =
   ).toEqual([{ publish_blocked_reason: null }]);
 });
 
-it("reports collecting changes purged when delete and reconnect replace their lifetime during upload", async () => {
+it("reports collecting changes replaced, not purged, when delete and reconnect replace their lifetime during upload", async () => {
   const w = await world({ streams: 1, publishWhileCollecting: true });
   let hold = false;
   let entered!: () => void;
@@ -263,9 +264,47 @@ it("reports collecting changes purged when delete and reconnect replace their li
   });
   await d.sync.intake.end("new", ended());
   release();
-  expect((await first)?.map((r) => r.outcome)).toEqual(["purged"]);
+  // The connection is live again: the caller's work is unconfirmed, not settled.
+  const outcomes = (await first)?.map((r) => r.outcome);
+  expect(outcomes).toEqual(["replaced"]);
+  expect(outcomes?.some(leavesUnconfirmed)).toBe(true);
   await publishLog(d.deps, CONNECTION_ID);
   expect((await d.sync.intake.publicationStatus("new")).state).toBe(
     "published",
   );
+});
+
+it("reports collecting changes purged, and settled, when the connection is deleted during upload", async () => {
+  const w = await world({ streams: 1, publishWhileCollecting: true });
+  let hold = false;
+  let entered!: () => void;
+  const uploading = new Promise<void>((r) => (entered = r));
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const d = await w.device("d1", {
+    beforePut: async () => {
+      if (hold) {
+        hold = false;
+        entered();
+        await gate;
+      }
+    },
+  });
+  await d.run("seed", [{ stream: "s0", id: "seed" }]);
+  await publishLog(d.deps, CONNECTION_ID);
+  await d.sync.intake.begin("collecting", request());
+  await d.sync.intake.batch("collecting", {
+    batch: 0,
+    records: [{ stream: "s0", data: { id: "old" } }],
+  });
+  hold = true;
+  const first = publishLog(d.deps, CONNECTION_ID);
+  await uploading;
+  await d.sync.deleter.requestConnectionDelete(CONNECTOR);
+  expect(await d.sync.deleter.resumeDeletes()).toEqual([]);
+  release();
+  // The connection stays deleted: its tombstone was adopted, nothing is owed.
+  const outcomes = (await first)?.map((r) => r.outcome);
+  expect(outcomes).toEqual(["purged"]);
+  expect(outcomes?.some(leavesUnconfirmed)).toBe(false);
 });
