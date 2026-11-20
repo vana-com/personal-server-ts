@@ -395,7 +395,7 @@ describe("log first load, key by key", () => {
       expect(got.heads).toEqual(expected.heads);
       expect(got.state).toEqual(expected.state);
     }
-  });
+  }, 120_000); // a file database commits slower than memory, and this stops at every commit
 
   it("keeps what precedes a segment it cannot fetch, raises the error, and goes on when it is there", async () => {
     const w = await world({ streams: 2 });

@@ -10,7 +10,7 @@ import {
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -26,7 +26,7 @@ async function world(
   const blobs = createMemoryStreamSyncBlobs();
   let now = 1000;
   const make = async (deviceId: string) => {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    const db = await openLocalDb(await openLogTestDatabase(), {
       owner,
       network: "test",
       deviceId,

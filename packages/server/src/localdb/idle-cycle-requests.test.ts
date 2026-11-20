@@ -20,7 +20,7 @@ import {
   type StreamSyncRegistry,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
 const drivers: SqlDriver[] = [];
@@ -29,7 +29,7 @@ afterEach(async () => {
 });
 
 async function world(connectors: number, streamsPer: number) {
-  const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+  const db = await openLocalDb(await openLogTestDatabase(), {
     owner: OWNER,
     network: "test",
     deviceId: "d",

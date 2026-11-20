@@ -425,7 +425,11 @@ export async function openLogWorkspace(
     async acquire(bytes: number, signal?: AbortSignal) {
       await runtimeAdmission.enqueue(db, binding.operation);
       try {
-        return await runtimeAdmission.acquire(binding.operation, bytes, signal);
+        return await runtimeAdmission.acquireWaiting(
+          binding.operation,
+          bytes,
+          signal,
+        );
       } catch (error) {
         return recordWorkspaceFailure(
           db,

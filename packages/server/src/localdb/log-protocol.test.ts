@@ -51,7 +51,7 @@ import {
   world,
 } from "./log-world.test-utils.js";
 
-afterEach(closeWorldDrivers);
+afterEach(closeWorldDrivers, 60_000);
 
 const six = (prefix = "a") =>
   Array.from({ length: 6 }, (_, i) => [

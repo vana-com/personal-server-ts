@@ -63,6 +63,9 @@ afterEach(async () => {
   }
 });
 
+// Production ids are random, so a restart never reuses one. A per-open counter
+// would hand a restarted device the id of the failed run's leftover workspace.
+let operations = 0;
 async function openDeps(world: Pick<World, "dir" | "registry">, blobs: object) {
   const driver = openBetterSqlite3(join(world.dir, "db.sqlite"));
   await openLocalDb(driver, {
@@ -70,7 +73,6 @@ async function openDeps(world: Pick<World, "dir" | "registry">, blobs: object) {
     network: "test",
     deviceId: "test-device",
   });
-  let op = 0;
   const deps: LocalSyncDeps = {
     db: driver,
     queue: connectionQueue(),
@@ -91,7 +93,7 @@ async function openDeps(world: Pick<World, "dir" | "registry">, blobs: object) {
     },
     logger: { info: () => {}, warn: () => {} },
     now: () => 1780000000000,
-    newOp: () => `op-${++op}`,
+    newOp: () => `op-${++operations}`,
     partTargetBytes: 4096,
   };
   return { driver, deps };

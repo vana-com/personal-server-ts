@@ -82,6 +82,11 @@ const activeLeases = new WeakMap<
   { released: boolean; owned: boolean }
 >();
 let current: ByteLease | undefined;
+/** A lease is an accounting cap, not an allocation. A record may be as large as
+ * the protocol allows (512 MiB), and its admission is six times its size, so the
+ * ceiling must cover that or a legal record could never publish. */
+export const LEASE_CEILING_BYTES = 4 * 1024 * 1024 * 1024;
+const waiters: (() => void)[] = [];
 export function checkLease(
   lease: ByteLease,
   operation: string,
@@ -129,7 +134,11 @@ export const runtimeAdmission = {
     signal?: AbortSignal,
   ): Promise<ByteLease> {
     if (signal?.aborted) throw new Error("workspace_cancelled");
-    if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 128 * 1024 * 1024)
+    if (
+      !Number.isSafeInteger(bytes) ||
+      bytes <= 0 ||
+      bytes > LEASE_CEILING_BYTES
+    )
       throw new Error("workspace_admission");
     if (current) throw new Error("workspace_busy");
     const state = { released: false, owned: false };
@@ -139,12 +148,33 @@ export const runtimeAdmission = {
       async release() {
         if (state.owned) throw new Error("workspace_unit_owned");
         state.released = true;
-        if (current === lease) current = undefined;
+        if (current === lease) {
+          current = undefined;
+          waiters.shift()?.();
+        }
       },
     };
     activeLeases.set(lease, state);
     current = lease;
     return lease;
+  },
+  /** Wait for the owner instead of failing as busy. Nothing is held while
+   * waiting but a resolver, and the caller has decoded nothing yet. Waiters are
+   * woken in arrival order, so one connection cannot starve the others of a
+   * cycle. Never call it while holding a lease: that waits on itself. */
+  async acquireWaiting(
+    operation: string,
+    bytes: number,
+    signal?: AbortSignal,
+  ): Promise<ByteLease> {
+    for (;;) {
+      if (signal?.aborted) throw new Error("workspace_cancelled");
+      if (!current) return runtimeAdmission.acquire(operation, bytes, signal);
+      await new Promise<void>((resolve) => {
+        waiters.push(resolve);
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    }
   },
   async enqueue(db: SqlDriver, job: string) {
     if (job.length > 256 || encodedSize(job) > 256)

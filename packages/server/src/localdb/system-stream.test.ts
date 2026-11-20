@@ -15,6 +15,7 @@ import { systemStreamIdentity } from "../../../core/src/localdb/system-stream-de
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
@@ -32,11 +33,14 @@ afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
 });
 async function fixture(path = ":memory:") {
-  const db = await openLocalDb(openBetterSqlite3(path), {
-    owner,
-    network: "test",
-    deviceId: "fixture",
-  });
+  const db = await openLocalDb(
+    path === ":memory:" ? await openLogTestDatabase() : openBetterSqlite3(path),
+    {
+      owner,
+      network: "test",
+      deviceId: "fixture",
+    },
+  );
   drivers.push(db);
   const keys = {
     namespaceHmac: async () => new Uint8Array(32),

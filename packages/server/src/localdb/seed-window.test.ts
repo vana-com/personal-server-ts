@@ -22,6 +22,7 @@ import { createSeedStaging } from "../../../core/src/stream-sync/seed-staging.js
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 // A stream's one-time seed window closes at its first real write. These tests
 // drive real runs, publication and compaction, then seed from another install.
@@ -71,11 +72,14 @@ async function openDevice(
   path = ":memory:",
   streams = ["items"],
 ) {
-  const db = await openLocalDb(openBetterSqlite3(path), {
-    owner,
-    network: "test",
-    deviceId,
-  });
+  const db = await openLocalDb(
+    path === ":memory:" ? await openLogTestDatabase() : openBetterSqlite3(path),
+    {
+      owner,
+      network: "test",
+      deviceId,
+    },
+  );
   drivers.push(db);
   const deps = newDeps(db, registry, blobs, deviceId, clock);
   const sync = createLocalSync(deps, {

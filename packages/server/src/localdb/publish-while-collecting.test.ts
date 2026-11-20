@@ -10,7 +10,7 @@ import {
   createMemoryStreamSyncBlobs,
 } from "../../../core/src/stream-sync/index.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 // Publish while collecting (default-off flag `publishWhileCollecting`): a batch
 // is admitted into `records` in the transaction that stages it, so the
@@ -49,7 +49,7 @@ async function world(
   ) => {
     const db =
       again?.db ??
-      (await openLocalDb(openBetterSqlite3(":memory:"), {
+      (await openLocalDb(await openLogTestDatabase(), {
         owner,
         network: "test",
         deviceId,

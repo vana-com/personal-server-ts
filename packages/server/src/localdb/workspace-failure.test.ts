@@ -6,7 +6,10 @@ import { createHash } from "node:crypto";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { createWorkspaceValues } from "./workspace-values.js";
 import { migrate } from "../../../core/src/localdb/migrate.js";
-import { openWorkspace } from "../../../core/dist/localdb/workspace.js";
+import {
+  LEASE_CEILING_BYTES,
+  openWorkspace,
+} from "../../../core/dist/localdb/workspace.js";
 import {
   openLogWorkspace,
   workspaceAttempts,
@@ -166,7 +169,7 @@ it("a failed failure-write leaves the precommitted pending intent for restart", 
 it("oversized admission is durable, retryable, and never advances a unit", async () => {
   const { db } = await fixture(),
     ws = await openLogWorkspace(db, b);
-  await expect(ws.acquire(129 * 1024 * 1024)).rejects.toMatchObject({
+  await expect(ws.acquire(LEASE_CEILING_BYTES + 1)).rejects.toMatchObject({
     reason: "admission",
     receipt: "failed",
   });

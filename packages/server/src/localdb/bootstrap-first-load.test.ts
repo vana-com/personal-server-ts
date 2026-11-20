@@ -577,7 +577,13 @@ describe("disk-backed bootstrap swap", () => {
           )
         )[0]?.version ?? 0;
       const initial = await token();
-      expect((await ownerSnapshot(d)).ids).toEqual([]);
+      // A snapshot would apply the connection here (a file database can), and
+      // the finish below would then never be seen: read the table instead.
+      expect(
+        await d.db.query("SELECT 1 FROM records WHERE connection_id=?", [
+          CONNECTION_ID,
+        ]),
+      ).toEqual([]);
       const batch = d.db.batch.bind(d.db);
       let beforeFinish = -1;
       let afterFinish = -1;

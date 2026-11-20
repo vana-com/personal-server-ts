@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2";
+import { REPLICA_SOURCE_MAX_RECORD_JSON_BYTES } from "../replication/limits.js";
 import {
   canonicalJsonChunks,
   operationWireChunks,
@@ -141,7 +142,11 @@ export async function openReplacementPlan(
   };
   await setWorkspaceAuthority(deps.db, binding);
   const ws = await openLogWorkspace(deps.db, binding);
-  const lease = await ws.acquire(128 * 1024 * 1024);
+  const lease = await ws.acquire(
+    6 * REPLICA_SOURCE_MAX_RECORD_JSON_BYTES +
+      input.target * 2 +
+      2 * 1024 * 1024,
+  );
   try {
     await ws.freezeChanges(input.stream, input.from, input.to);
     if (input.cutoff) await ws.freezeMembership(input.stream, input.cutoff);

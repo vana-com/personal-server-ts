@@ -34,7 +34,7 @@ import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
 import { unwriteRefusedRun } from "../../../core/src/localdb/unwrite.js";
 import type { ImportSource } from "../../../core/src/localdb/legacy-import-types.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 const OWNER = `0x${"11".repeat(20)}` as const;
 const STREAMS = ["s0", "s1"];
@@ -69,6 +69,19 @@ const dropRawEndSchema = [
   { sql: "ALTER TABLE runs DROP COLUMN selected_streams" },
   { sql: "ALTER TABLE runs DROP COLUMN raw_end" },
 ];
+// The workspace relations came after the bootstrap schema.
+const dropWorkspaceSchema = [
+  "workspace_attempts",
+  "workspace_jobs",
+  "body_value_chunks",
+  "body_values",
+  "workspace_receipts",
+  "workspace_stage",
+  "workspace_cells",
+  "workspace_assert",
+  "workspaces",
+  "workspace_authority",
+].map((table) => ({ sql: `DROP TABLE ${table}` }));
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -103,7 +116,7 @@ async function device(
   } = {},
 ): Promise<Device> {
   const streams = hooks.streams ?? STREAMS;
-  const raw = await openLocalDb(hooks.driver ?? openBetterSqlite3(":memory:"), {
+  const raw = await openLocalDb(hooks.driver ?? (await openLogTestDatabase()), {
     owner: OWNER,
     network: "test",
     deviceId: id,
@@ -1016,7 +1029,9 @@ describe("view changes", () => {
     await collect(old, "c0");
     await old.cycle();
     await collect(old, "c1");
-    await old.cycle();
+    // One heavy workspace job runs at a time per process; a second connection
+    // in the same cycle is refused as busy, so each connection gets its own.
+    await old.cycle({ connections: ["pdpp.c1~"] });
     const raw = old.raw;
     drivers.splice(drivers.indexOf(old.db), 1); // the reopened device owns the close
     // The build whose last migration rebuilt `records` as a rowid table. Its
@@ -1041,6 +1056,7 @@ describe("view changes", () => {
     // rows had no stream meta.
     await raw.batch([
       ...dropRawEndSchema,
+      ...dropWorkspaceSchema,
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
@@ -1129,9 +1145,8 @@ describe("view changes", () => {
 
     // The upgraded device publishes a change through its log, and another
     // device reads it.
-    await upgraded.cycle();
     await collect(upgraded, "c0", 2);
-    await upgraded.cycle();
+    await upgraded.cycle({ connections: ["pdpp.c0~"] });
     const b = await device(s, "b");
     await b.cycle();
     const shown = await b.query.listRecords({
@@ -1159,6 +1174,7 @@ describe("view changes", () => {
     expect(MIGRATIONS[metaMigration]).toHaveLength(3);
     await raw.batch([
       ...dropRawEndSchema,
+      ...dropWorkspaceSchema,
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },

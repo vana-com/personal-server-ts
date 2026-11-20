@@ -16,7 +16,7 @@ import {
 } from "../../../core/src/stream-sync/index.js";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import { openLogTestDatabase } from "./log-database.test-utils.js";
 
 const owner = `0x${"12".repeat(20)}` as const;
 const connection = "pdpp.fixture-source~";
@@ -49,7 +49,7 @@ async function world() {
   };
   const surfaces = [];
   for (const name of ["desktop", "web", "phone"]) {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
+    const db = await openLocalDb(await openLogTestDatabase(), {
       owner,
       network: "test",
       deviceId: `${name}-device`,
