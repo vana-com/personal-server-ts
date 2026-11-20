@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { MIGRATIONS } from "../../../core/src/localdb/schema.js";
-import { RegistryUnavailableError } from "../../../core/src/stream-sync/ports.js";
+import { RegistryUnavailableError } from "../../../core/dist/stream-sync/ports.js";
 import {
   CONNECTOR,
   OWNER,
