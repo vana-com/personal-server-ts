@@ -326,6 +326,53 @@ describe("the account-mode record", () => {
       });
     });
 
+    it("lets the saved Off authorize again after a restart that follows a failed On save (the withdrawal is in memory only)", async () => {
+      // Pins a known limit: a failed save leaves the store's old record, and
+      // the store is the only durable place, so nothing durable can say that
+      // an On arrived. See `submitEvidence` in authority.ts.
+      const memory = createMemoryModeRecordStore();
+      let failSaves = false;
+      const store: ModeRecordStore = {
+        load: () => memory.load(),
+        save: async (owner, record) => {
+          if (failSaves) throw new Error("disk full");
+          await memory.save(owner, record);
+        },
+      };
+      const first = createModeAuthority({ store });
+      await first.submitEvidence({ owner: OWNER, state: "off", generation: 2 });
+      failSaves = true;
+      await expect(
+        first.submitEvidence({ owner: OWNER, state: "on", generation: 2 }),
+      ).rejects.toThrow("disk full");
+      expect(first.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      // The record the store kept is still the Off.
+      expect([...memory.saved.values()]).toMatchObject([{ answer: "off" }]);
+
+      const restarted = createModeAuthority({ store });
+      await restarted.ready;
+      // The Account cannot be read: a failed read, no answer.
+      await restarted.submitEvidence({ owner: OWNER, state: "unknown" });
+      expect(restarted.legacyWriteDecision(OWNER)).toEqual({ kind: "legacy" });
+      expect(await restarted.commitLegacy(OWNER, () => 1)).toEqual({
+        ok: true,
+        value: 1,
+      });
+      // The first answer the Account gives ends it.
+      failSaves = false;
+      expect(
+        await restarted.submitEvidence({
+          owner: OWNER,
+          state: "on",
+          generation: 2,
+        }),
+      ).toEqual({ kind: "streams" });
+      expect(await restarted.commitLegacy(OWNER, () => 2)).toMatchObject({
+        ok: false,
+        decision: { code: "LEGACY_REFUSED_SWITCHED", status: 426 },
+      });
+    });
+
     it("withdraws the permission for an answer older than the record, and a failed read does not give it back", async () => {
       const store = createMemoryModeRecordStore([
         ["0xabc", { answer: "off", generation: 2, receivedAt: 1 }],

@@ -46,7 +46,16 @@
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence.
  * - `submitEvidence` takes the lock exclusively, saves the new record, then
- *   publishes it. A save that fails throws and changes nothing in memory.
+ *   publishes it. A save that fails throws; the record in memory stays as it
+ *   was, and legacy-write permission is withdrawn for that owner (above).
+ *   The withdrawal lives in memory only. A restart reads the record the store
+ *   kept, which a failed save leaves unchanged (the file store replaces by
+ *   rename, the IndexedDB store by one transaction), so after a failed On save
+ *   and a restart the saved Off authorizes legacy writes again while the
+ *   Account cannot be read. No durable mark can close that: the store that
+ *   failed to save the On is the only durable place, and a second write to it
+ *   fails for the same cause. It ends at the first answer the Account gives,
+ *   and the registry refuses legacy-protocol writes once the owner is On.
  * - `commitLegacy` takes the lock shared and reads the record inside it with no
  *   await before the write starts. An On therefore waits for every legacy
  *   write already running, and no legacy write starts after it. This is the
@@ -125,8 +134,10 @@ export function createModeAuthority(
    * Owners whose latest answer did not take effect: it could not be saved, or
    * its generation is older than the record's. The remembered Off must not
    * keep authorizing writes against an answer the Account just gave and this
-   * process could not keep. In memory only; a later answer that applies and is
-   * current removes the owner. A failed read does not add or remove anyone.
+   * process could not keep. In memory only, so it does not survive a restart
+   * (see `submitEvidence` above for why no store write can carry it); a later
+   * answer that applies and is current removes the owner. A failed read does
+   * not add or remove anyone.
    */
   const withdrawn = new Set<string>();
   /**
