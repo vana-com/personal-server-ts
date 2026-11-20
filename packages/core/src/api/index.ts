@@ -859,6 +859,19 @@ function streamSyncRefusal(decision: ReadDecision): Response | null {
         "INVALID_CONNECTION",
         "connection must be empty or 16 lowercase hex characters",
       );
+    case "incomplete":
+      // The flag-off refusal (`legacyViewRefusalResponse`), with the rows named.
+      return jsonResponse(
+        {
+          error: "CANONICAL_VIEW_UNAVAILABLE",
+          message:
+            "The latest data for this scope cannot be served from the owner's connector records (canonical_view_incomplete).",
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: decision.diagnostics,
+        },
+        { status: 503 },
+      );
     case "too_large":
       return errorResponse(
         503,

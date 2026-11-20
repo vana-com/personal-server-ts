@@ -81,7 +81,9 @@ const baseDeps = {
   createLogId: () => "log",
 };
 
-async function switchedFixture() {
+async function switchedFixture(
+  aliases: Record<string, readonly LocalAliasTarget[]> = ALIASES,
+) {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: "0xabc",
     network: "test",
@@ -110,8 +112,8 @@ async function switchedFixture() {
       newOp: () => "op",
     } as unknown as LocalSyncDeps,
     {
-      aliasScopes: () => Object.keys(ALIASES),
-      aliasTargets: (scope) => ALIASES[scope] ?? [],
+      aliasScopes: () => Object.keys(aliases),
+      aliasTargets: (scope) => aliases[scope] ?? [],
       resolveArtifact: () => null,
     },
   );
@@ -317,5 +319,67 @@ describe("every scope GET /v1/data lists answers on every scope route", () => {
       expect(response.status, route).toBe(200);
       await response.body?.cancel();
     }
+  });
+});
+
+describe("an alias read whose projection dropped rows", () => {
+  const dropped = {
+    kind: "records_dropped" as const,
+    scope: "plain.items",
+    stream: "items",
+    count: 2,
+    reasons: ["invalid id"],
+  };
+  const withDiagnostics = (diagnostics: unknown[]) => ({
+    "plain.items": [
+      {
+        connector: "plain",
+        streams: ["items"],
+        project: (records: readonly unknown[]) => ({
+          ok: true as const,
+          payload: { records },
+          diagnostics,
+        }),
+      },
+    ],
+  });
+
+  it("refuses as incomplete and names the dropped rows, never a short 200", async () => {
+    const { deps, seed } = await switchedFixture(withDiagnostics([dropped]));
+    await seed("plain", "c1", { items: [1] });
+    const response = await get(deps, "/plain.items");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: "CANONICAL_VIEW_UNAVAILABLE",
+      status: "incomplete",
+      reason: "canonical_view_incomplete",
+      diagnostics: [
+        { stream: "items", kind: "dropped", detail: "2 rows: invalid id" },
+      ],
+    });
+  });
+
+  it("refuses rows the source reports short of detail", async () => {
+    const { deps, seed } = await switchedFixture(
+      withDiagnostics([{ ...dropped, kind: "records_partial" }]),
+    );
+    await seed("plain", "c1", { items: [1] });
+    const response = await get(deps, "/plain.items");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      diagnostics: [{ kind: "partial" }],
+    });
+  });
+
+  it("still serves a projection with no dropped or partial rows", async () => {
+    const { deps, seed } = await switchedFixture(
+      withDiagnostics([
+        { kind: "stream_missing", scope: "plain.items", stream: "x" },
+      ]),
+    );
+    await seed("plain", "c1", { items: [1] });
+    const response = await get(deps, "/plain.items");
+    expect(response.status).toBe(200);
+    await response.body?.cancel();
   });
 });
