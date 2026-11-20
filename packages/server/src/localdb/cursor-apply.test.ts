@@ -201,6 +201,111 @@ describe("a device that reads the log takes the stream's cursor", () => {
     });
   });
 
+  // A run end saves the device's cursor before the log carries it. A
+  // segment applied in between was published before it, so the device's own
+  // cursor is the later one in log order until the log acknowledges it.
+  describe("a cursor applied while the device's own waits to publish", () => {
+    const at = (since: number) => ({ [S0]: { since } });
+
+    it("does not replace the device's own cursor", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: { [S0]: "ca" },
+      });
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        checkpoints: { [S0]: "cb" },
+      });
+      await b.cycle();
+      // a's begin applies b's segment and its cursor first.
+      const begun = await a.begin("run-a-2", { full: false });
+      expect(begun.start).toEqual({
+        collection_mode: "incremental",
+        state: { [S0]: "ca" },
+      });
+    });
+
+    it("does not replace the connector version of the device's own cursor", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await a.run("run-0", [{ stream: S0, id: "seed" }], { version: "1.0.0" });
+      await a.cycle();
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        version: "1.0.0",
+        checkpoints: { [S0]: "ca" },
+      });
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        version: "1.1.0",
+        checkpoints: { [S0]: "cb" },
+      });
+      await b.cycle();
+      // The cursor a resumes from is its own, written by 1.0.0.
+      const begun = await a.begin("run-a-2", { full: false, version: "1.0.0" });
+      expect(begun.start.state).toEqual({ [S0]: "ca" });
+    });
+
+    it("takes the applied cursor once its own is in the log", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: { [S0]: "ca" },
+      });
+      await a.cycle();
+      await b.cycle();
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        checkpoints: { [S0]: "cb" },
+      });
+      await b.cycle();
+      const begun = await a.begin("run-a-2", { full: false });
+      expect(begun.start.state).toEqual({ [S0]: "cb" });
+    });
+
+    it("an older cursor from another device's run does not make the device read again", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      // b's run started before a's and stops at 15; a's reads to 20.
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: at(20),
+      });
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        checkpoints: at(15),
+      });
+      await b.cycle();
+      expect((await a.begin("run-a-2", { full: false })).start.state).toEqual(
+        at(20),
+      );
+      // a's cursor publishes after b's, so every device ends at it.
+      await a.cycle();
+      await b.cycle();
+      for (const [name, d] of [
+        ["a", a],
+        ["b", b],
+      ] as const)
+        expect(
+          (await d.begin(`run-${name}-3`, { full: false })).start.state,
+        ).toEqual(at(20));
+    });
+  });
+
   it("a rebase publishes the cursor again after the rows it queues again", async () => {
     const w = await world({ streams: 1 });
     const a = await w.device("a");
