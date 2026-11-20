@@ -6,11 +6,16 @@ import {
   encodeSegment,
   digestSegment,
   segmentBlobName,
+  snapshotPartBlobName,
   logScope,
   type Segment,
   type LogOperation,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { planCompaction } from "../../../core/dist/localdb/log-compact.js";
+import {
+  uploadOutputs,
+  type OutputSet,
+} from "../../../core/dist/localdb/log-output.js";
 import {
   world,
   closeWorldDrivers,
@@ -19,6 +24,18 @@ import {
 } from "./log-world.test-utils.js";
 import { keccakOf } from "../../../core/src/stream-sync/crypto-port.js";
 afterEach(closeWorldDrivers);
+
+/** Every object of a plan, by name, read back through the real upload loop. */
+async function uploaded(
+  deps: Parameters<typeof uploadOutputs>[0],
+  outputs: OutputSet,
+) {
+  const objects = new Map<string, Uint8Array>();
+  await uploadOutputs(deps, outputs, async (name, bytes) => {
+    objects.set(name, bytes);
+  });
+  return objects;
+}
 
 it.each([0x12345678, 0xaabbccdd, 0x13579bdf])(
   "compaction bytes equal the pure oracle while admitting one history unit at a time (%i)",
@@ -130,9 +147,14 @@ it.each([0x12345678, 0xaabbccdd, 0x13579bdf])(
       d.deps.partTargetBytes,
     );
     const clear = [];
-    for (const object of plan!.objects)
-      if (object.name.startsWith("q-"))
-        clear.push(await d.deps.keys.decrypt(scope, object.cipher));
+    const objects = await uploaded(d.deps, plan!.outputs);
+    for (const part of plan!.snapshot.parts)
+      clear.push(
+        await d.deps.keys.decrypt(
+          scope,
+          objects.get(snapshotPartBlobName(part.dataHash))!,
+        ),
+      );
     expect(clear).toEqual(expected.map(encodeSnapshotPart));
     expect(gets).toBe(40);
     expect(peak).toBe(1);
@@ -444,7 +466,19 @@ it("cursor compaction preserves every output byte and piece-before-part order ac
       },
     },
   );
-  expect(plan?.objects).toEqual(expected);
+  const byName = (a: { name: string }, b: { name: string }) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  // Two out-of-line bodies with the same content are one object (its name is
+  // its content): the workspace stages it once, and the first bytes stand.
+  const distinct = [
+    ...new Map(expected.map((object) => [object.name, object])).values(),
+  ];
+  expect(distinct.length).toBeLessThan(expected.length);
+  expect(
+    [...(await uploaded(d.deps, plan!.outputs))]
+      .map(([name, cipher]) => ({ name, cipher }))
+      .sort(byName),
+  ).toEqual(distinct.sort(byName));
 }, 60000);
 
 it("an adapter must advertise borrowed-lease sealing before any fold input is fetched", async () => {

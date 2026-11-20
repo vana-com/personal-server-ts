@@ -42,6 +42,7 @@ import {
   decodeSnapshotPart,
   canonicalJson,
 } from "../../packages/stream-sync/src/index.js";
+import { uploadOutputs } from "../../packages/core/src/localdb/log-output.js";
 import { endRequest } from "../../packages/core/src/test-utils/run-end.js";
 const dir = process.env.MEMORY_DIR;
 const mode = process.env.MEMORY_CASE;
@@ -117,6 +118,23 @@ globalThis.memoryOperations = (ops) => {
     operationBytes = Math.max(operationBytes, total);
   }
 };
+/** Bytes of every typed array reachable from `root` by properties (closures are
+ * not reachable: a descriptor holds none of the data). */
+function reachableBytes(root) {
+  const seen = new Set();
+  let total = 0;
+  const walk = (v) => {
+    if (v === null || typeof v !== "object" || seen.has(v)) return;
+    seen.add(v);
+    if (ArrayBuffer.isView(v)) {
+      total += v.byteLength;
+      return;
+    }
+    for (const key of Object.keys(v)) walk(v[key]);
+  };
+  walk(root);
+  return total;
+}
 const bytes = (v) =>
   Buffer.byteLength(
     JSON.stringify(v, (_, x) => (typeof x === "bigint" ? String(x) : x)),
@@ -326,9 +344,8 @@ try {
     ["crypto", "jobs", "receipts"].includes(mode) ? 1 : n,
   );
   await a.cycle();
-
-  if (mode === "compaction" || mode === "history")
-    await phase("compaction", async () => {
+  if (mode === "compaction" || mode === "history" || mode === "slow-output")
+    await phase(mode === "history" ? "compaction" : mode, async () => {
       let log = await readLogState(a.deps, CONNECTION_ID);
       if (mode === "history") log = await inflatedHistory(log, 10);
       const p = await planCompaction(a.deps, {
@@ -340,23 +357,40 @@ try {
         log,
       });
       if (!p) throw Error("planner did not run");
-      if (mode === "history") {
-        const b = await w.device("history-reader");
-        const { applySnapshotPart } =
-          await import("../../packages/core/src/localdb/log-apply.js");
-        for (const object of p.objects) {
-          if (!object.name.startsWith("q-")) continue;
-          const decoded = decodeSnapshotPart(object.cipher);
+      const reader = mode === "history" ? await w.device("history-reader") : null;
+      const applyPart =
+        mode === "history"
+          ? (await import("../../packages/core/src/localdb/log-apply.js"))
+              .applySnapshotPart
+          : null;
+      // The plan holds a workspace handle, never ciphertext: what it keeps
+      // reachable is what a retained candidate costs.
+      const retainedBytes = reachableBytes(p);
+      let outputBytes = 0,
+        objects = 0,
+        largest = 0,
+        inFlight = 0,
+        peakInFlight = 0;
+      // The one upload loop reads one sealed value into one buffer at a time. A
+      // slow store only lengthens the loop: nothing queues behind it.
+      await uploadOutputs(a.deps, p.outputs, async (name, bytes) => {
+        inFlight++;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        if (mode === "slow-output")
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        outputBytes += bytes.length;
+        largest = Math.max(largest, bytes.length);
+        objects++;
+        if (reader && name.startsWith("q-")) {
+          const decoded = decodeSnapshotPart(bytes);
           if (decoded.kind !== "ok") throw Error("snapshot decode");
-          await applySnapshotPart(b.deps, CONNECTION_ID, decoded.part);
+          await applyPart(reader.deps, CONNECTION_ID, decoded.part);
         }
-        if (JSON.stringify(await b.rows()) !== JSON.stringify(await a.rows()))
-          throw Error("history changed fixed winners");
-      }
-      return {
-        outputBytes: p.objects.reduce((n, o) => n + o.cipher.length, 0),
-        objects: p.objects.length,
-      };
+        inFlight--;
+      });
+      if (reader && JSON.stringify(await reader.rows()) !== JSON.stringify(await a.rows()))
+        throw Error("history changed fixed winners");
+      return { outputBytes, objects, largest, peakInFlight, retainedBytes };
     });
   if (mode === "rebase")
     await phase("rebase", async () => {

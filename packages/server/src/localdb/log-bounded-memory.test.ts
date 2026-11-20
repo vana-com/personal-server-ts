@@ -264,9 +264,13 @@ describe.skipIf(!enabled).sequential("bounded log memory baseline", () => {
   });
   it("compaction retains at most one output unit before upload", async () => {
     const [r] = await measure("compaction", 10000);
-    expect
-      .soft(r.outputBytes, "all ciphertext candidates remain reachable")
-      .toBeLessThanOrEqual(r.ledger.C);
+    expect(r.objects, "the snapshot has many objects").toBeGreaterThan(1);
+    expect(
+      r.retainedBytes,
+      "the plan holds a workspace handle, not ciphertext",
+    ).toBeLessThanOrEqual(r.ledger.C);
+    expect(r.largest, "one object is one unit").toBeLessThanOrEqual(r.ledger.C);
+    expect(r.peakInFlight, "one upload at a time").toBe(1);
     const [history] = await measure("history", 1000);
     expect
       .soft(
@@ -279,6 +283,11 @@ describe.skipIf(!enabled).sequential("bounded log memory baseline", () => {
     expect
       .soft(slow.candidateBytes, "slow uploads retain the complete candidate")
       .toBeLessThanOrEqual(slow.ledger.C);
+  }, 86400000);
+  it("a slow store holds one object, whatever the snapshot size", async () => {
+    const [r] = await measure("slow-output", 10000);
+    expect(r.retainedBytes).toBeLessThanOrEqual(r.ledger.C);
+    expect(r.peakInFlight).toBe(1);
   }, 86400000);
   it("rebase retains only one fold unit during atomic seed", async () => {
     const [r] = await measure("rebase", 10000);
@@ -296,11 +305,15 @@ describe.skipIf(!enabled).sequential("bounded log memory baseline", () => {
       const [b] = await measure("compaction", large, pad);
       // Declared before the large run; RSS is evidence, not a GC-sensitive pass/fail gate.
       expect
-        .soft(b.outputBytes, "source-sized ciphertext retention")
+        .soft(b.outputBytes, "the large run really is larger")
+        .toBeGreaterThan(a.outputBytes);
+      expect
+        .soft(b.retainedBytes, "source-sized ciphertext retention")
         .toBeLessThanOrEqual(a.ledger.C);
       expect
-        .soft(b.outputBytes)
-        .toBeLessThanOrEqual(a.outputBytes + a.ledger.C);
+        .soft(b.retainedBytes)
+        .toBeLessThanOrEqual(a.retainedBytes + a.ledger.C);
+      expect.soft(b.largest).toBeLessThanOrEqual(a.largest + a.ledger.C);
     }
   }, 86400000);
   it("progressive commits release consumed decoded batches", async () => {

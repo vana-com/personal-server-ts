@@ -45,18 +45,16 @@ import { fetchSegmentWire, fetchSnapshotPartWire } from "./log-input.js";
 import type { LogState } from "./log-state.js";
 import { openDiskFold } from "./log-disk-fold.js";
 import { putBodiesOutOfLine } from "./log-bodies.js";
+import { outputProducer, sealOutputs, type OutputSet } from "./log-output.js";
 
 export interface CompactionPlan {
   /** What the next segment's `snapshot` is. Its position is the next `base`. */
   readonly snapshot: SnapshotPointer;
   /**
-   * Objects to upload before the segment, by blob name: the parts, and the
-   * pieces of the out-of-line bodies they name that are not in storage yet.
+   * The parts, and the pieces of the out-of-line bodies they name, as sealed
+   * disk values in the compaction's workspace. No ciphertext lives in the plan.
    */
-  readonly objects: readonly {
-    readonly name: string;
-    readonly cipher: Uint8Array;
-  }[];
+  readonly outputs: OutputSet;
 }
 
 /**
@@ -102,7 +100,7 @@ export async function planCompaction(
     JSON.stringify(log),
     input.generation,
   );
-  let complete = false;
+  let handedOff = false;
   try {
     let position = 0;
     for (const part of previous) {
@@ -143,8 +141,7 @@ export async function planCompaction(
     const metaBytes =
       JSON.stringify(streams.map((m) => m.stream)).length +
       200 * streams.length;
-    const built: { name: string; cipher: Uint8Array }[] = [];
-    const pieces: { name: string; cipher: Uint8Array }[] = [];
+    const out = outputProducer(deps, fold.ws, fold.lease);
     const pointer: { dataHash: `0x${string}`; bytes: number }[] = [];
     let current: WireEntry[] = [],
       size = metaBytes;
@@ -166,30 +163,38 @@ export async function planCompaction(
         clear,
       );
       pointer.push({ dataHash, bytes: clear.length });
-      built.push({
-        name: snapshotPartBlobName(dataHash),
-        cipher: await deps.keys.encryptPart(input.scope, clear),
-      });
+      await out.put(
+        snapshotPartBlobName(dataHash),
+        await deps.keys.encryptPart(input.scope, clear),
+      );
       current = [];
       size = metaBytes;
     }
     for await (const entry of fold.entries(true)) {
       // Original references survive on disk; inline winners use the existing piece encoder.
-      const out = await putBodiesOutOfLine(deps, input.scope, [entry], target);
-      pieces.push(...out.pieces);
-      const wire = out.ops[0]!;
+      const bodies = await putBodiesOutOfLine(
+        deps,
+        input.scope,
+        [entry],
+        target,
+      );
+      for (const piece of bodies.pieces)
+        await out.put(piece.name, piece.cipher);
+      const wire = bodies.ops[0]!;
       const bytes = foldEntryBytes(wire);
       if (current.length > 0 && size + bytes > target) await flush();
       current.push(wire);
       size += bytes;
     }
     await flush();
-    complete = true;
+    await sealOutputs(fold.ws);
+    await fold.handOff();
+    handedOff = true;
     return {
       snapshot: { position: log.position, parts: pointer },
-      objects: [...pieces, ...built],
+      outputs: { ws: fold.ws, count: out.count },
     };
   } finally {
-    await fold.close(complete);
+    if (!handedOff) await fold.close(false);
   }
 }

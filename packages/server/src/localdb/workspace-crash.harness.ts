@@ -32,10 +32,13 @@ const db: SqlDriver = {
   ...base,
   async batch(statements) {
     const match = statements.some((s) =>
-      target!.startsWith("phase-")
-        ? s.sql === "UPDATE workspaces SET phase=? WHERE operation=?" &&
-          s.params?.[0] === target!.slice(6)
-        : s.sql.includes(patterns[target!]!),
+      target === "phase-sent"
+        ? // `sent` is written with its own `workspace_sent` row, by literal.
+          s.sql.includes("UPDATE workspaces SET phase='sent'")
+        : target!.startsWith("phase-")
+          ? s.sql === "UPDATE workspaces SET phase=? WHERE operation=?" &&
+            s.params?.[0] === target!.slice(6)
+          : s.sql.includes(patterns[target!]!),
     );
     if (match && edge === "before") await stop();
     const result = await base.batch(statements);
@@ -110,7 +113,7 @@ if (target === "seed") {
   await ws.transition("collect", "folded");
   await ws.transition("folded", "sealed");
   await ws.transition("sealed", "ready");
-  await ws.transition("ready", "sent");
+  await ws.markSent(2, "old-head", "candidate-head");
 } else await ws.discard();
 await ws.cleanupOne();
 throw new Error("boundary_not_reached");

@@ -841,6 +841,8 @@ export async function openLogWorkspace(
       controlVersion: number,
     ) => promoteWorkspaceSeed(db, binding, expected, target, controlVersion),
     transition: storage.transition,
+    markSent: storage.markSent,
+    settleSent: storage.settleSent,
     discard: storage.discard,
     cleanupOne: storage.cleanupOne,
   };

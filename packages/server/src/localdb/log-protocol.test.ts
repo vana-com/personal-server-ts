@@ -799,9 +799,14 @@ describe("log protocol: compaction", () => {
     let armed = false;
     let raced = 0;
     const b = await w.device("b");
-    const a = await w.device("a", {
-      beforePut: async (key) => {
-        if (!armed || !key.includes(`${LOG}/q-`)) return;
+    const a = await w.device("a");
+    // The compaction's parts are uploaded from disk under the runtime lease, so
+    // the other writer commits when the request leaves: the parts are all up,
+    // the lease is free, and the position is still the one `a` is about to take.
+    const registry = a.deps.registry;
+    const post = registry.postBatch!.bind(registry);
+    registry.postBatch = async (request) => {
+      if (armed) {
         armed = false;
         raced++;
         // Another writer commits at the position `a` is about to take.
@@ -811,8 +816,9 @@ describe("log protocol: compaction", () => {
           observedAt: 9000,
         });
         await b.cycle();
-      },
-    });
+      }
+      return post(request);
+    };
     await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
       observedAt: 1100,
     });

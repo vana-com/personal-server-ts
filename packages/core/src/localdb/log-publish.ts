@@ -95,6 +95,15 @@ import type { WorkspaceCanonicalRecord } from "./workspace-consumer.js";
 import { tombstoneOmissions } from "./admit.js";
 import { planCompaction } from "./log-compact.js";
 import {
+  refuseOutputs,
+  releaseOutputs,
+  sendOutputs,
+  settleAbandonedOutputs,
+  settleOutputs,
+  uploadOutputs,
+  type OutputSet,
+} from "./log-output.js";
+import {
   logPublishPhases,
   openPhases,
   type PhaseClock,
@@ -233,6 +242,8 @@ type Candidate = {
     readonly name: string;
     readonly cipher: Uint8Array;
   }[];
+  /** The compaction's parts and pieces, as sealed values on disk. */
+  readonly outputs: OutputSet | null;
   readonly position: number;
   readonly generation: number;
   readonly dataHash: `0x${string}`;
@@ -535,7 +546,15 @@ function transition(entry: PendingCommit, event: CandidateEvent): void {
     );
   }
 }
+function liveOperations(pending: Map<string, PendingCommit>): Set<string> {
+  const live = new Set<string>();
+  for (const entry of pending.values())
+    if (entry.candidate.outputs)
+      live.add(entry.candidate.outputs.ws.binding.operation);
+  return live;
+}
 async function releaseCandidate(
+  deps: LocalSyncDeps,
   pending: Map<string, PendingCommit>,
   id: string,
   entry: PendingCommit,
@@ -550,6 +569,9 @@ async function releaseCandidate(
   if (entry.state.kind === "committed" || entry.state.kind === "refused")
     for (const p of entry.candidate.planned) await p.workspace?.dispose();
   pending.delete(id);
+  // A sent workspace stays until a head observation settles it.
+  if (entry.candidate.outputs)
+    await releaseOutputs(deps, entry.candidate.outputs);
 }
 async function invalidateExpiredCandidate(
   held: LocalSyncDeps,
@@ -587,6 +609,21 @@ async function publishRounds(
     recordBlocked(deps, connectionId, list);
   let attempts = 0;
   const pending = pendingOf(deps.db);
+  await deps.queue.run(connectionId, "publish", async () => {
+    const held = insideQueue(deps, connectionId);
+    const [row] = await held.db.query<{ connector: string; ns: string }>(
+      "SELECT connector, ns FROM connections WHERE connection_id = ?",
+      [connectionId],
+    );
+    if (row)
+      await settleAbandonedOutputs(
+        held,
+        connectionId,
+        logScope(row.connector, row.ns),
+        (await readLogState(held, connectionId)).refs,
+        liveOperations(pending),
+      );
+  });
   for (;;) {
     let retained = pending.get(connectionId);
     if (retained) {
@@ -618,7 +655,7 @@ async function publishRounds(
         entry.state.kind === "committed" ||
         entry.state.kind === "refused"
       ) {
-        await releaseCandidate(pending, connectionId, entry);
+        await releaseCandidate(deps, pending, connectionId, entry);
         retained = undefined;
       }
     }
@@ -682,6 +719,16 @@ async function publishRounds(
                 candidate.cipher,
                 retained !== undefined || attempts > 0,
               ),
+              candidate.outputs
+                ? uploadOutputs(deps, candidate.outputs, (name, bytes) =>
+                    putIfMissing(
+                      deps,
+                      `${scope}/${name}`,
+                      bytes,
+                      retained !== undefined || attempts > 0,
+                    ),
+                  )
+                : undefined,
             ]),
           ),
         ]);
@@ -720,11 +767,13 @@ async function publishRounds(
         !hasAmbiguousCommit(transfer)
       ) {
         transition(transfer, "refused");
-        await releaseCandidate(pending, connectionId, transfer);
+        if (transfer.candidate.outputs)
+          await refuseOutputs(deps, transfer.candidate.outputs);
+        await releaseCandidate(deps, pending, connectionId, transfer);
       }
       throw error;
     }
-    await releaseCandidate(pending, connectionId, transfer);
+    await releaseCandidate(deps, pending, connectionId, transfer);
     if (committed.kind === "retry") {
       if (++attempts >= MAX_ATTEMPTS) {
         await record(await backoff(deps, connectionId));
@@ -867,6 +916,7 @@ async function snapshotRound(
   const planned: Planned[] = [];
   const roundObservedAt = held.now();
   let handedOff = false;
+  let compactionOutputs: OutputSet | null = null;
   try {
     const target = held.partTargetBytes ?? DEFAULT_PART_TARGET_BYTES;
     let budget = 0;
@@ -1348,6 +1398,7 @@ async function snapshotRound(
       scope,
       log,
     });
+    compactionOutputs = compaction?.outputs ?? null;
     const base = compaction ? log.position : log.base;
     const refs = compaction ? [] : log.refs;
     const snapshot = compaction ? compaction.snapshot : log.snapshot;
@@ -1427,7 +1478,8 @@ async function snapshotRound(
         base,
         refs,
         snapshot,
-        objects: [...(compaction?.objects ?? []), ...outOfLine.pieces],
+        objects: outOfLine.pieces,
+        outputs: compactionOutputs,
         position,
         generation: connection.generation,
         dataHash,
@@ -1444,7 +1496,12 @@ async function snapshotRound(
       },
     };
   } finally {
-    if (!handedOff) for (const p of planned) await p.workspace?.dispose();
+    if (!handedOff) {
+      for (const p of planned) await p.workspace?.dispose();
+      // The compaction's outputs are on disk: whatever stops this round before
+      // a candidate holds them lets them go.
+      if (compactionOutputs) await releaseOutputs(held, compactionOutputs);
+    }
   }
 }
 
@@ -2077,6 +2134,21 @@ async function commitRound(
   // them fails the save. A policy not yet known comes with the gateway's
   // refusal of the request.
   checkBatchRoom(batchBounds(held.registry), request);
+  // The candidate is durably `sent` before the request leaves: from here the
+  // registry may land it whatever this process sees next.
+  if (candidate.outputs) {
+    try {
+      await sendOutputs(
+        candidate.outputs,
+        candidate.position,
+        candidate.prevHash,
+        candidate.dataHash,
+      );
+    } catch {
+      transition(entry, "invalidated");
+      return { kind: "retry", conflict: false };
+    }
+  }
   let answer;
   try {
     answer = await clock.time("registry-commit", () =>
@@ -2257,6 +2329,12 @@ async function commitRound(
   await clock.time("local-commit", () =>
     held.db.batch(withOrigin("refresh", statements)),
   );
+  if (candidate.outputs)
+    await settleOutputs(held, candidate.outputs, {
+      kind: "head",
+      version: candidate.position,
+      head: candidate.dataHash,
+    });
 
   for (const p of touched)
     await p.workspace?.published(p.omitted, p.replace !== null);
@@ -2404,5 +2482,13 @@ async function reconcileCandidate(
       ...(await compaction(held, connectionId, candidate.planned)),
     ]),
   );
+  // The applied log holds this candidate's row at its position: the registry
+  // took it, whatever was appended after.
+  if (candidate.outputs)
+    await settleOutputs(held, candidate.outputs, {
+      kind: "head",
+      version: candidate.position,
+      head: candidate.dataHash,
+    });
   return publishedResults(connectionId, candidate);
 }

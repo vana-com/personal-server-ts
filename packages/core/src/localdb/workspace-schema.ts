@@ -28,3 +28,7 @@ export const PARTIAL_STAGE_SCHEMA = [
 export const PARTIAL_PASS_SCHEMA = [
   `CREATE TABLE workspace_partial_passes(connection TEXT PRIMARY KEY,operation TEXT NOT NULL UNIQUE) WITHOUT ROWID`,
 ];
+
+/** The version a sent candidate installs, the head it expects and the head it
+ * would install (`settleSent`). */
+export const WORKSPACE_SENT_SCHEMA = `CREATE TABLE workspace_sent(operation TEXT PRIMARY KEY, connection TEXT NOT NULL, position INTEGER NOT NULL, old_head TEXT, candidate_head TEXT NOT NULL) WITHOUT ROWID`;

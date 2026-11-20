@@ -343,6 +343,12 @@ export async function openDiskFold(
     async seedEntry(entry: LogEntry, primaryKey: readonly string[]) {
       await ws.stageSeed(entry, primaryKey);
     },
+    /** Give up the lease and the job slot but keep the workspace and its rows:
+     * its outputs go on to be uploaded. */
+    async handOff() {
+      await lease.release();
+      await runtimeAdmission.finish(deps.db, binding.operation);
+    },
     async close(cleanup = true) {
       await lease.release();
       await runtimeAdmission.finish(deps.db, binding.operation);

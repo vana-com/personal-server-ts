@@ -155,7 +155,7 @@ it("retains sent CAS work after an authority read or local fence; it may still l
   await ws.transition("collect", "folded");
   await ws.transition("folded", "sealed");
   await ws.transition("sealed", "ready");
-  await ws.transition("ready", "sent");
+  await ws.markSent(2, "old-head", "candidate-head");
   // A read of the old head cannot prove that the sent CAS will not land later.
   await setWorkspaceAuthority(db, b);
   await expect(ws.discard()).rejects.toThrow();

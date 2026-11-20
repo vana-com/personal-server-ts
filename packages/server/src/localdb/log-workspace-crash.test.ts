@@ -167,12 +167,9 @@ it.each(
   30000,
 );
 
-it.todo(
-  "D: SIGKILL after remote upload success before durable upload receipt; probe or retry identical sealed bytes",
-);
-it.todo(
-  "D: SIGKILL before/after CAS send, remote land, and reply; an old-head read does not retract the in-flight CAS",
-);
+// D: SIGKILL around each output seal, upload receipt, ready, sent, settle and
+// cleanup commit, and an old-head read never retracting a sent candidate, run in
+// log-output-crash.test.ts.
 it.todo(
   "D: sent CAS can land after local generation/key/deletion fence; resolve actual remote head/version before resend or discard",
 );
