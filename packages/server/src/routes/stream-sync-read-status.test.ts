@@ -7,6 +7,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
@@ -161,6 +162,98 @@ describe("stream-sync read status route", () => {
       issues: 1,
     });
     expect(text).not.toContain("secret-looking-detail");
+  });
+
+  describe("audit", () => {
+    const report = {
+      finishedAt: 5,
+      stopped: false,
+      imported: 3,
+      alreadyImported: 0,
+      excluded: [{ reason: "older_instance", streams: 1, rows: 4 }],
+      refused: [],
+      files: { total: 2, unimported: 1 },
+    };
+    function audited(legacyStoreImport?: () => typeof report | null) {
+      const status = vi.fn(async (options?: { audit?: boolean }) => ({
+        listed: true,
+        issues: [],
+        connections: [
+          {
+            connector: "conn-a",
+            ns: "",
+            control: "active",
+            streams: {
+              items: {
+                live: true,
+                complete: true,
+                tombstoned: false,
+                version: 3,
+                records: 12,
+                ...(options?.audit ? { digest: "ab".repeat(32) } : {}),
+              },
+            },
+          },
+        ],
+        ...(options?.audit
+          ? { importExclusions: [{ reason: "seed_window_closed", streams: 2 }] }
+          : {}),
+      }));
+      const route = streamSyncReadStatusRoutes({
+        serverOrigin: "http://127.0.0.1",
+        serverOwner: OWNER,
+        gateway: {} as GatewayClient,
+        accessToken: TOKEN,
+        localSync: { listing: { status } } as unknown as LocalSync,
+        legacyStoreImport,
+        streamSyncRead: undefined,
+      });
+      return {
+        status,
+        get: async (query = "") =>
+          (
+            await route.request(`/${query}`, {
+              headers: { authorization: `Bearer ${TOKEN}` },
+            })
+          ).json() as Promise<Record<string, unknown>>,
+      };
+    }
+
+    it("adds the digest and the seed exclusions only when asked", async () => {
+      const { status, get } = audited(() => report);
+      const plain = await get();
+      expect(status).toHaveBeenLastCalledWith(undefined);
+      expect(plain).not.toHaveProperty("seedExclusions");
+      expect(JSON.stringify(plain)).not.toContain("digest");
+
+      const body = await get("?audit=1");
+      expect(status).toHaveBeenLastCalledWith({ audit: true });
+      expect(body).toMatchObject({
+        streams: [
+          {
+            connector: "conn-a",
+            stream: "items",
+            records: 12,
+            digest: "ab".repeat(32),
+          },
+        ],
+        seedExclusions: {
+          ledger: [{ reason: "seed_window_closed", streams: 2 }],
+          legacyStore: report,
+        },
+      });
+    });
+
+    it("says the legacy store has not finished a run with null", async () => {
+      const { get } = audited(() => null);
+      expect(await get("?audit=1")).toMatchObject({
+        seedExclusions: { legacyStore: null },
+      });
+      const { get: without } = audited(undefined);
+      expect(await without("?audit=1")).toMatchObject({
+        seedExclusions: { legacyStore: null },
+      });
+    });
   });
 
   it("answers 404 when stream sync reading is off", async () => {

@@ -151,6 +151,7 @@ export async function* createCanonicalImportSource(options: {
       revision,
       target,
       exclusions: [],
+      rows: entry.rows,
       async *records() {
         await check();
         let cursor: string | null = null;

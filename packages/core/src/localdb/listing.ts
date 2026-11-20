@@ -4,6 +4,7 @@ import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { SEEN_O } from "./merge.js";
+import { streamDigest } from "./stream-digest.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
@@ -80,7 +81,13 @@ export interface LocalListing {
      */
     readonly includeLoading?: boolean;
   }): Promise<readonly ListedScope[]>;
-  status(): Promise<StreamSyncReadStatus>;
+  /**
+   * `audit` adds what two devices are compared by: a digest of each live,
+   * complete stream's records and the seed exclusions of the import ledger.
+   * It reads every live row of every stream (cost linear in the rows, and in
+   * their body size), so it is for a diagnostic that asks, not for a poll.
+   */
+  status(options?: { readonly audit?: boolean }): Promise<StreamSyncReadStatus>;
   /** Changes whenever any control row or stream head changes. */
   cacheKey(): Promise<string>;
 }
@@ -307,6 +314,25 @@ export function createLocalListing(
     return projected.kind === "ok";
   }
 
+  /** The stream's digest; `null` when a stored hash is not a SHA-256 hex digest. */
+  async function digestOf(connectionId: string, stream: string) {
+    try {
+      return (await streamDigest(reads.db, connectionId, stream)).fingerprint;
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "invalid_import_fingerprint_rows"
+      ) {
+        deps.logger.warn(
+          { stream },
+          "localdb status: a stored record hash is malformed; no digest",
+        );
+        return null;
+      }
+      throw error;
+    }
+  }
+
   // Overlapping calls share one read of local state; the next call after it
   // settles starts a new one, so nothing is served from a cache.
   const inflight = new Map<boolean, Promise<readonly Entry[]>>();
@@ -341,7 +367,8 @@ export function createLocalListing(
       return out;
     },
 
-    async status() {
+    async status(options) {
+      const audit = options?.audit === true;
       const rows = await connections();
       const states = await reads.db.query<StreamState>(
         "SELECT s.*, (SELECT COUNT(*) FROM records r WHERE r.connection_id = s.connection_id AND r.stream = s.stream) AS records FROM stream_state s ORDER BY s.connection_id, s.stream",
@@ -401,12 +428,20 @@ export function createLocalListing(
             state.head_generation === row.generation &&
             state.head_version > state.last_delete_version &&
             state.head_blob !== null;
+          const complete = live && state.complete === 1;
           streams[state.stream] = {
             tombstoned,
             live,
-            complete: live && state.complete === 1,
+            complete,
             version: live ? state.head_version : null,
             records: live ? state.records : null,
+            ...(audit
+              ? {
+                  digest: complete
+                    ? await digestOf(row.connection_id, state.stream)
+                    : null,
+                }
+              : {}),
             ...(partials.has(
               JSON.stringify([row.connection_id, state.stream]),
             ) && !(live && state.complete === 1)
@@ -431,6 +466,15 @@ export function createLocalListing(
         listed: true,
         connections: result,
         issues: [],
+        ...(audit
+          ? {
+              importExclusions: (
+                await reads.db.query<{ reason: string; streams: number }>(
+                  "SELECT COALESCE(reason, 'unknown') AS reason, COUNT(*) AS streams FROM import_ledger WHERE state = 'excluded' GROUP BY 1 ORDER BY 1",
+                )
+              ).map(({ reason, streams }) => ({ reason, streams })),
+            }
+          : {}),
       };
     },
 

@@ -26,6 +26,51 @@ import type { ImportRunner } from "@opendatalabs/personal-server-ts-core/sync/ac
 import { openLegacyAccess, type LegacyAccess } from "./legacy-access.js";
 import { importProjection } from "./sync.js";
 
+/**
+ * What the last finished import left out, for owner diagnostics
+ * (`read-status?audit=1`). A count of inventory the runner already decides:
+ * no rule here changes what is imported.
+ *
+ * - `excluded`: sources never offered to the database, by the reason the
+ *   inventory gave (`older_instance` and `deleted_instance` are the archive
+ *   and older copies of a connection; `undeclared_source`, `undeclared_stream`,
+ *   `unbound_store`, ... are stores with no verified declaration).
+ * - `refused`: sources the database turned down, by its reason
+ *   (`seed_window_closed`: a real write already owns the stream).
+ * - `files`: old data files seen at retirement, and those with no importable
+ *   source (file-only scopes). `null` until a retirement pass has finished.
+ *
+ * A source with no rows is not counted: the inventory lists every declared
+ * stream of each connection, and an empty one loses nothing.
+ *
+ * In memory: a restart clears it until the next run, which recounts the whole
+ * inventory. `rows` is the inventory's row count at the snapshot, `null` when
+ * the source did not carry one.
+ */
+export interface LegacyStoreImportReport {
+  readonly finishedAt: number;
+  readonly stopped: boolean;
+  readonly imported: number;
+  readonly alreadyImported: number;
+  readonly excluded: readonly LegacyStoreImportCount[];
+  readonly refused: readonly LegacyStoreImportCount[];
+  readonly files: {
+    readonly total: number;
+    readonly unimported: number;
+  } | null;
+}
+
+export interface LegacyStoreImportCount {
+  readonly reason: string;
+  readonly streams: number;
+  readonly rows: number | null;
+}
+
+export interface LegacyStoreRunner extends ImportRunner {
+  /** The last finished run's report, or null before one has finished. */
+  report(): LegacyStoreImportReport | null;
+}
+
 export interface LegacyStoreImportOptions {
   /** The server's own `index.db` handle. Borrowed: never closed here. */
   readonly db: Database;
@@ -79,9 +124,11 @@ export interface LegacyStoreImportOptions {
  */
 export function createLegacyStoreRunner(
   options: LegacyStoreImportOptions,
-): ImportRunner {
+): LegacyStoreRunner {
   const { logger } = options;
+  let last: LegacyStoreImportReport | null = null;
   return {
+    report: () => last,
     async run(signal) {
       const deps = await options.getDeps();
       const root = await realpath(options.root);
@@ -115,9 +162,17 @@ export function createLegacyStoreRunner(
       });
       try {
         const imported = await importSources(deps, access, signal, logger);
+        last = imported.report(deps.now(), signal.aborted);
         if (signal.aborted) return;
         try {
-          await retire(options, deps, access, imported, signal);
+          const files = await retire(
+            options,
+            deps,
+            access,
+            imported.sources,
+            signal,
+          );
+          last = { ...last, files };
         } catch (error) {
           logger.warn(
             { error: String(error) },
@@ -169,21 +224,48 @@ const sourceKey = (source: string, connectionId: string, stream: string) =>
 /** The import descriptors, kept for the read-back that follows. */
 type ImportedSources = ReadonlyMap<string, ImportSource>;
 
+/** Streams and rows per reason; `rows` is null once a source carried none. */
+function tally() {
+  const byReason = new Map<string, { streams: number; rows: number | null }>();
+  return {
+    add(reason: string, rows: number | undefined) {
+      // A stream the inventory lists with no row loses nothing: a connection
+      // lists every declared stream, held or not.
+      if (rows === 0) return;
+      const entry = byReason.get(reason) ?? { streams: 0, rows: 0 };
+      entry.streams += 1;
+      entry.rows =
+        entry.rows === null || rows === undefined ? null : entry.rows + rows;
+      byReason.set(reason, entry);
+    },
+    counts: (): LegacyStoreImportCount[] =>
+      [...byReason]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([reason, { streams, rows }]) => ({ reason, streams, rows })),
+  };
+}
+
 async function importSources(
   deps: LocalSyncDeps,
   access: LegacyAccess,
   signal: AbortSignal,
   logger: LocalSyncDeps["logger"],
-): Promise<ImportedSources> {
+): Promise<{
+  readonly sources: ImportedSources;
+  report(finishedAt: number, stopped: boolean): LegacyStoreImportReport;
+}> {
   const ledger = createImportLedger(deps.db);
   const sources = new Map<string, ImportSource>();
   const refreshed = new Set<string>();
   const counts: Record<string, number> = {};
   const count = (name: string) => (counts[name] = (counts[name] ?? 0) + 1);
+  const excluded = tally();
+  const refused = tally();
   for await (const entry of access.sources()) {
     if (signal.aborted) break;
     if ("kind" in entry) {
       count(`excluded:${entry.reason}`);
+      excluded.add(entry.reason, entry.rows);
       continue;
     }
     const source = entry as ImportSource;
@@ -217,12 +299,24 @@ async function importSources(
     }
     const result = await importLegacySource(deps, ledger, source);
     count(result.kind === "refused" ? `refused:${result.reason}` : result.kind);
+    if (result.kind === "refused") refused.add(result.reason, source.rows);
   }
   logger.info(
     { ...counts, stopped: signal.aborted },
     "legacy store import finished",
   );
-  return sources;
+  return {
+    sources,
+    report: (finishedAt, stopped) => ({
+      finishedAt,
+      stopped,
+      imported: counts.imported ?? 0,
+      alreadyImported: counts["already-imported"] ?? 0,
+      excluded: excluded.counts(),
+      refused: refused.counts(),
+      files: null,
+    }),
+  };
 }
 
 async function retire(
@@ -231,7 +325,7 @@ async function retire(
   access: LegacyAccess,
   imported: ImportedSources,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<{ readonly total: number; readonly unimported: number }> {
   const report = await retireLegacyCopies(
     deps,
     retireAccess(deps, access, imported, signal),
@@ -246,6 +340,7 @@ async function retire(
     { ...report, stopped: signal.aborted },
     "legacy retirement finished",
   );
+  return { total: report.files, unimported: report.unimported };
 }
 
 /** Read-back is diagnostic only, over the sources this run imported. The copy
