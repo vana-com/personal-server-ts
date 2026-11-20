@@ -1,3 +1,18 @@
+import { world, closeWorldDrivers } from "./log-world.test-utils.js";
+import {
+  handlePersonalServerDataRequest,
+  type PersonalServerDataApiDeps,
+} from "../../../core/src/api/index.js";
+import { privateKeyToAccount } from "viem/accounts";
+import {
+  dataRegistryDomain,
+  escrowPaymentDomain,
+  GENERIC_PAYMENT_TYPES,
+  RECORD_DATA_ACCESS_TYPES,
+} from "@opendatalabs/vana-sdk/browser";
+import { createMemoryDataStorage } from "../../../core/src/test-utils/memory-storage.js";
+import { encodePaymentHeader } from "../../../core/src/payment/x402.js";
+import { computeDataPointId } from "../../../core/src/sync/data-point-id.js";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1529,4 +1544,226 @@ describe("local resolve through the host's real legacy alias port", () => {
     );
     expect(verdict(await readOf(resolver))).toBe("deleted");
   });
+});
+
+it("never charges keyed first-load rows before their pending publication", async () => {
+  const f = await fixture();
+  await f.connection();
+  await f.head();
+  await f.record("items", "keyed-row");
+  await f.db.batch([
+    {
+      sql: "INSERT INTO log_state(connection_id,position,base,refs,snapshot) VALUES ('c1',0,0,'[]',NULL)",
+    },
+    {
+      sql: "INSERT INTO log_keyed_pending(connection_id,position,base,refs) VALUES ('c1',1,0,'[]')",
+    },
+  ]);
+  // The registry fixture cannot publish, and apply is held at this partial
+  // local image. The resolver must not sign the stream's installed counter.
+  expect(
+    await f.resolver.resolve(input(undefined, { requireRegistered: true })),
+  ).toMatchObject({ kind: "read_not_registered" });
+});
+
+async function chargedRead(
+  f: Pick<Awaited<ReturnType<typeof fixture>>, "resolver">,
+  scope: string,
+  beforeRetry?: () => void | Promise<void>,
+  signal?: AbortSignal,
+) {
+  const builder = privateKeyToAccount(`0x${"11".repeat(32)}`);
+  const server = privateKeyToAccount(`0x${"22".repeat(32)}`);
+  const owner = "0x0000000000000000000000000000000000000aaa";
+  const config = {
+    chainId: 14800,
+    contracts: {
+      dataRegistry: "0x0000000000000000000000000000000000000001",
+      dataPortabilityEscrow: "0x0000000000000000000000000000000000000005",
+    },
+  } as Parameters<typeof dataRegistryDomain>[0];
+  const grantId = `0x${"ee".repeat(32)}`;
+  const paymentFetch = vi.fn(async () => Response.json({ success: true }));
+  const deps = {
+    storage: createMemoryDataStorage(),
+    accessLogWriter: { write: vi.fn(async () => {}) },
+    accountStorageMode: { owner, read: () => "switched" },
+    streamSyncRead: f.resolver,
+    auth: {
+      authorizeBuilderRead: async () => ({ builder: builder.address, grantId }),
+    },
+    paymentEnabled: true,
+    paymentFetch,
+    gatewayConfig: config,
+    gatewayUrl: "https://gateway.test",
+    gateway: {
+      getGrant: async () => ({
+        paymentStatus: "pending",
+        fee: {
+          asset: "0x0000000000000000000000000000000000000000",
+          registrationFee: "100",
+          dataAccessFee: "5",
+          totalDue: "105",
+        },
+      }),
+    },
+    serverOwner: owner,
+    serverAddress: server.address,
+    serverSigner: {
+      signRecordDataAccess: (message: never) =>
+        server.signTypedData({
+          domain: dataRegistryDomain(config),
+          types: RECORD_DATA_ACCESS_TYPES,
+          primaryType: "RecordDataAccess",
+          message,
+        }),
+    },
+  } as unknown as PersonalServerDataApiDeps;
+  const url = `https://server.test/${scope}`;
+  const challenge = await handlePersonalServerDataRequest(
+    new Request(url),
+    deps,
+  );
+  expect(challenge.status).toBe(402);
+  const accept = (await challenge.json()).accepts[0];
+  const signature = await builder.signTypedData({
+    domain: escrowPaymentDomain(config),
+    types: GENERIC_PAYMENT_TYPES,
+    primaryType: "GenericPayment",
+    message: {
+      ...accept.message,
+      amount: BigInt(accept.message.amount),
+      paymentNonce: BigInt(accept.message.paymentNonce),
+    },
+  });
+  await beforeRetry?.();
+  const response = await handlePersonalServerDataRequest(
+    new Request(url, {
+      signal,
+      headers: {
+        "x-payment": encodePaymentHeader({
+          x402Version: 1,
+          scheme: "vana-escrow-grant",
+          network: "vana:14800",
+          payload: {
+            message: accept.message,
+            signature,
+            accessRecord: accept.accessRecord,
+          },
+        }),
+      },
+    }),
+    deps,
+  );
+  return { response, paymentFetch, receipt: accept.accessRecord, owner };
+}
+
+it("charges the selected covered connection despite unpublished edits on an older connection", async () => {
+  const f = await fixture();
+  await f.connection("active", "c1", "aaaaaaaaaaaaaaaa");
+  await f.connection("active", "c2", "bbbbbbbbbbbbbbbb");
+  await f.head("items", { version: 1, id: "c1" });
+  await f.head("items", { version: 2, id: "c2" });
+  await f.record("items", "unpublished older copy", "c1");
+  await f.record("items", "selected registered copy", "c2");
+  await f.db.batch([
+    {
+      sql: "UPDATE stream_state SET publish_watermark=(SELECT MAX(seq) FROM record_changes) WHERE connection_id='c2'",
+    },
+    {
+      sql: "INSERT INTO log_state(connection_id,position,base,refs,snapshot) VALUES ('c1',1,0,'[]',NULL),('c2',7,0,'[]',NULL)",
+    },
+  ]);
+  // c1 cannot publish through this registry fixture. Its pending edits must
+  // neither block the read nor cause the resolver to fall back to c1.
+  const paid = await chargedRead(f, "pdpp.fixture-source.items");
+  expect(paid.response.status).toBe(200);
+  expect(await paid.response.json()).toMatchObject({
+    data: { records: [{ id: "key", value: "selected registered copy" }] },
+  });
+  expect(paid.receipt).toMatchObject({
+    dataPointId: computeDataPointId(
+      paid.owner,
+      "pdpp.fixture-source~bbbbbbbbbbbbbbbb.~log",
+    ),
+    version: "7",
+  });
+  expect(paid.paymentFetch).toHaveBeenCalledOnce();
+  expect(f.deps.logger.warn).not.toHaveBeenCalled();
+});
+
+it("sends no payment when an alias projection aborts the request", async () => {
+  const f = await fixture();
+  await f.connection();
+  await f.head("parents");
+  await f.head("children");
+  await f.record("parents");
+  await f.record("children");
+  await f.db.batch([
+    {
+      sql: "UPDATE stream_state SET publish_watermark=(SELECT MAX(seq) FROM record_changes)",
+    },
+    {
+      sql: "INSERT INTO log_state(connection_id,position,base,refs,snapshot) VALUES ('c1',3,0,'[]',NULL)",
+    },
+  ]);
+  const controller = new AbortController();
+  const paid = await chargedRead(
+    f,
+    "fixture.alias",
+    () => {
+      mocked.project.mockImplementation(() => {
+        controller.abort();
+        return { ok: true, payload: { records: [] } };
+      });
+    },
+    controller.signal,
+  );
+  expect(controller.signal.aborted).toBe(true);
+  expect(paid.paymentFetch.mock.calls.length).toBe(0);
+  expect(paid.response.status).toBe(503);
+  expect(await paid.response.json()).toMatchObject({
+    error: { errorCode: "READ_ABORTED" },
+  });
+});
+
+it("returns READ_ABORTED when publication is interrupted before payment", async () => {
+  const controller = new AbortController();
+  let blocked = false;
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const w = await world({ streams: 1 });
+  const a = await w.device("a", {
+    beforePut: async () => {
+      if (blocked) {
+        controller.abort();
+        await gate;
+      }
+    },
+  });
+  try {
+    await a.run("first", [{ stream: "s0", id: 1, v: 1 }]);
+    await a.sync.publish();
+    const paid = await chargedRead(
+      { resolver: a.sync.resolver },
+      "pdpp.fixture.s0",
+      async () => {
+        await a.run("second", [{ stream: "s0", id: 1, v: 2 }]);
+        blocked = true;
+      },
+      controller.signal,
+    );
+    expect(paid.response.status).toBe(503);
+    expect(await paid.response.json()).toMatchObject({
+      error: { errorCode: "READ_ABORTED" },
+    });
+    expect(paid.paymentFetch).not.toHaveBeenCalled();
+  } finally {
+    blocked = false;
+    release();
+    await a.sync.publish();
+    await closeWorldDrivers();
+  }
 });

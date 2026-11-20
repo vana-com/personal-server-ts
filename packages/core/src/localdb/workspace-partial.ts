@@ -46,6 +46,9 @@ export interface KeyFact {
 }
 export interface Naming {
   meta: LogStreamMeta;
+  /** The newest cursor any unit named this stream with (`followMeta`): a later
+   * unit that carries none leaves it. It is staged with the final part's rows. */
+  cursor?: { index: number; value: NonNullable<LogStreamMeta["cursor"]> };
   index: number;
   batch: { generation: number; observedAt: number };
   identity: BatchIdentity;
@@ -352,6 +355,8 @@ export function workspacePartial(db: SqlDriver, b: WorkspaceBinding) {
             marker.version === head.version,
         };
       }
+      if (meta.cursor && (!row.cursor || row.cursor.index < index))
+        row = { ...row, cursor: { index, value: meta.cursor } };
       await admitMetadata(row);
       const statements: SqlStatement[] = [];
       if (list && !row.skip && !row.begun) {
@@ -546,6 +551,13 @@ function finishStatements(b: WorkspaceBinding): SqlStatement[] {
     {
       sql: "DELETE FROM stream_partial WHERE connection_id=? AND EXISTS (SELECT 1 FROM workspace_partial_streams w WHERE w.operation=? AND w.stream=stream_partial.stream AND w.skip=0)",
       params: [b.connection, b.operation],
+    },
+    // Every row of the pass is in this transaction: each stream stages the
+    // newest cursor its units carried, as a segment applied one batch at a time does.
+    {
+      sql: `UPDATE stream_state SET cursor_applied = (SELECT json_extract(w.payload,'$.cursor.value') FROM workspace_partial_streams w WHERE w.operation=? AND w.stream=stream_state.stream)
+      WHERE connection_id=? AND EXISTS (SELECT 1 FROM workspace_partial_streams w WHERE w.operation=? AND w.stream=stream_state.stream AND w.skip=0 AND json_extract(w.payload,'$.cursor.value') IS NOT NULL)`,
+      params: [b.operation, b.connection, b.operation],
     },
   ];
 }

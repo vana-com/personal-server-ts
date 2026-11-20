@@ -14,6 +14,7 @@ import type {
   StreamSyncRegistry,
 } from "../../stream-sync/ports.js";
 import { createRegistryChangePush } from "./change-push.js";
+import { createGatewayStreamSyncRegistry } from "../../stream-sync/registry.js";
 import {
   createSyncManager,
   type ChangePush,
@@ -1467,4 +1468,49 @@ describe("the timer's retry of owed work reads only what is owed", () => {
     expectFull(t);
     await t.manager.stop();
   });
+});
+
+it("does not run a full pull when a healthy change feed is overloaded", async () => {
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let overload!: (response: Response) => void;
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json({ seq: "1", changed: true }))
+    .mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          overload = resolve;
+        }),
+    )
+    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockImplementation(() => new Promise(() => {}));
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch,
+  });
+  const cycle = vi.fn(async () => {});
+  const manager = build({
+    localSync: { cycle, applyDelta: deltaToCycle },
+    changeProbe: {
+      read: async () => "m1",
+      intervalMs: 5_000,
+      push: createRegistryChangePush(registry),
+    },
+  });
+  manager.start();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  cycle.mockClear();
+  overload(
+    new Response(null, { status: 429, headers: { "Retry-After": "5" } }),
+  );
+  await vi.advanceTimersByTimeAsync(4999);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(cycle).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(fetch).toHaveBeenCalledTimes(4);
+  expect(cycle).not.toHaveBeenCalled();
+  await manager.stop();
+  vi.restoreAllMocks();
 });

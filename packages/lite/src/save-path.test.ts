@@ -167,6 +167,7 @@ async function savePathWorld(autoStartSync = true) {
     await server.streamSyncIntake!.begin(runId, {
       connector: CONNECTOR,
       artifactDigest: CONNECTOR,
+      join: true,
       owner: { address: ownerAddress, leaseId: null },
       observedAt: Date.now(),
       connect: true,
@@ -203,14 +204,16 @@ async function savePathWorld(autoStartSync = true) {
 }
 
 describe("the save path of a Web write", () => {
-  it("admits and publishes first and warm full collections without registry GETs", async () => {
+  it("admits and publishes a first full collection with one registry GET and a warm one with none", async () => {
     const { server, collect, reads, segmentPuts, commits } =
       await savePathWorld(false);
     for (const id of ["first", "warm"]) {
       reads.length = 0;
       await collect(id);
       await server.publish();
-      expect(reads).toEqual([]);
+      // The first save asks the registry once whether the connection already
+      // exists (the join gate); a joined device then admits without a GET.
+      expect(reads).toHaveLength(id === "first" ? 1 : 0);
     }
     expect(segmentPuts).toHaveLength(2);
     expect(commits).toEqual([{ landed: true }, { landed: true }]);

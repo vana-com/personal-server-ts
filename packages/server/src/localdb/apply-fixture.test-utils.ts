@@ -227,6 +227,7 @@ export async function remoteFixture(
       connector,
       artifactDigest: connector,
       wantFull: true,
+      join: true,
       observedAt: options.o ?? 100,
       owner: { address: `0x${"22".repeat(20)}`, leaseId: null },
     });

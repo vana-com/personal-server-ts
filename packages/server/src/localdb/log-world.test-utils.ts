@@ -15,6 +15,7 @@ import {
   deriveKeyCheck,
   logScope,
   pkHash,
+  type JsonValue,
   type WireSegment,
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -77,6 +78,8 @@ export async function world(options: {
   trace?: RequestTrace;
   /** The `Batch-Policy` the gateway advertises and enforces (`FakeGatewayOptions.policy`). */
   policy?: FakeGatewayOptions["policy"];
+  /** Each stream's declared state parents (none: no parents). */
+  stateParents?: Readonly<Record<string, readonly string[]>>;
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
@@ -247,9 +250,39 @@ export async function world(options: {
           primaryKey: ["id"],
           coverageStrategy: "full_inventory" as const,
           ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
+          ...(options.stateParents?.[name]
+            ? { stateParents: options.stateParents[name] }
+            : {}),
         })),
       }),
     });
+    /** A run's begin: the mode and state the connector starts from. */
+    const begin = (
+      runId: string,
+      opts: {
+        full?: boolean;
+        observedAt?: number;
+        connect?: boolean;
+        connector?: string;
+        version?: string;
+        join?: boolean;
+      } = {},
+    ) => {
+      clock++;
+      const connector = opts.connector ?? CONNECTOR;
+      return sync.intake.begin(runId, {
+        connector,
+        artifactDigest:
+          opts.version === undefined
+            ? connector
+            : `${connector}@${opts.version}`,
+        wantFull: opts.full ?? true,
+        ...(opts.connect ? { connect: true } : {}),
+        ...(opts.join === false ? {} : { join: true as const }),
+        observedAt: opts.observedAt,
+        owner: { address: OWNER, leaseId: null },
+      });
+    };
     /** One run that writes `records` and ends covering `covered`. */
     const run = async (
       runId: string,
@@ -276,21 +309,19 @@ export async function world(options: {
         connector?: string;
         /** The connector version the run's artifact declares (default "1"). */
         version?: string;
+        /**
+         * The host's accepted join prompt. On by default, so a second device
+         * collects as it did before the join gate; `false` is a device the
+         * user has not asked to continue the connection.
+         */
+        join?: boolean;
+        /** The connector cursor the run ends with, per stream. */
+        checkpoints?: Readonly<Record<string, JsonValue>>;
+        /** What happens on the device while the run collects, before it ends. */
+        during?: () => Promise<unknown>;
       } = {},
     ) => {
-      clock++;
-      const connector = opts.connector ?? CONNECTOR;
-      await sync.intake.begin(runId, {
-        connector,
-        artifactDigest:
-          opts.version === undefined
-            ? connector
-            : `${connector}@${opts.version}`,
-        wantFull: opts.full ?? true,
-        ...(opts.connect ? { connect: true } : {}),
-        observedAt: opts.observedAt,
-        owner: { address: OWNER, leaseId: null },
-      });
+      const begun = await begin(runId, opts);
       await sync.intake.batch(runId, {
         batch: 0,
         records: records.map(({ stream, id, v, pad, blobId, remove }) => ({
@@ -311,6 +342,7 @@ export async function world(options: {
           mimeType: "application/octet-stream",
           bytes: opts.blob.bytes,
         });
+      await opts.during?.();
       const selected = opts.selected ?? names;
       const covered = opts.covered ?? selected;
       await sync.intake.end(
@@ -326,8 +358,10 @@ export async function world(options: {
             .map((record) => record.stream),
           skipped: selected.filter((name) => !covered.includes(name)),
           ...(opts.full === false ? {} : { provenFullStreams: selected }),
+          ...(opts.checkpoints ? { checkpoints: opts.checkpoints } : {}),
         }),
       );
+      return begun;
     };
     const cycle = async () => {
       const report = await sync.cycle();
@@ -363,7 +397,19 @@ export async function world(options: {
           [CONNECTION_ID],
         )
       )[0]?.position ?? 0;
-    return { db, deps, sync, run, cycle, records, rows, position, puts, gets };
+    return {
+      db,
+      deps,
+      sync,
+      begin,
+      run,
+      cycle,
+      records,
+      rows,
+      position,
+      puts,
+      gets,
+    };
   }
 
   /** The decoded segments in the blob store, by position. */

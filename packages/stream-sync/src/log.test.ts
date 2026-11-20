@@ -885,7 +885,7 @@ describe("deletions carry the canonical record key", () => {
       .decode(encodeSegment(segment()))
       .replace(`"format":${LOG_FORMAT}`, '"format":1')
       .replace(`,"rk":["record-2"]`, "");
-    expect(LOG_FORMAT).toBe(2);
+    expect(LOG_FORMAT).toBe(3);
     expect(decodeSegment(utf8(old))).toEqual({
       kind: "unsupported_format",
       format: 1,
@@ -1108,5 +1108,180 @@ describe("fold: bodies of one key at one stamp (equal-stamp order)", () => {
         .replace('"n":3', `"n":${bad}`);
       expect(decodeSegment(utf8(text)).kind).toBe("malformed");
     }
+  });
+});
+
+describe("the stream cursor (format 3)", () => {
+  const partContext = {
+    connector: "c",
+    ns: "fedcba9876543210",
+    generation: 1,
+    keyCheck: "0123456789abcdef",
+    position: 2,
+  };
+  const withCursor = (
+    stream: string,
+    state: unknown,
+    connectorVersion = "1.2.0",
+  ) => ({
+    ...meta(stream),
+    cursor: { state, connectorVersion },
+  });
+  const cursorSeg = (
+    position: number,
+    streams: Segment["streams"],
+    operations: Segment["operations"] = [],
+  ) =>
+    segment({
+      position,
+      base: 0,
+      refs: refs(1, position - 1),
+      streams,
+      operations,
+    } as Partial<Segment>);
+
+  it("is written as format 3", () => {
+    expect(LOG_FORMAT).toBe(3);
+  });
+
+  it("round-trips a segment whose stream meta carries a cursor, and verifies it", async () => {
+    const s = cursorSeg(
+      2,
+      [withCursor("a", { since: "2026-11-19" })],
+      [up("a", 1, 1)],
+    );
+    const bytes = encodeSegment(s);
+    expect(new TextDecoder().decode(bytes)).toContain(
+      '"cursor":{"connectorVersion":"1.2.0","state":{"since":"2026-11-19"}}',
+    );
+    const decoded = decodeSegment(bytes);
+    expect(decoded).toEqual({ kind: "ok", segment: s });
+    const { dataHash } = await digestSegment(keccak256, bytes);
+    const verified = await verifySegment(keccak256, bytes, {
+      ...expected(s, dataHash),
+      position: 2,
+    });
+    expect(verified.kind).toBe("ok");
+    if (verified.kind === "ok")
+      expect(verified.segment.streams[0]).toEqual(
+        withCursor("a", { since: "2026-11-19" }),
+      );
+  });
+
+  it("a cursor-only segment (a meta with a cursor and no operation) round-trips", () => {
+    const s = cursorSeg(2, [withCursor("a", 7)]);
+    expect(decodeSegment(encodeSegment(s))).toEqual({ kind: "ok", segment: s });
+  });
+
+  it("refuses a malformed cursor", () => {
+    const text = new TextDecoder().decode(
+      encodeSegment(cursorSeg(2, [withCursor("a", 7)])),
+    );
+    for (const bad of [
+      text.replace('"connectorVersion":"1.2.0"', '"connectorVersion":""'),
+      text.replace('"connectorVersion":"1.2.0"', '"connectorVersion":3'),
+      text.replace(',"state":7', ""),
+      text.replace('"state":7', '"state":7,"x":1'),
+    ])
+      expect(decodeSegment(utf8(bad)).kind).toBe("malformed");
+  });
+
+  it("still reads format 2, which has no cursor; a format-2 meta with a cursor is malformed", () => {
+    const plain = new TextDecoder()
+      .decode(encodeSegment(seg(1, [up("a", 1, 1)])))
+      .replace(`"format":${LOG_FORMAT}`, '"format":2');
+    const decoded = decodeSegment(utf8(plain));
+    expect(decoded.kind).toBe("ok");
+    // The hash a reader checks is the hash of the bytes as written: a format-2
+    // segment encodes again as the same bytes.
+    if (decoded.kind === "ok") {
+      expect(decoded.segment.format).toBe(2);
+      expect(new TextDecoder().decode(encodeSegment(decoded.segment))).toBe(
+        plain,
+      );
+    }
+    const carrying = new TextDecoder()
+      .decode(encodeSegment(cursorSeg(2, [withCursor("a", 7)])))
+      .replace(`"format":${LOG_FORMAT}`, '"format":2');
+    expect(decodeSegment(utf8(carrying)).kind).toBe("malformed");
+  });
+
+  it("a newer format is unsupported, not malformed", () => {
+    const text = new TextDecoder()
+      .decode(encodeSegment(cursorSeg(2, [withCursor("a", 7)])))
+      .replace(`"format":${LOG_FORMAT}`, '"format":4');
+    expect(decodeSegment(utf8(text))).toEqual({
+      kind: "unsupported_format",
+      format: 4,
+    });
+    const part = new TextDecoder()
+      .decode(
+        encodeSnapshotPart(
+          partitionFold(
+            foldLog({
+              snapshot: [],
+              segments: [cursorSeg(1, [withCursor("a", 7)])],
+            }),
+            partContext,
+          )[0]!,
+        ),
+      )
+      .replace(`"format":${LOG_FORMAT}`, '"format":4');
+    expect(decodeSnapshotPart(utf8(part))).toEqual({
+      kind: "unsupported_format",
+      format: 4,
+    });
+  });
+
+  it("the fold keeps the last cursor a segment carried, past later segments that carry none", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [
+        cursorSeg(1, [withCursor("a", "c1")], [up("a", 1, 1)]),
+        cursorSeg(2, [{ ...meta("a"), complete: false }], [up("a", 2, 2)]),
+      ],
+    });
+    expect(fold.streams).toEqual([
+      { ...withCursor("a", "c1"), complete: false },
+    ]);
+  });
+
+  it("the fold takes the cursor of the newest segment that carries one, even an older cursor", () => {
+    const fold = foldLog({
+      snapshot: [],
+      segments: [
+        cursorSeg(2, [withCursor("a", "older", "1.0.0")], [up("a", 2, 2)]),
+        cursorSeg(1, [withCursor("a", "newer", "1.1.0")], [up("a", 1, 1)]),
+      ],
+    });
+    expect(fold.streams[0]!.cursor).toEqual({
+      state: "older",
+      connectorVersion: "1.0.0",
+    });
+  });
+
+  it("a snapshot part carries the cursor, and a fold over it and a cursorless tail keeps it", () => {
+    const [part] = partitionFold(
+      foldLog({
+        snapshot: [],
+        segments: [cursorSeg(1, [withCursor("a", "c1")], [up("a", 1, 1)])],
+      }),
+      partContext,
+    );
+    const decoded = decodeSnapshotPart(encodeSnapshotPart(part!));
+    expect(decoded.kind).toBe("ok");
+    if (decoded.kind !== "ok") return;
+    expect(decoded.part.streams[0]!.cursor).toEqual({
+      state: "c1",
+      connectorVersion: "1.2.0",
+    });
+    const fold = foldLog({
+      snapshot: [decoded.part as SnapshotPart],
+      segments: [cursorSeg(2, [meta("a")], [up("a", 2, 2)])],
+    });
+    expect(fold.streams[0]!.cursor).toEqual({
+      state: "c1",
+      connectorVersion: "1.2.0",
+    });
   });
 });

@@ -1,10 +1,17 @@
-import { streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  logScope,
+  streamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   type ReadDecision,
   type ResolveInput,
 } from "../stream-sync-read/service.js";
 import { streamReadScope } from "../stream-sync-read/routing.js";
 import { RegistryUnavailableBeforeWriteError } from "../stream-sync/ports.js";
+import {
+  ensureRegisteredRead,
+  registeredReadPosition,
+} from "./registered-read.js";
 import { applyConnection } from "./apply.js";
 import { nextApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
@@ -369,6 +376,16 @@ export function createLocalResolver(
     if (input.cursor !== null && input.cursor !== cursor)
       return { kind: "cursor_stale" };
 
+    const position = input.requireRegistered
+      ? await registeredReadPosition(
+          deps,
+          connection.connection_id,
+          installed.map((s) => s.stream),
+        )
+      : null;
+    if (input.requireRegistered && position === null)
+      return { kind: "read_not_registered" };
+
     let payload: AsyncIterable<string>;
     const binding = candidate.target.alias;
     if (!binding) {
@@ -407,8 +424,11 @@ export function createLocalResolver(
       ns: connection.ns,
       cursor,
       served: {
-        scope: streamScope(connection.connector, connection.ns, servedStream),
-        version: head.installed_version,
+        scope:
+          position === null
+            ? streamScope(connection.connector, connection.ns, servedStream)
+            : logScope(connection.connector, connection.ns),
+        version: position ?? head.installed_version,
       },
       body: bodyStream(
         envelope(
@@ -451,6 +471,7 @@ export function createLocalResolver(
       let sawConnection = false;
       let sawActive = false;
       let applyUnavailable = false;
+      const initial: Candidate[] = [];
       for (const target of targets) {
         // Apply sees the persisted state so it can mark pending deletes before
         // selection hides them. Selection below still uses effective control.
@@ -496,14 +517,30 @@ export function createLocalResolver(
         const loaded: { connection: Connection; streams: Stream[] }[] = [];
         for (const connection of rows) {
           if (
-            connection.control_state !== "active" ||
-            connection.deleted_at !== null
+            connection.deleted_at !== null ||
+            (connection.control_state !== "active" &&
+              !(
+                input.requireRegistered && connection.control_state === "absent"
+              ))
           )
             continue;
-          loaded.push({
-            connection,
-            streams: await streams(connection.connection_id),
-          });
+          const available = await streams(connection.connection_id);
+          if (connection.control_state === "active")
+            loaded.push({ connection, streams: available });
+          if (input.requireRegistered) {
+            const pending = servedStreams(
+              target,
+              available.filter((s) => target.streams.includes(s.stream)),
+              connection,
+            );
+            if (!pending.missingRequired && pending.streams.length > 0)
+              initial.push({
+                target,
+                connection,
+                streams: pending.streams,
+                registered: -Infinity,
+              });
+          }
         }
         const picked = selectForTarget(target, loaded, { progressive });
         if (picked.kind === "invalid_binding") return picked;
@@ -520,9 +557,20 @@ export function createLocalResolver(
           applyUnavailable = true;
         if (picked.candidate) candidates.push(picked.candidate);
       }
-      const chosen = chooseCandidate(candidates);
+      const ranked = chooseCandidate(candidates);
+      // First publication has no readable head to rank yet. Bootstrap only
+      // an unambiguous connection after ordinary selection found no body.
+      // A readable winner always keeps its existing rank and identity.
+      const chosen =
+        ranked ??
+        (!sawTombstoned && !applyUnavailable && initial.length === 1
+          ? initial[0]
+          : undefined);
       if (!chosen) {
-        if (applyUnavailable) return { kind: "busy", retryAfterSeconds: 5 };
+        if (applyUnavailable)
+          return input.requireRegistered
+            ? { kind: "read_not_registered" }
+            : { kind: "busy", retryAfterSeconds: 5 };
         if (sawTombstoned) return deleted();
         if (sawDeleted) return deleted();
         if (sawForeign && !sawActive) return { kind: "key_mismatch" };
@@ -532,6 +580,18 @@ export function createLocalResolver(
         }
         return noData();
       }
+      if (
+        input.requireRegistered &&
+        !(await ensureRegisteredRead(
+          deps,
+          chosen.connection.connection_id,
+          chosen.streams.map((s) => s.stream),
+          input.signal,
+        ))
+      )
+        return {
+          kind: input.signal?.aborted ? "read_aborted" : "read_not_registered",
+        };
       if (chosen.partialStreams?.length) {
         const partial = await buildPartial({ ...input, scope }, chosen);
         if (partial) return partial;
@@ -540,9 +600,24 @@ export function createLocalResolver(
       // until its reader finished or cancelled, which a reader that stopped
       // pulling never did, and every apply and read of the connection waited.
       // The body checks its head itself, on every page.
-      return deps.queue.run(chosen.connection.connection_id, "end", () =>
-        build({ ...input, scope }, chosen),
-      );
+      const decide = () =>
+        deps.queue.run(chosen.connection.connection_id, "end", () =>
+          build({ ...input, scope }, chosen),
+        );
+      const decision = await decide();
+      // A collector can commit between the early coverage check and build.
+      // Publish outside the queue and reselect the body once in that case.
+      if (decision.kind === "read_not_registered" && input.requireRegistered) {
+        const registered = await ensureRegisteredRead(
+          deps,
+          chosen.connection.connection_id,
+          chosen.target.streams,
+          input.signal,
+        );
+        if (input.signal?.aborted) return { kind: "read_aborted" };
+        if (registered) return decide();
+      }
+      return decision;
     },
   };
 }

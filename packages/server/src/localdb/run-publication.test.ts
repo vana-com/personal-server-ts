@@ -766,6 +766,28 @@ describe("run publication state", () => {
     ]);
   });
 
+  it("a run refused after end leaves no cursor to publish", async () => {
+    const world = await makeWorld();
+    await collect(world, "r1", 1000);
+    await createRunEndStore(world.deps).end(
+      "r1",
+      endRequest({ lastBatch: 0, live: [A], checkpoints: { [A]: "C1" } }),
+    );
+    const pending = () =>
+      world.deps.db.query<{ cursor_unpublished: string | null }>(
+        "SELECT cursor_unpublished FROM stream_state WHERE stream = ?",
+        [A],
+      );
+    expect((await pending())[0]!.cursor_unpublished).not.toBeNull();
+    await unwriteRefusedRun(world.deps, {
+      connectionId: CONNECTION_ID,
+      stream: A,
+      runId: "r1",
+      reason: "connector_update_required",
+    });
+    expect(await pending()).toEqual([{ cursor_unpublished: null }]);
+  });
+
   it("says a newer replacing run supersedes older runs, but a per-key overwrite does not", async () => {
     const world = await makeWorld();
     await collect(world, "r1", 1000, { [A]: ["a", "b"] });

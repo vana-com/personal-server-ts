@@ -1,5 +1,7 @@
+import { NODE_MAX_TIMER_DELAY_MS } from "../../stream-sync/timer.js";
 import {
   ChangeFeedAbsentError,
+  RegistryOverloadError,
   type StreamSyncRegistry,
 } from "../../stream-sync/ports.js";
 import type { ChangePush } from "./sync-manager.js";
@@ -102,18 +104,25 @@ export function createRegistryChangePush(
       // The abort listener goes away on both ways out. An outage sleeps once
       // per attempt; a listener left behind by each sleep is a leak that grows
       // with the subscription's age.
-      const sleep = (ms: number) =>
-        new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            lifetime.signal.removeEventListener("abort", done);
-            resolve();
-          };
-          const timer = setTimeout(done, ms);
-          lifetime.signal.addEventListener("abort", done, { once: true });
-        });
+      const sleep = async (ms: number) => {
+        const deadline = Date.now() + ms;
+        while (!lifetime.signal.aborted && Date.now() < deadline) {
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer);
+              lifetime.signal.removeEventListener("abort", done);
+              resolve();
+            };
+            const timer = setTimeout(
+              done,
+              Math.min(deadline - Date.now(), NODE_MAX_TIMER_DELAY_MS),
+            );
+            lifetime.signal.addEventListener("abort", done, { once: true });
+          });
+        }
+      };
 
-      async function once(): Promise<"answer" | "failed" | "absent"> {
+      async function once(): Promise<"answer" | "failed" | "absent" | number> {
         const request = new AbortController();
         let timer: ReturnType<typeof setTimeout> | undefined;
         let onStop: (() => void) | undefined;
@@ -155,6 +164,7 @@ export function createRegistryChangePush(
           }
           return "answer";
         } catch (error) {
+          if (error instanceof RegistryOverloadError) return error.retryAfterMs;
           if (error instanceof ChangeFeedAbsentError) return "absent";
           return "failed";
         } finally {
@@ -167,6 +177,10 @@ export function createRegistryChangePush(
         while (!lifetime.signal.aborted) {
           const outcome = await once();
           if (lifetime.signal.aborted) return;
+          if (typeof outcome === "number") {
+            await sleep(outcome);
+            continue;
+          }
           if (outcome === "absent") {
             // No route: stay unhealthy, so the manager's timer and probe keep
             // watching, and ask again after one held period. An absent route

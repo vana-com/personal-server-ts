@@ -1,6 +1,6 @@
 import { workspaceAttempt } from "./workspace-failure.js";
 import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { SqlDriver } from "./driver.js";
+import type { SqlDriver, SqlStatement } from "./driver.js";
 import type { WorkspaceBinding } from "./workspace-capability.js";
 import { workspaceAssert, workspaceGuard } from "./workspace.js";
 import {
@@ -60,6 +60,9 @@ export async function promoteWorkspaceSeed(
   expected: LogState,
   target: LogState,
   controlVersion: number,
+  /** Statements that read the seeded changes (a cursor waiting for them), run
+   * in the same transaction after the seed. */
+  after: readonly SqlStatement[] = [],
 ) {
   const pending = `NOT EXISTS(SELECT 1 FROM record_changes c WHERE c.connection_id=? AND c.stream=s.stream AND c.pk_hash=s.pk_hash AND c.seq>COALESCE((SELECT publish_watermark FROM stream_state WHERE connection_id=? AND stream=s.stream),0))`;
   await workspaceAttempt(db, b, "seed", "promote-seed", [
@@ -111,6 +114,7 @@ export async function promoteWorkspaceSeed(
       ],
     },
     writeLogState(b.connection, target),
+    ...after,
     {
       sql: "UPDATE workspaces SET phase='finished' WHERE operation=?",
       params: [b.operation],

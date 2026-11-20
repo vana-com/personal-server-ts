@@ -15,11 +15,16 @@
 // rows, and the next publish writes the queued changes on top of it. Every
 // operation merges per key by stamp, so the log then holds, for every key, the
 // greatest of both histories, and every reader converges on it.
+//
+// A stream cursor the lost segments carried is lost from the log with them.
+// The stream's checkpoint entry queues again too, and like every cursor
+// waiting to publish it waits for the queued rows (`cursorsRequeued`).
 
 import {
   logScope,
   type SegmentRef,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { cursorsRequeued, foldAppliedCursors } from "./cursor.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { fetchSegmentWire, fetchSnapshotPartWire } from "./log-input.js";
 import type { LogApplyContext } from "./log-apply.js";
@@ -103,6 +108,14 @@ export async function rebaseOnLog(
       await fold.seedEntry(entry, pk);
     }
     await fold.ws.transition("collect", "folded");
+    // The checkpoint must hold every applied cursor before the cursors the
+    // lost segments carried queue again, and they queue in the seed's own
+    // transaction: they wait for the rows it queues.
+    await foldAppliedCursors(deps.db, connectionId);
+    const carried: string[] = [];
+    for await (const meta of fold.metadata())
+      if (meta.cursor) carried.push(meta.stream);
+    const cursors = await cursorsRequeued(deps.db, connectionId, carried);
     await fold.ws.promoteSeed(
       local,
       fork === 0
@@ -114,6 +127,7 @@ export async function rebaseOnLog(
             snapshot: local.snapshot,
           },
       fold.controlVersion,
+      cursors,
     );
     deps.logger.warn(
       {

@@ -51,9 +51,15 @@ const artifactFor = (
   declarations.set(digest, { connector, ...shape });
   return digest;
 };
-async function build(device: string) {
-  const registry = createMemoryStreamSyncRegistry(),
-    blobs = createMemoryStreamSyncBlobs();
+async function build(
+  device: string,
+  shared?: {
+    registry: ReturnType<typeof createMemoryStreamSyncRegistry>;
+    blobs: ReturnType<typeof createMemoryStreamSyncBlobs>;
+  },
+) {
+  const registry = shared?.registry ?? createMemoryStreamSyncRegistry(),
+    blobs = shared?.blobs ?? createMemoryStreamSyncBlobs();
   const open = async (name: string) => {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
       owner: OWNER,
@@ -132,7 +138,7 @@ async function build(device: string) {
       },
       body: typeof json === "string" ? json : JSON.stringify(json),
     });
-  return { sync, call, read, db };
+  return { sync, call, read, db, shared: { registry, blobs } };
 }
 
 const beginBody = (extra: Record<string, unknown> = {}) => {
@@ -378,6 +384,38 @@ describe("stream-sync run intake route", () => {
     expect((await call("PUT", "a1", beginBody(), "wrong-token")).status).toBe(
       401,
     );
+  });
+});
+
+describe("join gate over HTTP", () => {
+  it("answers a second device 409 join_required until the begin carries join: true", async () => {
+    const first = await build("route-join-a");
+    const body = beginBody();
+    expect((await first.call("PUT", "r1", body)).status).toBe(200);
+    await first.call("POST", "r1/batches", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "a" } }],
+    });
+    await first.call(
+      "POST",
+      "r1/end",
+      endRequest({
+        lastBatch: 0,
+        live: ["items"],
+        checkpoints: { items: "c1" },
+      }),
+    );
+    await first.sync.cycle();
+
+    const second = await build("route-join-b", first.shared);
+    const refused = await second.call("PUT", "r2", body);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: "join_required" });
+    expect(await second.db.query("SELECT 1 FROM runs")).toEqual([]);
+
+    const joined = await second.call("PUT", "r2", { ...body, join: true });
+    expect(joined.status).toBe(200);
+    expect(await joined.json()).toMatchObject({ status: "collecting" });
   });
 });
 

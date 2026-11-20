@@ -644,6 +644,47 @@ END`,
         VALUES (${row}.connection_id,${row}.stream,${row}.record_key,${event === "DELETE" ? "NULL" : "NEW.body"}); END`;
     }),
   ],
+  [
+    // A device-local fact, never published: this device collected, or was
+    // asked and accepted, the connection. Begin asks before a first run of a
+    // connection that already exists. A device with a checkpoint or a run for
+    // a connection already collects it.
+    `CREATE TABLE connection_participation (
+  connection_id TEXT PRIMARY KEY, joined_at INTEGER NOT NULL) WITHOUT ROWID`,
+    `INSERT INTO connection_participation(connection_id, joined_at)
+  SELECT connection_id, CAST(strftime('%s','now') AS INTEGER) * 1000 FROM (
+    SELECT connection_id FROM runs
+    UNION SELECT connection_id FROM connections WHERE checkpoint IS NOT NULL)`,
+  ],
+  [
+    // A stream's connector cursor travels in the log with the rows it covers.
+    //   cursor_unpublished: the stream's checkpoint entry a run end saved and
+    //     no segment has carried yet, as {state, connectorVersion}.
+    //   cursor_seq: the stream's last record_changes seq when it was saved; a
+    //     segment that closes the stream through that seq may carry it.
+    //   cursor_children: the streams whose rows the cursor also claims (its
+    //     state descendants, read through it), as a JSON array; the cursor
+    //     travels only in a segment that closes them too.
+    //   cursor_version: the connector version that wrote the stream's local
+    //     checkpoint entry, here or on the device whose segment set it.
+    //   cursor_applied: the cursor of the last segment applied (or published
+    //     here) that carried one, as {state, connectorVersion}, until it is
+    //     folded into `connections.checkpoint` (cursor.ts). It is written in
+    //     the batch of the rows it covers; the fold is a JSON merge, done in JS.
+    `ALTER TABLE stream_state ADD COLUMN cursor_unpublished TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_seq INTEGER`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_children TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_version TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_applied TEXT`,
+    // Every path that drops the local checkpoint (a discarded or fenced run, a
+    // purge, a deleted connection) drops the cursors with it, so none of them
+    // can publish a cursor the device no longer resumes from.
+    `CREATE TRIGGER connections_checkpoint_cleared AFTER UPDATE OF checkpoint ON connections
+WHEN NEW.checkpoint IS NULL BEGIN
+  UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL, cursor_version = NULL, cursor_applied = NULL
+  WHERE connection_id = NEW.connection_id;
+END`,
+  ],
   WORKSPACE_SCHEMA,
   [
     `CREATE TABLE workspace_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT NOT NULL,unit TEXT NOT NULL,action TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','failed','succeeded')),reason TEXT,UNIQUE(operation,unit,action))`,

@@ -138,6 +138,7 @@ async function world() {
       const begin = await send(base, "PUT", {
         connector: "fixture-source",
         artifactDigest: digest,
+        join: true,
         owner: { address: context.serverOwner!, leaseId: null },
         wantFull: true,
         observedAt: Date.now(),

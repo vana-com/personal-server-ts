@@ -106,6 +106,7 @@ import {
   hasOwn,
   isPlainObject,
   type JsonObject,
+  type JsonValue,
 } from "./json.js";
 import { streamScope } from "./names.js";
 import { deletionKeyMatchesHash } from "./records.js";
@@ -122,11 +123,25 @@ import { deletionKeyMatchesHash } from "./records.js";
  *    different records, and derives the string record key from `key` as it
  *    does for an upsert's value.
  *
+ * 3  A stream meta may also carry the stream's connector cursor (`cursor`):
+ *    the state the connector resumes from, and the connector version that
+ *    wrote it. A writer puts it only in the segment that closes every row the
+ *    cursor covers, so a device that applies the segment holds those rows
+ *    when it resumes from the cursor. A format-2 reader would report such a
+ *    meta as malformed, not as a format it cannot read; the new number makes
+ *    it say `unsupported_format` (update required) instead.
+ *
  * Format 1 is `unsupported_format`: not read, and not read as keyless. Nothing
  * wrote it, so there is nothing to carry forward, and a reader that took a
- * hash-only deletion would apply it in a form this format forbids.
+ * hash-only deletion would apply it in a form this format forbids. Format 2 is
+ * read (it is format 3 with no cursor) and written again as itself, so its
+ * hash holds; this build writes only format 3.
  */
-export const LOG_FORMAT = 2;
+export const LOG_FORMAT = 3;
+
+/** The formats this build reads: `LOG_FORMAT` and the cursorless format 2. */
+export type LogFormat = 2 | typeof LOG_FORMAT;
+const READ_FORMATS: readonly unknown[] = [2, LOG_FORMAT];
 
 /**
  * The reserved stream name of the log row. A connector stream is a manifest
@@ -304,12 +319,38 @@ export function segmentRemoves(operations: readonly WireOperation[]): boolean {
   );
 }
 
+/**
+ * A stream's connector cursor as the log carries it: the stream's entry of the
+ * connection checkpoint, opaque here, and the connector version that wrote it.
+ * A device applies it with the rows of the segment that carries it.
+ */
+export interface LogCursor {
+  readonly state: JsonValue;
+  readonly connectorVersion: string;
+}
+
 /** What the stream's head said, carried with the batch that touched the stream. */
 export interface LogStreamMeta {
   readonly stream: string;
   readonly primaryKey: readonly string[];
   readonly profile: { readonly key: string | null; readonly version: string };
   readonly complete: boolean;
+  /** Format 3: the stream's cursor, only in a segment that closes its rows. */
+  readonly cursor?: LogCursor;
+}
+
+/**
+ * The meta of a stream after `next`, given the one before it: `next`, with the
+ * cursor before it when `next` carries none. A segment that only adds rows
+ * says nothing about the cursor, so the last cursor the log carried stays.
+ */
+export function followMeta(
+  previous: LogStreamMeta | undefined,
+  next: LogStreamMeta,
+): LogStreamMeta {
+  return next.cursor === undefined && previous?.cursor !== undefined
+    ? { ...next, cursor: previous.cursor }
+    : next;
 }
 
 /** One older segment of the log. */
@@ -358,7 +399,7 @@ export type WireOperation = LogOperation | LogUpsertByRef;
  * bodies out of line.
  */
 export interface Segment<Op extends WireOperation = LogOperation> {
-  readonly format: typeof LOG_FORMAT;
+  readonly format: LogFormat;
   readonly connector: string;
   readonly ns: string;
   readonly generation: number;
@@ -431,7 +472,7 @@ export type LogEntry = LogUpsert | LogDelete | LogOmitted;
 export type WireEntry = LogEntry | LogUpsertByRef;
 
 export interface SnapshotPart<E extends WireEntry = LogEntry> {
-  readonly format: typeof LOG_FORMAT;
+  readonly format: LogFormat;
   readonly connector: string;
   readonly ns: string;
   readonly generation: number;
@@ -591,8 +632,10 @@ export function foldLog(input: {
     stampAfter(stamp, d.stamp) ||
     (!d.explicit && !stampAfter(d.stamp, stamp));
   const metas = new Map<string, LogStreamMeta>();
+  const follow = (meta: LogStreamMeta) =>
+    metas.set(meta.stream, followMeta(metas.get(meta.stream), meta));
   for (const part of input.snapshot) {
-    for (const meta of part.streams) metas.set(meta.stream, meta);
+    for (const meta of part.streams) follow(meta);
     for (const entry of part.entries)
       if (entry.kind === "upsert") upsert(entry);
       else
@@ -606,7 +649,7 @@ export function foldLog(input: {
   }
   const ordered = [...input.segments].sort((a, b) => a.position - b.position);
   for (const segment of ordered) {
-    for (const meta of segment.streams) metas.set(meta.stream, meta);
+    for (const meta of segment.streams) follow(meta);
     for (const op of segment.operations)
       if (op.kind === "upsert") upsert(op);
       else if (op.kind === "delete")
@@ -846,6 +889,14 @@ const SEGMENT_FIELDS = [
 const REF_FIELDS = ["bytes", "dataHash", "position"];
 const REF_FIELDS_WITH_REMOVES = ["bytes", "dataHash", "position", "removes"];
 const META_FIELDS = ["complete", "primaryKey", "profile", "stream"];
+const META_CURSOR_FIELDS = [
+  "complete",
+  "cursor",
+  "primaryKey",
+  "profile",
+  "stream",
+];
+const CURSOR_FIELDS = ["connectorVersion", "state"];
 const UPSERT_FIELDS = ["f", "k", "o", "p", "r", "s", "v"];
 /** An upsert of a run's later intake batch also carries its ordinal `n` (>= 1). */
 const UPSERT_ORDINAL_FIELDS = ["f", "k", "n", "o", "p", "r", "s", "v"];
@@ -992,7 +1043,10 @@ function operationProblem(op: unknown, at: string): string | null {
   return null;
 }
 
-function streamsProblem(streams: unknown): {
+function streamsProblem(
+  streams: unknown,
+  format: unknown,
+): {
   readonly problem: string | null;
   readonly seen: Set<string>;
 } {
@@ -1001,11 +1055,30 @@ function streamsProblem(streams: unknown): {
     return { problem: "streams must be an array", seen };
   for (let i = 0; i < streams.length; i += 1) {
     const meta: unknown = streams[i];
-    if (!isPlainObject(meta) || !exactKeys(meta, META_FIELDS))
+    if (
+      !isPlainObject(meta) ||
+      !(
+        exactKeys(meta, META_FIELDS) ||
+        (format !== 2 && exactKeys(meta, META_CURSOR_FIELDS))
+      )
+    )
       return {
-        problem: `stream ${i} must have exactly ${META_FIELDS.join(", ")}`,
+        problem: `stream ${i} must have exactly ${META_FIELDS.join(", ")}${format === 2 ? "" : ", and may have cursor"}`,
         seen,
       };
+    if (hasOwn(meta, "cursor")) {
+      const cursor = meta["cursor"];
+      if (
+        !isPlainObject(cursor) ||
+        !exactKeys(cursor, CURSOR_FIELDS) ||
+        typeof cursor["connectorVersion"] !== "string" ||
+        cursor["connectorVersion"] === ""
+      )
+        return {
+          problem: `stream ${i} cursor must be {connectorVersion, state}`,
+          seen,
+        };
+    }
     const name = meta["stream"];
     if (typeof name !== "string" || name === "" || isLogStream(name))
       return { problem: `stream ${i} name is invalid`, seen };
@@ -1087,7 +1160,7 @@ function segmentProblem(value: Record<string, unknown>): string | null {
   }
   if (refs.length + snapshotParts > maxSegmentRefs())
     return "refs and snapshot parts exceed the head bound";
-  const checked = streamsProblem(v["streams"]);
+  const checked = streamsProblem(v["streams"], v["format"]);
   if (checked.problem) return checked.problem;
   const seen = checked.seen;
   const operations = v["operations"];
@@ -1161,6 +1234,23 @@ export function* operationWireChunks(op: WireOperation): Generator<string> {
   yield* canonicalJsonChunks(opToWire(op));
 }
 
+function metaToWire(m: LogStreamMeta): Record<string, unknown> {
+  return {
+    complete: m.complete,
+    ...(m.cursor === undefined
+      ? {}
+      : {
+          cursor: {
+            connectorVersion: m.cursor.connectorVersion,
+            state: m.cursor.state,
+          },
+        }),
+    primaryKey: [...m.primaryKey],
+    profile: { key: m.profile.key, version: m.profile.version },
+    stream: m.stream,
+  };
+}
+
 function toWire(segment: WireSegment): Record<string, unknown> {
   return {
     base: segment.base,
@@ -1187,12 +1277,7 @@ function toWire(segment: WireSegment): Record<string, unknown> {
           position: segment.snapshot.position,
         }
       : null,
-    streams: segment.streams.map((m) => ({
-      complete: m.complete,
-      primaryKey: [...m.primaryKey],
-      profile: { key: m.profile.key, version: m.profile.version },
-      stream: m.stream,
-    })),
+    streams: segment.streams.map(metaToWire),
   };
 }
 
@@ -1294,7 +1379,8 @@ export function decodeSegment(bytes: Uint8Array): DecodedSegment {
   if (!isPlainObject(parsed))
     return { kind: "malformed", reason: "segment is not an object" };
   const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
-  if (format !== LOG_FORMAT) return { kind: "unsupported_format", format };
+  if (!READ_FORMATS.includes(format))
+    return { kind: "unsupported_format", format };
   const problem = segmentProblem(parsed);
   if (problem) return { kind: "malformed", reason: problem };
   if (canonicalJson(parsed) !== text)
@@ -1303,7 +1389,7 @@ export function decodeSegment(bytes: Uint8Array): DecodedSegment {
   return {
     kind: "ok",
     segment: {
-      format: LOG_FORMAT,
+      format: format as LogFormat,
       connector: p["connector"] as string,
       ns: p["ns"] as string,
       generation: p["generation"] as number,
@@ -1384,7 +1470,7 @@ function partProblem(value: Record<string, unknown>): string | null {
     return "keyCheck must be 16 lowercase hex";
   if (!isCount(value["position"], 1)) return "position must be >= 1";
   if (!isCount(value["index"], 0)) return "index must be a count";
-  const checked = streamsProblem(value["streams"]);
+  const checked = streamsProblem(value["streams"], value["format"]);
   if (checked.problem) return checked.problem;
   const entries = value["entries"];
   if (!Array.isArray(entries)) return "entries must be an array";
@@ -1422,12 +1508,7 @@ export function encodeSnapshotPart(part: WireSnapshotPart): Uint8Array {
     keyCheck: part.keyCheck,
     ns: part.ns,
     position: part.position,
-    streams: part.streams.map((m) => ({
-      complete: m.complete,
-      primaryKey: [...m.primaryKey],
-      profile: { key: m.profile.key, version: m.profile.version },
-      stream: m.stream,
-    })),
+    streams: part.streams.map(metaToWire),
   };
   const problem = partProblem(wire);
   if (problem)
@@ -1465,7 +1546,8 @@ export function decodeSnapshotPart(bytes: Uint8Array): DecodedSnapshotPart {
   if (!isPlainObject(parsed))
     return { kind: "malformed", reason: "part is not an object" };
   const format = hasOwn(parsed, "format") ? parsed["format"] : undefined;
-  if (format !== LOG_FORMAT) return { kind: "unsupported_format", format };
+  if (!READ_FORMATS.includes(format))
+    return { kind: "unsupported_format", format };
   const problem = partProblem(parsed);
   if (problem) return { kind: "malformed", reason: problem };
   if (canonicalJson(parsed) !== text)
@@ -1474,7 +1556,7 @@ export function decodeSnapshotPart(bytes: Uint8Array): DecodedSnapshotPart {
   return {
     kind: "ok",
     part: {
-      format: LOG_FORMAT,
+      format: format as LogFormat,
       connector: p["connector"] as string,
       ns: p["ns"] as string,
       generation: p["generation"] as number,

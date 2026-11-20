@@ -84,6 +84,7 @@ async function world(seed = true) {
       await sync.intake.begin(id, {
         connector: "fixture-source",
         artifactDigest: "fixture",
+        join: true,
         owner: { address: owner, leaseId: null },
         wantFull: input.full ?? true,
         observedAt: at,

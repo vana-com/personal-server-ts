@@ -1,5 +1,6 @@
 import { copyBootstrapRecords } from "./bootstrap-copy.js";
 import {
+  followMeta,
   segmentBlobName,
   segmentRemoves,
   type Segment,
@@ -423,9 +424,14 @@ async function runBootstrap(input: {
       string,
       { receipt: Receipt; meta: Segment["streams"][number] }
     >();
+    // The last meta of each stream gives its head; the last one that carried
+    // a cursor gives its cursor.
     for (const receipt of receipts)
       for (const meta of JSON.parse(receipt.metas))
-        latest.set(meta.stream, { receipt, meta });
+        latest.set(meta.stream, {
+          receipt,
+          meta: followMeta(latest.get(meta.stream)?.meta, meta),
+        });
     for (const { receipt, meta } of latest.values()) {
       finish.push(
         ...streamHeadStatements(

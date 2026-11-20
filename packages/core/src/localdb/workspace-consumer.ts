@@ -13,7 +13,7 @@ import type {
   LogKey,
   LogStamp,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import type { SqlValue, SqlDriver } from "./driver.js";
+import type { SqlValue, SqlDriver, SqlStatement } from "./driver.js";
 import type {
   BoundedCursor,
   BoundedValueStore,
@@ -839,7 +839,16 @@ export async function openLogWorkspace(
       expected: LogState,
       target: LogState,
       controlVersion: number,
-    ) => promoteWorkspaceSeed(db, binding, expected, target, controlVersion),
+      after?: readonly SqlStatement[],
+    ) =>
+      promoteWorkspaceSeed(
+        db,
+        binding,
+        expected,
+        target,
+        controlVersion,
+        after,
+      ),
     transition: storage.transition,
     markSent: storage.markSent,
     settleSent: storage.settleSent,

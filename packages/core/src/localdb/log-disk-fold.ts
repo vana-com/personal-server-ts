@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import {
   canonicalJson,
+  followMeta,
   primaryKeyValues,
   stampAfter,
   PART_LIMIT_BYTES,
@@ -157,11 +158,23 @@ export async function openDiskFold(
     const primaryKeys = new Map(
       input.streams.map((meta) => [meta.stream, meta.primaryKey]),
     );
-    for (const meta of input.streams)
+    for (const meta of input.streams) {
+      // A unit that names a stream without a cursor leaves the one before it.
+      const earlier = await ws.lookup(
+        unitId,
+        "streams",
+        foldCellKey(meta.stream),
+        lease,
+      );
+      const next = followMeta(
+        earlier ? ((await read(earlier.metadata)) as LogStreamMeta) : undefined,
+        meta,
+      );
       await staged.stage("streams", {
         stream: meta.stream,
-        metadata: await store(encoder.encode(canonicalJson(meta))),
+        metadata: await store(encoder.encode(canonicalJson(next))),
       });
+    }
     async function deletion(
       stream: string,
       pkHash: string,
