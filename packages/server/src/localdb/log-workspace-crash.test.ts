@@ -179,9 +179,7 @@ it.todo(
 it.todo(
   "C1/D: SIGKILL before/after canonical restore/publication finalization and accepted watermark transaction",
 );
-it.todo(
-  "C2: SIGKILL before/after canonical partial visibility marker, rows, receipt, and final snapshot cursor commit",
-);
+// Progressive visibility/marker crash replays live in progressive-workspace-crash.test.ts.
 it.todo(
   "C3/D: SIGKILL across replacement fragment completion and omission publication receipts",
 );

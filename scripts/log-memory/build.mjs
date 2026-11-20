@@ -17,7 +17,7 @@ const source = async (file) =>
       )
     : readFile(file, "utf8");
 await build({
-  entryPoints: ["scripts/log-memory/measure.mjs"],
+  entryPoints: [process.argv[3] ?? "scripts/log-memory/measure.mjs"],
   outfile: process.argv[2],
   bundle: true,
   platform: "node",
@@ -45,6 +45,16 @@ await build({
     {
       name: "measurement-boundaries",
       setup(b) {
+        b.onResolve({ filter: /log-progressive\.js$/ }, () =>
+          process.env.MEMORY_BASE_APPLY
+            ? {
+                path: process.env.MEMORY_BASE_APPLY.replace(
+                  /apply\.ts$/,
+                  "progressive.ts",
+                ),
+              }
+            : null,
+        );
         b.onLoad(
           { filter: /log-(compact|rebase|seed)\.ts$/ },
           async ({ path: file }) => ({
@@ -142,8 +152,14 @@ await build({
           else throw Error("operations probe drift");
           return { contents: s, loader: "ts" };
         });
-        b.onLoad({ filter: /log-apply\.ts$/ }, async ({ path: file }) => {
-          let s = await source(file);
+        b.onLoad({ filter: /log-(apply|input)\.ts$/ }, async ({ path: file }) => {
+          let s = file.endsWith("log-apply.ts")
+            ? process.env.MEMORY_BASE_APPLY
+              ? await readFile(process.env.MEMORY_BASE_APPLY, "utf8")
+              : await source(file)
+            : await readFile(file, "utf8");
+          if (file.endsWith("log-apply.ts") && !s.includes("verifySegment("))
+            return { contents: s, loader: "ts" };
           if (s.includes("return verified.part;")) {
             s = s.replace(
               "return verified.part;",

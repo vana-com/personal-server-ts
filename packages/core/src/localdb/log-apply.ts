@@ -1,8 +1,7 @@
-import {
-  loadBootstrap,
-  discardBootstrap,
-  FalseRemovalFact,
-} from "./log-bootstrap.js";
+import { fetchSegment, fetchSnapshotPart } from "./log-input.js";
+export { fetchSegment, fetchSnapshotPart } from "./log-input.js";
+import { loadProgressively } from "./log-progressive-workspace.js";
+import { loadBootstrap, discardBootstrap } from "./log-bootstrap.js";
 // The reader of the stream-sync log (stream-sync/src/log.ts).
 //
 // One registry read says the log's position. A device at position n fetches
@@ -36,34 +35,23 @@ import {
   logScope,
   planOpsSince,
   segmentBlobName,
-  segmentRemoves,
   snapshotPartBlobName,
-  verifySegment,
-  verifySnapshotPart,
   type ControlHashes,
-  type LogStreamMeta,
   type Segment,
   type SegmentRef,
   type SnapshotPart,
   type SnapshotPointer,
-  type WireSegment,
-  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
-import { resolveBodies } from "./log-bodies.js";
 import { rebaseOnLog } from "./log-rebase.js";
 import { seedFromRecords } from "./log-seed.js";
 import { announceApplied } from "./apply-progress.js";
 import type { LocalSyncDeps } from "./deps.js";
-import type { SqlStatement } from "./driver.js";
 import {
   applyBatch,
   applyInGroups,
   stageBatch,
-  streamHeadStatements,
   streamStateStatement,
-  type BatchStep,
-  type OperationBatch,
   type PassItem,
 } from "./log-batch.js";
 import {
@@ -74,7 +62,6 @@ import {
   unfinishedKeyedLoad,
   type KeyedSource,
 } from "./log-keyed.js";
-import { heldKeys, removalsOf } from "./log-progressive.js";
 import {
   LogDivergedError,
   readKeyedPending,
@@ -83,11 +70,9 @@ import {
   type LogState,
 } from "./log-state.js";
 import { recommitApplied } from "./log-recommit.js";
-import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
   failureCode,
-  hideStoredRows,
   partialRowStatement,
   type PartialIdentity,
 } from "./partial-load.js";
@@ -277,6 +262,7 @@ export async function applyLog(
     context,
     read.dataHash,
     read.version,
+    deps.progressiveFirstLoad === true,
   );
   const head = newest.segment;
   if (head.generation < context.generation) {
@@ -304,7 +290,7 @@ export async function applyLog(
     position: head.position,
     dataHash: read.dataHash.toLowerCase() as `0x${string}`,
     bytes: newest.bytes,
-    removes: segmentRemoves(head.operations),
+    removes: newest.removes,
   };
   const allRefs: SegmentRef[] = [...head.refs, headRef];
   // The segment this device applied last must be the one the log names at that
@@ -398,7 +384,15 @@ export async function applyLog(
       connectionId,
       generation: context.generation,
       base: head.base,
-      head,
+      head: (
+        await fetchSegment(
+          deps,
+          scope,
+          context,
+          headRef.dataHash,
+          head.position,
+        )
+      ).segment,
       refs: tail,
       fetch: async (ref) =>
         (await fetchSegment(deps, scope, context, ref.dataHash, ref.position))
@@ -510,7 +504,17 @@ function segmentItem(
     stage: async () => {
       const segment =
         ref.position === head.position
-          ? head
+          ? deps.progressiveFirstLoad
+            ? (
+                await fetchSegment(
+                  deps,
+                  scope,
+                  context,
+                  ref.dataHash,
+                  ref.position,
+                )
+              ).segment
+            : head
           : (
               await fetchSegment(
                 deps,
@@ -553,7 +557,17 @@ function segmentSource(
     load: async () => ({
       batch:
         ref.position === head.position
-          ? head
+          ? deps.progressiveFirstLoad
+            ? (
+                await fetchSegment(
+                  deps,
+                  scope,
+                  context,
+                  ref.dataHash,
+                  ref.position,
+                )
+              ).segment
+            : head
           : (
               await fetchSegment(
                 deps,
@@ -631,103 +645,6 @@ function snapshotItems(
   }));
 }
 
-/** One segment, fetched, decrypted and verified against the hash and position. */
-export async function fetchWireSegment(
-  deps: LocalSyncDeps,
-  scope: string,
-  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
-  dataHash: string,
-  position: number,
-): Promise<{ segment: WireSegment; bytes: number; cipherBytes: number }> {
-  const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
-  if (cipher === null)
-    throw new Error(`apply: missing log segment ${position}`);
-  const verified = await verifySegment(
-    keccakOf(deps.streamCrypto),
-    await deps.keys.decrypt(scope, cipher),
-    {
-      dataHash,
-      connector: context.connector,
-      ns: context.ns,
-      keyCheck: context.keyCheck,
-      position,
-    },
-  );
-  if (verified.kind === "unsupported_format")
-    throw new UpdateRequiredError(
-      `apply: invalid log segment ${position} (unsupported_format)`,
-      verified.format,
-    );
-  if (verified.kind !== "ok")
-    throw new Error(
-      `apply: invalid log segment ${position} (${verified.kind})`,
-    );
-  return {
-    segment: verified.segment,
-    bytes: verified.bytes,
-    cipherBytes: cipher.length,
-  };
-}
-
-/** One snapshot part, fetched, decrypted and verified. */
-export async function fetchWireSnapshotPart(
-  deps: LocalSyncDeps,
-  scope: string,
-  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
-  dataHash: string,
-  position: number,
-): Promise<WireSnapshotPart> {
-  const cipher = await deps.blobs.get(
-    `${scope}/${snapshotPartBlobName(dataHash)}`,
-  );
-  if (cipher === null) throw new Error("apply: missing log snapshot part");
-  const verified = await verifySnapshotPart(
-    keccakOf(deps.streamCrypto),
-    await deps.keys.decrypt(scope, cipher),
-    {
-      dataHash,
-      connector: context.connector,
-      ns: context.ns,
-      keyCheck: context.keyCheck,
-      position,
-    },
-  );
-  if (verified.kind === "unsupported_format")
-    throw new UpdateRequiredError(
-      "apply: invalid log snapshot part (unsupported_format)",
-      verified.format,
-    );
-  if (verified.kind !== "ok")
-    throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
-  return verified.part;
-}
-
-export async function fetchSegment(
-  ...args: Parameters<typeof fetchWireSegment>
-): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
-  const result = await fetchWireSegment(...args);
-  return {
-    ...result,
-    segment: {
-      ...result.segment,
-      operations: await resolveBodies(
-        args[0],
-        args[1],
-        result.segment.operations,
-      ),
-    },
-  };
-}
-export async function fetchSnapshotPart(
-  ...args: Parameters<typeof fetchWireSnapshotPart>
-): Promise<SnapshotPart> {
-  const part = await fetchWireSnapshotPart(...args);
-  return {
-    ...part,
-    entries: await resolveBodies(args[0], args[1], part.entries),
-  };
-}
-
 /**
  * List the streams a key-ordered first load will publish, before it fetches a
  * segment: each is a stream state with a partial row at 0 of the segments, so a
@@ -787,465 +704,4 @@ async function listKeyedLoad(
         );
     },
   };
-}
-
-/**
- * The pass of `applyLog` for a device that serves a first load while it
- * applies (`progressiveFirstLoad`): the same batches in the same order, with
- * `stream_partial` rows between them. See `log-progressive.ts` for why a row
- * of a key a later batch removes stays hidden.
- *
- * The pass lists the streams the head names, with no rows, as soon as it has
- * read the head; reads the segments that remove a key (the head's refs say
- * which) and the first snapshot part; and then applies every batch as the
- * read-ahead delivers it, the first alone. A segment that removes nothing is
- * fetched when its batch is next, not before: the first rows show after the
- * first segment, and the download and the apply overlap.
- *
- * Every stream finishes with the last batch: that commit writes the heads of
- * all the streams the pass named, whichever batch named them last.
- */
-async function loadProgressively(
-  deps: LocalSyncDeps,
-  connectionId: string,
-  scope: string,
-  context: LogApplyContext,
-  head: Segment,
-  allRefs: readonly SegmentRef[],
-  snapshot: SnapshotPointer | null,
-  tail: readonly SegmentRef[],
-): Promise<number> {
-  const partRefs = snapshot?.parts ?? [];
-  // A part is fetched once, whoever asks first: the plan asks for the first,
-  // the pass for the others as read-ahead reaches them.
-  const parts: (Promise<SnapshotPart> | undefined)[] = [];
-  const partAt = (index: number) => {
-    if (!parts[index]) {
-      const fetching = fetchSnapshotPart(
-        deps,
-        scope,
-        context,
-        partRefs[index]!.dataHash,
-        snapshot!.position,
-      );
-      fetching.catch(() => undefined);
-      parts[index] = fetching;
-    }
-    return parts[index]!;
-  };
-  if (partRefs.length > 0) void partAt(0);
-
-  // A segment is fetched once, whoever asks first. The head is in hand.
-  const segments = new Map<number, Promise<Segment>>([
-    [head.position, Promise.resolve(head)],
-  ]);
-  const segmentAt = (ref: SegmentRef) => {
-    let fetching = segments.get(ref.position);
-    if (!fetching) {
-      fetching = fetchSegment(
-        deps,
-        scope,
-        context,
-        ref.dataHash,
-        ref.position,
-      ).then((fetched) => fetched.segment);
-      fetching.catch(() => undefined);
-      segments.set(ref.position, fetching);
-    }
-    return fetching;
-  };
-  // The segments the head does not say remove nothing: those are read first.
-  const removing = tail.filter(
-    (ref) => ref.position !== head.position && ref.removes !== false,
-  );
-  for (const ref of removing) void segmentAt(ref);
-
-  // Every batch's identity: the hash and blob its stream head will name.
-  const identities = [
-    ...partRefs.map((ref) => ({
-      dataHash: ref.dataHash.toLowerCase(),
-      blobName: snapshotPartBlobName(ref.dataHash),
-    })),
-    ...tail.map((ref) => ({
-      dataHash: ref.dataHash.toLowerCase(),
-      blobName: segmentBlobName(ref.dataHash),
-    })),
-  ];
-  const total = identities.length;
-  const lastIndex = total - 1;
-
-  const stored = await deps.db.query<{
-    stream: string;
-    complete: number;
-    head_generation: number;
-    head_version: number;
-    last_delete_version: number;
-  }>(
-    `SELECT stream, complete, head_generation, head_version, last_delete_version
-       FROM stream_state WHERE connection_id = ?`,
-    [connectionId],
-  );
-  const skip = new Set(
-    stored
-      .filter(
-        (row) =>
-          row.complete === 1 &&
-          row.head_generation === context.generation &&
-          row.head_version > row.last_delete_version,
-      )
-      .map((row) => row.stream),
-  );
-  const versionOf = new Map(
-    stored.map((row) => [
-      row.stream,
-      Math.max(row.head_version, row.last_delete_version) + 1,
-    ]),
-  );
-
-  // The row a stream's load shows is the head the pass ends as: the version
-  // its last batch writes, and the hash and blob of the pass's last batch.
-  const identityOf = new Map<string, PartialIdentity>();
-  const headOf = (stream: string): PartialIdentity => {
-    let identity = identityOf.get(stream);
-    if (!identity) {
-      identity = {
-        connectionId,
-        stream,
-        version: versionOf.get(stream) ?? 1,
-        generation: context.generation,
-        dataHash: identities[lastIndex]!.dataHash,
-        headBlob: identities[lastIndex]!.blobName,
-        observedAt: head.observedAt,
-      };
-      identityOf.set(stream, identity);
-    }
-    return identity;
-  };
-  // A load of the same head that stopped continues: its rows keep showing.
-  const markers = await deps.db.query<{
-    stream: string;
-    version: number;
-    generation: number;
-    data_hash: string;
-  }>(
-    `SELECT stream, version, generation, data_hash
-       FROM stream_partial WHERE connection_id = ?`,
-    [connectionId],
-  );
-  const resumed = new Set<string>();
-  const stale: SqlStatement[] = [];
-  for (const marker of markers) {
-    const mine = headOf(marker.stream);
-    if (
-      marker.version === mine.version &&
-      marker.generation === mine.generation
-    ) {
-      resumed.add(marker.stream);
-      if (marker.data_hash !== mine.dataHash)
-        stale.push({
-          sql: "UPDATE stream_partial SET data_hash=?,head_blob=?,observed_at=?,failed=0,last_error=NULL WHERE connection_id=? AND stream=? AND version=? AND generation=? AND data_hash=?",
-          params: [
-            mine.dataHash,
-            mine.headBlob,
-            mine.observedAt,
-            connectionId,
-            marker.stream,
-            marker.version,
-            marker.generation,
-            marker.data_hash,
-          ],
-        });
-    } else if (skip.has(marker.stream))
-      // A load this pass does not continue, of a stream that reads complete.
-      stale.push({
-        sql: "DELETE FROM stream_partial WHERE connection_id = ? AND stream = ?",
-        params: [connectionId, marker.stream],
-      });
-  }
-
-  // The streams the head names are listed now, with no rows: the stream's
-  // row, its rows hidden, and a partial row at 0 of `total` batches. A reader
-  // that lists with progressive on sees the source here, with the others
-  // loading. Streams a segment names that the head does not are listed with
-  // the first batch that names them.
-  const begun = new Set<string>();
-  const listed: SqlStatement[] = [...stale];
-  for (const meta of head.streams) {
-    if (skip.has(meta.stream) || resumed.has(meta.stream)) continue;
-    begun.add(meta.stream);
-    listed.push(
-      streamStateStatement(connectionId, meta),
-      ...hideStoredRows(connectionId, meta.stream),
-      partialRowStatement(headOf(meta.stream), 0, total, 0),
-    );
-  }
-  if (listed.length > 0) {
-    await deps.db.batch(listed);
-    if (begun.size > 0 || stale.length > 0) announceApplied(deps, connectionId);
-  }
-
-  // What a later batch removes: read from the segments that say they remove,
-  // which are in hand (or on their way) before the first batch applies.
-  const [firstPart] = await Promise.all([
-    partRefs.length > 0 ? partAt(0) : Promise.resolve(undefined),
-    ...removing.map(segmentAt),
-  ]).catch(async (error) => {
-    const stopped = [...new Set([...begun, ...resumed])].map(headOf);
-    if (stopped.length)
-      await deps.db
-        .batch(
-          stopped.map((identity) =>
-            failedRowStatement(identity, failureCode(error)),
-          ),
-        )
-        .then(
-          () => announceApplied(deps, connectionId),
-          () => undefined,
-        );
-    throw error;
-  });
-  const removed = removalsOf(
-    await Promise.all(
-      tail
-        .filter(
-          (ref) => ref.position === head.position || ref.removes !== false,
-        )
-        .map(async (ref) => ({
-          index: partRefs.length + tail.indexOf(ref),
-          operations: (await segmentAt(ref)).operations,
-        })),
-    ),
-  );
-
-  // What each batch does for the streams that load progressively: a function
-  // of its place in the pass and its own operations, so the batches can be
-  // staged in any order and are committed in this one.
-  const stepsOf: ReadonlyMap<string, BatchStep>[] = [];
-  const lastNaming = new Map<
-    string,
-    { index: number; meta: LogStreamMeta; batch: OperationBatch }
-  >();
-  const stepsFor = (
-    index: number,
-    batch: OperationBatch,
-  ): ReadonlyMap<string, BatchStep> => {
-    const steps = new Map<string, BatchStep>();
-    const final = index === lastIndex;
-    for (const meta of batch.streams) {
-      if (skip.has(meta.stream)) continue;
-      const seen = lastNaming.get(meta.stream);
-      if (!seen || seen.index < index)
-        lastNaming.set(meta.stream, { index, meta, batch });
-      steps.set(meta.stream, {
-        begin: !resumed.has(meta.stream),
-        final,
-        held: final
-          ? []
-          : heldKeys(removed, meta.stream, index, batch.operations),
-        row: final
-          ? undefined
-          : {
-              head: headOf(meta.stream),
-              applied: Math.min(index + 1, total - 1),
-              total,
-            },
-      });
-    }
-    stepsOf[index] = steps;
-    return steps;
-  };
-  const stateOf = (index: number): LogState | undefined => {
-    const lastPart = index === partRefs.length - 1;
-    const position = index - partRefs.length;
-    return index < partRefs.length
-      ? lastPart
-        ? {
-            position: snapshot!.position,
-            base: head.base,
-            refs: allRefs.filter((r) => r.position <= snapshot!.position),
-            snapshot,
-          }
-        : undefined
-      : {
-          position: tail[position]!.position,
-          base: head.base,
-          refs: allRefs.filter((r) => r.position <= tail[position]!.position),
-          snapshot: head.snapshot,
-        };
-  };
-  // The last batch's commit ends the load of every stream the pass named. A
-  // stream whose last batch is an earlier one gets its head here, from the
-  // batch that named it last; one whose last meta says it is not complete
-  // ends with no head and no partial row. A stream an earlier pass began and
-  // none of the batches left names is ended from the newest batch that did.
-  type Naming = {
-    meta: LogStreamMeta;
-    batch: { generation: number; observedAt: number };
-    identity: { dataHash: string; blobName: string };
-  };
-  const earlierNaming = async (
-    streams: readonly string[],
-  ): Promise<Map<string, Naming>> => {
-    const found = new Map<string, Naming>();
-    const inTail = new Set(tail.map((ref) => ref.position));
-    const earlier = allRefs
-      .filter((ref) => !inTail.has(ref.position))
-      .sort((a, b) => b.position - a.position);
-    for (const ref of earlier) {
-      if (found.size === streams.length) break;
-      const segment = await segmentAt(ref);
-      for (const meta of segment.streams)
-        if (streams.includes(meta.stream) && !found.has(meta.stream))
-          found.set(meta.stream, {
-            meta,
-            batch: segment,
-            identity: {
-              dataHash: ref.dataHash.toLowerCase(),
-              blobName: segmentBlobName(ref.dataHash),
-            },
-          });
-    }
-    const pointer = snapshot ?? head.snapshot ?? null;
-    if (found.size < streams.length && pointer && pointer.parts.length > 0) {
-      const part = await fetchSnapshotPart(
-        deps,
-        scope,
-        context,
-        pointer.parts[0]!.dataHash,
-        pointer.position,
-      );
-      for (const meta of part.streams)
-        if (streams.includes(meta.stream) && !found.has(meta.stream))
-          found.set(meta.stream, {
-            meta,
-            batch: { generation: part.generation, observedAt: 0 },
-            identity: {
-              dataHash: pointer.parts[0]!.dataHash.toLowerCase(),
-              blobName: snapshotPartBlobName(pointer.parts[0]!.dataHash),
-            },
-          });
-    }
-    return found;
-  };
-  const ending = async (): Promise<SqlStatement[]> => {
-    const out: SqlStatement[] = [];
-    const named = new Map<string, Naming & { final: boolean }>();
-    for (const [stream, { index, meta, batch }] of lastNaming)
-      named.set(stream, {
-        meta,
-        batch,
-        identity: identities[index]!,
-        final: index === lastIndex,
-      });
-    const orphans = [...resumed].filter(
-      (stream) => !lastNaming.has(stream) && !skip.has(stream),
-    );
-    if (orphans.length > 0) {
-      const found = await earlierNaming(orphans);
-      for (const stream of orphans) {
-        const hit = found.get(stream);
-        if (!hit)
-          throw new Error(
-            `apply: no batch of the log names stream ${stream}, which an earlier load began`,
-          );
-        named.set(stream, { ...hit, final: false });
-      }
-    }
-    for (const [stream, { meta, batch, identity, final }] of named) {
-      if (!final)
-        out.push(
-          ...streamHeadStatements(connectionId, [meta], batch, identity),
-        );
-      if (!meta.complete)
-        out.push({
-          sql: "DELETE FROM stream_partial WHERE connection_id = ? AND stream = ?",
-          params: [connectionId, stream],
-        });
-    }
-    return out;
-  };
-  const items: PassItem[] = identities.map((_, index) => ({
-    bytes:
-      index < partRefs.length
-        ? partRefs[index]!.bytes
-        : tail[index - partRefs.length]!.bytes,
-    stage: async () => {
-      let batch: OperationBatch;
-      if (index < partRefs.length) {
-        const part = await partAt(index);
-        if (
-          part.index !== index ||
-          JSON.stringify(part.streams) !== JSON.stringify(firstPart!.streams)
-        )
-          throw new Error("apply: invalid log snapshot part (inconsistent)");
-        batch = {
-          generation: part.generation,
-          observedAt: 0,
-          streams: part.streams,
-          operations: part.entries,
-        };
-      } else {
-        const ref = tail[index - partRefs.length]!;
-        const segment = await segmentAt(ref);
-        // A segment the head says removes nothing was not read first. If it
-        // removes a key, rows of the keys it removes may be showing.
-        if (ref.removes === false && segmentRemoves(segment.operations))
-          throw new FalseRemovalFact();
-        batch = segment;
-      }
-      const staged = await stageBatch(
-        deps,
-        connectionId,
-        batch,
-        identities[index]!,
-        stateOf(index),
-        stepsFor(index, batch),
-      );
-      return index === lastIndex ? { ...staged, after: ending } : staged;
-    },
-  }));
-
-  const showing = new Map<string, PartialIdentity>();
-  const finished = new Set<string>();
-  try {
-    await applyInGroups(deps, items, {
-      // The first batch commits alone: it is the first screen.
-      firstAlone: true,
-      begun,
-      onCommit: (first, last) => {
-        let shown = false;
-        for (let index = first; index <= last; index++)
-          for (const [stream, step] of stepsOf[index]!) {
-            shown = true;
-            if (step.final) finished.add(stream);
-            else showing.set(stream, headOf(stream));
-          }
-        if (shown) announceApplied(deps, connectionId);
-      },
-    });
-  } catch (error) {
-    // The load stopped short of its last batch: say so on its rows, for a
-    // reader to tell this from a load that is still going. The next batch
-    // clears it. A failure here must not hide the one being thrown.
-    const code = failureCode(error);
-    const stopped = [...new Set([...begun, ...showing.keys()])]
-      .filter((stream) => !finished.has(stream))
-      .map(headOf);
-    if (stopped.length > 0)
-      await deps.db
-        .batch(
-          stopped.flatMap((identity) => [
-            ...(error instanceof FalseRemovalFact
-              ? hideStoredRows(connectionId, identity.stream)
-              : []),
-            failedRowStatement(identity, code),
-          ]),
-        )
-        .then(
-          () => announceApplied(deps, connectionId),
-          () => undefined,
-        );
-    throw error;
-  }
-  return total;
 }

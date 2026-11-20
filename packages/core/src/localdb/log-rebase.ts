@@ -21,11 +21,8 @@ import {
   type SegmentRef,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
-import {
-  fetchWireSegment,
-  fetchWireSnapshotPart,
-  type LogApplyContext,
-} from "./log-apply.js";
+import { fetchSegmentWire, fetchSnapshotPartWire } from "./log-input.js";
+import type { LogApplyContext } from "./log-apply.js";
 import { openDiskFold } from "./log-disk-fold.js";
 import { type LogState } from "./log-state.js";
 
@@ -67,7 +64,7 @@ export async function rebaseOnLog(
   try {
     let position = 0;
     for (const part of snapshot?.parts ?? []) {
-      const input = await fetchWireSnapshotPart(
+      const input = await fetchSnapshotPartWire(
         deps,
         scope,
         context,
@@ -83,7 +80,7 @@ export async function rebaseOnLog(
       );
     }
     for (const ref of [...lost].sort((a, b) => a.position - b.position)) {
-      const { segment } = await fetchWireSegment(
+      const { segment } = await fetchSegmentWire(
         deps,
         scope,
         context,

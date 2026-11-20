@@ -69,19 +69,14 @@ const dropRawEndSchema = [
   { sql: "ALTER TABLE runs DROP COLUMN selected_streams" },
   { sql: "ALTER TABLE runs DROP COLUMN raw_end" },
 ];
-// The workspace relations came after the bootstrap schema.
-const dropWorkspaceSchema = [
-  "workspace_attempts",
-  "workspace_jobs",
-  "body_value_chunks",
-  "body_values",
-  "workspace_receipts",
-  "workspace_stage",
-  "workspace_cells",
-  "workspace_assert",
-  "workspaces",
-  "workspace_authority",
-].map((table) => ({ sql: `DROP TABLE ${table}` }));
+// The workspace relations came after the bootstrap schema. Every relation a
+// later migration adds is named by the schema itself, so none can be missed.
+const dropWorkspaceSchema = async (db: SqlDriver) =>
+  (
+    await db.query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type='table' AND (name='workspaces' OR name LIKE 'workspace\\_%' ESCAPE '\\' OR name LIKE 'body\\_value%' ESCAPE '\\')",
+    )
+  ).map(({ name }) => ({ sql: `DROP TABLE ${name}` }));
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -1056,7 +1051,7 @@ describe("view changes", () => {
     // rows had no stream meta.
     await raw.batch([
       ...dropRawEndSchema,
-      ...dropWorkspaceSchema,
+      ...(await dropWorkspaceSchema(raw)),
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
@@ -1174,7 +1169,7 @@ describe("view changes", () => {
     expect(MIGRATIONS[metaMigration]).toHaveLength(3);
     await raw.batch([
       ...dropRawEndSchema,
-      ...dropWorkspaceSchema,
+      ...(await dropWorkspaceSchema(raw)),
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },

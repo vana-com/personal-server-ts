@@ -41,11 +41,8 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
-import {
-  fetchWireSegment,
-  fetchWireSnapshotPart,
-  type LogState,
-} from "./log-apply.js";
+import { fetchSegmentWire, fetchSnapshotPartWire } from "./log-input.js";
+import type { LogState } from "./log-state.js";
 import { openDiskFold } from "./log-disk-fold.js";
 import { putBodiesOutOfLine } from "./log-bodies.js";
 
@@ -109,7 +106,7 @@ export async function planCompaction(
   try {
     let position = 0;
     for (const part of previous) {
-      const unit = await fetchWireSnapshotPart(
+      const unit = await fetchSnapshotPartWire(
         deps,
         input.scope,
         context,
@@ -125,7 +122,7 @@ export async function planCompaction(
       );
     }
     for (const ref of [...log.refs].sort((a, b) => a.position - b.position)) {
-      const { segment } = await fetchWireSegment(
+      const { segment } = await fetchSegmentWire(
         deps,
         input.scope,
         context,

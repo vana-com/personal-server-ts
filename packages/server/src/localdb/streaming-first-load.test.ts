@@ -10,8 +10,8 @@
 //               the segments that remove a key are read before the first apply
 //               (the head's refs say which: `SegmentRef.removes`).
 //
-// A fourth test holds the write cost: the load writes each row once (no staging
-// tables), the same rows a key-ordered load ends with. The Node bench
+// A fourth test compares the durable staged replay with the same rows a
+// key-ordered load ends with. The Node bench
 // (`bench/first-load-bench.workload.ts`) counts page writes for the same claim
 // on 198k rows.
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -110,7 +110,11 @@ async function sevenSegments(w: World) {
 }
 
 /** A device that stops its own fetch of the blobs `held` names, until released. */
-async function heldDevice(w: World, held: ReadonlySet<string>) {
+async function heldDevice(
+  w: World,
+  held: ReadonlySet<string>,
+  afterScan = false,
+) {
   const arrived = new Map<string, () => void>();
   const arrivals = new Map<string, Promise<void>>();
   let release!: () => void;
@@ -120,10 +124,14 @@ async function heldDevice(w: World, held: ReadonlySet<string>) {
       key,
       new Promise<void>((resolve) => arrived.set(key, resolve)),
     );
+  const counts = new Map<string, number>();
   const d = await w.device("b", {
     progressiveFirstLoad: true,
     beforeGet: async (key) => {
       if (!held.has(key)) return;
+      const count = (counts.get(key) ?? 0) + 1;
+      counts.set(key, count);
+      if (afterScan && count === 1) return;
       arrived.get(key)!();
       await open;
     },
@@ -209,15 +217,15 @@ describe("first load of a large source on a second device", () => {
     const w = await world({ streams: 1 });
     await sevenSegments(w);
     const keys = await w.segmentKeys();
-    // Segment 5 removes nothing and is not read until its turn. Segments 4 and
-    // 6 remove a key: they are read first.
+    // Hold the application reread after the bounded prerequisite scan.
     const { d, release, reached } = await heldDevice(
       w,
       new Set([keys.get(5)!]),
+      true,
     );
     const applying = applyConnection(d.deps, CONNECTION_ID);
     await Promise.race([reached(keys.get(5)!), applying]);
-    // The apply is a step ahead of the read: let its commits land.
+    // Wait for the committed prefix before inspecting the view.
     for (let i = 0; i < 20 && (await d.position()) < 4; i++) await sleep(25);
 
     const view = await reads(d)();
@@ -288,7 +296,7 @@ describe("first load of a large source on a second device", () => {
     ]);
   });
 
-  it("writes each row once: no staging table, and the rows a key-ordered load ends with", async () => {
+  it("stages records durably and ends with the rows a key-ordered load ends with", async () => {
     const w = await world({ streams: 1 });
     await sevenSegments(w);
     const statementsOf = async (hooks: { keyedFirstLoad: boolean }) => {

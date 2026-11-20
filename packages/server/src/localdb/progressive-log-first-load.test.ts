@@ -564,11 +564,12 @@ describe(
       const slow = partKey(head, 2);
       let blocked!: () => void;
       const arrived = new Promise<void>((r) => (blocked = r));
+      let readsOfSlow = 0;
       const b = await w.device("b", {
         progressiveFirstLoad: true,
         keyedFirstLoad: false,
         beforeGet: async (key) => {
-          if (key !== slow) return;
+          if (key !== slow || ++readsOfSlow === 1) return;
           blocked();
           await open;
         },
@@ -648,10 +649,14 @@ describe(
       const { w, head, victim } = await compacted();
       const key = partKey(head, 2);
       const bytes = (await w.innerBlobs.get(key))!;
-      w.innerBlobs.delete(key);
+      let readsOfMissing = 0;
       const b = await w.device("b", {
         progressiveFirstLoad: true,
         keyedFirstLoad: false,
+        beforeGet: async (requested) => {
+          if (requested === key && ++readsOfMissing === 2)
+            w.innerBlobs.delete(key);
+        },
         maxBytesInFlight: ONE_AT_A_TIME,
       });
       await connect(b);
@@ -680,7 +685,7 @@ describe(
       expect(await count(b, "partial_hidden")).toBe(0);
     });
 
-    it("with parts committed together, the snapshot's position is written only with its last part, and the tables end as a part-by-part load leaves them", async () => {
+    it("with disk staging, the snapshot's position is written only with its last part, and the tables end as a part-by-part load leaves them", async () => {
       const { w, head } = await compacted();
       const one = await reference(w);
       await applyConnection(one.deps, CONNECTION_ID);
@@ -716,15 +721,19 @@ describe(
       expect(await dump(b)).toEqual(await dump(one));
     });
 
-    it("a last part that is missing leaves the committed parts' rows without a snapshot position, and the next apply finishes, with parts committed together", async () => {
+    it("a last part that is missing leaves the committed parts' rows without a snapshot position, and the next apply finishes, with disk staging", async () => {
       const { w, head, victim } = await compacted();
       const last = head.snapshot!.parts.length - 1;
       const key = partKey(head, last);
       const bytes = (await w.innerBlobs.get(key))!;
-      w.innerBlobs.delete(key);
+      let readsOfMissing = 0;
       const b = await w.device("b", {
         progressiveFirstLoad: true,
         keyedFirstLoad: false,
+        beforeGet: async (requested) => {
+          if (requested === key && ++readsOfMissing === 2)
+            w.innerBlobs.delete(key);
+        },
       });
       await connect(b);
       await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
@@ -852,12 +861,10 @@ describe("progressive first load, log protocol on, flag off", () => {
   });
 });
 
-// Commits that carry several batches (the default budget: a batch is
-// committed together with the ones fetched while it was written). The load's
-// rules do not depend on how many commit together. The tests below hold each
-// rule to the answer of a load that commits one batch at a time.
-describe("progressive first load, batches committed together", () => {
-  it("ends in every table a one-batch-at-a-time load ends in, and commits fewer times", async () => {
+// The same visibility and restart rules apply with the default transport
+// budget. The fixed workspace lease commits one verified input unit at a time.
+describe("progressive first load with disk staging", () => {
+  it("ends in every table a one-batch-at-a-time load ends in with one input unit per commit", async () => {
     const w = await world({ streams: 1 });
     await sevenSegments(w);
     const one = await reference(w);
@@ -872,11 +879,11 @@ describe("progressive first load, batches committed together", () => {
     await applyConnection(grouped.deps, CONNECTION_ID);
 
     expect(commits.flat()).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(commits.length).toBeLessThan(7);
+    expect(commits.length).toBe(7);
     expect(await dump(grouped)).toEqual(await dump(one));
   });
 
-  it("a key a later batch deletes or omits is in no view, at any commit, though the batches commit together", async () => {
+  it("a key a later batch deletes or omits is in no view, at any commit, with one input unit per commit", async () => {
     const w = await world({ streams: 1 });
     await sevenSegments(w);
     const b = await w.device("b", {
@@ -894,7 +901,7 @@ describe("progressive first load, batches committed together", () => {
       if (view !== BLOCKED && view.kind === "view") views.push(view.ids);
     });
     await applyConnection(b.deps, CONNECTION_ID);
-    expect(commits.length).toBeLessThan(7);
+    expect(commits.length).toBe(7);
     for (const ids of views) {
       // A2 is deleted at position 4 and A3 omitted at 6: never shown.
       expect(ids).not.toContain("A2");
@@ -904,7 +911,7 @@ describe("progressive first load, batches committed together", () => {
     expect((await reads.read()).ids).toEqual(["A1", "B", "C", "D", "E"]);
   });
 
-  it("a key deleted and then written again is shown once written, with batches committed together", async () => {
+  it("a key deleted and then written again is shown once written, with disk staging", async () => {
     const w = await world({ streams: 1 });
     const a = await w.device("a");
     await publish(a, "run-1", ["A", "B"], { full: true, observedAt: 1100 });
@@ -1006,18 +1013,22 @@ describe("progressive first load, batches committed together", () => {
     const keys = await w.segmentKeys();
     const missing = keys.get(4)!;
     const bytes = (await w.innerBlobs.get(missing))!;
-    await w.innerBlobs.delete(missing);
+    let readsOfMissing = 0;
 
     const grouped = await w.device("grouped", {
       progressiveFirstLoad: true,
       keyedFirstLoad: false,
+      beforeGet: async (key) => {
+        if (key === missing && ++readsOfMissing === 2)
+          w.innerBlobs.delete(missing);
+      },
     });
     await connect(grouped);
     await expect(
       applyConnection(grouped.deps, CONNECTION_ID),
     ).rejects.toThrow();
-    // Segments are read as the apply reaches them: the prefix before the
-    // missing one is kept, the missing one and the ones after it are not.
+    // The application reread fails after the prerequisite scan. The durable
+    // prefix and its markers remain; the missing unit is not applied.
     expect(await grouped.position()).toBeLessThan(4);
     const complete = await grouped.db.query<{ stream: string }>(
       "SELECT stream FROM stream_state WHERE complete = 1",
@@ -1085,7 +1096,7 @@ describe("progressive first load, batches committed together", () => {
       keyedFirstLoad: false,
     });
     await connect(b);
-    // The first commit is one batch; the second carries the ones fetched with it.
+    // Each input unit commits separately; the second commit fails.
     const commits = afterCommits(b, async () => undefined, { failCommit: 2 });
     await expect(applyConnection(b.deps, CONNECTION_ID)).rejects.toThrow(
       "injected",
