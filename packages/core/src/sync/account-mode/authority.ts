@@ -171,6 +171,24 @@ export function createModeAuthority(
     string,
     Array<{ through: number; resolve: () => void }>
   >();
+  /**
+   * Invariant: for every sequence of answers and failed loads, the permission
+   * once the records load again equals the permission the same answers give
+   * with the records readable throughout, or is stricter.
+   *
+   * An Off that arrives while the records will not load is judged against
+   * nothing, so it is remembered here (the latest Off per owner) and judged
+   * by `judge`, the same rule the readable path uses, the next time the
+   * records are loaded. Until then the owner has no legacy permission. An On
+   * that arrives then is never applied: it replaces the remembered Off and
+   * marks the entry `blocked`, so nothing later that is judged at load lifts
+   * the withdrawal; only an answer that arrives after the load can. In memory
+   * only.
+   */
+  const unjudgedOff = new Map<
+    string,
+    { generation: number | null; ticket: number; blocked: boolean }
+  >();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -219,7 +237,10 @@ export function createModeAuthority(
     const decision = read(owner);
     if (decision.kind !== "legacy") return decision;
     const key = typeof owner === "string" ? normalizeOwner(owner) : null;
-    return key !== null && !withdrawn.has(key) && !unsettled.has(key)
+    return key !== null &&
+      !withdrawn.has(key) &&
+      !unsettled.has(key) &&
+      !unjudgedOff.has(key)
       ? decision
       : UNKNOWN_DECISION;
   }
@@ -254,6 +275,52 @@ export function createModeAuthority(
     for (const w of waiters) if (w.through < oldest) w.resolve();
   }
 
+  /**
+   * Judge one answer against the loaded records, saving it when it applies.
+   * The only rule for an answer's effect on the permission: used for a live
+   * answer and for an Off remembered through a failed load. Under the lock.
+   */
+  async function judge(
+    owner: string,
+    state: "on" | "off",
+    generation: number,
+    ticket: number,
+  ): Promise<PermissionEffect> {
+    const prev = records.get(owner);
+    const next = applyAnswer(prev, state, generation, now());
+    if (next !== prev) {
+      await options.store.save(owner, next);
+      records.set(owner, next);
+    }
+    // The answer takes effect only when it was applied, no later answer was
+    // submitted, and it is not older than the record.
+    return latest.get(owner) === ticket && generation >= next.generation
+      ? "lift"
+      : "withdraw";
+  }
+
+  function applyEffect(owner: string, effect: PermissionEffect): void {
+    if (effect === "lift") withdrawn.delete(owner);
+    else if (effect === "withdraw") withdrawn.add(owner);
+  }
+
+  /** Judge every remembered Off, now that records are loaded. Under the lock. */
+  async function judgeRemembered(): Promise<void> {
+    for (const [owner, off] of [...unjudgedOff]) {
+      unjudgedOff.delete(owner);
+      let effect: PermissionEffect = "withdraw";
+      try {
+        if (off.generation !== null) {
+          const judged = await judge(owner, "off", off.generation, off.ticket);
+          if (!off.blocked) effect = judged;
+        }
+      } catch (error: unknown) {
+        warn("a remembered Off could not be saved", error);
+      }
+      applyEffect(owner, effect);
+    }
+  }
+
   return {
     ready,
     read,
@@ -286,34 +353,30 @@ export function createModeAuthority(
           if (loadFailed) {
             // Still no records to judge against: save nothing, change no record.
             // An On that was never applied could contradict the Off a later
-            // load brings back, so it withdraws; an Off cannot, so it keeps.
+            // load brings back, so it withdraws and replaces any remembered
+            // Off; an Off is remembered and judged when the records load.
+            const blocked =
+              input.state === "on" || unjudgedOff.get(owner)?.blocked === true;
+            unjudgedOff.set(owner, {
+              generation:
+                input.state === "off" ? (input.generation ?? 0) : null,
+              ticket,
+              blocked,
+            });
             effect = input.state === "on" ? "withdraw" : "keep";
             return read(owner);
           }
-          const prev = records.get(owner);
-          const generation = input.generation ?? 0;
-          const next = applyAnswer(
-            prev,
+          await judgeRemembered();
+          effect = await judge(
+            owner,
             input.state as "on" | "off",
-            generation,
-            now(),
+            input.generation ?? 0,
+            ticket,
           );
-          if (next !== prev) {
-            await options.store.save(owner, next);
-            records.set(owner, next);
-          }
-          // The answer takes effect only when it was applied, no later answer
-          // was submitted, and it is not older than the record. Any other end
-          // withdraws the permission the remembered Off gave.
-          effect =
-            latest.get(owner) === ticket && generation >= next.generation
-              ? "lift"
-              : "withdraw";
         } finally {
           // The release comes last, whatever the bookkeeping does.
           try {
-            if (effect === "lift") withdrawn.delete(owner);
-            else if (effect === "withdraw") withdrawn.add(owner);
+            applyEffect(owner, effect);
             settle(owner, ticket);
           } finally {
             release?.();
@@ -322,7 +385,16 @@ export function createModeAuthority(
       } else {
         await ready;
         await retryLoadIfFailed();
-        // Nothing to add: a failed read changes no record and no permission.
+        // A failed read adds no answer, but a load it triggered must still
+        // judge the Offs remembered while the records were unreadable.
+        if (loaded && !loadFailed && unjudgedOff.size > 0) {
+          const release = await lock.exclusive();
+          try {
+            await judgeRemembered();
+          } finally {
+            release();
+          }
+        }
       }
       const decision = legacyWriteDecision(owner);
       if (decision.kind === "streams") {

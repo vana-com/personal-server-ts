@@ -947,6 +947,108 @@ describe("the account-mode record", () => {
       expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
       expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
     });
+    describe("an Off answered while the records would not load is judged when they do", () => {
+      // Invariant: for any sequence of answers and failed loads, the
+      // permission once the store is readable again equals the permission the
+      // same answers give with the store readable throughout, or is stricter.
+      function offAtGenerationTwo(failures: number) {
+        const durable = new Map([
+          ["0xabc", { answer: "off" as const, generation: 2, receivedAt: 1 }],
+        ]);
+        const saves: unknown[] = [];
+        let loads = 0;
+        const store: ModeRecordStore = {
+          load: async () => {
+            loads += 1;
+            if (loads <= failures) throw new Error("unreadable");
+            return new Map(durable);
+          },
+          save: async (_owner, record) => {
+            saves.push(record);
+            durable.set("0xabc", record as never);
+          },
+        };
+        return { store, saves };
+      }
+
+      it("withdraws for a generation 1 Off older than the saved generation 2 Off", async () => {
+        const { store, saves } = offAtGenerationTwo(2);
+        const authority = createModeAuthority({ store, onWarning: () => {} });
+        await authority.ready;
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 1,
+        });
+        expect(
+          await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+        ).toEqual(UNKNOWN);
+        expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+        expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
+          ok: false,
+          decision: { status: 503 },
+        });
+        expect(saves).toEqual([]);
+      });
+
+      it("lifts and saves for a generation 3 Off newer than the saved generation 2 Off", async () => {
+        const { store, saves } = offAtGenerationTwo(2);
+        const authority = createModeAuthority({ store, onWarning: () => {} });
+        await authority.ready;
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 3,
+        });
+        expect(
+          await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+        ).toEqual({ kind: "legacy" });
+        expect(saves).toEqual([
+          expect.objectContaining({ answer: "off", generation: 3 }),
+        ]);
+        expect(await authority.commitLegacy(OWNER, () => 2)).toEqual({
+          ok: true,
+          value: 2,
+        });
+      });
+
+      it("judges only the latest Off: an older one given while unreadable does not decide", async () => {
+        const { store } = offAtGenerationTwo(3);
+        const authority = createModeAuthority({ store, onWarning: () => {} });
+        await authority.ready;
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 1,
+        });
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 3,
+        });
+        expect(
+          await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+        ).toEqual({ kind: "legacy" });
+      });
+
+      it("withdraws for the stale Off when the load recovers on the next answer, not a failed read", async () => {
+        const { store } = offAtGenerationTwo(2);
+        const authority = createModeAuthority({ store, onWarning: () => {} });
+        await authority.ready;
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 1,
+        });
+        // Recovers here; this Off is also older than the record.
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 0,
+        });
+        expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      });
+    });
   });
 
   it("applyAnswer never lowers an On at the same generation", () => {
