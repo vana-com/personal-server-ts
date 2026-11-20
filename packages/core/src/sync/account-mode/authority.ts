@@ -8,8 +8,7 @@
  *   while the Account cannot be reached.
  * - `legacyWriteDecision` is what a legacy write gets. It is `read`, except
  *   while an answer is waiting to be applied (below) or after an answer that
- *   did not take effect (an On that could not be judged because the records
- *   would not load, a save that failed, or a generation older than the
+ *   did not take effect (a save that failed, or a generation older than the
  *   record's). The saved Off is the Account's last word, and it authorizes
  *   legacy writes after a restart and while the Account cannot be read: a
  *   failed read (the host posts `unknown`) changes nothing, so a person who
@@ -36,25 +35,23 @@
  *   When the answer settles, what it does to the permission is one of three
  *   effects (`PermissionEffect`):
  *   - lift: it was applied, is the latest, and is not older than the record.
- *   - withdraw: it failed to apply (a save that threw), is not the latest, is
- *     older than the record, or is an On that could not be judged because the
- *     records would not load (a later load may bring back an Off that this On
- *     contradicts). The owner stays without permission until a later current
- *     answer lifts it; a failed read does not give it back.
- *   - keep: an Off that could not be judged because the records would not
- *     load. It cannot contradict a saved Off and gives no permission, so it
- *     changes nothing, like a failed read.
- *   A load failure is therefore not a withdrawal by itself: if only Offs and
- *   failed reads arrive while the load fails, the next successful load of a
- *   saved Off restores the permission. This is a change to the in-memory write
- *   permission only: the saved record and what reads follow stay as they were.
+ *   - withdraw: it failed to apply (a save that threw), is not the latest, or is
+ *     older than the record. The owner stays without permission until a later
+ *     current answer lifts it; a failed read does not give it back.
+ *   - keep: it could not be judged because the records would not load. It is
+ *     held (below) and judged when they do; until then it changes nothing, like
+ *     a failed read, and the owner has no permission.
+ *   This is a change to the in-memory write permission only: the saved record
+ *   and what reads follow stay as they were.
  * - This is a local guarantee. It cannot make a switch on another device
  *   atomic with this device's storage: a write between the last answer and the
  *   next one is detected afterwards, not prevented. Preventing it needs the
  *   registry to refuse legacy-protocol writes.
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
- *   `submitEvidence` retries the load before judging the evidence.
+ *   `submitEvidence` retries the load before judging the evidence. The answers
+ *   that arrive meanwhile are held in arrival order and judged, one by one by
+ *   the same rule as a live answer, when the records load (`held` below).
  * - `submitEvidence` takes the lock exclusively, saves the new record, then
  *   publishes it. A save that fails throws; the record in memory stays as it
  *   was, and legacy-write permission is withdrawn for that owner (above).
@@ -86,6 +83,16 @@ import { createRwLock } from "./rw-lock.js";
 
 /** What an answer does to its owner's write permission when it settles. */
 type PermissionEffect = "lift" | "withdraw" | "keep";
+
+/** An answer that arrived while the records would not load. */
+interface HeldAnswer {
+  state: "on" | "off";
+  generation: number;
+  ticket: number;
+}
+
+/** Different held answers kept per owner before one is dropped (see `held`). */
+const MAX_HELD_ANSWERS = 1024;
 
 export type CommitResult<T> =
   { ok: true; value: T } | { ok: false; decision: RefuseDecision };
@@ -143,14 +150,12 @@ export function createModeAuthority(
   const lock = createRwLock();
   /**
    * Owners whose latest answer did not take effect: it could not be saved, its
-   * generation is older than the record's, it was superseded, or it is an On
-   * that could not be judged because the records would not load. The
+   * generation is older than the record's, or it was superseded. The
    * remembered Off must not keep authorizing writes against an answer the
    * Account just gave and this process could not keep. In memory only, so a
    * restart clears it (see `submitEvidence` above); a later answer that
-   * applies and is current removes the owner. A failed read, and an Off that
-   * could not be judged because the records would not load, add or remove
-   * no one.
+   * applies and is current removes the owner. A failed read, and an answer
+   * held because the records would not load, add or remove no one.
    */
   const withdrawn = new Set<string>();
   /**
@@ -176,19 +181,27 @@ export function createModeAuthority(
    * once the records load again equals the permission the same answers give
    * with the records readable throughout, or is stricter.
    *
-   * An Off that arrives while the records will not load is judged against
-   * nothing, so it is remembered here (the latest Off per owner) and judged
-   * by `judge`, the same rule the readable path uses, the next time the
-   * records are loaded. Until then the owner has no legacy permission. An On
-   * that arrives then is never applied: it replaces the remembered Off and
-   * marks the entry `blocked`, so nothing later that is judged at load lifts
-   * the withdrawal; only an answer that arrives after the load can. In memory
-   * only.
+   * It holds by construction: an answer that arrives while the records will
+   * not load is judged against nothing, so it is held here, per owner, in
+   * arrival order. When the records load, `replayHeld` folds the held answers
+   * through `judge`, the rule the readable path uses, in that order and under
+   * the lock, so the record and the permission are what the readable path
+   * would have produced. The owner keeps no permission (`legacyWriteDecision`
+   * is `unknown`) from the first held answer until the last one's effect has
+   * been applied, including while a save is pending. In memory only.
+   *
+   * Bound: adjacent answers that are equal (state and generation) fold to the
+   * last one alone, which is exact (the repeat changes no record, and its
+   * effect equals the first's), so a poll that repeats cannot grow the list.
+   * Past `MAX_HELD_ANSWERS` different answers the oldest is dropped and the
+   * owner is marked `lost`: the record may then differ from the readable
+   * path's, so the owner gets no permission back in this process (a restart
+   * clears it, as for any withdrawal). Dropping an answer would otherwise be
+   * able to allow more than the readable path, so it is always paired with
+   * that permanent withdrawal.
    */
-  const unjudgedOff = new Map<
-    string,
-    { generation: number | null; ticket: number; blocked: boolean }
-  >();
+  const held = new Map<string, HeldAnswer[]>();
+  const lost = new Set<string>();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -240,7 +253,7 @@ export function createModeAuthority(
     return key !== null &&
       !withdrawn.has(key) &&
       !unsettled.has(key) &&
-      !unjudgedOff.has(key)
+      !held.has(key)
       ? decision
       : UNKNOWN_DECISION;
   }
@@ -278,7 +291,7 @@ export function createModeAuthority(
   /**
    * Judge one answer against the loaded records, saving it when it applies.
    * The only rule for an answer's effect on the permission: used for a live
-   * answer and for an Off remembered through a failed load. Under the lock.
+   * answer and for each answer held through a failed load. Under the lock.
    */
   async function judge(
     owner: string,
@@ -300,24 +313,54 @@ export function createModeAuthority(
   }
 
   function applyEffect(owner: string, effect: PermissionEffect): void {
-    if (effect === "lift") withdrawn.delete(owner);
-    else if (effect === "withdraw") withdrawn.add(owner);
+    // An owner that lost a held answer is never lifted again in this process.
+    if (effect === "lift" && !lost.has(owner)) withdrawn.delete(owner);
+    else if (effect !== "keep") withdrawn.add(owner);
   }
 
-  /** Judge every remembered Off, now that records are loaded. Under the lock. */
-  async function judgeRemembered(): Promise<void> {
-    for (const [owner, off] of [...unjudgedOff]) {
-      unjudgedOff.delete(owner);
-      let effect: PermissionEffect = "withdraw";
-      try {
-        if (off.generation !== null) {
-          const judged = await judge(owner, "off", off.generation, off.ticket);
-          if (!off.blocked) effect = judged;
-        }
-      } catch (error: unknown) {
-        warn("a remembered Off could not be saved", error);
+  function hold(owner: string, answer: HeldAnswer): void {
+    const list = held.get(owner) ?? [];
+    const last = list[list.length - 1];
+    if (
+      last &&
+      last.state === answer.state &&
+      last.generation === answer.generation
+    ) {
+      list[list.length - 1] = answer;
+    } else {
+      list.push(answer);
+      if (list.length > MAX_HELD_ANSWERS) {
+        list.shift();
+        lost.add(owner);
       }
-      applyEffect(owner, effect);
+    }
+    held.set(owner, list);
+  }
+
+  /**
+   * Judge every held answer in arrival order, now that records are loaded.
+   * Under the lock. An owner's entry stays until its last effect is applied,
+   * with nothing awaited between that and the removal, so no check sees an
+   * owner that is judged but not settled as free.
+   */
+  async function replayHeld(): Promise<void> {
+    for (const [owner, answers] of [...held]) {
+      for (const answer of answers) {
+        let effect: PermissionEffect = "withdraw";
+        try {
+          effect = await judge(
+            owner,
+            answer.state,
+            answer.generation,
+            answer.ticket,
+          );
+        } catch (error: unknown) {
+          warn("a held answer could not be saved", error);
+        }
+        applyEffect(owner, effect);
+      }
+      if (lost.has(owner)) withdrawn.add(owner);
+      held.delete(owner);
     }
   }
 
@@ -351,22 +394,17 @@ export function createModeAuthority(
           // and no legacy write starts after it.
           await retryLoadIfFailed();
           if (loadFailed) {
-            // Still no records to judge against: save nothing, change no record.
-            // An On that was never applied could contradict the Off a later
-            // load brings back, so it withdraws and replaces any remembered
-            // Off; an Off is remembered and judged when the records load.
-            const blocked =
-              input.state === "on" || unjudgedOff.get(owner)?.blocked === true;
-            unjudgedOff.set(owner, {
-              generation:
-                input.state === "off" ? (input.generation ?? 0) : null,
+            // Still no records to judge against: save nothing, change no
+            // record. Hold the answer; it is judged when the records load.
+            hold(owner, {
+              state: input.state as "on" | "off",
+              generation: input.generation ?? 0,
               ticket,
-              blocked,
             });
-            effect = input.state === "on" ? "withdraw" : "keep";
+            effect = "keep";
             return read(owner);
           }
-          await judgeRemembered();
+          await replayHeld();
           effect = await judge(
             owner,
             input.state as "on" | "off",
@@ -386,11 +424,11 @@ export function createModeAuthority(
         await ready;
         await retryLoadIfFailed();
         // A failed read adds no answer, but a load it triggered must still
-        // judge the Offs remembered while the records were unreadable.
-        if (loaded && !loadFailed && unjudgedOff.size > 0) {
+        // judge the answers held while the records were unreadable.
+        if (loaded && !loadFailed && held.size > 0) {
           const release = await lock.exclusive();
           try {
-            await judgeRemembered();
+            await replayHeld();
           } finally {
             release();
           }

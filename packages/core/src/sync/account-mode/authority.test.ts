@@ -3,6 +3,9 @@ import {
   applyAnswer,
   createMemoryModeRecordStore,
   createModeAuthority,
+  type AccountModeRecord,
+  type ModeAnswer,
+  type ModeAuthority,
   type ModeRecordStore,
 } from "./index.js";
 
@@ -906,46 +909,51 @@ describe("the account-mode record", () => {
       expect(saves).toEqual([]);
     });
 
-    it("keeps refusing legacy writes after an On that was never applied, even once the saved Off loads", async () => {
+    it("applies an On answered while the records would not load once they load: the owner is switched, as with a readable store", async () => {
       const { store, saves } = offStoreFailing(2);
-      const authority = createModeAuthority({ store, onWarning: () => {} });
+      const onOn: string[] = [];
+      const authority = createModeAuthority({
+        store,
+        onWarning: () => {},
+        onOn: (owner) => onOn.push(owner),
+      });
       await authority.ready;
       expect(
         (await authority.submitEvidence({ owner: OWNER, state: "on" })).kind,
       ).toBe("refuse");
+      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
 
-      // The saved Off loads; the On it may contradict was not applied.
+      // The saved Off loads; the held On is judged against it and latches.
       expect(
         await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
-      ).toEqual(UNKNOWN);
-      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
-      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      ).toEqual({ kind: "streams" });
+      expect(authority.read(OWNER)).toEqual({ kind: "streams" });
+      expect(saves).toEqual([expect.objectContaining({ answer: "on" })]);
+      expect(onOn).toEqual(["0xabc"]);
       expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
         ok: false,
-        decision: { status: 503 },
+        decision: { status: 426 },
       });
-      expect(saves).toEqual([]);
 
-      // A later Off that applies and is current is the Account's word again.
+      // On latches: a later Off at the same generation changes nothing.
       expect(
         await authority.submitEvidence({ owner: OWNER, state: "off" }),
-      ).toEqual({ kind: "legacy" });
-      expect(await authority.commitLegacy(OWNER, () => 2)).toEqual({
-        ok: true,
-        value: 2,
-      });
+      ).toEqual({ kind: "streams" });
+      expect(authority.read(OWNER)).toEqual({ kind: "streams" });
     });
 
-    it("does not let an Off that could not be judged lift the block an unapplied On left", async () => {
+    it("judges an Off held after an On against that On, not on its own", async () => {
       const { store } = offStoreFailing(3);
       const authority = createModeAuthority({ store, onWarning: () => {} });
       await authority.ready;
       await authority.submitEvidence({ owner: OWNER, state: "on" });
       await authority.submitEvidence({ owner: OWNER, state: "off" });
-      // The third load succeeds here, on a failed read: still blocked.
+      // The third load succeeds here, on a failed read: the On latched.
       await authority.submitEvidence({ owner: OWNER, state: "unknown" });
-      expect(authority.read(OWNER)).toEqual({ kind: "legacy" });
-      expect(authority.legacyWriteDecision(OWNER)).toEqual(UNKNOWN);
+      expect(authority.read(OWNER)).toEqual({ kind: "streams" });
+      expect(authority.legacyWriteDecision(OWNER)).toEqual({
+        kind: "streams",
+      });
     });
     describe("an Off answered while the records would not load is judged when they do", () => {
       // Invariant: for any sequence of answers and failed loads, the
@@ -1012,7 +1020,7 @@ describe("the account-mode record", () => {
         });
       });
 
-      it("judges only the latest Off: an older one given while unreadable does not decide", async () => {
+      it("judges every held Off in order: an older one given while unreadable does not decide, a newer one does", async () => {
         const { store } = offAtGenerationTwo(3);
         const authority = createModeAuthority({ store, onWarning: () => {} });
         await authority.ready;
@@ -1107,6 +1115,346 @@ describe("the commit fence", () => {
     await Promise.all([running, closing]);
     expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
       ok: false,
+    });
+  });
+});
+
+describe("answers given while the records will not load, against a model of the readable store", () => {
+  // The oracle: the answers applied in arrival order with the store readable
+  // throughout. `applyAnswer` decides the record. An answer lifts the write
+  // permission when it is not older than the record it produced, withdraws it
+  // otherwise, and withdraws it when its save fails (the record stays). The
+  // permission is a saved Off that is not withdrawn. Nothing else matters: no
+  // load, no buffer, no lock.
+  interface Model {
+    record: AccountModeRecord | undefined;
+    withdrawn: boolean;
+  }
+  interface Answer {
+    state: ModeAnswer;
+    generation: number;
+  }
+  const saveKey = (state: ModeAnswer, generation: number) =>
+    `${state}:${generation}`;
+
+  function modelAnswer(
+    model: Model,
+    answer: Answer,
+    failingSaves: ReadonlySet<string>,
+  ): Model {
+    const next = applyAnswer(model.record, answer.state, answer.generation, 0);
+    if (next !== model.record) {
+      if (failingSaves.has(saveKey(next.answer, next.generation))) {
+        return { record: model.record, withdrawn: true };
+      }
+    }
+    return {
+      record: next,
+      withdrawn: !(answer.generation >= next.generation),
+    };
+  }
+  const modelAllows = (m: Model) => m.record?.answer === "off" && !m.withdrawn;
+
+  type Step =
+    | { kind: "answers"; answers: Answer[] }
+    | { kind: "unknown" }
+    | { kind: "readable"; readable: boolean };
+
+  interface Scenario {
+    saved: AccountModeRecord | undefined;
+    readable: boolean;
+    failingSaves: string[];
+    steps: Step[];
+  }
+
+  /** Run one scenario; return what went wrong, or null. */
+  async function check(scenario: Scenario): Promise<string | null> {
+    const failing = new Set(scenario.failingSaves);
+    const durable = new Map<string, AccountModeRecord>();
+    if (scenario.saved) durable.set("0xabc", scenario.saved);
+    let readable = scenario.readable;
+    const created: { authority?: ModeAuthority } = {};
+    const admittedDuringSave: string[] = [];
+    const store: ModeRecordStore = {
+      load: async () => {
+        if (!readable) throw new Error("unreadable");
+        return new Map(durable);
+      },
+      save: async (owner, record) => {
+        // A judged answer is not applied until its save settles: nothing may
+        // admit a legacy write meanwhile.
+        for (let i = 0; i < 3; i += 1) {
+          if (created.authority?.legacyWriteDecision(OWNER).kind === "legacy") {
+            admittedDuringSave.push(`${record.answer}:${record.generation}`);
+          }
+          await Promise.resolve();
+        }
+        if (failing.has(saveKey(record.answer, record.generation))) {
+          throw new Error("save failed");
+        }
+        durable.set(owner, record);
+      },
+    };
+    const authority = createModeAuthority({ store, onWarning: () => {} });
+    created.authority = authority;
+    await authority.ready;
+
+    let model: Model = { record: scenario.saved, withdrawn: false };
+    let loaded = readable;
+    const log: string[] = [];
+    for (const [index, step] of scenario.steps.entries()) {
+      if (step.kind === "readable") {
+        readable = step.readable;
+        log.push(`store ${readable ? "readable" : "unreadable"}`);
+        continue;
+      }
+      if (step.kind === "unknown") {
+        await authority.submitEvidence({ owner: OWNER, state: "unknown" });
+        log.push("failed read");
+      } else {
+        await Promise.allSettled(
+          step.answers.map((a) =>
+            authority.submitEvidence({
+              owner: OWNER,
+              state: a.state,
+              generation: a.generation,
+            }),
+          ),
+        );
+        for (const a of step.answers) {
+          model = modelAnswer(model, a, failing);
+          log.push(`${a.state}@${a.generation}`);
+        }
+      }
+      if (readable) loaded = true;
+      const allowed = authority.legacyWriteDecision(OWNER).kind === "legacy";
+      const where = `after step ${index} [${log.join(" ")}]`;
+      if (allowed && !modelAllows(model)) {
+        return `${where}: legacy writes allowed, the readable store withdraws`;
+      }
+      if (loaded) {
+        if (allowed !== modelAllows(model)) {
+          return `${where}: store loaded, permission ${allowed}, readable store ${modelAllows(model)}`;
+        }
+        const want = model.record
+          ? model.record.answer === "on"
+            ? "streams"
+            : "legacy"
+          : "refuse";
+        if (authority.read(OWNER).kind !== want) {
+          return `${where}: store loaded, read ${authority.read(OWNER).kind}, readable store ${want}`;
+        }
+      }
+      if (admittedDuringSave.length > 0) {
+        return `${where}: legacy writes admitted while ${admittedDuringSave[0]} was unsaved`;
+      }
+    }
+    return null;
+  }
+
+  async function shrink(scenario: Scenario): Promise<Scenario> {
+    let best = scenario;
+    for (let progress = true; progress;) {
+      progress = false;
+      for (let i = 0; i < best.steps.length; i += 1) {
+        const candidate = {
+          ...best,
+          steps: best.steps.filter((_, j) => j !== i),
+        };
+        if ((await check(candidate)) !== null) {
+          best = candidate;
+          progress = true;
+          break;
+        }
+      }
+    }
+    return best;
+  }
+
+  /** A seeded generator (mulberry32): the run is the same every time. */
+  function generator(seed: number) {
+    let a = seed >>> 0;
+    const next = () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const int = (n: number) => Math.floor(next() * n);
+    return { next, int };
+  }
+
+  function scenarioFrom(seed: number): Scenario {
+    const { next, int } = generator(seed);
+    const answer = (): Answer => ({
+      state: next() < 0.65 ? "off" : "on",
+      generation: int(6),
+    });
+    const failRate = [0, 0, 0.1, 0.3][int(4)]!;
+    const failingSaves: string[] = [];
+    for (const state of ["on", "off"] as const) {
+      for (let g = 0; g < 6; g += 1) {
+        if (next() < failRate) failingSaves.push(saveKey(state, g));
+      }
+    }
+    const steps: Step[] = [];
+    for (let n = 1 + int(10); n > 0; n -= 1) {
+      const r = next();
+      if (r < 0.45) steps.push({ kind: "answers", answers: [answer()] });
+      else if (r < 0.6) {
+        const answers = Array.from({ length: 2 + int(2) }, answer);
+        steps.push({ kind: "answers", answers });
+      } else if (r < 0.75) steps.push({ kind: "unknown" });
+      else steps.push({ kind: "readable", readable: next() < 0.5 });
+    }
+    return {
+      saved:
+        next() < 0.3
+          ? undefined
+          : {
+              answer: next() < 0.8 ? "off" : "on",
+              generation: int(6),
+              receivedAt: 1,
+            },
+      readable: next() < 0.3,
+      failingSaves,
+      steps,
+    };
+  }
+
+  const SEED = 20261120;
+  const RUNS = 3000;
+
+  it(`never allows more than the readable store, and matches it once loaded (${RUNS} scenarios, seed ${SEED})`, async () => {
+    for (let run = 0; run < RUNS; run += 1) {
+      const scenario = scenarioFrom(SEED + run);
+      const problem = await check(scenario);
+      if (problem !== null) {
+        const small = await shrink(scenario);
+        throw new Error(
+          `seed ${SEED + run}: ${problem}\nsmallest scenario: ${JSON.stringify(small)}\nits failure: ${await check(small)}`,
+        );
+      }
+    }
+  }, 120_000);
+
+  describe("the bound on held answers", () => {
+    function unreadableThenReadable() {
+      const durable = new Map([
+        ["0xabc", { answer: "off" as const, generation: 0, receivedAt: 1 }],
+      ]);
+      let readable = false;
+      const store: ModeRecordStore = {
+        load: async () => {
+          if (!readable) throw new Error("unreadable");
+          return new Map(durable);
+        },
+        save: async (owner, record) => {
+          durable.set(owner, record);
+        },
+      };
+      return {
+        store,
+        recover: () => {
+          readable = true;
+        },
+      };
+    }
+
+    it("folds a repeated answer to one, so a poll during a long outage holds no backlog and keeps the permission", async () => {
+      const { store, recover } = unreadableThenReadable();
+      const authority = createModeAuthority({ store, onWarning: () => {} });
+      await authority.ready;
+      for (let i = 0; i < 5000; i += 1) {
+        await authority.submitEvidence({ owner: OWNER, state: "off" });
+      }
+      recover();
+      expect(
+        await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
+      ).toEqual({ kind: "legacy" });
+    });
+
+    it("withdraws for good, in this process, once different answers outnumber the bound", async () => {
+      const { store, recover } = unreadableThenReadable();
+      const authority = createModeAuthority({ store, onWarning: () => {} });
+      await authority.ready;
+      for (let i = 0; i < 1100; i += 1) {
+        await authority.submitEvidence({
+          owner: OWNER,
+          state: "off",
+          generation: 1 + (i % 2),
+        });
+      }
+      recover();
+      expect(
+        (await authority.submitEvidence({ owner: OWNER, state: "unknown" }))
+          .kind,
+      ).toBe("refuse");
+      // A newer Off cannot lift it: the record may lack a dropped answer.
+      await authority.submitEvidence({
+        owner: OWNER,
+        state: "off",
+        generation: 9,
+      });
+      expect(authority.legacyWriteDecision(OWNER).kind).toBe("refuse");
+    });
+  });
+
+  // The two counterexamples the review found, fixed in place.
+  it("withdraws for an Off at generation 2 after an Off at generation 3 while the store would not load", async () => {
+    const saved = { answer: "off" as const, generation: 1, receivedAt: 1 };
+    const scenario: Scenario = {
+      saved,
+      readable: false,
+      failingSaves: [],
+      steps: [
+        { kind: "answers", answers: [{ state: "off", generation: 3 }] },
+        { kind: "answers", answers: [{ state: "off", generation: 2 }] },
+        { kind: "readable", readable: true },
+        { kind: "unknown" },
+      ],
+    };
+    expect(await check(scenario)).toBeNull();
+  });
+
+  it("keeps the owner unadmitted while a remembered answer's save is pending, and after it fails", async () => {
+    const durable = new Map([
+      ["0xabc", { answer: "off" as const, generation: 1, receivedAt: 1 }],
+    ]);
+    let readable = false;
+    const gate = deferred();
+    const store: ModeRecordStore = {
+      load: async () => {
+        if (!readable) throw new Error("unreadable");
+        return new Map(durable);
+      },
+      save: async () => {
+        await gate.promise;
+        throw new Error("save failed");
+      },
+    };
+    const authority = createModeAuthority({ store, onWarning: () => {} });
+    await authority.ready;
+    await authority.submitEvidence({
+      owner: OWNER,
+      state: "off",
+      generation: 3,
+    });
+    readable = true;
+    const recovery = authority.submitEvidence({
+      owner: OWNER,
+      state: "unknown",
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    // The Off at generation 3 is judged and its save is blocked.
+    expect(authority.legacyWriteDecision(OWNER).kind).toBe("refuse");
+    gate.resolve();
+    await recovery;
+    expect(authority.legacyWriteDecision(OWNER).kind).toBe("refuse");
+    expect(await authority.commitLegacy(OWNER, () => 1)).toMatchObject({
+      ok: false,
+      decision: { status: 503 },
     });
   });
 });
