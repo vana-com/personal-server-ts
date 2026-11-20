@@ -27,6 +27,7 @@ export function cursorSaved(
   return {
     sql: `UPDATE stream_state SET
       cursor_unpublished = ?,
+      cursor_write = cursor_write + 1,
       cursor_seq = (SELECT COALESCE(MAX(seq), 0) FROM record_changes WHERE connection_id = ? AND stream = ?),
       cursor_children = ?,
       cursor_version = ?
@@ -102,18 +103,26 @@ export function cursorApplied(
 
 /**
  * Move the applied cursors into `connections.checkpoint`, each as its stream's
- * entry, whatever the entry held: the device holds the rows the log's cursor
- * covers. Run before every read of the checkpoint. The write is conditional
- * on the checkpoint it read; a fold that loses that race leaves the cursors
- * staged for the next one, and the reader resumes from what the checkpoint
- * held, which reads more, never less.
+ * entry: the device holds the rows the log's cursor covers. Run before every
+ * read of the checkpoint.
+ *
+ * The cursor later in log order wins. A stream whose own cursor waits to
+ * publish (`cursor_unpublished`) keeps its entry and `cursor_version`: every
+ * segment this device applies was published before that cursor, which goes
+ * to the log after it. Its applied cursor stays staged. The acknowledgement
+ * of the device's own cursor replaces it; a drop of the pending cursor lets
+ * the next fold take it.
+ *
+ * The write is conditional on the checkpoint it read; a fold that loses that
+ * race leaves the cursors staged for the next one, and the reader resumes
+ * from what the checkpoint held, which reads more, never less.
  */
 export async function foldAppliedCursors(
   db: SqlDriver,
   connectionId: string,
 ): Promise<void> {
   const applied = await db.query<{ stream: string; cursor_applied: string }>(
-    "SELECT stream, cursor_applied FROM stream_state WHERE connection_id = ? AND cursor_applied IS NOT NULL",
+    "SELECT stream, cursor_applied FROM stream_state WHERE connection_id = ? AND cursor_applied IS NOT NULL AND cursor_unpublished IS NULL",
     [connectionId],
   );
   if (applied.length === 0) return;
@@ -141,6 +150,7 @@ export async function foldAppliedCursors(
     ...cursors.map(({ stream, cursor_applied, cursor }) => ({
       sql: `UPDATE stream_state SET cursor_version = ?, cursor_applied = NULL
              WHERE connection_id = ? AND stream = ? AND cursor_applied = ?
+               AND cursor_unpublished IS NULL
                AND (SELECT checkpoint FROM connections WHERE connection_id = ?) = ?`,
       params: [
         cursor.connectorVersion,
@@ -186,7 +196,8 @@ export async function cursorsRequeued(
       const version = rows.find((r) => r.stream === stream)?.cursor_version;
       if (state === undefined || version == null) continue;
       statements.push({
-        sql: `UPDATE stream_state SET cursor_unpublished = ?, cursor_children = ?
+        sql: `UPDATE stream_state SET cursor_unpublished = ?, cursor_children = ?,
+                 cursor_write = cursor_write + 1
                WHERE connection_id = ? AND stream = ? AND cursor_unpublished IS NULL`,
         params: [
           JSON.stringify({ state, connectorVersion: version }),

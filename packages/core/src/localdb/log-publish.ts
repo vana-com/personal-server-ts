@@ -215,9 +215,10 @@ type Planned = {
   readonly bytes: number;
   /**
    * The stream's unpublished cursor (`stream_state.cursor_unpublished`, as
-   * stored) when this round's segment carries it in the stream's meta.
+   * stored) and the write that stored it (`cursor_write`), when this round's
+   * segment carries it in the stream's meta.
    */
-  readonly cursor: string | null;
+  readonly cursor: { readonly saved: string; readonly write: number } | null;
 };
 
 type Candidate = {
@@ -1359,8 +1360,9 @@ async function carryCursors(
     cursor_unpublished: string;
     cursor_seq: number | null;
     cursor_children: string | null;
+    cursor_write: number;
   }>(
-    `SELECT stream, cursor_unpublished, cursor_seq, cursor_children FROM stream_state
+    `SELECT stream, cursor_unpublished, cursor_seq, cursor_children, cursor_write FROM stream_state
       WHERE connection_id = ? AND cursor_unpublished IS NOT NULL`,
     [connectionId],
   );
@@ -1391,7 +1393,7 @@ async function carryCursors(
         ...(p.meta ?? cursorOnlyMeta(p, rows, connector)),
         cursor,
       },
-      cursor: row.cursor_unpublished,
+      cursor: { saved: row.cursor_unpublished, write: row.cursor_write },
     };
   }
 }
@@ -1928,7 +1930,7 @@ async function basisOf(
   for (const p of planned) {
     const [state] = await deps.db.query(
       `SELECT head_version, head_generation, head_data_hash, last_delete_version, publish_watermark,
-              cursor_unpublished, cursor_seq
+              cursor_unpublished, cursor_seq, cursor_write
          FROM stream_state WHERE connection_id = ? AND stream = ?`,
       [connectionId, p.stream],
     );
@@ -2276,7 +2278,12 @@ async function commitRound(
     );
   }
   statements.push(
-    ...(await candidateAcknowledgements(held, connectionId, candidate)),
+    ...(await candidateAcknowledgements(
+      held,
+      connectionId,
+      candidate,
+      "direct",
+    )),
   );
   statements.push(
     writeLogState(connectionId, {
@@ -2325,10 +2332,20 @@ function publishedResults(
   }));
 }
 
+/**
+ * How the device learned that its candidate committed. `"direct"`: the
+ * registry answered the commit, so the candidate's segment is the newest the
+ * device holds. `"history"`: a reply was lost and the device applied the
+ * registry's history before it acknowledges; that apply staged the cursor of
+ * the candidate's segment and of every later one.
+ */
+type Acknowledged = "direct" | "history";
+
 async function candidateAcknowledgements(
   held: LocalSyncDeps,
   connectionId: string,
   candidate: Candidate,
+  acknowledged: Acknowledged,
 ): Promise<SqlStatement[]> {
   const statements: SqlStatement[] = [];
   const touched = candidate.planned.filter((p) => p.included);
@@ -2368,21 +2385,33 @@ async function candidateAcknowledgements(
           runIds: p.runIds,
         })),
       );
-    // The cursor this segment carried is published, and is the log's cursor
-    // for the stream: this device's entry takes it, as if it applied its own
-    // segment. A newer one a run end saved since (it changed the basis, so not
-    // before this commit) stays, and so does the entry that run wrote.
+    // The cursor this segment carried is published. After a direct commit it
+    // is the log's cursor for the stream: this device's entry takes it, as if
+    // it applied its own segment. After a history apply the staged cursor is
+    // already the log's (this segment's, or a later segment's that wins in log
+    // order), so it stays. A newer one a run end saved since stays, and so
+    // does the entry that run wrote: the match is on the write, since a later
+    // write can store the same cursor (its entry moved away and back).
     if (p.included && p.cursor !== null)
       statements.push(
-        {
-          sql: `UPDATE stream_state SET cursor_applied = cursor_unpublished
-                 WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
-          params: [connectionId, p.stream, p.cursor],
-        },
+        ...(acknowledged === "direct"
+          ? [
+              {
+                sql: `UPDATE stream_state SET cursor_applied = cursor_unpublished
+                       WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ? AND cursor_write = ?`,
+                params: [
+                  connectionId,
+                  p.stream,
+                  p.cursor.saved,
+                  p.cursor.write,
+                ],
+              },
+            ]
+          : []),
         {
           sql: `UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL
-                 WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
-          params: [connectionId, p.stream, p.cursor],
+                 WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ? AND cursor_write = ?`,
+          params: [connectionId, p.stream, p.cursor.saved, p.cursor.write],
         },
       );
     if (p.included || !p.rest)
@@ -2447,7 +2476,12 @@ async function reconcileCandidate(
   transition(entry, "committed");
   await held.db.batch(
     withOrigin("refresh", [
-      ...(await candidateAcknowledgements(held, connectionId, candidate)),
+      ...(await candidateAcknowledgements(
+        held,
+        connectionId,
+        candidate,
+        "history",
+      )),
       ...(await compaction(held, connectionId, candidate.planned)),
     ]),
   );

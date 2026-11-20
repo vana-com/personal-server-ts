@@ -6,6 +6,7 @@ import {
   sName,
   world,
 } from "./log-world.test-utils.js";
+import { requestTrace } from "./request-trace.test-utils.js";
 
 // A device that reads a stream's rows from the log takes the stream's cursor
 // with them, so its next run reads on from where the writer's run stopped.
@@ -198,6 +199,217 @@ describe("a device that reads the log takes the stream's cursor", () => {
     expect((await a.begin("run-a-2", { full: false })).start).toEqual({
       collection_mode: "incremental",
       state: { [S0]: "ca" },
+    });
+  });
+
+  // A run end saves the device's cursor before the log carries it. A
+  // segment applied in between was published before it, so the device's own
+  // cursor is the later one in log order until the log acknowledges it.
+  describe("a cursor applied while the device's own waits to publish", () => {
+    const at = (since: number) => ({ [S0]: { since } });
+
+    it("does not replace the device's own cursor", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: { [S0]: "ca" },
+      });
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        checkpoints: { [S0]: "cb" },
+      });
+      await b.cycle();
+      // a's begin applies b's segment and its cursor first.
+      const begun = await a.begin("run-a-2", { full: false });
+      expect(begun.start).toEqual({
+        collection_mode: "incremental",
+        state: { [S0]: "ca" },
+      });
+    });
+
+    it("does not replace the connector version of the device's own cursor", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await a.run("run-0", [{ stream: S0, id: "seed" }], { version: "1.0.0" });
+      await a.cycle();
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        version: "1.0.0",
+        checkpoints: { [S0]: "ca" },
+      });
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        version: "1.1.0",
+        checkpoints: { [S0]: "cb" },
+      });
+      await b.cycle();
+      // The cursor a resumes from is its own, written by 1.0.0.
+      const begun = await a.begin("run-a-2", { full: false, version: "1.0.0" });
+      expect(begun.start.state).toEqual({ [S0]: "ca" });
+    });
+
+    it("takes the applied cursor once its own is in the log", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: { [S0]: "ca" },
+      });
+      await a.cycle();
+      await b.cycle();
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        checkpoints: { [S0]: "cb" },
+      });
+      await b.cycle();
+      const begun = await a.begin("run-a-2", { full: false });
+      expect(begun.start.state).toEqual({ [S0]: "cb" });
+    });
+
+    it("an older cursor from another device's run does not make the device read again", async () => {
+      const w = await world({ streams: 1 });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      // b's run started before a's and stops at 15; a's reads to 20.
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: at(20),
+      });
+      await b.run("run-b", [{ stream: S0, id: "y" }], {
+        full: false,
+        checkpoints: at(15),
+      });
+      await b.cycle();
+      expect((await a.begin("run-a-2", { full: false })).start.state).toEqual(
+        at(20),
+      );
+      // a's cursor publishes after b's, so every device ends at it.
+      await a.cycle();
+      await b.cycle();
+      for (const [name, d] of [
+        ["a", a],
+        ["b", b],
+      ] as const)
+        expect(
+          (await d.begin(`run-${name}-3`, { full: false })).start.state,
+        ).toEqual(at(20));
+    });
+  });
+
+  // a's commit lands, but the reply to it and to its one resend are lost
+  // (503): a learns it committed only when it next reads the registry, after
+  // applying the registry's history.
+  describe("a commit whose reply was lost", () => {
+    async function lostReply(
+      whileLost: (b: Device) => Promise<void>,
+      beforeReconcile: (a: Device) => Promise<void> = async () => {},
+    ) {
+      let lose = 0;
+      let other = false;
+      const trace = requestTrace(0);
+      const track = trace.track;
+      trace.track = (kind, label, run) =>
+        track(kind, label, async () => {
+          const reply = await run();
+          if (lose === 0 || other || (kind !== "post" && kind !== "batch"))
+            return reply;
+          // The first lost reply is the commit's: b works before a hears.
+          if (lose-- === 2) {
+            other = true;
+            await whileLost(b).finally(() => (other = false));
+          }
+          return new Response("", { status: 503 }) as typeof reply;
+        });
+      const w = await world({ streams: 1, trace });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: { [S0]: "ca" },
+      });
+      lose = 2;
+      await expect(a.cycle()).rejects.toThrow(/503/);
+      expect(lose).toBe(0);
+      await beforeReconcile(a);
+      // a's next cycle applies the registry's history, then acknowledges.
+      await a.cycle();
+      await b.cycle();
+      expect(await a.position()).toBe(await b.position());
+      return { w, a, b };
+    }
+
+    const resumesFrom = async (devices: Device[], state: string) => {
+      for (const [i, d] of devices.entries())
+        expect((await d.begin(`run-next-${i}`, { full: false })).start).toEqual(
+          {
+            collection_mode: "incremental",
+            state: { [S0]: state },
+          },
+        );
+    };
+
+    it("leaves every device at the later cursor another device committed", async () => {
+      const { w, a, b } = await lostReply(async (b) => {
+        await b.cycle();
+        await b.run("run-b", [{ stream: S0, id: "y" }], {
+          full: false,
+          checkpoints: { [S0]: "cb" },
+        });
+        await b.cycle();
+      });
+      expect(cursorOf(await headOf(w))).toEqual({
+        state: "cb",
+        connectorVersion: "1",
+      });
+      await resumesFrom([a, b], "cb");
+    });
+
+    it("leaves every device at its own cursor when nothing came after it", async () => {
+      const { w, a, b } = await lostReply(async () => {});
+      expect(cursorOf(await headOf(w))).toEqual({
+        state: "ca",
+        connectorVersion: "1",
+      });
+      await resumesFrom([a, b], "ca");
+    });
+
+    it("publishes a newer pending cursor equal to the lost one after its rows", async () => {
+      // a's own runs move its cursor away and back before it hears: its
+      // pending cursor is the lost commit's again, with rows the log lacks.
+      const { w, a, b } = await lostReply(
+        async () => {},
+        async (a) => {
+          await a.run("run-a2", [{ stream: S0, id: "y" }], {
+            full: false,
+            checkpoints: { [S0]: "cx" },
+          });
+          await a.run("run-a3", [{ stream: S0, id: "z" }], {
+            full: false,
+            checkpoints: { [S0]: "ca" },
+          });
+        },
+      );
+      const head = await headOf(w);
+      const carryingCa = [...(await w.segments())]
+        .filter(([, s]) => cursorOf(s)?.state === "ca")
+        .map(([position]) => position);
+      // The lost commit's segment and the one with y and z both carry it.
+      expect(carryingCa).toEqual([2, head.position]);
+      expect(head.operations.length).toBe(2);
+      await resumesFrom([a, b], "ca");
     });
   });
 
