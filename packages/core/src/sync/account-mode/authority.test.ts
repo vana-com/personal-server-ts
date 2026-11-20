@@ -1122,21 +1122,22 @@ describe("the commit fence", () => {
 
 describe("answers given while the records will not load, against a model of the readable store", () => {
   // The oracle: the answers applied in arrival order with the store readable
-  // throughout. `applyAnswer` decides the record. An answer lifts the write
-  // permission when it is not older than the record it produced, withdraws it
-  // otherwise, and withdraws it when its save fails (the record stays). The
-  // permission is a saved Off that is not withdrawn. Each answer is one save
-  // attempt: nothing is retried. Nothing else matters: no load, no buffer, no
-  // lock.
+  // throughout. `applyAnswer` decides each owner's record. An answer lifts the
+  // write permission when it is not older than the record it produced,
+  // withdraws it otherwise, and withdraws it when its save fails (the record
+  // stays). The permission is a saved Off that is not withdrawn. Each answer
+  // is one save attempt: nothing is retried. Nothing else matters: no load, no
+  // buffer, no lock.
   //
-  // The contract, for every sequence of answers, failed loads, failed saves
-  // (counted over every save the store sees, whatever the record) and restarts
-  // at any step:
+  // The contract, for every sequence of answers (of several owners, arriving
+  // interleaved), failed loads, failed saves (counted over every save the
+  // store sees, whichever the owner and whatever the record) and restarts at
+  // any step, with backlogs of any length:
   // - The permission is never wider than the oracle's, and equals it when no
   //   save fails and the process has read the store.
   // - A submission returns the decision a legacy write then meets.
   // - An On the process applies, live or replayed after the store loads,
-  //   notifies `onOn`.
+  //   notifies `onOn` for its owner.
   // - A restart loses an answer the process held because the store never
   //   loaded: no process could keep it (the registry refuses legacy writes
   //   once the owner is On, see the header of `authority.ts`). The oracle is
@@ -1150,7 +1151,13 @@ describe("answers given while the records will not load, against a model of the 
   interface Answer {
     state: ModeAnswer;
     generation: number;
+    /** Absent means `OWNER`. */
+    owner?: string;
   }
+  /** The owners a scenario can use: the store keeps them apart by this key. */
+  const OWNERS = [OWNER, "0xDeF", "0x123"];
+  const keyOf = (owner: string) => owner.trim().toLowerCase();
+  const ownerOf = (a: { owner?: string }) => a.owner ?? OWNER;
 
   /**
    * Which save attempts fail. Attempts are counted over every save the store
@@ -1162,13 +1169,16 @@ describe("answers given while the records will not load, against a model of the 
     | { kind: "none" }
     /** The first `count` attempts fail, then every attempt saves. */
     | { kind: "first"; count: number }
-    /** Each of the first 24 attempts fails with chance `rate`. */
+    /** Exactly these attempts fail (numbered from 1). */
+    | { kind: "at"; attempts: number[] }
+    /** Each of the first 40 attempts fails with chance `rate`. */
     | { kind: "random"; rate: number; salt: number };
 
   function failsAt(failures: Failures, attempt: number): boolean {
     if (failures.kind === "none") return false;
     if (failures.kind === "first") return attempt <= failures.count;
-    if (attempt > 24) return false;
+    if (failures.kind === "at") return failures.attempts.includes(attempt);
+    if (attempt > 40) return false;
     return generator(failures.salt * 100 + attempt).next() < failures.rate;
   }
 
@@ -1197,26 +1207,37 @@ describe("answers given while the records will not load, against a model of the 
   type LogEntry =
     { kind: "answer"; answer: Answer; lost: boolean } | { kind: "restart" };
 
-  /** The oracle after the first `upTo` log entries: pure, from the start. */
+  /** The record saved for `owner` before the scenario starts. */
+  function savedFor(scenario: Scenario, owner: string) {
+    return keyOf(owner) === keyOf(OWNER)
+      ? scenario.saved
+      : scenario.savedOthers?.[keyOf(owner)];
+  }
+
+  /** The oracle's owners after the first `upTo` log entries: pure, from the start. */
   function readableStore(
     scenario: Scenario,
     log: LogEntry[],
     upTo = log.length,
-  ): Model {
+  ): Map<string, Model> {
     const saveFails = attemptCounter(scenario.failures);
-    let model: Model = {
-      record: scenario.saved,
-      withdrawn: false,
-      failed: false,
-    };
+    const models = new Map<string, Model>(
+      OWNERS.map((o) => [
+        keyOf(o),
+        { record: savedFor(scenario, o), withdrawn: false, failed: false },
+      ]),
+    );
     for (const entry of log.slice(0, upTo)) {
       if (entry.kind === "restart") {
-        model = { record: model.record, withdrawn: false, failed: false };
+        for (const [o, m] of models) {
+          models.set(o, { record: m.record, withdrawn: false, failed: false });
+        }
       } else if (!entry.lost) {
-        model = modelAnswer(model, entry.answer, saveFails);
+        const o = keyOf(ownerOf(entry.answer));
+        models.set(o, modelAnswer(models.get(o)!, entry.answer, saveFails));
       }
     }
-    return model;
+    return models;
   }
 
   const modelAllows = (m: Model) => m.record?.answer === "off" && !m.withdrawn;
@@ -1230,8 +1251,12 @@ describe("answers given while the records will not load, against a model of the 
         : "refuse";
 
   type Step =
-    | { kind: "answers"; answers: Answer[] }
-    | { kind: "unknown" }
+    /**
+     * `sequential`: one submission after another is awaited, as polls are;
+     * otherwise they are all submitted at once.
+     */
+    | { kind: "answers"; answers: Answer[]; sequential?: boolean }
+    | { kind: "unknown"; owner?: string }
     | { kind: "readable"; readable: boolean }
     /**
      * The process restarts, at any step: held, withdrawn or settled. The new
@@ -1240,7 +1265,10 @@ describe("answers given while the records will not load, against a model of the 
     | { kind: "restart" };
 
   interface Scenario {
+    /** The record saved for `OWNER`. */
     saved: AccountModeRecord | undefined;
+    /** The records saved for the other owners, by lower-case owner. */
+    savedOthers?: Record<string, AccountModeRecord>;
     readable: boolean;
     failures: Failures;
     steps: Step[];
@@ -1254,11 +1282,14 @@ describe("answers given while the records will not load, against a model of the 
     const noFailures = scenario.failures.kind === "none";
     const saveFails = attemptCounter(scenario.failures);
     const durable = new Map<string, AccountModeRecord>();
-    if (scenario.saved) durable.set("0xabc", scenario.saved);
+    for (const o of OWNERS) {
+      const saved = savedFor(scenario, o);
+      if (saved) durable.set(keyOf(o), saved);
+    }
     let readable = scenario.readable;
     const created: { authority?: ModeAuthority } = {};
     const admittedDuringSave: string[] = [];
-    let wakeups = 0;
+    const wakeups = new Map<string, number>();
     const store: ModeRecordStore = {
       load: async () => {
         if (!readable) throw new Error("unreadable");
@@ -1266,10 +1297,12 @@ describe("answers given while the records will not load, against a model of the 
       },
       save: async (owner, record) => {
         // A judged answer is not applied until its save settles: nothing may
-        // admit a legacy write meanwhile.
+        // admit a legacy write for its owner meanwhile.
         for (let i = 0; i < 3; i += 1) {
-          if (created.authority?.legacyWriteDecision(OWNER).kind === "legacy") {
-            admittedDuringSave.push(`${record.answer}:${record.generation}`);
+          if (created.authority?.legacyWriteDecision(owner).kind === "legacy") {
+            admittedDuringSave.push(
+              `${owner}:${record.answer}:${record.generation}`,
+            );
           }
           await Promise.resolve();
         }
@@ -1281,8 +1314,8 @@ describe("answers given while the records will not load, against a model of the 
       const authority = createModeAuthority({
         store,
         onWarning: () => {},
-        onOn: () => {
-          wakeups += 1;
+        onOn: (owner) => {
+          wakeups.set(keyOf(owner), (wakeups.get(keyOf(owner)) ?? 0) + 1);
         },
       });
       created.authority = authority;
@@ -1296,10 +1329,16 @@ describe("answers given while the records will not load, against a model of the 
     let loaded = readable;
     let held: Array<Extract<LogEntry, { kind: "answer" }>> = [];
     const names: string[] = [];
+    const submit = (a: Answer) =>
+      authority.submitEvidence({
+        owner: ownerOf(a),
+        state: a.state,
+        generation: a.generation,
+      });
     for (const [index, step] of scenario.steps.entries()) {
-      let returned: ModeDecision | undefined;
-      let submitted = false;
-      const wakeupsBefore = wakeups;
+      /** What each owner's last submission in this step returned. */
+      const returned = new Map<string, ModeDecision>();
+      const wakeupsBefore = new Map(wakeups);
       /** Log positions of the answers this step makes the process apply. */
       let replayed: number[] = [];
       const reachStore = (entries: Array<(typeof held)[number]>) => {
@@ -1324,12 +1363,12 @@ describe("answers given while the records will not load, against a model of the 
         names.push("restart");
       } else if (step.kind === "unknown") {
         reachStore([]);
-        returned = await authority.submitEvidence({
-          owner: OWNER,
-          state: "unknown",
-        });
-        submitted = true;
-        names.push("failed read");
+        const owner = step.owner ?? OWNER;
+        returned.set(
+          keyOf(owner),
+          await authority.submitEvidence({ owner, state: "unknown" }),
+        );
+        names.push(`failed read ${keyOf(owner)}`);
       } else {
         const entries = step.answers.map((answer) => ({
           kind: "answer" as const,
@@ -1338,64 +1377,72 @@ describe("answers given while the records will not load, against a model of the 
         }));
         log.push(...entries);
         reachStore(entries);
-        const results = await Promise.allSettled(
-          step.answers.map((a) =>
-            authority.submitEvidence({
-              owner: OWNER,
-              state: a.state,
-              generation: a.generation,
-            }),
-          ),
-        );
-        const last = results[results.length - 1];
-        if (last?.status === "fulfilled") returned = last.value;
+        let results: PromiseSettledResult<ModeDecision>[];
+        if (step.sequential) {
+          results = [];
+          for (const a of step.answers) {
+            results.push(...(await Promise.allSettled([submit(a)])));
+          }
+        } else results = await Promise.allSettled(step.answers.map(submit));
         // A save that fails rejects the submission: nothing to wake for.
-        submitted = results.some((r) => r.status === "fulfilled");
-        for (const a of step.answers) names.push(`${a.state}@${a.generation}`);
+        for (const [i, result] of results.entries()) {
+          const owner = keyOf(ownerOf(step.answers[i]!));
+          if (result.status === "fulfilled") returned.set(owner, result.value);
+          else returned.delete(owner);
+        }
+        for (const a of step.answers) {
+          names.push(`${keyOf(ownerOf(a))}:${a.state}@${a.generation}`);
+        }
       }
 
-      const where = `after step ${index} [${names.join(" ")}]`;
-      const model = readableStore(scenario, log);
-      const decision = authority.legacyWriteDecision(OWNER);
-      const allowed = decision.kind === "legacy";
-      if (allowed && !modelAllows(model)) {
-        return `${where}: legacy writes allowed, the readable store withdraws`;
-      }
-      if (noFailures && loaded) {
-        if (decision.kind !== modelWrite(model)) {
-          return `${where}: store loaded, write decision ${decision.kind}, readable store ${modelWrite(model)}`;
+      const where = `after step ${index} [${names.length > 40 ? `… ${names.slice(-40).join(" ")}` : names.join(" ")}]`;
+      const models = readableStore(scenario, log);
+      for (const o of OWNERS) {
+        const model = models.get(keyOf(o))!;
+        const decision = authority.legacyWriteDecision(o);
+        const allowed = decision.kind === "legacy";
+        if (allowed && !modelAllows(model)) {
+          return `${where}: ${keyOf(o)}: legacy writes allowed, the readable store withdraws`;
         }
-        if (authority.read(OWNER).kind !== modelRead(model)) {
-          return `${where}: store loaded, read ${authority.read(OWNER).kind}, readable store ${modelRead(model)}`;
+        if (noFailures && loaded) {
+          if (decision.kind !== modelWrite(model)) {
+            return `${where}: ${keyOf(o)}: store loaded, write decision ${decision.kind}, readable store ${modelWrite(model)}`;
+          }
+          if (authority.read(o).kind !== modelRead(model)) {
+            return `${where}: ${keyOf(o)}: store loaded, read ${authority.read(o).kind}, readable store ${modelRead(model)}`;
+          }
         }
-      }
-      if (returned !== undefined && !same(returned, decision)) {
-        return `${where}: the submission returned ${JSON.stringify(returned)}, a legacy write meets ${JSON.stringify(decision)}`;
-      }
-      const wrote = await authority.commitLegacy(OWNER, () => "wrote");
-      const met = wrote.ok
-        ? "legacy"
-        : wrote.decision.status === 426
-          ? "streams"
-          : "refuse";
-      if (met !== decision.kind) {
-        return `${where}: decision ${decision.kind}, the write met ${met}`;
-      }
-      if (
-        submitted &&
-        decision.kind === "streams" &&
-        wakeups === wakeupsBefore
-      ) {
-        return `${where}: the owner is On and the import was not woken`;
+        const answered = returned.get(keyOf(o));
+        if (answered !== undefined && !same(answered, decision)) {
+          return `${where}: ${keyOf(o)}: the submission returned ${JSON.stringify(answered)}, a legacy write meets ${JSON.stringify(decision)}`;
+        }
+        const wrote = await authority.commitLegacy(o, () => "wrote");
+        const met = wrote.ok
+          ? "legacy"
+          : wrote.decision.status === 426
+            ? "streams"
+            : "refuse";
+        if (met !== decision.kind) {
+          return `${where}: ${keyOf(o)}: decision ${decision.kind}, the write met ${met}`;
+        }
+        if (
+          answered !== undefined &&
+          decision.kind === "streams" &&
+          (wakeups.get(keyOf(o)) ?? 0) === (wakeupsBefore.get(keyOf(o)) ?? 0)
+        ) {
+          return `${where}: ${keyOf(o)} is On and the import was not woken`;
+        }
       }
       for (const position of replayed) {
-        const afterIt = readableStore(scenario, log, position + 1);
+        const entry = log[position] as Extract<LogEntry, { kind: "answer" }>;
+        const o = keyOf(ownerOf(entry.answer));
+        const afterIt = readableStore(scenario, log, position + 1).get(o)!;
         if (
           afterIt.record?.answer === "on" &&
           !afterIt.failed &&
-          wakeups === wakeupsBefore
+          (wakeups.get(o) ?? 0) === (wakeupsBefore.get(o) ?? 0)
         ) {
-          return `${where}: a replayed On did not wake the import`;
+          return `${where}: a replayed On of ${o} did not wake the import`;
         }
       }
       if (admittedDuringSave.length > 0) {
@@ -1407,9 +1454,25 @@ describe("answers given while the records will not load, against a model of the 
 
   async function shrink(scenario: Scenario): Promise<Scenario> {
     let best = scenario;
+    const onlyFirstOwner = (s: Scenario): Scenario => ({
+      ...s,
+      steps: s.steps.map((step) =>
+        step.kind === "answers"
+          ? {
+              ...step,
+              answers: step.answers.map(({ owner: _, ...rest }) => rest),
+            }
+          : step.kind === "unknown"
+            ? { kind: "unknown" }
+            : step,
+      ),
+    });
     for (let progress = true; progress;) {
       progress = false;
       const candidates: Scenario[] = [];
+      const single = onlyFirstOwner(best);
+      // Only a change is progress: a scenario already of one owner is not.
+      if (!same(single, best)) candidates.push(single);
       for (let i = 0; i < best.steps.length; i += 1) {
         candidates.push({
           ...best,
@@ -1417,18 +1480,25 @@ describe("answers given while the records will not load, against a model of the 
         });
         const step = best.steps[i]!;
         if (step.kind === "answers" && step.answers.length > 1) {
+          const without = (from: number, to: number): Scenario => ({
+            ...best,
+            steps: best.steps.map((s, j) =>
+              j === i
+                ? {
+                    ...step,
+                    answers: step.answers.filter((_, m) => m < from || m >= to),
+                  }
+                : s,
+            ),
+          });
+          // Chunks first, so a long backlog shrinks in a few rounds.
+          for (let chunk = step.answers.length >> 1; chunk > 1; chunk >>= 1) {
+            for (let from = 0; from < step.answers.length; from += chunk) {
+              candidates.push(without(from, from + chunk));
+            }
+          }
           for (let k = 0; k < step.answers.length; k += 1) {
-            candidates.push({
-              ...best,
-              steps: best.steps.map((s, j) =>
-                j === i
-                  ? {
-                      kind: "answers",
-                      answers: step.answers.filter((_, m) => m !== k),
-                    }
-                  : s,
-              ),
-            });
+            candidates.push(without(k, k + 1));
           }
         }
       }
@@ -1437,6 +1507,17 @@ describe("answers given while the records will not load, against a model of the 
           ...best,
           failures: { kind: "first", count: best.failures.count - 1 },
         });
+      }
+      if (best.failures.kind === "at" && best.failures.attempts.length > 1) {
+        for (let k = 0; k < best.failures.attempts.length; k += 1) {
+          candidates.push({
+            ...best,
+            failures: {
+              kind: "at",
+              attempts: best.failures.attempts.filter((_, m) => m !== k),
+            },
+          });
+        }
       }
       for (const candidate of candidates) {
         if ((await check(candidate)) !== null) {
@@ -1463,17 +1544,31 @@ describe("answers given while the records will not load, against a model of the 
     return { next, int };
   }
 
+  /**
+   * The most different answers in a row the implementation once held per owner
+   * before it dropped some. The generator goes past it, whatever the code now
+   * does, so a bound that drops answers is caught again.
+   */
+  const FORMER_BACKLOG_BOUND = 64;
+
   function scenarioFrom(seed: number): Scenario {
     const { next, int } = generator(seed);
+    const owners = OWNERS.slice(0, 1 + int(OWNERS.length));
     const answer = (): Answer => ({
       state: next() < 0.55 ? "off" : "on",
       generation: int(4),
+      owner: owners[int(owners.length)],
     });
     let failures: Failures = { kind: "none" };
     const mode = next();
-    if (mode >= 0.2 && mode < 0.6) {
-      failures = { kind: "first", count: 1 + int(4) };
-    } else if (mode >= 0.6) {
+    if (mode >= 0.2 && mode < 0.5) {
+      failures = { kind: "first", count: 1 + int(6) };
+    } else if (mode >= 0.5 && mode < 0.7) {
+      failures = {
+        kind: "at",
+        attempts: Array.from({ length: 1 + int(3) }, () => 1 + int(8)),
+      };
+    } else if (mode >= 0.7) {
       failures = {
         kind: "random",
         rate: [0.2, 0.5, 0.8][int(3)]!,
@@ -1481,27 +1576,68 @@ describe("answers given while the records will not load, against a model of the 
       };
     }
     const steps: Step[] = [];
-    for (let n = 2 + int(12); n > 0; n -= 1) {
+    const small = (): Step => {
       const r = next();
-      if (r < 0.45) steps.push({ kind: "answers", answers: [answer()] });
-      else if (r < 0.55) {
-        const answers = Array.from({ length: 2 + int(2) }, answer);
-        steps.push({ kind: "answers", answers });
-      } else if (r < 0.67) steps.push({ kind: "unknown" });
-      else if (r < 0.82) {
-        steps.push({ kind: "readable", readable: next() < 0.5 });
-      } else steps.push({ kind: "restart" });
+      if (r < 0.45) return { kind: "answers", answers: [answer()] };
+      if (r < 0.55) {
+        return {
+          kind: "answers",
+          answers: Array.from({ length: 2 + int(2) }, answer),
+        };
+      }
+      if (r < 0.67)
+        return { kind: "unknown", owner: owners[int(owners.length)] };
+      if (r < 0.82) return { kind: "readable", readable: next() < 0.5 };
+      return { kind: "restart" };
+    };
+    // A third of the scenarios hold a backlog past the former bound: polls
+    // that bring a different answer each time while the store will not load,
+    // with the small steps (a restart, a failed read, a recovery) between.
+    const backlog = next() < 0.33;
+    if (backlog) {
+      // Generations climb through the backlog, so most answers are save
+      // attempts and the failures land on them.
+      let climb = 0;
+      const burst = (length: number): Step => ({
+        kind: "answers",
+        sequential: true,
+        answers: Array.from({ length }, () => {
+          climb += next() < 0.25 ? 1 : 0;
+          return {
+            state: next() < 0.5 ? "off" : "on",
+            generation: climb + int(2),
+            owner: owners[int(owners.length)],
+          };
+        }),
+      });
+      const total = FORMER_BACKLOG_BOUND + 1 + int(60);
+      const parts = 1 + int(3);
+      for (let part = 0; part < parts; part += 1) {
+        steps.push(burst(Math.ceil(total / parts)));
+        if (next() < 0.6) steps.push(small());
+      }
+      for (let n = int(5); n > 0; n -= 1) steps.push(small());
+    } else {
+      for (let n = 2 + int(12); n > 0; n -= 1) steps.push(small());
+    }
+    const savedRecord = (): AccountModeRecord | undefined =>
+      next() < 0.3
+        ? undefined
+        : {
+            answer: next() < 0.7 ? "off" : "on",
+            generation: int(4),
+            receivedAt: 1,
+          };
+    const saved = savedRecord();
+    const savedOthers: Record<string, AccountModeRecord> = {};
+    for (const o of OWNERS.slice(1)) {
+      const record = savedRecord();
+      if (record) savedOthers[keyOf(o)] = record;
     }
     return {
-      saved:
-        next() < 0.3
-          ? undefined
-          : {
-              answer: next() < 0.7 ? "off" : "on",
-              generation: int(4),
-              receivedAt: 1,
-            },
-      readable: next() < 0.15,
+      saved,
+      savedOthers,
+      readable: backlog ? next() < 0.05 : next() < 0.15,
       failures,
       steps,
     };
@@ -1510,7 +1646,7 @@ describe("answers given while the records will not load, against a model of the 
   const SEED = Number(process.env.ACCOUNT_MODE_PROPERTY_SEED ?? 20261120);
   const RUNS = Number(process.env.ACCOUNT_MODE_PROPERTY_RUNS ?? 20000);
 
-  it(`never allows more than the readable store, through failed loads, failed saves and restarts at any step, matches it when no save fails, returns what a write meets, and wakes the import for every On (${RUNS} scenarios, seed ${SEED})`, async () => {
+  it(`never allows more than the readable store, for owners interleaved and backlogs of any length, through failed loads, failed saves and restarts at any step, matches it when no save fails, returns what a write meets, and wakes the import for every On (${RUNS} scenarios, seed ${SEED})`, async () => {
     for (let run = 0; run < RUNS; run += 1) {
       const scenario = scenarioFrom(SEED + run);
       const problem = await check(scenario);
@@ -1523,7 +1659,81 @@ describe("answers given while the records will not load, against a model of the 
     }
   }, 3_600_000);
 
-  describe("the two sequences Codex found on the merged head (e7dbf40c)", () => {
+  describe("the sequences Codex found on the merged head (e7dbf40c) and on #845 (93d3aca5)", () => {
+    // #845 P1 (replay by owner): A On at 1, B On at 1, then A Off at 2, with
+    // the store's third save failing. The readable store keeps A On (its Off
+    // is the failed save). Recovery that applied A's answers before B's spent
+    // the third save on B's On, saved A's Off, and let A write legacy data.
+    it("#845 P1: the store's saves are spent in the order the answers arrived, not owner by owner", async () => {
+      expect(
+        await check({
+          saved: { answer: "off", generation: 0, receivedAt: 1 },
+          savedOthers: {
+            "0xdef": { answer: "off", generation: 0, receivedAt: 1 },
+          },
+          readable: false,
+          failures: { kind: "at", attempts: [3] },
+          steps: [
+            {
+              kind: "answers",
+              sequential: true,
+              answers: [
+                { state: "on", generation: 1 },
+                { state: "on", generation: 1, owner: "0xDeF" },
+                { state: "off", generation: 2 },
+              ],
+            },
+            { kind: "readable", readable: true },
+            { kind: "unknown" },
+            { kind: "unknown", owner: "0xDeF" },
+          ],
+        }),
+      ).toBeNull();
+    });
+
+    // #845 P1 (compaction): the first save fails on Off at 1, the second saves
+    // On at 1, and more than the former bound of different answers follow. A
+    // backlog reduced to the On spent the failed save on it, left the owner
+    // Off, and let a fresh Off at 1 write legacy data, or, after a restart,
+    // the saved Off do so.
+    describe("#845 P1: a backlog past the former bound keeps the save a failed Off absorbed", () => {
+      const backlog = (): Step => ({
+        kind: "answers",
+        sequential: true,
+        answers: [
+          { state: "off", generation: 1 },
+          { state: "on", generation: 1 },
+          ...Array.from({ length: FORMER_BACKLOG_BOUND + 6 }, (_, i) => ({
+            state: "off" as const,
+            generation: i % 2,
+          })),
+        ],
+      });
+      const scenario = (after: Step[]): Scenario => ({
+        saved: { answer: "off", generation: 0, receivedAt: 1 },
+        readable: false,
+        failures: { kind: "first", count: 1 },
+        steps: [
+          backlog(),
+          { kind: "readable", readable: true },
+          { kind: "unknown" },
+          ...after,
+        ],
+      });
+      it("so a fresh Off at the same generation does not lift the On", async () => {
+        expect(
+          await check(
+            scenario([
+              { kind: "answers", answers: [{ state: "off", generation: 1 }] },
+            ]),
+          ),
+        ).toBeNull();
+      });
+      it("so the saved record after a restart is the On the readable store saved", async () => {
+        expect(await check(scenario([{ kind: "restart" }]))).toBeNull();
+      });
+    });
+
     // P1: saved On at generation 0; the store will not load while On at
     // generation 1 and Off at generation 2 arrive; the first two saves fail.
     // The readable store spends them on the On and the Off and keeps the saved
@@ -1609,7 +1819,7 @@ describe("answers given while the records will not load, against a model of the 
     expect(authority.legacyWriteDecision(A)).toEqual({ kind: "streams" });
   });
 
-  describe("the held answers are bounded, however many arrive", () => {
+  describe("the held answers are runs, however many polls arrive", () => {
     const saveKey = (state: ModeAnswer, generation: number) =>
       `${state}:${generation}`;
     function unreadableThenReadable(
@@ -1681,8 +1891,8 @@ describe("answers given while the records will not load, against a model of the 
       });
     });
 
-    it("past the bound gives no permission back until a fresh answer", async () => {
-      const { store, recover } = unreadableThenReadable();
+    it("applies a backlog of any length in arrival order, as the readable store would", async () => {
+      const { store, durable, recover } = unreadableThenReadable();
       const authority = createModeAuthority({ store, onWarning: () => {} });
       await authority.ready;
       for (let i = 0; i < 1100; i += 1) {
@@ -1693,17 +1903,14 @@ describe("answers given while the records will not load, against a model of the 
         });
       }
       recover();
-      // A backlog that lost answers cannot say the Off still stands.
+      // Every answer is applied: the Off at generation 2 stands.
       expect(
         await authority.submitEvidence({ owner: OWNER, state: "unknown" }),
-      ).toMatchObject({ kind: "refuse", status: 503 });
-      expect(
-        await authority.submitEvidence({
-          owner: OWNER,
-          state: "off",
-          generation: 2,
-        }),
       ).toEqual({ kind: "legacy" });
+      expect(durable.get("0xabc")).toMatchObject({
+        answer: "off",
+        generation: 2,
+      });
     });
 
     // Codex round 5, P1: coalescing dropped the second On. The readable store

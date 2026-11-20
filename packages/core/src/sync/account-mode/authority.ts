@@ -50,10 +50,11 @@
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence. The answers
- *   that arrive meanwhile are held per owner, in arrival order (`held` below),
- *   and applied when the records load, each as a live answer is; the owner has
- *   no permission until they are all applied. A submission that loads the
- *   records returns only after that, with the decision a write then meets.
+ *   that arrive meanwhile are held in arrival order, across owners (`held`
+ *   below), and applied when the records load, each as a live answer is; an
+ *   owner has no permission until they are all applied. A submission that
+ *   loads the records returns only after that, with the decision a write then
+ *   meets.
  * - `submitEvidence` takes the lock exclusively, saves the new record, then
  *   publishes it. A save that fails throws; the record in memory stays as it
  *   was, and legacy-write permission is withdrawn for that owner (above).
@@ -87,29 +88,18 @@ import { createRwLock } from "./rw-lock.js";
 type PermissionEffect = "lift" | "withdraw" | "keep";
 
 /**
- * The most runs of different answers held per owner. Past it the runs are
- * reduced to the highest On and the owner is not given the permission when
- * they are applied: a backlog that long is a store that has been down through
- * hundreds of switches, and a fresh answer replaces it.
+ * Answers that could not be judged yet, as they arrived, whichever the owner.
+ * Consecutive identical answers of one owner are one run with a count: each is
+ * a save attempt when applied, as on the readable path, but a poll that
+ * repeats costs a number, not a backlog.
  */
-const MAX_HELD_RUNS = 64;
-
-/** The answers of one owner that could not be judged yet, in arrival order. */
-interface HeldAnswers {
-  /**
-   * Consecutive identical answers are one run with a count: each is a save
-   * attempt when applied, as on the readable path, but a poll that repeats
-   * costs a number, not a backlog.
-   */
-  runs: Array<{
-    state: "on" | "off";
-    generation: number;
-    count: number;
-    /** The ticket of the run's last answer. */
-    ticket: number;
-  }>;
-  /** Runs were dropped (`MAX_HELD_RUNS`): the permission is not given back. */
-  lossy: boolean;
+interface HeldRun {
+  owner: string;
+  state: "on" | "off";
+  generation: number;
+  count: number;
+  /** The ticket of the run's last answer. */
+  ticket: number;
 }
 
 export type CommitResult<T> =
@@ -208,19 +198,31 @@ export function createModeAuthority(
    * not load) is held as it arrived, and when they load `replayHeld` applies
    * it with `judge`, the call a live answer makes: one save attempt, and a
    * failed save withdraws the permission and moves on. So recovery makes the
-   * save attempts the readable store makes, in its order, and meets the same
-   * failures however the store counts them. A shortcut that applies fewer or
-   * other answers (a fold of them) makes other attempts, meets other
-   * failures, and can save an answer the readable store lost.
+   * save attempts the readable store makes, in the order it makes them (the
+   * order of arrival over all owners: a failure is a property of the store's
+   * n-th save, not of one owner's), and meets the same failures however the
+   * store counts them. A shortcut that applies fewer or other answers, or
+   * the same ones in another order (a fold of them, or one owner's after
+   * another's), makes other attempts, meets other failures, and can save an
+   * answer the readable store lost.
    *
    * Restart: held answers are in memory only. One a restart loses was given
    * while the records would not load, so no process could keep it; the
    * registry refuses legacy writes once the owner is On.
    *
-   * The memory per owner is the runs of different answers, at most
-   * `MAX_HELD_RUNS`, however many arrive.
+   * The memory is one small run per change of answer (or of owner) while the
+   * records will not load, not one per poll. It has no bound of its own, on
+   * purpose: whether an answer makes a save attempt depends on whether the
+   * saves before it failed, which is not known until the records load, so no
+   * run can be dropped or merged without changing the attempts that follow it
+   * and so, under some failure, the decision (a bound of 64 runs per owner
+   * once did this: it kept the highest On and let a failed save of that On
+   * lift an Off the readable store had refused). The runs are bounded by how
+   * often the Account changes its answer while the store is down.
    */
-  const held = new Map<string, HeldAnswers>();
+  let held: HeldRun[] = [];
+  /** The owners with a run in `held`: they have no permission. */
+  const heldOwners = new Set<string>();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -272,7 +274,7 @@ export function createModeAuthority(
     return key !== null &&
       !withdrawn.has(key) &&
       !unsettled.has(key) &&
-      !held.has(key)
+      !heldOwners.has(key)
       ? decision
       : UNKNOWN_DECISION;
   }
@@ -334,11 +336,14 @@ export function createModeAuthority(
     owner: string,
     answer: { state: "on" | "off"; generation: number; ticket: number },
   ): void {
-    const entry = held.get(owner) ?? { runs: [], lossy: false };
-    held.set(owner, entry);
-    const last = entry.runs[entry.runs.length - 1];
+    heldOwners.add(owner);
+    // Only the run just before it can absorb it: an answer of another owner
+    // between two of this owner's keeps them apart, as the readable store
+    // spends a save attempt between them.
+    const last = held[held.length - 1];
     if (
       last &&
+      last.owner === owner &&
       last.state === answer.state &&
       last.generation === answer.generation
     ) {
@@ -346,17 +351,7 @@ export function createModeAuthority(
       last.ticket = answer.ticket;
       return;
     }
-    entry.runs.push({ ...answer, count: 1 });
-    if (entry.runs.length > MAX_HELD_RUNS) {
-      let on: (typeof entry.runs)[number] | undefined;
-      for (const run of entry.runs) {
-        if (run.state === "on" && (!on || run.generation > on.generation)) {
-          on = run;
-        }
-      }
-      entry.runs = on ? [{ ...on, count: 1 }] : [];
-      entry.lossy = true;
-    }
+    held.push({ owner, ...answer, count: 1 });
   }
 
   /** Apply one answer to the loaded record and save it; throws if the save does. */
@@ -376,37 +371,38 @@ export function createModeAuthority(
 
   /**
    * Apply every held answer, now that the records are loaded, in arrival
-   * order, each through `judge` as a live answer is. A save that fails
-   * withdraws the owner and the next answer is applied, as on the readable
-   * path. An owner is released in the step that applies its last effect, with
-   * nothing awaited between, so no check sees an owner that is judged but not
-   * settled as free. Adds to `woken` each owner an applied answer left On.
-   * Under the lock.
+   * order over all owners, each through `judge` as a live answer is. A save
+   * that fails withdraws its owner and the next answer is applied, as on the
+   * readable path. The owners are released together, once the last answer is
+   * applied, with nothing awaited between, so no check sees an owner that is
+   * judged but not settled as free. Adds to `woken` each owner an applied
+   * answer left On. Under the lock.
    */
   async function replayHeld(woken: Set<string>): Promise<void> {
-    for (const [owner, entry] of [...held]) {
+    // Only an owner's last answer's effect counts: an older one is no longer
+    // the latest, so it can only withdraw.
+    const effects = new Map<string, PermissionEffect>();
+    for (const run of held) {
       let effect: PermissionEffect = "withdraw";
-      for (const run of entry.runs) {
-        for (let n = 1; n <= run.count; n += 1) {
-          try {
-            // Only the last answer's effect counts: an older one is no
-            // longer the latest, so it can only withdraw.
-            effect = await judge(
-              owner,
-              run.state,
-              run.generation,
-              n === run.count ? run.ticket : 0,
-            );
-            if (records.get(owner)?.answer === "on") woken.add(owner);
-          } catch (error: unknown) {
-            warn("a held answer could not be saved", error);
-            effect = "withdraw";
-          }
+      for (let n = 1; n <= run.count; n += 1) {
+        try {
+          effect = await judge(
+            run.owner,
+            run.state,
+            run.generation,
+            n === run.count ? run.ticket : 0,
+          );
+          if (records.get(run.owner)?.answer === "on") woken.add(run.owner);
+        } catch (error: unknown) {
+          warn("a held answer could not be saved", error);
+          effect = "withdraw";
         }
       }
-      applyEffect(owner, entry.lossy ? "withdraw" : effect);
-      held.delete(owner);
+      effects.set(run.owner, effect);
     }
+    for (const [owner, effect] of effects) applyEffect(owner, effect);
+    held = [];
+    heldOwners.clear();
   }
 
   return {
@@ -474,7 +470,7 @@ export function createModeAuthority(
           await retryLoadIfFailed();
           // A failed read adds no answer, but a load it triggered must still
           // judge the answers held while the records were unreadable.
-          if (loaded && !loadFailed && held.size > 0) {
+          if (loaded && !loadFailed && held.length > 0) {
             const release = await lock.exclusive();
             try {
               await replayHeld(woken);
