@@ -48,8 +48,9 @@
 // starts, and a failed batch stops the pass. So a pass that stops anywhere,
 // or a restart, leaves every segment that names a remaining part or piece in
 // place, and the next pass enumerates the same objects again. The newest
-// segment's absence is the completion mark: nothing is left to find once it
-// is gone. A delete that answers 404 counts as done, so every step repeats.
+// segment is removed only after a complete inventory and acknowledged deletes.
+// Its absence is checked against the full version inventory before a repeat
+// reports completion. A delete that answers 404 counts as done, so every step repeats.
 
 import {
   bodyPieceBlobName,
@@ -82,6 +83,8 @@ export interface LogVersionLister {
     scope: string,
     options?: { readonly signal?: AbortSignal },
   ): Promise<{
+    /** True only when all pages of the version inventory were read. */
+    readonly complete: boolean;
     readonly versions: readonly {
       readonly expectedVersion: string;
       readonly dataHash: string;
@@ -139,9 +142,8 @@ export interface LogErasureDeps {
 
 export type ErasureOutcome =
   /**
-   * Every object of the log is gone (or was). `unenumerated` counts objects
-   * that could not be opened: they were deleted by name, but what they named
-   * is unknown, so those pieces and parts may remain.
+   * Every object discovered from the complete version inventory was acknowledged
+   * deleted or missing. A successful outcome always has zero unenumerated objects.
    */
   | {
       readonly kind: "erased";
@@ -151,7 +153,7 @@ export type ErasureOutcome =
   /** Not finished; the same call again continues. */
   | {
       readonly kind: "pending";
-      readonly why: "finality" | "storage" | "error";
+      readonly why: "finality" | "storage" | "inventory" | "error";
       readonly detail?: string;
     }
   /** Not erased, and a repeat will not change that. */
@@ -270,22 +272,29 @@ async function eraseOne(
       return { kind: "pending", why: "finality" };
 
     const head = await deps.registry.read(scope, signal);
-    if (!head.found) return { kind: "erased", deleted: 0, unenumerated: 0 };
-    const headName = segmentBlobName(head.dataHash);
-    const opened = await open(deps, scope, headName);
-    // The newest segment goes last: its absence says nothing is left to find.
-    if (opened === "absent")
+    const headName = head.found ? segmentBlobName(head.dataHash) : null;
+    const inventory = await deps.versions.list(scope, { signal });
+    if (inventory.complete !== true)
+      return { kind: "pending", why: "inventory", detail: "log version inventory is incomplete" };
+
+    const segments = new Set<string>();
+    for (const v of inventory.versions)
+      if (!v.isTombstone) segments.add(segmentBlobName(v.dataHash));
+    const opened = headName === null ? "absent" : await open(deps, scope, headName);
+    if (headName === null || opened === "absent") {
+      // A finished pass leaves no listed segment in storage (the head went
+      // last). Do not treat a missing head with surviving segments as proof.
+      for (const name of segments) {
+        if (name !== headName && (await deps.blobs.get(`${scope}/${name}`)) !== null)
+          return { kind: "pending", why: "inventory", detail: "log head is missing with listed segments still present" };
+      }
       return { kind: "erased", deleted: 0, unenumerated: 0 };
+    }
     const decoded = opened === "unreadable" ? null : decodeSegment(opened);
     if (decoded?.kind !== "ok" || decoded.segment.keyCheck !== target.keyCheck)
       return { kind: "stopped", why: "head-unreadable" };
 
-    // Every segment the registry ever listed for the log, plus the ones the
-    // newest names (a cross-check, and a page the inventory did not return).
-    const inventory = await deps.versions.list(scope, { signal });
-    const segments = new Set<string>([headName]);
-    for (const v of inventory.versions)
-      if (!v.isTombstone) segments.add(segmentBlobName(v.dataHash));
+    segments.add(headName);
     for (const ref of decoded.segment.refs)
       segments.add(segmentBlobName(ref.dataHash));
 
@@ -321,6 +330,9 @@ async function eraseOne(
       note(part.part.entries);
     });
 
+    if (unenumerated > 0)
+      return { kind: "pending", why: "inventory", detail: `${unenumerated} log objects could not be enumerated` };
+
     const rest = [...segments].filter((name) => name !== headName);
     let deleted = 0;
     for (const phase of [[...pieces], [...parts], rest, [headName]]) {
@@ -347,6 +359,11 @@ async function eraseOne(
             why: "storage",
             detail: `${outcome.failed.length} of ${batch.length} deletes failed: ${outcome.failed[0]!.error}`,
           };
+        const acknowledged = [...outcome.deleted, ...outcome.missing];
+        const names = new Set(acknowledged);
+        if (acknowledged.length !== batch.length || names.size !== batch.length ||
+            batch.some((name) => !names.has(name)))
+          return { kind: "pending", why: "storage", detail: "delete batch was not fully acknowledged" };
       }
     }
     return { kind: "erased", deleted, unenumerated };

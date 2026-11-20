@@ -197,6 +197,7 @@ function world() {
     },
     versions: {
       list: async (scope) => ({
+        complete: true,
         versions: (inventory.get(scope) ?? []).map((v) => ({
           expectedVersion: String(v.version),
           dataHash: v.dataHash,
@@ -509,14 +510,27 @@ describe("eraseDeletedConnectionLogs", () => {
       expect(w.objects("alpha", NS)).toEqual([]);
     });
 
-    it("a connection whose newest segment is gone is done: nothing is asked of storage", async () => {
+    it("a verified complete pass remains erased without further deletes", async () => {
       const w = world();
       await w.compactedLog("alpha", NS);
       w.setControl("alpha", NS, 2, true);
-      await eraseDeletedConnectionLogs(w.deps);
+      const first = await eraseDeletedConnectionLogs(w.deps);
+      expect(first.connections[0]!.outcome).toEqual({
+        kind: "erased", deleted: 9, unenumerated: 0,
+      });
       w.calls.length = 0;
-
-      const again = await eraseDeletedConnectionLogs(w.deps);
+      let inventories = 0;
+      const original = w.deps.versions;
+      const again = await eraseDeletedConnectionLogs({
+        ...w.deps,
+        versions: {
+          list: async (scope, options) => {
+            inventories += 1;
+            return original.list(scope, options);
+          },
+        },
+      });
+      expect(inventories).toBe(1);
 
       expect(again.connections[0]!.outcome).toEqual({
         kind: "erased",
@@ -544,24 +558,75 @@ describe("eraseDeletedConnectionLogs", () => {
     });
   });
 
-  it("erases an object it cannot open by name and reports what it could not enumerate", async () => {
+  it("keeps discovery objects until the complete inventory is readable", async () => {
     const w = world();
     await w.compactedLog("alpha", NS);
     w.setControl("alpha", NS, 2, true);
     const scope = logScope("alpha", NS);
-    const part = w.objects("alpha", NS).find((n) => n[0] === "q")!;
-    // The part is corrupt: it names pieces nobody can find any more.
-    w.store.set(`${scope}/${part}`, new TextEncoder().encode("not json"));
-
-    const report = await eraseDeletedConnectionLogs(w.deps);
-
-    expect(report.connections[0]!.outcome).toEqual({
-      kind: "erased",
-      // The piece the part named (c) is not found: 3 pieces, the part, 4 segments.
-      deleted: 8,
-      unenumerated: 1,
+    const before = w.objects("alpha", NS);
+    const incomplete = await eraseDeletedConnectionLogs({
+      ...w.deps,
+      versions: { list: async () => ({ complete: false, versions: [] }) },
     });
-    expect(w.objects("alpha", NS)).toEqual([`v-${hex64(3)}`]);
+    expect(incomplete.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "inventory" });
+    expect(w.calls).toEqual([]);
+    expect(w.objects("alpha", NS)).toEqual(before);
+
+    const part = before.find((n) => n[0] === "q")!;
+    const bytes = w.store.get(`${scope}/${part}`)!;
+    w.store.set(`${scope}/${part}`, new TextEncoder().encode("not json"));
+    const unreadable = await eraseDeletedConnectionLogs(w.deps);
+    expect(unreadable.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "inventory" });
+    expect(w.calls).toEqual([]);
+    expect(w.objects("alpha", NS)).toEqual(before);
+
+    w.store.set(`${scope}/${part}`, bytes);
+    const readable = await eraseDeletedConnectionLogs(w.deps);
+    expect(readable.connections[0]!.outcome).toEqual({
+      kind: "erased", deleted: before.length, unenumerated: 0,
+    });
+  });
+
+  it("keeps listed segments when the head is unavailable", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const scope = logScope("alpha", NS);
+    const current = await w.deps.registry.read(scope);
+    if (!current.found) throw new Error("fixture expected a log head");
+    const head = `${scope}/s-${current.dataHash.replace(/^0x/, "")}`;
+    const before = w.objects("alpha", NS);
+    const report = await eraseDeletedConnectionLogs({
+      ...w.deps,
+      blobs: {
+        get: async (name) => name === head ? null : w.deps.blobs.get(name),
+      },
+    });
+    expect(report.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "inventory" });
+    expect(w.calls).toEqual([]);
+    expect(w.objects("alpha", NS)).toEqual(before);
+  });
+
+  it("does not advance a phase without every requested name acknowledged", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const before = w.objects("alpha", NS);
+    const batches: string[][] = [];
+    const partial = await eraseDeletedConnectionLogs({
+      ...w.deps,
+      objects: {
+        deleteBlobVersions: async (scope, names) => {
+          batches.push([...names]);
+          return w.deps.objects.deleteBlobVersions(scope, names.slice(0, -1));
+        },
+      },
+    });
+    expect(partial.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "storage" });
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.every(name => name.startsWith("v-"))).toBe(true);
+    expect(w.objects("alpha", NS).filter(name => !name.startsWith("v-")))
+      .toEqual(before.filter(name => !name.startsWith("v-")));
   });
 
   it("does not delete a log whose newest segment is not under this key", async () => {

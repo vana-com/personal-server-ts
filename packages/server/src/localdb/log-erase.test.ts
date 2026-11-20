@@ -79,6 +79,7 @@ async function deletedCompactedLog() {
     registry: a.deps.registry,
     versions: {
       list: async (scope) => ({
+        complete: true,
         versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
           expectedVersion: String(i + 1),
           dataHash: v.dataHash,
