@@ -566,7 +566,12 @@ async function releaseCandidate(
   )
     throw new Error("publish: cannot release an unsettled candidate");
   // Unknown remote outcomes keep their preparation until recovery resolves them.
-  if (entry.state.kind === "committed" || entry.state.kind === "refused")
+  // An invalidated candidate never reached the registry, so nothing waits on it.
+  if (
+    entry.state.kind === "committed" ||
+    entry.state.kind === "refused" ||
+    entry.state.kind === "invalidated"
+  )
     for (const p of entry.candidate.planned) await p.workspace?.dispose();
   pending.delete(id);
   // A sent workspace stays until a head observation settles it.
