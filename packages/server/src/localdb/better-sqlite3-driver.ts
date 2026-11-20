@@ -268,7 +268,13 @@ export function openBetterSqlite3(
     : undefined;
 
   const driver: SqlDriver = {
-    info: { sqliteVersion: v, host: "node", persistent },
+    info: {
+      sqliteVersion: v,
+      host: "node",
+      persistent,
+      // A file database takes the worker's process lock at its first write.
+      exclusive: persistent,
+    },
     query: writer.query,
     batch: writer.batch,
     ...(reads ? { reads } : {}),

@@ -735,3 +735,33 @@ export async function cleanableOperation(
     )[0]?.operation ?? null
   );
 }
+
+/**
+ * A process that owns the database file is its only writer, so at open every
+ * workspace that is not over belongs to a process that is gone: abort it and
+ * page its rows and sealed values away. A `sent` workspace stays, because the
+ * registry may have landed its request: only a head observation ends it
+ * (`settleSent`). A progressive first load that is still collecting stays too:
+ * its durable owner resumes it (`openProgressiveLogWorkspace`). The job queue
+ * is per process, so every job row left is stale.
+ */
+export async function reclaimDeadWorkspaces(db: SqlDriver): Promise<void> {
+  await db.batch([{ sql: "DELETE FROM workspace_jobs" }]);
+  const dead = await db.query<{ operation: string }>(
+    `SELECT w.operation FROM workspaces w
+      WHERE w.phase NOT IN ('clean','sent')
+        AND NOT (w.phase='collect' AND EXISTS (SELECT 1 FROM workspace_partial_passes p WHERE p.operation=w.operation))
+      ORDER BY w.operation`,
+  );
+  for (const { operation } of dead) {
+    await db.batch([
+      {
+        sql: "UPDATE workspaces SET phase='aborted' WHERE operation=? AND phase NOT IN ('aborted','finished','clean','sent')",
+        params: [operation],
+      },
+    ]);
+    while (await cleanupWorkspaceOne(db, operation)) {
+      /* One indexed metadata row/value per call. */
+    }
+  }
+}

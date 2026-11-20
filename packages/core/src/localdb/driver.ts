@@ -37,6 +37,14 @@ export interface SqlDriver {
     readonly sqliteVersion: string;
     readonly host: "node" | "web" | "phone";
     readonly persistent: boolean;
+    /**
+     * One process holds this database for as long as the driver is open (a
+     * process lock taken at the first write, dropped when the process dies).
+     * Whatever the file says is in progress then belongs to a process that is
+     * gone: `openLocalDb` reclaims it. A driver that cannot promise this
+     * leaves the flag off and reclaims nothing.
+     */
+    readonly exclusive?: boolean;
   };
   query<R extends Record<string, SqlValue>>(
     sql: string,

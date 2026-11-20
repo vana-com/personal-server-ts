@@ -25,6 +25,7 @@ import {
   type SentObservation,
 } from "../../../core/dist/localdb/workspace.js";
 import { settleAbandonedOutputs } from "../../../core/dist/localdb/log-output.js";
+import { openLocalDb } from "../../../core/dist/localdb/open.js";
 import { openLogWorkspace } from "../../../core/dist/localdb/workspace-consumer.js";
 import type { LocalSyncDeps } from "../../../core/dist/localdb/deps.js";
 
@@ -400,6 +401,64 @@ it("a candidate settled finished is not settled again, and a later competing rea
     await resume(path, remote, COMPETING);
     db = openBetterSqlite3(path);
     expect(await phaseOf(db)).toBe("clean");
+    await db.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 60000);
+
+const OWNER = { owner: "o", network: "test", deviceId: "d" };
+const rowsOf = async (db: ReturnType<typeof openBetterSqlite3>, sql: string) =>
+  Number(
+    (await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${sql}`))[0]!.n,
+  );
+
+it.each([
+  ["after", "output-receipt", "collect"],
+  ["after", "upload-receipt", "sealed"],
+  ["after", "ready", "ready"],
+] as const)(
+  "a restart reclaims what a dead process left: after SIGKILL %s %s (%s), opening the database pages the workspace and its sealed values away",
+  async (edge, target, phase) => {
+    const { dir, path } = await killedAt(edge, target);
+    try {
+      let db = openBetterSqlite3(path);
+      expect(await phaseOf(db)).toBe(phase);
+      expect(await rowsOf(db, "body_values")).toBeGreaterThan(0);
+      await db.close();
+      // One process owns the file (the driver's process lock), so a workspace
+      // that is not over belongs to a process that is gone.
+      db = openBetterSqlite3(path);
+      await openLocalDb(db, OWNER);
+      for (const table of [
+        "workspace_cells",
+        "workspace_stage",
+        "workspace_receipts",
+        "workspace_attempts",
+        "workspace_sent",
+        "body_values",
+        "body_value_chunks",
+        "workspace_jobs",
+      ])
+        expect(await rowsOf(db, table), table).toBe(0);
+      expect(await phaseOf(db)).toBe("clean");
+      await db.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+  60000,
+);
+
+it("a restart keeps a sent workspace and its objects: only the registry's head ends it", async () => {
+  const { dir, path } = await killedAt("after", "sent");
+  try {
+    const db = openBetterSqlite3(path);
+    await openLocalDb(db, OWNER);
+    expect(await phaseOf(db)).toBe("sent");
+    expect(await rowsOf(db, "workspace_sent")).toBe(1);
+    expect(await rowsOf(db, "workspace_cells")).toBeGreaterThan(0);
+    expect(await rowsOf(db, "body_values")).toBeGreaterThan(0);
     await db.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

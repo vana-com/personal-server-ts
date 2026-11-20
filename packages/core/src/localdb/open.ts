@@ -1,5 +1,6 @@
 import type { SqlDriver } from "./driver.js";
 import { migrate } from "./migrate.js";
+import { reclaimDeadWorkspaces } from "./workspace.js";
 import { TEMP_TABLES } from "./merge.js";
 import type { ViewChangeRecorder, ViewLogger } from "./view-changes.js";
 
@@ -69,6 +70,7 @@ export async function openLocalDb(
   if (meta.network !== identity.network) {
     throw new LocalDbIdentityMismatch("network");
   }
+  if (driver.info.exclusive) await reclaimDeadWorkspaces(driver);
   const views = options.viewChanges;
   return views ? views.recorder.attach(driver, views.logger) : driver;
 }
