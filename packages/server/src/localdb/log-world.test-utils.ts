@@ -304,7 +304,7 @@ export async function world(options: {
         during?: () => Promise<unknown>;
       } = {},
     ) => {
-      await begin(runId, opts);
+      const begun = await begin(runId, opts);
       await sync.intake.batch(runId, {
         batch: 0,
         records: records.map(({ stream, id, v, pad, blobId, remove }) => ({
@@ -344,6 +344,7 @@ export async function world(options: {
           ...(opts.checkpoints ? { checkpoints: opts.checkpoints } : {}),
         }),
       );
+      return begun;
     };
     const cycle = async () => {
       const report = await sync.cycle();
