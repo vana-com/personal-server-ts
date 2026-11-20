@@ -45,6 +45,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 import {
   handleOwnerConnectorDelete,
+  handleOwnerConnectorLifetime,
   type ConnectionDeletePort,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
@@ -1479,7 +1480,7 @@ export function createPsLiteRuntime(
           url.pathname,
         );
         if (connectorPath) {
-          if (request.method !== "DELETE") {
+          if (request.method !== "DELETE" && request.method !== "GET") {
             // Owner first: a caller who is not the owner learns nothing of the route.
             await auth.authorizeOwner(request);
             return errorResponse(
@@ -1495,11 +1496,14 @@ export function createPsLiteRuntime(
             // A malformed percent-escape is a bad id (400 after authorization).
             connectorId = null;
           }
-          return handleOwnerConnectorDelete(request, connectorId, {
-            authorizeOwner: (req) => auth.authorizeOwner(req),
+          const connectorDeps = {
+            authorizeOwner: (req: Request) => auth.authorizeOwner(req),
             mode: accountStorageMode,
             connectionDelete: options.streamSyncConnectionDelete,
-          });
+          };
+          return request.method === "GET"
+            ? handleOwnerConnectorLifetime(request, connectorId, connectorDeps)
+            : handleOwnerConnectorDelete(request, connectorId, connectorDeps);
         }
 
         if (url.pathname === "/v1/replication/sync") {

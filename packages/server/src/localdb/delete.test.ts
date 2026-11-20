@@ -20,7 +20,11 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
-import { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
+import {
+  ConnectionLifetimeChanged,
+  InvalidConnectionLifetime,
+  createConnectionDeleter,
+} from "../../../core/src/localdb/delete.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
@@ -1120,4 +1124,114 @@ it("purges an interrupted delete before clearing a superseded intent", async () 
       [f.control],
     ),
   ).toEqual([{ control_state: "deleted" }]);
+});
+
+// ---------------------------------------------------------------------------
+// The lifetime a delete names: a resend of a delete the person made cannot
+// reach a lifetime the person never saw.
+// ---------------------------------------------------------------------------
+
+/**
+ * The phone connects the source again. When this device's delete already
+ * wrote the tombstone (version 2) the phone only connects; otherwise it
+ * deletes (its own tombstone) and then connects.
+ */
+async function phoneReconnects(f: World, alreadyDeleted: boolean) {
+  if (!alreadyDeleted) await rivalPost(f, f.control, 2, tombstone(f));
+  await rivalPost(f, f.control, 3, active(f));
+}
+
+it("names the lifetime a connector holds now: one generation per namespace that is live (mutant: LIFETIME_NOT_READ)", async () => {
+  const f = await world(undefined, ["items"], true, [WORK]);
+  // The control row of the default namespace is at version 1 (active); the
+  // other namespace's row is a foreign key's at version 1.
+  expect(await f.a.deleter.readConnectionLifetime("fixture-source")).toBe(
+    `v1:@1,${WORK}@1`,
+  );
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  // Nothing is live after the delete: nothing to name.
+  expect(await f.a.deleter.readConnectionLifetime("fixture-source")).toBe(
+    "v1:",
+  );
+});
+
+it("a delete that names the lifetime the connector holds deletes it", async () => {
+  const f = await world();
+  const lifetime = await f.a.deleter.readConnectionLifetime("fixture-source");
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source", {
+    lifetime,
+  });
+  expect(started.fenced).toBe(true);
+  expect(await f.registry.read(f.control)).toMatchObject({
+    version: 2,
+    dataHash: f.hashes.tombstoneData,
+  });
+});
+
+it("a resend that names a lifetime another device has since replaced is refused, and nothing is tombstoned (mutant: NO_LIFETIME_FENCE)", async () => {
+  const f = await world();
+  const lifetime = await f.a.deleter.readConnectionLifetime("fixture-source");
+  await f.a.deleter.requestConnectionDelete("fixture-source", { lifetime });
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  await phoneReconnects(f, true);
+  const before = f.registry.log.length;
+  await expect(
+    f.a.deleter.requestConnectionDelete("fixture-source", { lifetime }),
+  ).rejects.toBeInstanceOf(ConnectionLifetimeChanged);
+  // The new lifetime is untouched: no write, no intent, no batch.
+  expect(f.registry.log.length).toBe(before);
+  expect(f.registry.batches).toHaveLength(1);
+  expect(await f.registry.read(f.control)).toMatchObject({
+    version: 3,
+    dataHash: f.hashes.activeData,
+  });
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a resend of a lifetime this delete already ended is done: it writes nothing and refuses nothing", async () => {
+  const f = await world();
+  const lifetime = await f.a.deleter.readConnectionLifetime("fixture-source");
+  await f.a.deleter.requestConnectionDelete("fixture-source", { lifetime });
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  const before = f.registry.log.length;
+  const again = await f.a.deleter.requestConnectionDelete("fixture-source", {
+    lifetime,
+  });
+  expect(again.fenced).toBe(true);
+  expect(f.registry.log.length).toBe(before);
+  expect(await f.registry.read(f.control)).toMatchObject({
+    version: 2,
+    dataHash: f.hashes.tombstoneData,
+  });
+});
+
+it("a lifetime that names no live row refuses a delete when a row became live since (mutant: EMPTY_LIFETIME_PASSES)", async () => {
+  const f = await world();
+  const before = f.registry.log.length;
+  await expect(
+    f.a.deleter.requestConnectionDelete("fixture-source", { lifetime: "v1:" }),
+  ).rejects.toBeInstanceOf(ConnectionLifetimeChanged);
+  expect(f.registry.log.length).toBe(before);
+});
+
+it("a lifetime that is not one this server names is refused as invalid", async () => {
+  const f = await world();
+  for (const lifetime of ["", "1", "v1:@0", "v1:@x", "v2:@1", "v1:zz@1"])
+    await expect(
+      f.a.deleter.requestConnectionDelete("fixture-source", { lifetime }),
+    ).rejects.toBeInstanceOf(InvalidConnectionLifetime);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a delete that names no lifetime is the delete it always was", async () => {
+  const f = await world();
+  await phoneReconnects(f, false);
+  await applyConnection(f.a.deps, f.control);
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(started.fenced).toBe(true);
+  expect(await f.registry.read(f.control)).toMatchObject({
+    version: 4,
+    dataHash: f.hashes.tombstoneData,
+  });
 });

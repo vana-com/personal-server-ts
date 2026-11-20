@@ -272,7 +272,7 @@
     {
       "path": "/v1/owner/connectors",
       "hosts": ["server"],
-      "methods": ["ALL", "DELETE"]
+      "methods": ["ALL", "DELETE", "GET"]
     },
     {
       "path": "/v1/records/completions",

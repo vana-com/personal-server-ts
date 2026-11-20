@@ -597,8 +597,13 @@ export async function createIndexedDbPsLiteRuntime(
       : undefined,
     streamSyncConnectionDelete: syncRuntime
       ? {
-          requestConnectionDelete: async (connector) =>
+          requestConnectionDelete: async (connector, request) =>
             (await syncRuntime!.getLocalSync()).deleter.requestConnectionDelete(
+              connector,
+              request,
+            ),
+          readConnectionLifetime: async (connector) =>
+            (await syncRuntime!.getLocalSync()).deleter.readConnectionLifetime(
               connector,
             ),
         }

@@ -30,15 +30,35 @@
  *                               local state and the delete is already done
  *                               (`fenced: true`)
  *   400 INVALID_CONNECTOR       the id is not a connector key
+ *   400 INVALID_LIFETIME        `?lifetime=` is not one this server named
+ *   409 CONNECTION_LIFETIME_CHANGED
+ *                               `?lifetime=` names a connection the connector
+ *                               no longer holds: it was connected again since
+ *                               the person chose to delete. Nothing changed
  *   409 NOT_SWITCHED            the account has not moved to stream sync
  *   503 ACCOUNT_MODE_UNKNOWN    the storage mode cannot be read yet; retry
  *   503 STREAM_SYNC_UNAVAILABLE no stream-sync writer is wired on this host
+ *
+ * `?lifetime=<token>` is optional. A caller that keeps a delete to send again
+ * (Desktop's recovery) reads the token with `GET /v1/owner/connectors/:id` when
+ * the person confirms, and sends it on every send: the delete then ends that
+ * connection and no later one. A send already ended by this delete answers 202
+ * `fenced: true`, with nothing written. Without it the delete ends whatever
+ * is connected now.
+ *
+ *   GET /v1/owner/connectors/:connectorId
+ *     200 { lifetime }          the lifetime the connector holds now; the same
+ *                               refusals as the delete answer before it
  *
  * Every refusal has the one error shape of the API, the `ProtocolError`
  * envelope: `{ error: { code, errorCode, message } }`.
  */
 
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  ConnectionLifetimeChanged,
+  InvalidConnectionLifetime,
+} from "../localdb/delete-lifetime.js";
 
 /**
  * What the route needs of the account's storage mode: the read shape of
@@ -50,9 +70,16 @@ export interface StorageModeRead {
 
 /** The writer's side of the route: persist the intent, then answer. */
 export interface ConnectionDeletePort {
+  /**
+   * Rejects `ConnectionLifetimeChanged` for a lifetime the connector no longer
+   * holds and `InvalidConnectionLifetime` for a token it never named.
+   */
   requestConnectionDelete(
     connector: string,
+    request?: { readonly lifetime?: string },
   ): Promise<{ readonly deleteId: string; readonly fenced: boolean }>;
+  /** The lifetime the connector's live control rows hold now. */
+  readConnectionLifetime?(connector: string): Promise<string>;
 }
 
 export interface OwnerConnectorDeleteDeps {
@@ -105,16 +132,14 @@ function isConnectorKey(connectorId: string): boolean {
 }
 
 /**
- * `connectorId` is the path segment decoded strictly; a host passes `null`
- * when it cannot be decoded (a malformed percent-escape), which answers 400
- * after owner authorization like any other bad id. A host never falls back to
- * the raw segment: that would name a connector the owner did not write.
+ * What the two routes refuse before they ask the writer: the owner, a bad id,
+ * the storage mode, a missing writer. `null` when the request may go on.
  */
-export async function handleOwnerConnectorDelete(
+async function refusalBeforeWriter(
   request: Request,
   connectorId: string | null,
   deps: OwnerConnectorDeleteDeps,
-): Promise<Response> {
+): Promise<Response | null> {
   await deps.authorizeOwner(request);
   if (connectorId === null || !isConnectorKey(connectorId)) {
     return ownerConnectorRefusal(
@@ -138,14 +163,78 @@ export async function handleOwnerConnectorDelete(
       "This account has not moved to stream sync. Delete each scope of the source instead.",
     );
   }
-  if (!deps.connectionDelete) {
-    return ownerConnectorRefusal(
-      503,
-      "STREAM_SYNC_UNAVAILABLE",
-      "Stream sync is not running on this server.",
-    );
+  return null;
+}
+
+const unavailable = () =>
+  ownerConnectorRefusal(
+    503,
+    "STREAM_SYNC_UNAVAILABLE",
+    "Stream sync is not running on this server.",
+  );
+
+/**
+ * `connectorId` is the path segment decoded strictly; a host passes `null`
+ * when it cannot be decoded (a malformed percent-escape), which answers 400
+ * after owner authorization like any other bad id. A host never falls back to
+ * the raw segment: that would name a connector the owner did not write.
+ */
+export async function handleOwnerConnectorDelete(
+  request: Request,
+  connectorId: string | null,
+  deps: OwnerConnectorDeleteDeps,
+): Promise<Response> {
+  const refusal = await refusalBeforeWriter(request, connectorId, deps);
+  if (refusal) return refusal;
+  if (!deps.connectionDelete) return unavailable();
+  const lifetime = new URL(request.url).searchParams.get("lifetime");
+  try {
+    const started =
+      lifetime === null
+        ? await deps.connectionDelete.requestConnectionDelete(connectorId!)
+        : await deps.connectionDelete.requestConnectionDelete(connectorId!, {
+            lifetime,
+          });
+    return accepted(started.deleteId, started.fenced);
+  } catch (error) {
+    if (error instanceof ConnectionLifetimeChanged) {
+      return ownerConnectorRefusal(
+        409,
+        "CONNECTION_LIFETIME_CHANGED",
+        "The source was connected again after this delete was chosen. Nothing was deleted.",
+      );
+    }
+    if (error instanceof InvalidConnectionLifetime) {
+      return ownerConnectorRefusal(
+        400,
+        "INVALID_LIFETIME",
+        "lifetime is not one this server named",
+      );
+    }
+    throw error;
   }
-  const started =
-    await deps.connectionDelete.requestConnectionDelete(connectorId);
-  return accepted(started.deleteId, started.fenced);
+}
+
+/**
+ * `GET /v1/owner/connectors/:connectorId`: the lifetime the connector holds
+ * now, for a caller that will send a delete of it more than once. Answers what
+ * the delete answers before it asks the writer.
+ */
+export async function handleOwnerConnectorLifetime(
+  request: Request,
+  connectorId: string | null,
+  deps: OwnerConnectorDeleteDeps,
+): Promise<Response> {
+  const refusal = await refusalBeforeWriter(request, connectorId, deps);
+  if (refusal) return refusal;
+  const read = deps.connectionDelete?.readConnectionLifetime;
+  if (!read) return unavailable();
+  const lifetime = await read.call(deps.connectionDelete, connectorId!);
+  return new Response(JSON.stringify({ lifetime }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
+  });
 }

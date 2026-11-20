@@ -1797,10 +1797,13 @@ async function bootstrapServer(
     streamSyncIntake,
     streamSyncConnectionDelete: localSyncSource
       ? {
-          requestConnectionDelete: async (connector) =>
+          requestConnectionDelete: async (connector, request) =>
             (await localSyncSource()).deleter.requestConnectionDelete(
               connector,
+              request,
             ),
+          readConnectionLifetime: async (connector) =>
+            (await localSyncSource()).deleter.readConnectionLifetime(connector),
         }
       : null,
     // Shutdown stops admission before the database closes.

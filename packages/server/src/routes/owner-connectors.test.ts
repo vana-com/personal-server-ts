@@ -68,6 +68,9 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
       calls.push(connector);
       return { deleteId: `delete-${connector}`, fenced: true };
     },
+    async readConnectionLifetime(connector) {
+      return `v1:@${connector.length}`;
+    },
   };
 
   async function makeApp(opts: {
@@ -291,7 +294,7 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     }
   });
 
-  it("answers another method with 405 to the owner only (mutant: METHOD_BEFORE_AUTH)", async () => {
+  it("answers the lifetime a connector holds to its owner on GET, and nobody else (mutant: LIFETIME_BEFORE_AUTH)", async () => {
     const app = await makeApp({ switched: true });
     const stranger = await app.request("/v1/owner/connectors/github", {
       method: "GET",
@@ -300,6 +303,22 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     expect(stranger.status).toBeLessThan(404);
     const owner = await app.request("/v1/owner/connectors/github", {
       method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(owner.status).toBe(200);
+    expect(await owner.json()).toEqual({ lifetime: "v1:@6" });
+    expect(calls).toEqual([]);
+  });
+
+  it("answers another method with 405 to the owner only (mutant: METHOD_BEFORE_AUTH)", async () => {
+    const app = await makeApp({ switched: true });
+    const stranger = await app.request("/v1/owner/connectors/github", {
+      method: "PATCH",
+    });
+    expect(stranger.status).toBeGreaterThanOrEqual(401);
+    expect(stranger.status).toBeLessThan(404);
+    const owner = await app.request("/v1/owner/connectors/github", {
+      method: "PATCH",
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(owner.status).toBe(405);

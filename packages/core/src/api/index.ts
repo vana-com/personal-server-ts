@@ -2388,6 +2388,7 @@ export {
 
 export {
   handleOwnerConnectorDelete,
+  handleOwnerConnectorLifetime,
   ownerConnectorRefusal,
   type ConnectionDeletePort,
   type OwnerConnectorDeleteDeps,
