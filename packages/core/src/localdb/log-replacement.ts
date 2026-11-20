@@ -15,11 +15,7 @@ import {
   type StagingWorkspaceUnit,
   type WorkspaceRows,
 } from "./workspace-consumer.js";
-import {
-  runtimeAdmission,
-  setWorkspaceAuthority,
-  readWorkspaceAuthority,
-} from "./workspace.js";
+import { runtimeAdmission, setWorkspaceAuthority } from "./workspace.js";
 
 const encoder = new TextEncoder();
 export function operationBytes(op: WireOperation): number {
@@ -123,15 +119,19 @@ export async function openReplacementPlan(
   const [meta] = await deps.db.query<{
     owner: string;
     device_id: string;
+    network: string;
     created_at: number;
-  }>("SELECT owner,device_id,created_at FROM db_meta WHERE id=1");
+  }>("SELECT owner,device_id,network,created_at FROM db_meta WHERE id=1");
   if (!meta) throw new Error("replacement_database_identity");
-  const authority = await readWorkspaceAuthority(deps.db, input.connection);
   const binding = {
     owner: meta.owner,
-    databaseIncarnation:
-      authority?.databaseIncarnation ??
-      JSON.stringify([meta.device_id, meta.created_at]),
+    // One derivation for every workspace kind: the connection has one
+    // authority row, and a differing value would fence the other kind's workspace.
+    databaseIncarnation: JSON.stringify([
+      meta.network,
+      meta.device_id,
+      meta.created_at,
+    ]),
     connection: input.connection,
     generation: input.generation,
     keyCheck: input.keyCheck,

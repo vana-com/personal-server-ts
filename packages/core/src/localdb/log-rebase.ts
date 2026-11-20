@@ -57,7 +57,7 @@ export async function rebaseOnLog(
     deps,
     connectionId,
     context.keyCheck,
-    JSON.stringify(local),
+    local.refs.at(-1)?.dataHash ?? "null",
     context.generation,
   );
   let complete = false;

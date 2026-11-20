@@ -1,7 +1,7 @@
 import { afterEach, expect, it } from "vitest";
-import { rebaseOnLog } from "../../../core/src/localdb/log-rebase.js";
-import { readLogState } from "../../../core/src/localdb/log-state.js";
-import { nobleStreamCrypto } from "../../../core/src/stream-sync/crypto-port.js";
+import { rebaseOnLog } from "../../../core/dist/localdb/log-rebase.js";
+import { readLogState } from "../../../core/dist/localdb/log-state.js";
+import { nobleStreamCrypto } from "../../../core/dist/stream-sync/crypto-port.js";
 import {
   deriveKeyCheck,
   controlHashes,

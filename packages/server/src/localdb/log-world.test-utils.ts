@@ -67,8 +67,6 @@ export async function closeWorldDrivers(): Promise<void> {
 
 export async function world(options: {
   streams: number;
-  /** SQL-only reference folds do not need durable workspace storage. */
-  persistent?: boolean;
   publishWhileCollecting?: boolean;
   /** The registry's rule that refuses a stream row write beside a log row (default on). */
   connectionLogFence?: boolean;
@@ -130,19 +128,14 @@ export async function world(options: {
       streamCrypto?: StreamCryptoPort;
     } = {},
   ) {
-    const directory =
-      options.persistent === false
-        ? null
-        : await mkdtemp(join(tmpdir(), "log-world-"));
-    if (directory) directories.push(directory);
-    const db = await openLocalDb(
-      openBetterSqlite3(directory ? join(directory, "db") : ":memory:"),
-      {
-        owner: OWNER,
-        network: "test",
-        deviceId,
-      },
-    );
+    // Publication and replay keep their workspace on disk: a file database.
+    const directory = await mkdtemp(join(tmpdir(), "log-world-"));
+    directories.push(directory);
+    const db = await openLocalDb(openBetterSqlite3(join(directory, "db")), {
+      owner: OWNER,
+      network: "test",
+      deviceId,
+    });
     drivers.push(db);
     const puts: string[] = [];
     const gets: string[] = [];

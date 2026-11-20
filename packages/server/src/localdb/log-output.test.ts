@@ -154,9 +154,11 @@ it("a plan and its candidate hold a workspace handle, never ciphertext, however 
 it("the upload loop holds one object, puts each once and ends ready only when every object has its receipt", async () => {
   const { d, deps, plan } = await history(300);
   const phase = async () =>
-    (await d.db.query<{ phase: string }>("SELECT phase FROM workspaces")).map(
-      (r) => r.phase,
-    );
+    (
+      await d.db.query<{ phase: string }>(
+        "SELECT phase FROM workspaces WHERE phase<>'clean'",
+      )
+    ).map((r) => r.phase);
   expect(await phase()).toEqual(["sealed"]);
   let active = 0,
     peak = 0;
@@ -191,9 +193,11 @@ it("a put that fails leaves the workspace sealed; the retry puts the failed obje
     }),
   ).rejects.toThrow("process lost");
   expect(
-    (await d.db.query<{ phase: string }>("SELECT phase FROM workspaces")).map(
-      (r) => r.phase,
-    ),
+    (
+      await d.db.query<{ phase: string }>(
+        "SELECT phase FROM workspaces WHERE phase<>'clean'",
+      )
+    ).map((r) => r.phase),
   ).toEqual(["sealed"]);
   // Early ready: two receipts of the many are not every receipt.
   await expect(plan.outputs.ws.transition("sealed", "ready")).rejects.toThrow();
@@ -205,9 +209,11 @@ it("a put that fails leaves the workspace sealed; the retry puts the failed obje
   expect(new Set(twice[0]![1]).size).toBe(1); // identical bytes: never re-encrypted
   expect(sums.size).toBe(plan.outputs.count);
   expect(
-    (await d.db.query<{ phase: string }>("SELECT phase FROM workspaces")).map(
-      (r) => r.phase,
-    ),
+    (
+      await d.db.query<{ phase: string }>(
+        "SELECT phase FROM workspaces WHERE phase<>'clean'",
+      )
+    ).map((r) => r.phase),
   ).toEqual(["ready"]);
 }, 120_000);
 

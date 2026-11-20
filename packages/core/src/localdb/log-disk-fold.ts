@@ -74,7 +74,7 @@ export async function openDiskFold(
     generation: control.generation,
     keyCheck,
     operation: deps.newOp(),
-    expectedHead: digest(encoder.encode(head)),
+    expectedHead: head,
     codecVersion: 1,
   };
   // No decoded input exists before runtime-wide admission.

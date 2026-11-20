@@ -67,11 +67,7 @@ await build({
           async ({ path: file }) => {
             let s = await readFile(file, "utf8");
             s = s.replace(
-              'openBetterSqlite3(":memory:")',
-              "globalThis.memoryDriver(deviceId)",
-            );
-            s = s.replace(
-              'openBetterSqlite3(directory ? join(directory, "db") : ":memory:")',
+              'openBetterSqlite3(join(directory, "db"))',
               "globalThis.memoryDriver(deviceId)",
             );
             const start = s.indexOf(

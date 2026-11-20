@@ -1211,7 +1211,7 @@ describe("log protocol: boundary kinds at equal stamps (P2-1)", () => {
     d.records().then((rs) => rs.some((r) => r.includes('"id":"k"')));
 
   const seeded = async () => {
-    const w = await world({ streams: 1, persistent: false });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
       observedAt: 1100,
@@ -1528,7 +1528,7 @@ describe("log protocol: first-seen travels with the winning observation (P2-a, P
   };
 
   const seeded = async () => {
-    const w = await world({ streams: 1, persistent: false });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "seed" }], {
       observedAt: 1100,
@@ -1835,7 +1835,7 @@ describe("log protocol: deletions carry the canonical record key", () => {
 describe("log protocol: a deletion's key must be the key its hash names", () => {
   const S = { o: 5000, r: "run-k" };
   const seeded = async () => {
-    const w = await world({ streams: 1, persistent: false });
+    const w = await world({ streams: 1 });
     const a = await w.device("a");
     await a.run("run-1", [{ stream: sName(0), id: "A" }], { observedAt: 1100 });
     await a.cycle();

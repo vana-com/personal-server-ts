@@ -26,7 +26,7 @@ afterEach(closeWorldDrivers);
 it.each([0x12345678, 0xaabbccdd, 0x13579bdf])(
   "folded prefixes and fork suffixes preserve rows, stamps, first seen, tombstones and completion",
   async (seed) => {
-    const w = await world({ streams: 1, persistent: false });
+    const w = await world({ streams: 1 });
     const a = await w.device("seed");
     await a.run("seed", [{ stream: "s0", id: 99 }]);
     await a.cycle();

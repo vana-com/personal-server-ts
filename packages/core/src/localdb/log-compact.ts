@@ -97,7 +97,7 @@ export async function planCompaction(
     deps,
     controlScope(input.connector, input.ns),
     input.keyCheck,
-    JSON.stringify(log),
+    log.refs.at(-1)?.dataHash ?? "null",
     input.generation,
   );
   let handedOff = false;
