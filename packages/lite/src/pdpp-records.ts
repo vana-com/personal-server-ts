@@ -98,6 +98,7 @@ export async function handleLitePdppRecordList(
       url: request.url,
       stream,
       context,
+      prefer: request.headers.get("prefer"),
     });
     return Response.json(result.body, { status: 200, headers });
   } catch (error) {

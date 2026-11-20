@@ -79,3 +79,21 @@ export function parseRecordQuery(
     source: params.get("source") ?? undefined,
   };
 }
+
+/**
+ * The count grade a `Prefer` header asks for (`count=none|estimated|exact`),
+ * read among its other tokens. Anything else is `none`: a count is opt-in.
+ */
+export function requestedCountGrade(
+  prefer: string | null | undefined,
+): "none" | "estimated" | "exact" {
+  for (const token of (prefer ?? "").split(",")) {
+    const [name, value] = token.split("=").map((part) => part.trim());
+    if (
+      name?.toLowerCase() === "count" &&
+      (value === "estimated" || value === "exact")
+    )
+      return value;
+  }
+  return "none";
+}

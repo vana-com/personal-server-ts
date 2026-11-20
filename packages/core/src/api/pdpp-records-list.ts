@@ -25,7 +25,7 @@ import type {
   StreamDeclaration,
   StreamDeclarationRegistry,
 } from "../storage/pdpp-records/stream-declaration.js";
-import { parseRecordQuery } from "./pdpp-record-query.js";
+import { parseRecordQuery, requestedCountGrade } from "./pdpp-record-query.js";
 
 export interface LocalRecord {
   readonly instance: string;
@@ -126,11 +126,17 @@ export async function localRecordPage(
   history: RecordHistory | undefined,
   candidate: boolean,
   eligibilityFields: string[] | undefined,
+  /**
+   * Also state the whole stream's record count across the instances, read with
+   * each instance's page. Only the owner's plain listing has one.
+   */
+  withTotal = false,
 ): Promise<{
   data: LocalRecord[];
   hasMore: boolean;
   nextCursor: string | null;
   nextChangesSince?: string;
+  total?: number;
 }> {
   const instances = [...new Set(instanceIds)].sort();
   const visible = (row: LocalRecord) =>
@@ -267,14 +273,17 @@ export async function localRecordPage(
   const after = localListCursors(input.cursor, stream, instances);
   const records: { index: number; record: StoredRecord }[] = [];
   let more = false;
+  let total = 0;
   for (const [index, instance] of instances.entries()) {
     const page = await query.listRecords({
       connectionId: instance,
       stream,
       cursor: after[index],
       limit: input.limit,
+      ...(withTotal && { withTotal }),
     });
     more ||= page.nextCursor !== null;
+    total += page.total ?? 0;
     for (const record of page.records) records.push({ index, record });
   }
   // SQLite record_key order is binary UTF-8, independent of locale or stamp_o.
@@ -310,6 +319,7 @@ export async function localRecordPage(
       .filter(visible),
     hasMore,
     nextCursor,
+    ...(withTotal && { total }),
   };
 }
 
@@ -393,6 +403,8 @@ export async function listPdppRecords(
     readonly url: string;
     readonly stream: string;
     readonly context: PdppTokenContext;
+    /** The request's `Prefer` header, where it may ask for a `count`. */
+    readonly prefer?: string | null;
   },
 ): Promise<RecordListResult> {
   const { context, stream } = input;
@@ -424,11 +436,23 @@ export async function listPdppRecords(
   }
 
   const candidate = grantIsCandidate(context.grant);
-  const warnings = query.clamped
-    ? { warnings: [{ code: "limit_clamped", message: "limit clamped to 100" }] }
-    : undefined;
+  const warnings: { code: string; message: string; param?: string }[] = [];
+  if (query.clamped)
+    warnings.push({ code: "limit_clamped", message: "limit clamped to 100" });
 
   if (localQuery) {
+    // A count is the whole stream across the read's connections, never the
+    // page. Only the owner's plain listing has that one filter to count over;
+    // a grant's visibility and a change feed have no such total.
+    const wantsCount = requestedCountGrade(input.prefer) !== "none";
+    const countable = owner && query.changesSince === undefined;
+    if (wantsCount && !countable) {
+      warnings.push({
+        code: "count_downgraded",
+        message: "No exact count is available for this read",
+        param: "count",
+      });
+    }
     const page = await localRecordPage(
       localQuery,
       stream,
@@ -439,7 +463,12 @@ export async function listPdppRecords(
       ports.recordHistory,
       candidate,
       candidate ? scope.streamGrant?.fields : scope.fields,
+      wantsCount && countable,
     );
+    const count =
+      page.total === undefined
+        ? undefined
+        : ({ kind: "exact", value: page.total } as const);
     return {
       feed: true,
       body: {
@@ -452,7 +481,12 @@ export async function listPdppRecords(
         data: page.data.map((row) =>
           localRecordJson(stream, row, scope.fields, candidate),
         ),
-        ...(warnings && { meta: warnings }),
+        ...((count || warnings.length > 0) && {
+          meta: {
+            ...(count && { count }),
+            ...(warnings.length > 0 && { warnings }),
+          },
+        }),
       },
     };
   }

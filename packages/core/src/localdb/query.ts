@@ -31,6 +31,12 @@ export interface RecordPage {
   readonly records: readonly StoredRecord[];
   /** Resumes after the page's last row (see `listCursor`); `null` when there is no more. */
   readonly nextCursor: string | null;
+  /**
+   * How many records the connection holds in the stream, whatever the cursor.
+   * Present only when `listRecords` was asked for it, and read in the same
+   * statement as the page, so it always covers the page's rows.
+   */
+  readonly total?: number;
 }
 
 export interface ChangePage {
@@ -57,6 +63,8 @@ export interface RecordQuery {
     readonly stream: string;
     readonly cursor?: string;
     readonly limit?: number;
+    /** Also state the stream's `total` (see `RecordPage`). */
+    readonly withTotal?: boolean;
   }): Promise<RecordPage>;
   getRecord(input: {
     readonly connectionId: string;
@@ -142,11 +150,10 @@ function stored(row: RecordRow): StoredRecord {
 
 export function createRecordQuery(db: SqlReader): RecordQuery {
   return {
-    async listRecords({ connectionId, stream, cursor, limit }) {
+    async listRecords({ connectionId, stream, cursor, limit, withTotal }) {
       const size = pageLimit(limit);
       const after = cursor === undefined ? null : parseListCursor(cursor);
-      const rows = await db.query<RecordRow>(
-        `SELECT ${RECORD_COLUMNS} FROM records
+      const pageSql = `SELECT ${RECORD_COLUMNS} FROM records
          WHERE connection_id = ? AND stream = ?
            ${
              after === null
@@ -155,24 +162,44 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
                  ? "AND record_key > ?"
                  : "AND (record_key, pk_hash) > (?, ?)"
            }
-         ORDER BY record_key, pk_hash LIMIT ?`,
-        [
-          connectionId,
-          stream,
-          ...(after === null
-            ? []
-            : after.pkHash === null
-              ? [after.recordKey]
-              : [after.recordKey, after.pkHash]),
-          size + 1,
-        ],
-      );
+         ORDER BY record_key, pk_hash LIMIT ?`;
+      const pageParams = [
+        connectionId,
+        stream,
+        ...(after === null
+          ? []
+          : after.pkHash === null
+            ? [after.recordKey]
+            : [after.recordKey, after.pkHash]),
+        size + 1,
+      ];
+      let total: number | undefined;
+      let rows: RecordRow[];
+      if (withTotal) {
+        // The count and the page are one statement, so they read one
+        // snapshot: a row admitted or removed meanwhile is in both or neither.
+        // The count row survives an empty page through the LEFT JOIN.
+        const joined = await db.query<
+          { total: number } & { [K in keyof RecordRow]: RecordRow[K] | null }
+        >(
+          `WITH total AS (
+             SELECT COUNT(*) AS total FROM records
+             WHERE connection_id = ? AND stream = ?
+           ), page AS (${pageSql})
+           SELECT total.total AS total, page.* FROM total LEFT JOIN page ON 1 = 1
+           ORDER BY page.record_key, page.pk_hash`,
+          [connectionId, stream, ...pageParams],
+        );
+        total = Number(joined[0]?.total ?? 0);
+        rows = joined.filter((row) => row.record_key !== null) as RecordRow[];
+      } else rows = await db.query<RecordRow>(pageSql, pageParams);
       const more = rows.length > size;
       const page = rows.slice(0, size);
       const last = page[page.length - 1];
       return {
         records: page.map(stored),
         nextCursor: more ? listCursor(last!.record_key, last!.pk_hash) : null,
+        ...(total !== undefined && { total }),
       };
     },
 

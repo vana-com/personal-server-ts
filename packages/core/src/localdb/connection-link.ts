@@ -52,15 +52,22 @@ export function createLinkedRecordQuery(
   };
   return {
     async listRecords(input) {
+      // A read that fails the link, or loses it while reading, states an empty
+      // stream: no rows and, when asked, a total of zero.
+      const none = {
+        records: [],
+        nextCursor: null,
+        ...(input.withTotal && { total: 0 }),
+      };
       const selected = await target(input.connectionId, input.stream);
-      if (!selected) return { records: [], nextCursor: null };
+      if (!selected) return none;
       const page = await query.listRecords({
         ...input,
         connectionId: selected.id,
       });
       return (await valid(selected, input.connectionId, input.stream))
         ? page
-        : { records: [], nextCursor: null };
+        : none;
     },
     async getRecord(input) {
       const selected = await target(input.connectionId, input.stream);
