@@ -85,6 +85,7 @@ async function world(
         await sync.intake.begin(id, {
           connector: options.connector ?? "fixture",
           artifactDigest: options.connector ?? "fixture",
+          join: true,
           wantFull: true,
           observedAt: options.observedAt,
           owner: { address: owner, leaseId: null },
@@ -176,6 +177,7 @@ it("a pending explicit tombstone wins over an older head learned before publish"
   await b.sync.intake.begin("older", {
     connector: "fixture",
     artifactDigest: "fixture",
+    join: true,
     owner: { address: owner, leaseId: null },
     observedAt: 1002,
   });
@@ -203,6 +205,7 @@ it("a staged delete leaves data intact if its run aborts", async () => {
   await a.sync.intake.begin("aborted", {
     connector: "fixture",
     artifactDigest: "fixture",
+    join: true,
     owner: { address: owner, leaseId: null },
   });
   const batch = {
@@ -241,6 +244,7 @@ it("a mismatched declared key rejects the whole delete batch", async () => {
   await a.sync.intake.begin("bad-key", {
     connector: "fixture",
     artifactDigest: "fixture",
+    join: true,
     owner: { address: owner, leaseId: null },
   });
   await expect(

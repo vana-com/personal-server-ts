@@ -268,6 +268,7 @@ describe("Node database composition", () => {
     const begin = await send("/v1/stream-sync/runs/intake", "PUT", {
       connector: "fixture-source",
       artifactDigest: digest,
+      join: true,
       owner: { address: context.serverOwner!, leaseId: null },
       observedAt: 42,
     });
@@ -302,6 +303,7 @@ describe("Node database composition", () => {
     const resumed = await send("/v1/stream-sync/runs/resumed", "PUT", {
       connector: "fixture-source",
       artifactDigest: digest,
+      join: true,
       owner: { address: context.serverOwner!, leaseId: null },
     });
     expect(resumed.status).toBe(200);
@@ -332,6 +334,7 @@ describe("Node database composition", () => {
         await send("/v1/stream-sync/runs/zz-full", "PUT", {
           connector: "fixture-source",
           artifactDigest: digest,
+          join: true,
           owner: { address: context.serverOwner!, leaseId: null },
           wantFull: true,
           observedAt: Date.now() + 100,

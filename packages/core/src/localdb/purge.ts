@@ -89,6 +89,11 @@ export async function purgeConnection(
           sql: "DELETE FROM stream_partial WHERE connection_id = ?",
           params: [connectionId],
         },
+        // A later lifetime is a connection this device has not joined.
+        {
+          sql: "DELETE FROM connection_participation WHERE connection_id = ?",
+          params: [connectionId],
+        },
       ]),
     );
     // Rotate only after the purge batch commits, before releasing its slot.

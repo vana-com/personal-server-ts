@@ -69,6 +69,9 @@ const dropRawEndSchema = [
   { sql: "ALTER TABLE runs DROP COLUMN selected_streams" },
   { sql: "ALTER TABLE runs DROP COLUMN raw_end" },
 ];
+const dropJoinSchema = [
+  { sql: "DROP TABLE IF EXISTS connection_participation" },
+];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -168,6 +171,7 @@ async function collect(
   await sync.intake.begin(runId, {
     connector,
     artifactDigest: connector,
+    join: true,
     wantFull: true,
     owner: { address: OWNER, leaseId: null },
   });
@@ -335,6 +339,7 @@ describe("view changes", () => {
       b.intake.begin("rejected-run", {
         connector: "c0",
         artifactDigest: "c0",
+        join: true,
         wantFull: true,
         owner: { address: OWNER, leaseId: null },
       }),
@@ -986,6 +991,7 @@ describe("view changes", () => {
       { sql: "ALTER TABLE record_changes DROP COLUMN publish_blocked_reason" },
       { sql: "ALTER TABLE run_streams DROP COLUMN publish_blocked_reason" },
       ...dropRawEndSchema,
+      ...dropJoinSchema,
       { sql: `PRAGMA user_version = ${viewMigration}` },
     ]);
     const records = await raw.query("SELECT count(*) AS n FROM records");
@@ -1041,6 +1047,7 @@ describe("view changes", () => {
     // rows had no stream meta.
     await raw.batch([
       ...dropRawEndSchema,
+      ...dropJoinSchema,
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
@@ -1159,6 +1166,7 @@ describe("view changes", () => {
     expect(MIGRATIONS[metaMigration]).toHaveLength(3);
     await raw.batch([
       ...dropRawEndSchema,
+      ...dropJoinSchema,
       ...dropBootstrapSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },

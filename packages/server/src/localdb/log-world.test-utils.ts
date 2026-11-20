@@ -259,6 +259,12 @@ export async function world(options: {
         connector?: string;
         /** The connector version the run's artifact declares (default "1"). */
         version?: string;
+        /**
+         * The host's accepted join prompt. On by default, so a second device
+         * collects as it did before the join gate; `false` is a device the
+         * user has not asked to continue the connection.
+         */
+        join?: boolean;
       } = {},
     ) => {
       clock++;
@@ -271,6 +277,7 @@ export async function world(options: {
             : `${connector}@${opts.version}`,
         wantFull: opts.full ?? true,
         ...(opts.connect ? { connect: true } : {}),
+        ...(opts.join === false ? {} : { join: true as const }),
         observedAt: opts.observedAt,
         owner: { address: OWNER, leaseId: null },
       });

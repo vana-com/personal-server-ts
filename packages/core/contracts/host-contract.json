@@ -57,6 +57,10 @@
       {
         "name": "control_foreign",
         "status": 409
+      },
+      {
+        "name": "join_required",
+        "status": 409
       }
     ],
     "endResults": [

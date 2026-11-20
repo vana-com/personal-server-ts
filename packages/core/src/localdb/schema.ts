@@ -636,4 +636,16 @@ END`,
         VALUES (${row}.connection_id,${row}.stream,${row}.record_key,${event === "DELETE" ? "NULL" : "NEW.body"}); END`;
     }),
   ],
+  [
+    // A device-local fact, never published: this device collected, or was
+    // asked and accepted, the connection. Begin asks before a first run of a
+    // connection that already exists. A device with a checkpoint or a run for
+    // a connection already collects it.
+    `CREATE TABLE connection_participation (
+  connection_id TEXT PRIMARY KEY, joined_at INTEGER NOT NULL) WITHOUT ROWID`,
+    `INSERT INTO connection_participation(connection_id, joined_at)
+  SELECT connection_id, CAST(strftime('%s','now') AS INTEGER) * 1000 FROM (
+    SELECT connection_id FROM runs
+    UNION SELECT connection_id FROM connections WHERE checkpoint IS NOT NULL)`,
+  ],
 ];

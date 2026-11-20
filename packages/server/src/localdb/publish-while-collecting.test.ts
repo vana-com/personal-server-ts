@@ -106,6 +106,7 @@ async function world(
       return sync.intake.begin(id, {
         connector: "fixture",
         artifactDigest: options.digest ?? "fixture",
+        join: true,
         wantFull: options.wantFull ?? true,
         observedAt: options.observedAt,
         owner: { address: owner, leaseId: null },
