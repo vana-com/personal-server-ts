@@ -38,7 +38,7 @@ import { importProjection } from "./sync.js";
  * - `refused`: sources the database turned down, by its reason
  *   (`seed_window_closed`: a real write already owns the stream).
  * - `files`: old data files seen at retirement, and those with no importable
- *   source (file-only scopes). `null` until a retirement pass has finished.
+ *   source (file-only scopes). `null` when the retirement pass failed.
  *
  * A source with no rows is not counted: the inventory lists every declared
  * stream of each connection, and an empty one loses nothing.
@@ -162,23 +162,21 @@ export function createLegacyStoreRunner(
       });
       try {
         const imported = await importSources(deps, access, signal, logger);
-        last = imported.report(deps.now(), signal.aborted);
+        // A run that stopped has not finished: the last finished report stays.
         if (signal.aborted) return;
+        const report = imported.report(deps.now(), false);
+        let files: LegacyStoreImportReport["files"] = null;
         try {
-          const files = await retire(
-            options,
-            deps,
-            access,
-            imported.sources,
-            signal,
-          );
-          last = { ...last, files };
+          files = await retire(options, deps, access, imported.sources, signal);
         } catch (error) {
           logger.warn(
             { error: String(error) },
             "legacy retirement failed; it runs again at the next import run",
           );
         }
+        // One publication, after retirement settled: a reader never sees the
+        // new counts with `files` still null while a finished report exists.
+        if (!signal.aborted) last = { ...report, files };
       } finally {
         await access.close();
       }
