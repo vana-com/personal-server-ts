@@ -51,15 +51,6 @@ export interface LocalSyncDeps {
    */
   readonly recordsCommitted?: () => void;
   /**
-   * The host's wake for a connection whose lifetime ended on this device: its
-   * rows were purged, because a delete here, or one another device wrote and
-   * this device adopted, ended it. It says the lifetime is over here, not that
-   * the connector is deleted everywhere, so a host that acts on it checks the
-   * registry. Fire and forget, like `recordsCommitted`: a throw here never
-   * fails the purge.
-   */
-  readonly connectionPurged?: (connector: string) => void;
-  /**
    * Publish while collecting, default off. A run that begins with it on has each
    * batch admitted into `records` as it arrives (same fences as run end), so
    * the publisher relays rows during the run; run end keeps only omission
@@ -98,21 +89,6 @@ export function announceRecordsCommitted(deps: LocalSyncDeps): void {
     deps.logger.warn(
       { error: String(error) },
       "stream sync: the publish wake threw; the poll will publish",
-    );
-  }
-}
-
-/** The wake `connectionPurged` names; a throw never fails the caller. */
-export function announceConnectionPurged(
-  deps: LocalSyncDeps,
-  connector: string,
-): void {
-  try {
-    deps.connectionPurged?.(connector);
-  } catch (error) {
-    deps.logger.warn(
-      { connector, error: String(error) },
-      "stream sync: the connection-purged wake threw",
     );
   }
 }

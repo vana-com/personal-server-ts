@@ -50,6 +50,7 @@ import {
   type AliasScopes,
   type AliasTargets,
 } from "./resolve.js";
+import { onConnectionPurged } from "./purge.js";
 import { ELIGIBLE_CHANGE, PENDING_RUN } from "./publication-work.js";
 import { createRunEndStore } from "./run-end.js";
 import { createRunIntakeStore } from "./run-intake.js";
@@ -110,7 +111,7 @@ const RESUME_RETRY_FIRST_MS = 5_000;
 const RESUME_RETRY_MAX_MS = 5 * 60_000;
 
 export function createLocalSync(
-  hostDeps: LocalSyncDeps,
+  deps: LocalSyncDeps,
   options: {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
@@ -129,19 +130,6 @@ export function createLocalSync(
     readonly deleteRetryMs?: { readonly first: number; readonly max: number };
   },
 ): LocalSync {
-  // A connection purged here, by a delete made here or one adopted from
-  // another device, may be erased from storage once its delete has settled;
-  // the retry loop runs the erasure (and decides whether it is time).
-  const deps: LocalSyncDeps = {
-    ...hostDeps,
-    connectionPurged: (connector) => {
-      if (options.erasure) {
-        deletes().noteSettled(connector);
-        armRetry();
-      }
-      hostDeps.connectionPurged?.(connector);
-    },
-  };
   const retryFirst = options.deleteRetryMs?.first ?? RESUME_RETRY_FIRST_MS;
   const retryMax = options.deleteRetryMs?.max ?? RESUME_RETRY_MAX_MS;
   let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
@@ -313,6 +301,15 @@ export function createLocalSync(
     }, delay);
     retryTimer.unref?.();
   };
+  // A connection purged here, by a delete made here or one adopted from
+  // another device, may be erased from storage once its delete has settled;
+  // the retry loop runs the erasure (and decides whether it is time).
+  const stopHearingPurges = options.erasure
+    ? onConnectionPurged(deps.db, (connector) => {
+        deletes().noteSettled(connector);
+        armRetry();
+      })
+    : () => {};
   const resumes = new Set<Promise<readonly PendingDelete[]>>();
   const resume = () => {
     const work = resumeOnce();
@@ -501,6 +498,7 @@ export function createLocalSync(
     },
     close: () => {
       closed = true;
+      stopHearingPurges();
       clearTimeout(retryTimer);
       retryTimer = undefined;
       return (closing ??= (async () => {

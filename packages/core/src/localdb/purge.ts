@@ -1,5 +1,5 @@
 import { forgetUploadedBlobs } from "./blobs.js";
-import { announceConnectionPurged, type LocalSyncDeps } from "./deps.js";
+import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { endParticipation } from "./lifetime.js";
 import { withOrigin } from "./merge.js";
@@ -31,6 +31,24 @@ function passWatermark(connectionId: string): SqlStatement {
     WHERE record_changes.connection_id = stream_state.connection_id
       AND record_changes.stream = stream_state.stream), 0)`,
     params: [connectionId],
+  };
+}
+
+/**
+ * Who hears that a connection of a database was purged: the sync that owns the
+ * database (`createLocalSync`), by the database object, as the lifetime tokens
+ * above are kept. A host's `LocalSyncDeps` is shared and mutated by its
+ * owner, so the wake does not travel in it.
+ */
+const purgeListeners = new WeakMap<object, (connector: string) => void>();
+/** Hear every purge of `db`'s connections, until the returned function is called. */
+export function onConnectionPurged(
+  db: object,
+  listener: (connector: string) => void,
+): () => void {
+  purgeListeners.set(db, listener);
+  return () => {
+    if (purgeListeners.get(db) === listener) purgeListeners.delete(db);
   };
 }
 
@@ -180,6 +198,15 @@ export async function purgeConnection(
       "SELECT connector FROM connections WHERE connection_id = ?",
       [connectionId],
     );
-    if (row) announceConnectionPurged(deps, row.connector);
+    // Fire and forget: a listener that throws never fails the purge.
+    if (row)
+      try {
+        purgeListeners.get(deps.db)?.(row.connector);
+      } catch (error) {
+        deps.logger.warn(
+          { connectionId, error: String(error) },
+          "stream sync: the connection-purged listener threw",
+        );
+      }
   });
 }
