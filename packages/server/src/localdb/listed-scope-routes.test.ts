@@ -7,7 +7,10 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import type { SqlDriver } from "../../../core/src/localdb/driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
-import type { LocalAliasTarget } from "../../../core/src/localdb/resolve.js";
+import type {
+  AliasDiagnostic,
+  LocalAliasTarget,
+} from "../../../core/src/localdb/resolve.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
 import { createMemoryDataStorage } from "../../../core/src/test-utils/memory-storage.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
@@ -330,7 +333,7 @@ describe("an alias read whose projection dropped rows", () => {
     count: 2,
     reasons: ["invalid id"],
   };
-  const withDiagnostics = (diagnostics: unknown[]) => ({
+  const withDiagnostics = (diagnostics: readonly AliasDiagnostic[]) => ({
     "plain.items": [
       {
         connector: "plain",
@@ -369,6 +372,26 @@ describe("an alias read whose projection dropped rows", () => {
     expect(await response.json()).toMatchObject({
       diagnostics: [{ kind: "partial" }],
     });
+  });
+
+  it("is left out of the GET /v1/data listing, beside the logical stream it reads", async () => {
+    for (const kind of ["records_dropped", "records_partial"] as const) {
+      const { deps, seed } = await switchedFixture(
+        withDiagnostics([{ ...dropped, kind }]),
+      );
+      await seed("plain", "c1", { items: [1] });
+      expect(await listed(deps), kind).toEqual(["pdpp.plain.items"]);
+    }
+  });
+
+  it("stays in the listing when its only diagnostic is stream_missing", async () => {
+    const { deps, seed } = await switchedFixture(
+      withDiagnostics([
+        { kind: "stream_missing", scope: "plain.items", stream: "x" },
+      ]),
+    );
+    await seed("plain", "c1", { items: [1] });
+    expect(await listed(deps)).toEqual(["pdpp.plain.items", "plain.items"]);
   });
 
   it("still serves a projection with no dropped or partial rows", async () => {

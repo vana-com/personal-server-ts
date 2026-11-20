@@ -7,6 +7,7 @@ import { closeWorldDrivers, sName, world } from "./log-world.test-utils.js";
 afterEach(closeWorldDrivers);
 
 const S0 = sName(0);
+const S1 = sName(1);
 
 describe("the first run of a new connection", () => {
   it("leaves its cursor for the next begin after only an early publish", async () => {
@@ -33,6 +34,45 @@ describe("the first run of a new connection", () => {
     });
     const begun = await a.begin("run-1", { full: false });
     expect(begun.start.state).toBeNull();
+  });
+});
+
+describe("the first run of a new connection with a retryable partial peer", () => {
+  // The run ended with one complete stream and one that holds rows and will be
+  // retried. Its cursors may reach the next begin only through a publication that carries
+  // the rows they cover; the connection checkpoint is not that publication.
+  const firstRun = async () => {
+    const w = await world({ streams: 2 });
+    const a = await w.device("a");
+    await a.run(
+      "run-0",
+      [
+        { stream: S0, id: "x" },
+        { stream: S1, id: "y" },
+      ],
+      {
+        full: false,
+        checkpoints: { [S0]: "c1", [S1]: "d1" },
+        observe: { [S1]: { retryableSkip: true } },
+      },
+    );
+    return a;
+  };
+
+  it("gives the next begin no cursor before publication", async () => {
+    const a = await firstRun();
+    const begun = await a.begin("run-1", { full: false });
+    expect(begun.start.state).toBeNull();
+  });
+
+  it("gives the next begin only the complete stream's cursor after publication", async () => {
+    const a = await firstRun();
+    await a.sync.publish();
+    const begun = await a.begin("run-1", { full: false });
+    expect(begun.start).toEqual({
+      collection_mode: "incremental",
+      state: { [S0]: "c1" },
+    });
   });
 });
 

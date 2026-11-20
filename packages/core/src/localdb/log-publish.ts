@@ -430,7 +430,12 @@ async function completedResults(
       item.lifetime !== connectionLifetime(deps.db, id) ||
       connection?.generation !== item.generation;
     const outcome = lifetimeEnded
-      ? "purged"
+      ? // A deleted connection adopted its tombstone: settled. A lifetime a
+        // newer live generation replaced was not deleted: its work is owed
+        // still, and the caller is told it is unconfirmed.
+        connection?.control_state === "deleted"
+        ? "purged"
+        : "replaced"
       : deleting
         ? "deferred"
         : // A deleted connection owes nothing once its purge settled the work:

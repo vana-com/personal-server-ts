@@ -134,6 +134,44 @@ describe("legacy store import report", () => {
     expect(second.files).toEqual(first.files);
   }, 120_000);
 
+  it("publishes one report per run, after retirement: files are never null beside a finished report", async () => {
+    const base = await scratch("legacy-report-");
+    directories.push(base);
+    const root = join(base, "root");
+    writeLegacyStore(root);
+    const seen: Array<{ at: string; report: unknown }> = [];
+    const watch: { read?: () => unknown } = {};
+    const h = await direct(base, root, {
+      onLog: (message) => {
+        if (message.startsWith("legacy"))
+          seen.push({ at: message, report: watch.read?.() ?? null });
+      },
+    });
+    watch.read = () => h.runner.report();
+    closers.push(h.close);
+    await h.run();
+    // Import finished and every file was retired before anything was published.
+    expect(seen.length).toBeGreaterThan(1);
+    expect(seen.map((s) => s.report)).toEqual(seen.map(() => null));
+    expect(h.runner.report()?.files).not.toBeNull();
+  }, 120_000);
+
+  it("keeps the previous report when a run is stopped while it retires", async () => {
+    const base = await scratch("legacy-report-");
+    directories.push(base);
+    const root = join(base, "root");
+    writeLegacyStore(root);
+    const stop = new AbortController();
+    const h = await direct(base, root, {
+      onLog: (message) => {
+        if (message === "legacy file retirement") stop.abort();
+      },
+    });
+    closers.push(h.close);
+    await h.run(stop.signal);
+    expect(h.runner.report()).toBeNull();
+  }, 120_000);
+
   it("keeps the last finished report when a later run stops early", async () => {
     const base = await scratch("legacy-report-");
     directories.push(base);
@@ -146,10 +184,6 @@ describe("legacy store import report", () => {
     const stopped = new AbortController();
     stopped.abort();
     await h.run(stopped.signal);
-    expect(h.runner.report()).toMatchObject({
-      stopped: true,
-      imported: 0,
-    });
-    expect(done.stopped).toBe(false);
+    expect(h.runner.report()).toBe(done);
   }, 120_000);
 });

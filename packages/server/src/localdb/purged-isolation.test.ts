@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from "vitest";
+import { publishLog } from "../../../core/src/localdb/log-publish.js";
 import { closeWorldDrivers, world } from "./log-world.test-utils.js";
 
 afterEach(closeWorldDrivers);
@@ -77,3 +78,20 @@ it.each([
     expect(betaLog()).toBe(betaCommits);
   },
 );
+
+it("settles a delete recorded before this version: moot changes above its watermark report purged once, then noop", async () => {
+  const { d1 } = await deletedElsewhere(false);
+  await d1.sync.publish();
+  // The state an earlier version left: the connection is already deleted
+  // here, and a change it logged sits above the stream's watermark.
+  await d1.db.batch([
+    {
+      sql: "UPDATE stream_state SET publish_watermark = 0 WHERE connection_id = 'pdpp.beta~'",
+    },
+  ]);
+  const publish = async () =>
+    (await publishLog(d1.deps, "pdpp.beta~")).map((r) => r.outcome);
+  expect(await publish()).toEqual(["purged"]);
+  expect(await publish()).toEqual(["noop"]);
+  expect(await publish()).toEqual(["noop"]);
+});

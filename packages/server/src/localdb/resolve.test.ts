@@ -652,6 +652,51 @@ describe("local resolve", () => {
     });
   });
 
+  it.each([
+    ["first", ["cccccccccccccccc", "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]],
+    ["middle", ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "bbbbbbbbbbbbbbbb"]],
+    ["last", ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"]],
+  ] as const)(
+    "keeps the one readable partial of three connections when it is %s in namespace order",
+    async (_, namespaces) => {
+      const f = await fixture();
+      const holder = namespaces.indexOf("cccccccccccccccc");
+      const ids = ["c1", "c2", "c3"];
+      for (const [i, ns] of namespaces.entries())
+        await f.connection("active", ids[i]!, ns);
+      await f.head("x", { id: ids[holder]!, version: 1, complete: false });
+      await f.record("x", "first part", ids[holder]!);
+      for (const [i, id] of ids.entries())
+        if (i !== holder) await f.head("y", { id, version: 99 });
+      await f.db.batch([
+        {
+          sql: `INSERT INTO stream_partial(connection_id,stream,version,generation,data_hash,head_blob,observed_at,parts_applied,parts_total,records_total) VALUES ('${ids[holder]!}','x',1,2,'hash-x-1','head-x-1',100,1,2,2)`,
+        },
+      ]);
+      const deps = { ...f.deps, progressiveFirstLoad: true };
+      const resolver = createLocalResolver(deps, { query: f.query });
+      const read = await resolver.resolve(
+        input("pdpp.fixture-source.x", { isOwnerView: true }),
+      );
+      expect(read).toMatchObject({
+        kind: "view",
+        ns: "cccccccccccccccc",
+        partial: { partsApplied: 1, partsTotal: 2 },
+      });
+      expect((await drain(read)).data.records).toEqual([
+        { id: "key", value: "first part" },
+      ]);
+      expect(
+        (
+          await createLocalListing(deps).listScopes({
+            canRead: () => true,
+            includeLoading: true,
+          })
+        ).find((s) => s.scope === "pdpp.fixture-source.x"),
+      ).toMatchObject({ ns: "cccccccccccccccc", records: 1 });
+    },
+  );
+
   it.each([false, true])(
     "serves the complete legacy copy until canonical first load completes (canonical complete: %s)",
     async (canonicalComplete) => {
