@@ -1582,8 +1582,8 @@ describe("answers given while the records will not load, against a model of the 
 
   it("wakes the import for an owner whose On is replayed by another owner's submission", async () => {
     const [A, B] = ["0xaaa", "0xbbb"];
-    const durable = new Map([
-      [A, { answer: "off" as const, generation: 0, receivedAt: 1 }],
+    const durable = new Map<string, AccountModeRecord>([
+      [A, { answer: "off", generation: 0, receivedAt: 1 }],
     ]);
     let readable = false;
     const woken: string[] = [];
