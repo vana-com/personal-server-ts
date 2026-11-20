@@ -25,7 +25,12 @@ import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
+  streamSyncHashes,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  controlHashes,
+  controlScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import {
@@ -1013,6 +1018,7 @@ describe("startPersonalServer publication receipts", () => {
     server: Awaited<ReturnType<typeof startPersonalServer>>,
     connector: string,
     runId: string,
+    id = "a",
   ) {
     await server.streamSyncIntake!.begin(runId, {
       connector,
@@ -1022,7 +1028,7 @@ describe("startPersonalServer publication receipts", () => {
     });
     await server.streamSyncIntake!.batch(runId, {
       batch: 0,
-      records: [{ stream: "items", data: { id: "a" } }],
+      records: [{ stream: "items", data: { id } }],
     });
     await server.streamSyncIntake!.end(
       runId,
@@ -1082,6 +1088,48 @@ describe("startPersonalServer publication receipts", () => {
         new Error("registry unavailable"),
       );
       await expect(server.publish()).rejects.toThrow("registry unavailable");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("settles another connection's publish when a connection deleted on another device is purged", async () => {
+    const { options } = await setup();
+    const server = await startPersonalServer(options);
+    try {
+      await write(server, "other", "run-b1");
+      await write(server, "acme", "run-a1");
+      const first = await server.publish();
+      const ns = first.publications.find((p) => p.connector === "other")!.ns;
+      // "other" holds an ended run that is not published yet when another
+      // device's delete of it arrives in the registry.
+      await write(server, "other", "run-b2", "b");
+      const tombstone = await controlHashes(
+        streamSyncHashes.keccak256,
+        "0".repeat(16),
+      );
+      await expect(
+        options.streamSyncRegistry.post({
+          ownerAddress,
+          scope: controlScope("other", ns),
+          expectedVersion: "2",
+          dataHash: tombstone.tombstoneData,
+          metadataHash: tombstone.tombstoneMetadata,
+          signature: "0x01",
+        }),
+      ).resolves.toEqual({ kind: "committed" });
+      await write(server, "acme", "run-a2", "b");
+      const receipt = await server.publish();
+      expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-a2"]]);
+      // The deleted connection's run is settled, not owed: later publishes
+      // are not held back by it.
+      await expect(server.publish()).resolves.toEqual({
+        outcome: "noop",
+        publications: [],
+      });
+      expect(await server.publicationStatus("run-b2")).toMatchObject({
+        streams: [{ name: "items", state: "superseded" }],
+      });
     } finally {
       await server.stop();
     }

@@ -1,6 +1,7 @@
-import type {
-  PublicationReceipt,
-  SeedIntake,
+import {
+  leavesUnconfirmed,
+  type PublicationReceipt,
+  type SeedIntake,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   createPersonalServerInfoFromHealth,
@@ -109,6 +110,8 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
   /** One-time retained-snapshot intake, with the runtime's Account admission. */
   readonly streamSyncSeed: SeedIntake | null;
   /** Await a database publication cycle. Rejects if any stream cannot confirm publication.
+   * A stream of a deleted connection (outcome `purged`) is settled, not
+   * unconfirmed: it neither rejects nor appears in the receipts.
    * Receipts cover individual streams, not every stream of a connection.
    * A noop contains no new coverage. Unavailable or stopped runtimes reject.
    */
@@ -665,7 +668,7 @@ export async function startPersonalServer(
     for (const connection of report.connections) {
       if (connection.error) throw new Error(connection.error);
       for (const result of connection.published) {
-        if (result.outcome !== "published" && result.outcome !== "noop")
+        if (leavesUnconfirmed(result.outcome))
           throw new Error(
             `Stream publication ${result.outcome}: ${connection.connectionId}/${result.stream}`,
           );

@@ -61,6 +61,18 @@ export interface PublishResult {
   readonly watermark: number | null; // max(seq) read in step 1; new publish_watermark on success
 }
 
+/**
+ * Whether a stream's outcome leaves a caller that awaits publication without
+ * its confirmation. `purged` does not: the connection was deleted (on this
+ * device or another) and this device adopted the delete (F.5), so nothing of it
+ * is owed and nothing of it may be published. The caller reads the fate of its
+ * own runs with `publicationStatus` (`superseded`, `connection_deleted`); a
+ * deleted connection never fails the publication of another.
+ */
+export function leavesUnconfirmed(outcome: PublishResult["outcome"]): boolean {
+  return outcome !== "published" && outcome !== "noop" && outcome !== "purged";
+}
+
 /** metadataHash for a head: keccak over the UTF-8 JSON of the envelope facts. */
 export async function metadataHashFor(
   scope: string,
