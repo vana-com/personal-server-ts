@@ -31,7 +31,6 @@ function readReceipt(
     row.generation !== 1 ||
     !nonnegativeInteger(row.highest_seq) ||
     !nonnegativeInteger(row.rows) ||
-    (row.rows > 0 && row.highest_seq === 0) ||
     !nonempty(row.fingerprint) ||
     !nonnegativeInteger(row.at) ||
     (row.reason !== null && typeof row.reason !== "string") ||

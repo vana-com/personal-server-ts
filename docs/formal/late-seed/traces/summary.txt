@@ -1,0 +1,10 @@
+MutOwnTombOff-NoResurrection: Error: Invariant NoResurrection is violated. | 4449 states generated, 2567 distinct states found, 2267 states left on queue. | trace depth 5
+MutOwnTombOff-RetryAddsNothing: Error: Invariant RetryAddsNothing is violated. | 531 states generated, 436 distinct states found, 395 states left on queue. | trace depth 5
+MutSeedIgnoresTomb-NoResurrection: Error: Invariant NoResurrection is violated. | 5382 states generated, 2719 distinct states found, 2399 states left on queue. | trace depth 5
+MutSeedIgnoresPend-NoResurrection: Error: Invariant NoResurrection is violated. | 494 states generated, 345 distinct states found, 312 states left on queue. | trace depth 4
+MutSeedOverwrite-SeedNeverClobbersLive: Error: Invariant SeedNeverClobbersLive is violated. | 176 states generated, 122 distinct states found, 109 states left on queue. | trace depth 3
+MutSeedStampLive-LiveWins: Error: Invariant LiveWins is violated. | 11224 states generated, 5086 distinct states found, 3811 states left on queue. | trace depth 7
+MutSeedNotPublished-Convergence: Error: Invariant Convergence is violated. | 2 states generated, 2 distinct states found, 0 states left on queue. | trace depth 2
+MutSeedIgnoresWipe-WipeStays: Error: Invariant WipeStays is violated. | 651 states generated, 446 distinct states found, 410 states left on queue. | trace depth 3
+MutWindowClosed-Fills: Error: Invariant Fills is violated. | 296507 states generated, 117099 distinct states found, 86735 states left on queue. | trace depth 8
+ALLDONE

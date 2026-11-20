@@ -100,7 +100,11 @@ import {
   type PhaseClock,
 } from "./log-publish-phases.js";
 import { readLogState, writeLogState, type LogState } from "./log-apply.js";
-import { rowsPerStatement } from "./log-batch.js";
+import {
+  prepareOperations,
+  rowsPerStatement,
+  tombstoneStatements,
+} from "./log-batch.js";
 import {
   replaceDelete,
   seenBeforeParams,
@@ -2354,6 +2358,23 @@ async function candidateAcknowledgements(
 ): Promise<SqlStatement[]> {
   const statements: SqlStatement[] = [];
   const touched = candidate.planned.filter((p) => p.included);
+  // The deletions and omissions this segment sends become tombstones with its
+  // acknowledgement, on the direct path and when history shows the commit
+  // landed. Compaction prunes the changes that recorded them, and a record
+  // removed and published must stay removed when a late seed fills the
+  // stream (`late-seed`). A segment this device applies from the log writes
+  // the same rows through `operationStatements`.
+  for (const p of touched)
+    if (p.meta)
+      statements.push(
+        ...tombstoneStatements(
+          connectionId,
+          await prepareOperations(
+            [p.meta],
+            p.operations.filter((op) => op.kind !== "upsert"),
+          ),
+        ),
+      );
   // A replace still under way read the stream at its basis; the segment this
   // round committed is this device's own, so the basis moves to it (after the
   // head columns above have).

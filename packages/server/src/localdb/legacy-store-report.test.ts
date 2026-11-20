@@ -12,7 +12,6 @@ import {
   CONNECTOR,
   SOURCE_ID,
   STREAMS,
-  ROWS_PER_STREAM,
   direct,
   rowsOf,
   scratch,
@@ -111,7 +110,7 @@ describe("legacy store import report", () => {
     expect(first.files).toEqual({ total: 6, unimported: 1 });
 
     // A real write now owns one stream and its receipt is gone: the next run
-    // is refused for that stream alone.
+    // imports that stream again, and the seed only fills, so no row changes.
     await h.local.batch([
       {
         sql: "UPDATE stream_state SET floor_o = 1 WHERE connection_id = 'pdpp.github~' AND stream = 'repositories'",
@@ -124,12 +123,10 @@ describe("legacy store import report", () => {
     const second = h.runner.report()!;
     expect(second).toMatchObject({
       stopped: false,
-      imported: 0,
+      imported: 1,
       alreadyImported: STREAMS.length - 1,
+      refused: [],
     });
-    expect(second.refused).toEqual([
-      { reason: "seed_window_closed", streams: 1, rows: ROWS_PER_STREAM },
-    ]);
     expect(second.excluded).toEqual(first.excluded);
     expect(second.files).toEqual(first.files);
   }, 120_000);

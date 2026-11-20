@@ -225,27 +225,26 @@ export async function prepareOperations(
 }
 
 /**
- * The statements that write prepared operations as one batch: tombstones, then
- * the deletes and omissions of rows this device holds, then the upserts
- * (staged under `op`, filtered by the tombstones, merged by stamp).
+ * The tombstones of the deletes, omissions and completions among prepared
+ * operations. A tombstone has a rank beside its stamp, the model's order: an
+ * omission's cutoff ranks below an observation at its stamp (a pass proved a
+ * key absent only before its cutoff), an explicit delete above it. A key keeps
+ * the greatest (stamp, rank), which is the one that refuses the most.
+ * The tombstone also keeps the deletion's canonical record key, derived from
+ * the typed key the operation names (as an upsert's derives from its value),
+ * so a record-level reader of this table needs no map from hash to key (a
+ * key this device never held has no row to ask).
+ *
+ * `operationStatements` writes them for what a device applies. The publish
+ * commit writes them for what a device sends: a deletion that was published
+ * leaves no pending change after compaction, and without its tombstone a late
+ * seed (`late-seed`) could not tell the key from one never held.
  */
-export function operationStatements(
+export function tombstoneStatements(
   connectionId: string,
-  op: string,
   operations: readonly PreparedOperation[],
-  steps: ReadonlyMap<string, BatchStep> = new Map(),
 ): SqlStatement[] {
   const statements: SqlStatement[] = [];
-
-  // 1. Tombstones first, so the upserts of this very segment see them. A
-  // tombstone has a rank beside its stamp, the model's order: an omission's
-  // cutoff ranks below an observation at its stamp (a pass proved a key absent
-  // only before its cutoff), an explicit delete above it. A key keeps the
-  // greatest (stamp, rank), which is the one that refuses the most.
-  // The tombstone also keeps the deletion's canonical record key, derived from
-  // the typed key the operation names (as an upsert's derives from its value),
-  // so a record-level reader of this table needs no map from hash to key (a
-  // key this device never held has no row to ask).
   const tombstone = (
     stream: string,
     pk: string,
@@ -302,6 +301,24 @@ export function operationStatements(
           ),
         );
   }
+  return statements;
+}
+
+/**
+ * The statements that write prepared operations as one batch: tombstones, then
+ * the deletes and omissions of rows this device holds, then the upserts
+ * (staged under `op`, filtered by the tombstones, merged by stamp).
+ */
+export function operationStatements(
+  connectionId: string,
+  op: string,
+  operations: readonly PreparedOperation[],
+  steps: ReadonlyMap<string, BatchStep> = new Map(),
+): SqlStatement[] {
+  const statements: SqlStatement[] = [];
+
+  // 1. Tombstones first, so the upserts of this very segment see them.
+  statements.push(...tombstoneStatements(connectionId, operations));
 
   // 2. Deletes and omissions of rows this device holds, before the upserts: a
   // resurrection that follows a deletion then merges into no row, so its row

@@ -196,7 +196,7 @@ async function uploadSeed(
  * (`merge.ts`: "A strictly newer stamp (o, then r) wins; an equal or older one
  * changes no stamped fields"), so the first import of a key stays.
  */
-async function seededThenLegacy(options: { windowClosed: boolean }) {
+async function seededThenLegacy() {
   const { root, declared } = await world();
   const one = await start(root, declared, { retireLegacy: true });
   await (
@@ -210,18 +210,6 @@ async function seededThenLegacy(options: { windowClosed: boolean }) {
   await stop(one.context);
 
   writeLegacyStore(root, { repositories: rowsOf("repositories") });
-  if (options.windowClosed)
-    // A real write already owns the stream: `floor_o` is set by run end.
-    readLocal(
-      root,
-      (db) =>
-        db
-          .prepare(
-            "UPDATE stream_state SET floor_o = 1 WHERE stream = 'repositories'",
-          )
-          .run(),
-      true,
-    );
   const two = await start(root, declared, { retireLegacy: true });
   const run = watchRun(two.context);
   await two.context.startBackgroundServices();
@@ -231,9 +219,7 @@ async function seededThenLegacy(options: { windowClosed: boolean }) {
 
 describe("legacy-migration-seed-first", () => {
   it("a seed already in the database survives an older legacy copy; the store only adds the keys the database lacks", async () => {
-    const { root, context, run, seedRows } = await seededThenLegacy({
-      windowClosed: false,
-    });
+    const { root, context, run, seedRows } = await seededThenLegacy();
     const rows = await storedRows(context, "repositories");
     expect(Object.fromEntries(rows.map((r) => [r.key, r.body]))).toEqual({
       "repositories-0": seedRows[0],
@@ -243,21 +229,6 @@ describe("legacy-migration-seed-first", () => {
     });
     expect(lineOf(run.lines, "legacy store import finished")).toMatchObject({
       imported: 9,
-    });
-    expect(filesLeft(root)).toEqual([]);
-  }, 180_000);
-
-  it("a stream that a real write already owns refuses the legacy copy; it is counted and its file still retires", async () => {
-    const { root, context, run, seedRows } = await seededThenLegacy({
-      windowClosed: true,
-    });
-    const rows = await storedRows(context, "repositories");
-    expect(
-      rows.map((r) => r.body).sort((a, b) => a.id.localeCompare(b.id)),
-    ).toEqual([seedRows[0], seedRows[1]]);
-    expect(lineOf(run.lines, "legacy store import finished")).toMatchObject({
-      "refused:seed_window_closed": 1,
-      imported: 8,
     });
     expect(filesLeft(root)).toEqual([]);
   }, 180_000);
