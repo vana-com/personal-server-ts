@@ -308,7 +308,7 @@ export function createRunIntakeStore(
           throw new RunIntakeError("connection_stopped");
         // A device without a participation row must learn from the registry
         // whether the connection exists; the local connect shortcut cannot.
-        const joined =
+        const participates = async () =>
           !!systemStream ||
           (
             await db.query(
@@ -316,10 +316,11 @@ export function createRunIntakeStore(
               [id],
             )
           ).length > 0;
+        const joinedBeforeSync = await participates();
         let synced = await collectionBasis(
           deps,
           systemStream ? { ...req, connect: true } : req,
-          !joined,
+          !joinedBeforeSync,
         );
         // Another key's control row: this owner cannot publish what a run
         // would collect. Nothing is written for it (`syncBeforeBegin`).
@@ -391,6 +392,9 @@ export function createRunIntakeStore(
             throw new RunIntakeError("control_basis_mismatch");
         }
         if (await stopped(id)) throw new RunIntakeError("connection_stopped");
+        // The sync above may have ended this device's participation: it first
+        // learned of a new lifetime of the connection. Judge it only now.
+        const joined = await participates();
         // The join gate. An absent control row, read from the registry, means
         // this device creates the connection; an explicit reconnect of a
         // connection this device saw deleted starts a new lifetime it creates.

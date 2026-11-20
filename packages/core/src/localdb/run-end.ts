@@ -352,6 +352,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const statements: SqlStatement[] = [];
         const zeroDeleteStreams: string[] = [];
         const results: Record<string, StreamRunResult> = Object.create(null);
+        // A run that began before its connection had a generation commits at
+        // the publish. A stream it accepted whole can stage its cursor then.
+        const stageable = new Set<string>();
         let merged = false;
         let lateAdmission = false;
         let updateRequired = false;
@@ -508,6 +511,12 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 stream.stream,
               ],
             });
+            if (
+              run.generation === null &&
+              complete &&
+              stream.seed !== "unresolved"
+            )
+              stageable.add(stream.stream);
             results[stream.stream] =
               run.generation === null
                 ? { state: "pending" }
@@ -531,20 +540,23 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           );
           const blocked = new Set(
             streams
-              .filter(
-                (stream) =>
-                  run.generation === null ||
-                  checkpointDecision({
-                    target: run.generation,
-                    streams: Object.fromEntries([
-                      [stream.stream, results[stream.stream]!],
-                    ]),
-                    control:
-                      connection.control_state === "active"
-                        ? { kind: "active", generation: connection.generation }
-                        : { kind: "absent" },
-                    seedReceiptsPending: stream.seed === "unresolved",
-                  }).kind !== "save",
+              .filter((stream) =>
+                run.generation === null
+                  ? !stageable.has(stream.stream)
+                  : checkpointDecision({
+                      target: run.generation,
+                      streams: Object.fromEntries([
+                        [stream.stream, results[stream.stream]!],
+                      ]),
+                      control:
+                        connection.control_state === "active"
+                          ? {
+                              kind: "active",
+                              generation: connection.generation,
+                            }
+                          : { kind: "absent" },
+                      seedReceiptsPending: stream.seed === "unresolved",
+                    }).kind !== "save",
               )
               .map((stream) => stream.stream),
           );
@@ -591,6 +603,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
         const canSave =
           retryCanSave ||
           (outcome === "succeeded" &&
+            run.generation === null &&
+            streams.every((stream) => stageable.has(stream.stream))) ||
+          (outcome === "succeeded" &&
             run.generation !== null &&
             checkpointDecision({
               target: run.generation,
@@ -623,14 +638,17 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           candidate = Object.fromEntries(
             Object.entries(candidate).filter(([name]) => kept.has(name)),
           );
-          // A stream the plan held back keeps the cursor it had.
-          statements.push({
-            sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
-            params: [
-              JSON.stringify({ ...stored, ...candidate }),
-              run.connection_id,
-            ],
-          });
+          // A stream the plan held back keeps the cursor it had. A run with no
+          // generation yet has no committed rows: its cursor only waits to
+          // travel, and the checkpoint takes it once the publication carries it.
+          if (run.generation !== null || retryCanSave)
+            statements.push({
+              sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
+              params: [
+                JSON.stringify({ ...stored, ...candidate }),
+                run.connection_id,
+              ],
+            });
           // An entry this run changed waits to travel in the log. One it left
           // as it was says nothing new.
           const descendants = stateDescendants(
