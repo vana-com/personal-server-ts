@@ -79,6 +79,10 @@ const dropRawEndSchema = [
 const dropJoinSchema = [
   { sql: "DROP TABLE IF EXISTS connection_participation" },
 ];
+// A later migration's index on a table the older schema has too.
+const dropStampIndexSchema = [
+  { sql: "DROP INDEX IF EXISTS log_tombstones_by_stamp" },
+];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -1056,6 +1060,7 @@ describe("view changes", () => {
       ...dropRawEndSchema,
       ...dropJoinSchema,
       ...dropBootstrapSchema,
+      ...dropStampIndexSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
@@ -1175,6 +1180,7 @@ describe("view changes", () => {
       ...dropRawEndSchema,
       ...dropJoinSchema,
       ...dropBootstrapSchema,
+      ...dropStampIndexSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       // A later migration made the mark of a stream's changes.

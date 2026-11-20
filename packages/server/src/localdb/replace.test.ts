@@ -222,7 +222,10 @@ describe("#560 replacement key-set cases", () => {
     await b.sync.apply();
     expect(await b.rows("A")).toEqual(["a", "b"]);
   });
-  it("case 3: replacement keeps a row newer than the refresh stamp", async () => {
+  // A refresh that begins after this device applied a row starts above that
+  // row's stamp, so it replaces the row. A refresh that overlapped the row's
+  // run keeps it: the "basis/skew traces" below.
+  it("case 3: a refresh that began after seeing a newer row replaces it", async () => {
     const { a, b } = await world();
     await b.collect("late", 9000, {
       rows: { A: ["c"] },
@@ -235,7 +238,7 @@ describe("#560 replacement key-set cases", () => {
       proven: ["A"],
     });
     await b.sync.apply();
-    expect(await b.rows("A")).toEqual(["a", "c"]);
+    expect(await b.rows("A")).toEqual(["a"]);
   });
   it("case 4: a merge after the refresh adds without restoring omissions", async () => {
     const { a, b } = await world();

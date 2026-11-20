@@ -580,6 +580,9 @@ export function createRunIntakeStore(
             sql: "INSERT OR IGNORE INTO connection_participation(connection_id,joined_at) VALUES (?,?)",
             params: [id, deps.now()],
           });
+        // The clock proposes the stamp; the stamps the device holds are its
+        // lower bound, whatever the mode.
+        statements.push(clampRunStart(runId));
         if (deps.publishWhileCollecting === true) {
           // The run keeps this mode to its end. Compaction counts the new run.
           statements.push(
@@ -587,8 +590,6 @@ export function createRunIntakeStore(
               sql: "UPDATE runs SET admitting=1 WHERE run_id=?",
               params: [runId],
             },
-            // Stamp above every compacted tombstone, then count this run.
-            clampRunStart(runId),
             ...compactTombstones(id),
           );
         }
