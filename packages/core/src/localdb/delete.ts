@@ -23,6 +23,7 @@ import {
 import { RegistryRefusedError } from "../stream-sync/ports.js";
 import { commitFences } from "./delete-batch.js";
 import type { LocalSyncDeps } from "./deps.js";
+import type { ErasureReport } from "./log-erase.js";
 import { purgeConnection } from "./purge.js";
 import {
   ConnectionLifetimeChanged,
@@ -101,6 +102,14 @@ export interface ConnectionDeleter {
   readConnectionLifetime(connector: string): Promise<string>;
   resumeDeletes(): Promise<readonly PendingDelete[]>;
 }
+/**
+ * The erasure of deleted connections' log objects, as the deleter drives it
+ * (`log-erase.ts`). Never throws; `pending` says a later call still has work.
+ */
+export type EraseLogs = (
+  connector: string,
+  signal: AbortSignal,
+) => Promise<ErasureReport>;
 /** One running landing: when its fences ended, and when all of it did. */
 interface Landing {
   readonly fenced: Promise<boolean>;
@@ -122,6 +131,17 @@ export function createConnectionDeleter(
   originalDeps: LocalSyncDeps,
   options: {
     readonly eraseLegacy?: (connector: string) => Promise<void>;
+    /**
+     * Physically erases the log objects of a deleted connection from storage.
+     * It runs only once the delete is settled: no delete of the connector is
+     * in flight (its intent is cleared) and every local connection of it is
+     * purged, so a lifetime that is not deleted here is never erased. It runs
+     * after the delete, never inside it: a connection added again must not
+     * wait for storage, and a failure leaves the delete done. An erasure that
+     * is not finished is resumed by `resumeErasures` (the sync's retry loop),
+     * and once at the first call after a start, for deletes settled before it.
+     */
+    readonly eraseLogs?: EraseLogs;
     /**
      * How long a request waits for the fence before it answers
      * `fenced: false`. The landing keeps going in the background and the
@@ -188,6 +208,12 @@ export function createConnectionDeleter(
   const keccak = keccakOf(deps.streamCrypto);
   const flights = new Map<string, Landing>();
   const requests = new Set<Promise<ConnectionDeleteRequest>>();
+  /** Erasures running, by connector: one at a time per connector. */
+  const erasures = new Map<string, Promise<void>>();
+  /** Connectors whose erasure ended `pending`, until a later pass finishes it. */
+  const erasing = new Set<string>();
+  /** The start sweep (deletes settled before this process) is still owed. */
+  let sweepOwed = options.eraseLogs !== undefined;
   /**
    * The control rows the plan listed, by delete id, then by scope. Only a
    * delete this process just planned has one; the landing takes it. Each
@@ -579,6 +605,56 @@ export function createConnectionDeleter(
       throw error;
     }
   }
+  /**
+   * Whether the delete of `connector` is settled here: no intent in flight, and
+   * every local connection of it purged. A connection added again (or one the
+   * purge has not reached) is another lifetime, and is not erased.
+   */
+  async function deleteSettled(connector: string): Promise<boolean> {
+    const [intent] = await deps.db.query(
+      "SELECT 1 FROM delete_intents WHERE connector=?",
+      [connector],
+    );
+    if (intent) return false;
+    const [live] = await deps.db.query(
+      "SELECT 1 FROM connections WHERE connector=? AND control_state<>'deleted'",
+      [connector],
+    );
+    return !live;
+  }
+  async function eraseSettled(connector: string): Promise<void> {
+    try {
+      if (stop.signal.aborted || !(await deleteSettled(connector))) {
+        erasing.delete(connector);
+        return;
+      }
+      const report = await options.eraseLogs!(connector, stop.signal);
+      if (report.pending) erasing.add(connector);
+      else erasing.delete(connector);
+    } catch (error) {
+      // The eraser reports a failure as pending; this is its own bug or a
+      // database that went away. Try again later, never fail the delete.
+      erasing.add(connector);
+      deps.logger.warn(
+        {
+          connector,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "stream sync: connection log erasure failed",
+      );
+    }
+  }
+  /** One erasure at a time per connector; a caller joins the running one. */
+  function eraseLogsOf(connector: string): Promise<void> {
+    if (!options.eraseLogs) return Promise.resolve();
+    const held = erasures.get(connector);
+    if (held) return held;
+    const run = eraseSettled(connector).finally(() => {
+      if (erasures.get(connector) === run) erasures.delete(connector);
+    });
+    erasures.set(connector, run);
+    return run;
+  }
   function schedule(connector: string): Landing {
     const held = flights.get(connector);
     if (held) return held;
@@ -592,6 +668,11 @@ export function createConnectionDeleter(
       });
     const landing: Landing = { fenced, done };
     flights.set(connector, landing);
+    // A delete that settled is erased from storage, outside its own queue.
+    void done.then(
+      () => eraseLogsOf(connector),
+      () => undefined,
+    );
     return landing;
   }
   async function resumeDelete(
@@ -681,7 +762,12 @@ export function createConnectionDeleter(
         return decide(planned, new Set());
       },
     );
-    if (!intent) return { deleteId: deps.newOp(), fenced: true };
+    if (!intent) {
+      // Nothing to fence: the connection was deleted already, or never saved.
+      // Its delete is settled, and what an earlier delete left is erased.
+      void eraseLogsOf(connector);
+      return { deleteId: deps.newOp(), fenced: true };
+    }
     const landing = schedule(connector);
     landing.done.catch((error) =>
       deps.logger.warn(
@@ -727,12 +813,40 @@ export function createConnectionDeleter(
       ).filter((p): p is PendingDelete => p !== null);
     },
     resumeDelete,
+    /** A connection of the connector was purged here: its erasure may be owed. */
+    noteSettled(connector: string) {
+      if (options.eraseLogs) erasing.add(connector);
+    },
+    /** Whether erasure work is owed: the start sweep, or an unfinished erasure. */
+    erasureOwed: () => sweepOwed || erasing.size > 0,
+    /**
+     * Run the owed erasures: first, once, every connector with a connection
+     * deleted here (a delete settled before this process started, or adopted
+     * from another device); then every connector whose erasure is unfinished.
+     * Answers true while one is still unfinished, so the caller retries.
+     */
+    async resumeErasures(): Promise<boolean> {
+      if (!options.eraseLogs || stop.signal.aborted) return false;
+      if (sweepOwed) {
+        sweepOwed = false;
+        const rows = await deps.db.query<{ connector: string }>(
+          "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
+        );
+        for (const { connector } of rows) erasing.add(connector);
+      }
+      await Promise.all([...erasing].map(eraseLogsOf));
+      return erasing.size > 0;
+    },
     async close() {
       stop.abort(new Error("sync closed"));
       await Promise.allSettled([...requests]);
       await Promise.allSettled(
         [...flights.values()].map((flight) => flight.done),
       );
+      // After the flights: a landing that ends starts its erasure, which the
+      // abort above stops.
+      await Promise.resolve();
+      await Promise.allSettled([...erasures.values()]);
     },
   };
 }

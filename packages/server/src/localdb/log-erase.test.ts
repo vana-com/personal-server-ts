@@ -2,11 +2,13 @@
 // publisher wrote: real segments, a real compaction into snapshot parts, and a
 // record whose body is stored out of line in pieces. The registry is the
 // fake gateway the publisher commits to; storage is its in-memory store.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import { createConnectionDeleter } from "../../../core/src/localdb/index.js";
 import {
   eraseDeletedConnectionLogs,
   type LogErasureDeps,
+  type LogErasurePorts,
 } from "../../../core/src/localdb/log-erase.js";
 import {
   CONNECTOR,
@@ -190,5 +192,211 @@ describe("erasing a log the real publisher wrote", () => {
     expect(report.pending).toBe(true);
     expect(calls).toEqual([]);
     expect(keys(LOG)).toEqual(before);
+  });
+});
+
+describe("erasure wired into the connection delete", () => {
+  const RETRY = { first: 5, max: 20 };
+  type World = Awaited<ReturnType<typeof world>>;
+
+  /** The host's erasure ports over a world: its gateway inventory and its storage. */
+  function ports(w: World, state: { finalized: string | null }) {
+    const deleted: string[] = [];
+    const erasure: LogErasurePorts = {
+      versions: {
+        list: async (scope) => ({
+          complete: true,
+          versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
+            expectedVersion: String(i + 1),
+            dataHash: v.dataHash,
+            isTombstone: false,
+          })),
+        }),
+      },
+      finality: {
+        tombstoneState: async () => ({
+          finalized: state.finalized,
+          rolledBack: null,
+        }),
+      },
+      objects: {
+        deleteBlobVersions: async (scope, names) => {
+          deleted.push(...names);
+          const out = {
+            deleted: [] as string[],
+            missing: [] as string[],
+            failed: [] as { version: string; error: string }[],
+          };
+          for (const name of names)
+            (w.innerBlobs.delete(`${scope}/${name}`)
+              ? out.deleted
+              : out.missing
+            ).push(name);
+          return out;
+        },
+      },
+    };
+    return { erasure, deleted };
+  }
+  const logKeys = (w: World, scope: string) =>
+    w.innerBlobs.keys().filter((key) => key.startsWith(`${scope}/`));
+  const big = { stream: sName(0), id: "big", pad: PART_TARGET * 2 + 1000 };
+
+  /** A device that collected `big` for two connectors, published, and the world. */
+  async function collected(state: { finalized: string | null }) {
+    const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+    const { erasure, deleted } = ports(w, state);
+    const a = await w.device("a", {
+      erasure: () => erasure,
+      deleteRetryMs: RETRY,
+    });
+    await a.run("run-1", [big], { observedAt: 1100 });
+    await a.cycle();
+    await a.run("other-1", [{ ...big, id: "o" }], {
+      connector: OTHER,
+      observedAt: 1100,
+    });
+    await a.cycle();
+    expect(logKeys(w, LOG).some((k) => k.includes("/v-"))).toBe(true);
+    return { w, a, deleted, erasure };
+  }
+  const intents = (a: Awaited<ReturnType<World["device"]>>) =>
+    a.db.query("SELECT 1 FROM delete_intents");
+
+  it("erases the deleted connection's log objects once its delete settles, and no other connection's", async () => {
+    const { w, a } = await collected({ finalized: "99" });
+    const otherBefore = logKeys(w, OTHER_LOG);
+    expect(otherBefore.length).toBeGreaterThan(0);
+
+    expect(
+      (await a.sync.deleter.requestConnectionDelete(CONNECTOR)).fenced,
+    ).toBe(true);
+
+    await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+    expect(logKeys(w, OTHER_LOG)).toEqual(otherBefore);
+    expect(await intents(a)).toEqual([]);
+  });
+
+  it("erases nothing while the control tombstone is not final, and finishes once it is", async () => {
+    const state: { finalized: string | null } = { finalized: null };
+    const { w, a, deleted } = await collected(state);
+    const before = logKeys(w, LOG);
+
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+    // The retry loop asks again and again; each time the tombstone is not final.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(deleted).toEqual([]);
+    expect(logKeys(w, LOG)).toEqual(before);
+
+    state.finalized = "99";
+    await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+  });
+
+  it("never erases a connection added again after its delete, though the old tombstone is final", async () => {
+    const state: { finalized: string | null } = { finalized: null };
+    const { w, a, deleted } = await collected(state);
+
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+    await a.run("run-2", [big], { connect: true, observedAt: 1200 });
+    await a.cycle();
+    const readded = logKeys(w, LOG);
+
+    state.finalized = "99";
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(deleted).toEqual([]);
+    expect(logKeys(w, LOG)).toEqual(readded);
+    const b = await w.device("b");
+    await b.cycle();
+    expect(await b.records()).toEqual(await a.records());
+  });
+
+  it("erases a delete another device wrote once this device has adopted it", async () => {
+    const state = { finalized: "99" };
+    const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+    const { erasure } = ports(w, state);
+    // The deleting device cannot erase from storage (a phone); the adopting one can.
+    const phone = await w.device("phone");
+    const desktop = await w.device("desktop", {
+      erasure: () => erasure,
+      deleteRetryMs: RETRY,
+    });
+    await phone.run("run-1", [big], { observedAt: 1100 });
+    await phone.cycle();
+    await desktop.cycle();
+    expect(await desktop.records()).not.toEqual([]);
+    expect(logKeys(w, LOG).length).toBeGreaterThan(0);
+
+    await phone.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await vi.waitFor(async () => expect(await intents(phone)).toEqual([]));
+    expect(logKeys(w, LOG).length).toBeGreaterThan(0);
+
+    await desktop.cycle();
+    await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+  });
+
+  it("does nothing for a delete this device has not adopted yet", async () => {
+    const state = { finalized: "99" };
+    const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+    const { erasure, deleted } = ports(w, state);
+    const phone = await w.device("phone");
+    const desktop = await w.device("desktop", {
+      erasure: () => erasure,
+      deleteRetryMs: RETRY,
+    });
+    await phone.run("run-1", [big], { observedAt: 1100 });
+    await phone.cycle();
+    await desktop.cycle();
+    await phone.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await vi.waitFor(async () => expect(await intents(phone)).toEqual([]));
+
+    // The desktop has not looked at the registry since: its connection is live.
+    await desktop.sync.deleter.resumeDeletes();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(deleted).toEqual([]);
+    expect(logKeys(w, LOG).length).toBeGreaterThan(0);
+  });
+
+  describe("the gate on a delete that has not settled here", () => {
+    const owed = async (a: Awaited<ReturnType<World["device"]>>) => {
+      const eraseLogs = vi.fn(async () => ({
+        connections: [],
+        pending: false,
+      }));
+      const deleter = createConnectionDeleter(a.deps, { eraseLogs });
+      // The sweep that runs first once per process, then the owed connector.
+      await deleter.resumeErasures();
+      eraseLogs.mockClear();
+      deleter.noteSettled(CONNECTOR);
+      await deleter.resumeErasures();
+      return eraseLogs;
+    };
+
+    it("does not erase while a local connection of the connector is live", async () => {
+      const { a } = await collected({ finalized: "99" });
+      expect(await owed(a)).not.toHaveBeenCalled();
+    });
+
+    it("does not erase while a delete of the connector is in flight", async () => {
+      const { a } = await collected({ finalized: "99" });
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+      await a.db.batch([
+        {
+          sql: "INSERT INTO delete_intents(connector,delete_id,intent) VALUES (?,?,?)",
+          params: [CONNECTOR, "again", JSON.stringify({ pins: [] })],
+        },
+      ]);
+      expect(await owed(a)).not.toHaveBeenCalled();
+    });
+
+    it("erases once the delete is settled: every local connection purged and no intent", async () => {
+      const { a } = await collected({ finalized: "99" });
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+      expect(await owed(a)).toHaveBeenCalledTimes(1);
+    });
   });
 });

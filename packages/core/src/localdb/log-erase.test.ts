@@ -19,6 +19,7 @@ import {
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import {
   eraseDeletedConnectionLogs,
+  inventoryVersionLister,
   type LogErasureDeps,
 } from "./log-erase.js";
 
@@ -936,5 +937,54 @@ describe("what the erasure refuses to act on", () => {
         expect(batches).toHaveLength(1);
       },
     );
+  });
+});
+
+describe("inventoryVersionLister", () => {
+  const row = (expectedVersion: string, isTombstone = false) => ({
+    expectedVersion,
+    dataHash: `0x${hex64(Number(expectedVersion))}`,
+    metadataHash: `0x${hex64(0)}`,
+    status: "finalized",
+    addedAt: "2026-01-01T00:00:00.000Z",
+    isTombstone,
+  });
+
+  it("lists every version of the traversal as complete", async () => {
+    const seen: unknown[] = [];
+    const signal = new AbortController().signal;
+    const lister = inventoryVersionLister({
+      list: async (scope, options) => {
+        seen.push(scope, options?.signal);
+        return { head: null, versions: [row("1"), row("2", true)] };
+      },
+    });
+    await expect(lister.list("scope", { signal })).resolves.toEqual({
+      complete: true,
+      versions: [
+        { expectedVersion: "1", dataHash: `0x${hex64(1)}`, isTombstone: false },
+        { expectedVersion: "2", dataHash: `0x${hex64(2)}`, isTombstone: true },
+      ],
+    });
+    expect(seen).toEqual(["scope", signal]);
+  });
+
+  it("lets a traversal that could not finish throw, so a pass reports it pending", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const report = await eraseDeletedConnectionLogs({
+      ...w.deps,
+      versions: inventoryVersionLister({
+        list: async () => {
+          throw new Error("Gateway inventory page budget exceeded");
+        },
+      }),
+    });
+    expect(report.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "error",
+    });
+    expect(w.calls).toEqual([]);
   });
 });

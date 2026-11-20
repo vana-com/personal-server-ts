@@ -61,6 +61,8 @@ export {
 } from "./delete.js";
 export {
   eraseDeletedConnectionLogs,
+  inventoryVersionLister,
+  type LogErasurePorts,
   type ConnectionErasure,
   type ErasureOutcome,
   type ErasureReport,

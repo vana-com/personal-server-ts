@@ -16,7 +16,8 @@
 // re-add (`docs/design/write-once-publication.md`: no read-then-delete
 // reclaim). The fence:
 //
-// 1. Nothing is deleted until the control tombstone is FINALIZED. A tombstone
+// 1. Nothing is deleted until the control tombstone is FINALIZED at its own
+//    version or above (a lower finalized version says nothing about it). A tombstone
 //    the gateway has queued can still fail and roll the control row back to
 //    live data; erasing before that is ruled out would destroy a connection
 //    the registry can still show. The legacy blob delete waits the same way.
@@ -38,7 +39,10 @@
 //    keeps the first bytes of a name) and whose commit lands inside that
 //    window references a piece that is gone. Closing it needs a fence in the
 //    storage or the gateway, as `write-once-publication.md` says; a read here
-//    cannot.
+//    cannot. Cutting a lifetime's pieces at other offsets does not close it
+//    either: runs of identical bytes make equal pieces whatever the cut, and a
+//    name that carries a salt changes what a reader checks (`keccak(piece) =
+//    name`), so it is a format change every device must understand first.
 //
 // RETRY WITHOUT A JOURNAL
 //
@@ -71,6 +75,7 @@ import {
   type WireSegment,
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { VersionInventoryClient } from "../additions/version-inventory.js";
 import { keccakOf, type StreamCryptoPort } from "../stream-sync/crypto-port.js";
 import type {
   StreamSyncBlobs,
@@ -142,6 +147,37 @@ export interface LogErasureDeps {
   };
 }
 
+/** What a host supplies to erase; the rest of `LogErasureDeps` is the sync's own. */
+export type LogErasurePorts = Pick<
+  LogErasureDeps,
+  "versions" | "finality" | "objects"
+>;
+
+/**
+ * The version inventory as a `LogVersionLister`. A traversal that finishes
+ * read every page, so it is complete; one that cannot (a changed head, an
+ * exceeded page budget, a failed read) throws, which a pass reports as pending.
+ */
+export function inventoryVersionLister(
+  inventory: Pick<VersionInventoryClient, "list">,
+): LogVersionLister {
+  return {
+    async list(scope, options) {
+      const { versions } = await inventory.list(scope, {
+        signal: options?.signal,
+      });
+      return {
+        complete: true,
+        versions: versions.map((v) => ({
+          expectedVersion: v.expectedVersion,
+          dataHash: v.dataHash,
+          isTombstone: v.isTombstone,
+        })),
+      };
+    },
+  };
+}
+
 export type ErasureOutcome =
   /**
    * Every object discovered from the complete version inventory was acknowledged
@@ -186,9 +222,9 @@ const DELETE_BATCH = 15;
 
 /**
  * Erase the log objects of every deleted connection of `connector` (every
- * deleted connection of the owner when none is named). The one call the
- * connection delete makes after its fence lands, and again to resume after a
- * restart. It never throws and never touches the delete itself: a failure
+ * deleted connection of the owner when none is named). The connection deleter
+ * calls it once the delete has settled on this device (`delete.ts`,
+ * `eraseLogs`), and again to resume. It never throws and never touches the delete itself: a failure
  * comes back as a `pending` outcome for the caller to repeat later.
  */
 export async function eraseDeletedConnectionLogs(

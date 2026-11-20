@@ -1,5 +1,5 @@
 import { forgetUploadedBlobs } from "./blobs.js";
-import type { LocalSyncDeps } from "./deps.js";
+import { announceConnectionPurged, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { endParticipation } from "./lifetime.js";
 import { withOrigin } from "./merge.js";
@@ -176,5 +176,10 @@ export async function purgeConnection(
       },
       "purge connection",
     );
+    const [row] = await deps.db.query<{ connector: string }>(
+      "SELECT connector FROM connections WHERE connection_id = ?",
+      [connectionId],
+    );
+    if (row) announceConnectionPurged(deps, row.connector);
   });
 }

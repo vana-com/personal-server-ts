@@ -1,10 +1,12 @@
 import {
   createViewChanges,
+  inventoryVersionLister,
   localDatabaseName,
   openLocalDb,
   connectionQueue,
   type LocalSync,
   type LocalSyncDeps,
+  type LogErasurePorts,
   type SqlDriver,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
@@ -924,6 +926,13 @@ async function bootstrapServer(
         fetch: outboundFetch,
       }));
   }
+  /**
+   * What erasing a deleted connection's log objects needs of the host: the
+   * owner-signed storage delete, tombstone finality and the version inventory.
+   * Set where the sync's delete path is composed; absent in an enclave and
+   * where sync is off, which then erase nothing.
+   */
+  let logErasurePorts: LogErasurePorts | undefined;
   async function getLocalSync(): Promise<LocalSync> {
     requireStreamMode();
     if (localSync) return localSync;
@@ -991,6 +1000,10 @@ async function bootstrapServer(
               storage: rawDataStorage,
               pdpp: pdppConnections,
             }),
+          // A deleted connection's encrypted log objects leave storage once
+          // its delete settled. Only a server that deletes from storage can
+          // (see `logErasurePorts`); the ports are read when an erasure runs.
+          erasure: () => logErasurePorts,
         });
         localSyncDeps = deps;
         localDb = db;
@@ -1277,6 +1290,21 @@ async function bootstrapServer(
           fetch: outboundFetch,
         }),
       );
+    }
+
+    if (deleteData && tombstoneFinality && additionsInventorySigner) {
+      logErasurePorts = {
+        versions: inventoryVersionLister(
+          createVersionInventoryClient({
+            gatewayUrl: config.gateway.url,
+            ownerAddress: serverOwner,
+            ownerSigner: additionsInventorySigner,
+            fetch: outboundFetch,
+          }),
+        ),
+        finality: tombstoneFinality,
+        objects: deleteData,
+      };
     }
 
     const downloadDeps = {

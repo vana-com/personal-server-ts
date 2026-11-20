@@ -36,6 +36,10 @@ import {
   type PendingDelete,
 } from "./delete.js";
 import type { LocalSyncDeps } from "./deps.js";
+import {
+  eraseDeletedConnectionLogs,
+  type LogErasurePorts,
+} from "./log-erase.js";
 import { readerOf } from "./driver.js";
 import { createLocalHistory, type LocalHistory } from "./history.js";
 import { createLocalListing, type LocalListing } from "./listing.js";
@@ -106,18 +110,38 @@ const RESUME_RETRY_FIRST_MS = 5_000;
 const RESUME_RETRY_MAX_MS = 5 * 60_000;
 
 export function createLocalSync(
-  deps: LocalSyncDeps,
+  hostDeps: LocalSyncDeps,
   options: {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
     readonly resolveArtifact: ResolveArtifact;
     readonly eraseLegacy?: (connector: string) => Promise<void>;
+    /**
+     * The host's ports for erasing a deleted connection's log objects from
+     * storage (`log-erase.ts`). Read when an erasure runs, so a host that
+     * builds them after this sync can pass them late; `undefined` (a host
+     * that cannot delete from storage) erases nothing.
+     */
+    readonly erasure?: () => LogErasurePorts | undefined;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
     readonly currentLease?: () => string | null;
     /** Waits between resumes of a delete that keeps failing (tests shorten). */
     readonly deleteRetryMs?: { readonly first: number; readonly max: number };
   },
 ): LocalSync {
+  // A connection purged here, by a delete made here or one adopted from
+  // another device, may be erased from storage once its delete has settled;
+  // the retry loop runs the erasure (and decides whether it is time).
+  const deps: LocalSyncDeps = {
+    ...hostDeps,
+    connectionPurged: (connector) => {
+      if (options.erasure) {
+        deletes().noteSettled(connector);
+        armRetry();
+      }
+      hostDeps.connectionPurged?.(connector);
+    },
+  };
   const retryFirst = options.deleteRetryMs?.first ?? RESUME_RETRY_FIRST_MS;
   const retryMax = options.deleteRetryMs?.max ?? RESUME_RETRY_MAX_MS;
   let intakeStore: ReturnType<typeof createRunIntakeStore> | undefined;
@@ -250,6 +274,24 @@ export function createLocalSync(
   const makeDeleter = () =>
     createConnectionDeleter(deps, {
       ...(options.eraseLegacy && { eraseLegacy: options.eraseLegacy }),
+      ...(options.erasure && {
+        eraseLogs: async (connector, signal) => {
+          const ports = options.erasure!();
+          return ports
+            ? eraseDeletedConnectionLogs(
+                {
+                  registry: deps.registry,
+                  blobs: deps.blobs,
+                  keys: deps.keys,
+                  streamCrypto: deps.streamCrypto,
+                  logger: deps.logger,
+                  ...ports,
+                },
+                { connector, signal },
+              )
+            : { connections: [], pending: false };
+        },
+      }),
       // A request waits for the fence no longer than the loop waits to look
       // at a delete that has not landed.
       fenceWaitMs: retryFirst,
@@ -283,7 +325,9 @@ export function createLocalSync(
   };
   const resumeOnce = async () => {
     const pending = await deletes().resumeDeletes();
-    if (pending.length > 0) armRetry();
+    // An erasure that is not finished is retried with the same backoff.
+    const erasing = await deletes().resumeErasures();
+    if (pending.length > 0 || erasing) armRetry();
     else {
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = undefined;
@@ -297,7 +341,7 @@ export function createLocalSync(
     const rows = await deps.db.query<{ connector: string }>(
       "SELECT connector FROM delete_intents ORDER BY connector",
     );
-    if (rows.length) void resume().catch(armRetry);
+    if (rows.length || deletes().erasureOwed()) void resume().catch(armRetry);
     return rows;
   };
   const deleter: ConnectionDeleter = {
