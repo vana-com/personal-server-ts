@@ -50,8 +50,9 @@
  * - A load that fails leaves the authority unloaded: `read` stays `unknown`
  *   for every owner, `submitEvidence` saves nothing, and the next
  *   `submitEvidence` retries the load before judging the evidence. The answers
- *   that arrive meanwhile are held in arrival order and judged, one by one by
- *   the same rule as a live answer, when the records load (`held` below).
+ *   that arrive meanwhile are held as a three-value summary per owner (`held`
+ *   below) and applied when the records load; the owner has no permission
+ *   until the summary is saved and its latest answer is judged.
  * - `submitEvidence` takes the lock exclusively, saves the new record, then
  *   publishes it. A save that fails throws; the record in memory stays as it
  *   was, and legacy-write permission is withdrawn for that owner (above).
@@ -84,15 +85,21 @@ import { createRwLock } from "./rw-lock.js";
 /** What an answer does to its owner's write permission when it settles. */
 type PermissionEffect = "lift" | "withdraw" | "keep";
 
-/** An answer that arrived while the records would not load. */
-interface HeldAnswer {
-  state: "on" | "off";
-  generation: number;
-  ticket: number;
+/** What is kept, per owner, of the answers that could not be judged yet. */
+interface HeldSummary {
+  /** The highest generation among the On answers; -1 when none was seen. */
+  onGen: number;
+  /** The highest generation among all the answers. */
+  maxGen: number;
+  /**
+   * Save attempts left for an Off at `maxGen`: one per Off answer that arrived
+   * at that generation, as the readable path makes one per answer. Needed
+   * only while the record lacks that Off.
+   */
+  offAttempts: number;
+  /** The latest answer: the only one whose effect on the permission counts. */
+  latest: { state: "on" | "off"; generation: number; ticket: number };
 }
-
-/** Different held answers kept per owner before one is dropped (see `held`). */
-const MAX_HELD_ANSWERS = 1024;
 
 export type CommitResult<T> =
   { ok: true; value: T } | { ok: false; decision: RefuseDecision };
@@ -177,31 +184,48 @@ export function createModeAuthority(
     Array<{ through: number; resolve: () => void }>
   >();
   /**
-   * Invariant: for every sequence of answers and failed loads, the permission
-   * once the records load again equals the permission the same answers give
-   * with the records readable throughout, or is stricter.
+   * Invariant: for every sequence of answers, failed loads, failed saves and
+   * restarts, the permission is never wider than the one the same answers give
+   * with the records readable throughout (the oracle: `applyAnswer` and one
+   * save attempt per answer, in arrival order), and it is equal when no save
+   * fails. `authority.test.ts` checks it against a seeded model.
    *
-   * It holds by construction: an answer that arrives while the records will
-   * not load is judged against nothing, so it is held here, per owner, in
-   * arrival order. When the records load, `replayHeld` folds the held answers
-   * through `judge`, the rule the readable path uses, in that order and under
-   * the lock, so the record and the permission are what the readable path
-   * would have produced. The owner keeps no permission (`legacyWriteDecision`
-   * is `unknown`) from the first held answer until the last one's effect has
-   * been applied, including while a save is pending. In memory only.
+   * Why. The record `applyAnswer` leaves is a fold of the answers that does
+   * not depend on their order: its generation is the highest seen, and its
+   * state is On exactly when an On was seen at that generation (On latches; a
+   * higher generation replaces). Two answers give the same fold as all of
+   * them: the On at the highest On generation (`onGen`), then the Off at the
+   * highest generation (`maxGen`) when that is higher. Both arrived, and both
+   * go through `applyAnswer` and the store like a live answer. Refusing
+   * legacy writes is always safe, so wider is the only fault, and On means
+   * refused (`read` is `streams`, `commitLegacy` gives 426).
    *
-   * Bound: adjacent answers that are equal (state and generation) fold to the
-   * last one alone, which is exact (the repeat changes no record, and its
-   * effect equals the first's), so a poll that repeats cannot grow the list.
-   * Past `MAX_HELD_ANSWERS` different answers the oldest is dropped and the
-   * owner is marked `lost`: the record may then differ from the readable
-   * path's, so the owner gets no permission back in this process (a restart
-   * clears it, as for any withdrawal). Dropping an answer would otherwise be
-   * able to allow more than the readable path, so it is always paired with
-   * that permanent withdrawal.
+   * - No save fails: the two saves leave the oracle's record, and the latest
+   *   answer gets the live rule: lift when it is the latest ticket and not
+   *   older than the record. Same permission.
+   * - A save fails: the summary stays held, so the owner has no permission
+   *   (`legacyWriteDecision` is `unknown`), and nothing is judged past the
+   *   failed save: no later Off lifts past an On that is not saved. It is
+   *   applied again at the next load check or answer. The permission returns
+   *   only when the record holds the whole fold. Where the oracle's own saves
+   *   failed, its record has less than the fold. A missing On leaves it wider
+   *   than this side, so this side is stricter. A missing Off at `maxGen` would
+   *   leave it narrower, so an Off at `maxGen` is attempted once per Off that
+   *   arrived (`offAttempts`), the count the oracle makes: it cannot get
+   *   through a save failure that the oracle's attempts did not get through.
+   *   The On has no such count: trying it again can only refuse more.
+   * - A new answer while a summary is held joins it, and is not judged
+   *   ahead of it.
+   * - Restart: the summary is in memory only, like a withdrawal. After the
+   *   summary is saved a restart reads the oracle's record. A restart while it
+   *   is unsaved loses an answer that no process could keep, since it arrived
+   *   while the records would not load or its save failed; the registry
+   *   refuses legacy writes once the owner is On.
+   *
+   * The memory is two numbers, a counter and the latest answer per owner,
+   * however many answers arrive.
    */
-  const held = new Map<string, HeldAnswer[]>();
-  const lost = new Set<string>();
+  const held = new Map<string, HeldSummary>();
   let loaded = false;
   let loadFailed = false;
   let closed = false;
@@ -289,9 +313,8 @@ export function createModeAuthority(
   }
 
   /**
-   * Judge one answer against the loaded records, saving it when it applies.
-   * The only rule for an answer's effect on the permission: used for a live
-   * answer and for each answer held through a failed load. Under the lock.
+   * Judge one live answer against the loaded records, saving it when it
+   * applies. Under the lock.
    */
   async function judge(
     owner: string,
@@ -299,12 +322,7 @@ export function createModeAuthority(
     generation: number,
     ticket: number,
   ): Promise<PermissionEffect> {
-    const prev = records.get(owner);
-    const next = applyAnswer(prev, state, generation, now());
-    if (next !== prev) {
-      await options.store.save(owner, next);
-      records.set(owner, next);
-    }
+    const next = await applySaved(owner, state, generation);
     // The answer takes effect only when it was applied, no later answer was
     // submitted, and it is not older than the record.
     return latest.get(owner) === ticket && generation >= next.generation
@@ -313,53 +331,93 @@ export function createModeAuthority(
   }
 
   function applyEffect(owner: string, effect: PermissionEffect): void {
-    // An owner that lost a held answer is never lifted again in this process.
-    if (effect === "lift" && !lost.has(owner)) withdrawn.delete(owner);
+    if (effect === "lift") withdrawn.delete(owner);
     else if (effect !== "keep") withdrawn.add(owner);
   }
 
-  function hold(owner: string, answer: HeldAnswer): void {
-    const list = held.get(owner) ?? [];
-    const last = list[list.length - 1];
-    if (
-      last &&
-      last.state === answer.state &&
-      last.generation === answer.generation
-    ) {
-      list[list.length - 1] = answer;
-    } else {
-      list.push(answer);
-      if (list.length > MAX_HELD_ANSWERS) {
-        list.shift();
-        lost.add(owner);
-      }
+  function hold(
+    owner: string,
+    answer: { state: "on" | "off"; generation: number; ticket: number },
+  ): void {
+    const summary = held.get(owner);
+    if (!summary) {
+      held.set(owner, {
+        onGen: answer.state === "on" ? answer.generation : -1,
+        maxGen: answer.generation,
+        offAttempts: answer.state === "off" ? 1 : 0,
+        latest: answer,
+      });
+      return;
     }
-    held.set(owner, list);
+    if (answer.generation > summary.maxGen) {
+      summary.maxGen = answer.generation;
+      summary.offAttempts = 0;
+    }
+    if (answer.state === "on") {
+      summary.onGen = Math.max(summary.onGen, answer.generation);
+    } else if (answer.generation === summary.maxGen) {
+      summary.offAttempts += 1;
+    }
+    summary.latest = answer;
+  }
+
+  /** Apply one answer to the loaded record and save it; throws if the save does. */
+  async function applySaved(
+    owner: string,
+    state: "on" | "off",
+    generation: number,
+  ): Promise<AccountModeRecord> {
+    const prev = records.get(owner);
+    const next = applyAnswer(prev, state, generation, now());
+    if (next !== prev) {
+      await options.store.save(owner, next);
+      records.set(owner, next);
+    }
+    return next;
   }
 
   /**
-   * Judge every held answer in arrival order, now that records are loaded.
-   * Under the lock. An owner's entry stays until its last effect is applied,
-   * with nothing awaited between that and the removal, so no check sees an
-   * owner that is judged but not settled as free.
+   * Apply every held summary, now that records are loaded: the On at its
+   * highest generation, then the Off at the highest generation when that is
+   * higher, then judge the latest answer against the record those leave, by
+   * the live rule. Under the lock. A save that fails stops the owner's
+   * summary where it is: it stays held, and nothing after it is judged. An
+   * entry is removed in the same step that applies its effect, with nothing
+   * awaited between, so no check sees an owner that is judged but not settled
+   * as free.
    */
   async function replayHeld(): Promise<void> {
-    for (const [owner, answers] of [...held]) {
-      for (const answer of answers) {
-        let effect: PermissionEffect = "withdraw";
-        try {
-          effect = await judge(
-            owner,
-            answer.state,
-            answer.generation,
-            answer.ticket,
-          );
-        } catch (error: unknown) {
-          warn("a held answer could not be saved", error);
+    for (const [owner, summary] of [...held]) {
+      try {
+        if (summary.onGen >= 0) await applySaved(owner, "on", summary.onGen);
+        const record = records.get(owner);
+        if (
+          applyAnswer(record, "off", summary.maxGen, 0) !== record &&
+          summary.offAttempts > 0
+        ) {
+          summary.offAttempts -= 1;
+          await applySaved(owner, "off", summary.maxGen);
         }
-        applyEffect(owner, effect);
+      } catch (error: unknown) {
+        warn("a held answer could not be saved", error);
+        continue;
       }
-      if (lost.has(owner)) withdrawn.add(owner);
+      const record = records.get(owner);
+      const complete =
+        (summary.onGen < 0 ||
+          applyAnswer(record, "on", summary.onGen, 0) === record) &&
+        applyAnswer(record, "off", summary.maxGen, 0) === record;
+      // An Off at `maxGen` that arrived and could not be saved is not retried
+      // until another one arrives: the owner stays held.
+      if (!complete || !record) continue;
+      const { latest: last } = summary;
+      applyEffect(
+        owner,
+        latest.get(owner) === last.ticket &&
+          last.generation >= record.generation
+          ? "lift"
+          : "withdraw",
+      );
       held.delete(owner);
     }
   }
@@ -393,24 +451,22 @@ export function createModeAuthority(
           // the load starts: an On still waits for legacy writes in flight,
           // and no legacy write starts after it.
           await retryLoadIfFailed();
-          if (loadFailed) {
-            // Still no records to judge against: save nothing, change no
-            // record. Hold the answer; it is judged when the records load.
-            hold(owner, {
-              state: input.state as "on" | "off",
-              generation: input.generation ?? 0,
-              ticket,
-            });
+          const answer = {
+            state: input.state as "on" | "off",
+            generation: input.generation ?? 0,
+            ticket,
+          };
+          if (loadFailed || held.has(owner)) {
+            // No records to judge against, or an earlier answer is still
+            // waiting to be saved: this one joins it. Nothing is judged ahead
+            // of the summary, so no Off can lift past an On that is not saved.
+            hold(owner, answer);
+            if (!loadFailed) await replayHeld();
             effect = "keep";
             return read(owner);
           }
           await replayHeld();
-          effect = await judge(
-            owner,
-            input.state as "on" | "off",
-            input.generation ?? 0,
-            ticket,
-          );
+          effect = await judge(owner, answer.state, answer.generation, ticket);
         } finally {
           // The release comes last, whatever the bookkeeping does.
           try {
