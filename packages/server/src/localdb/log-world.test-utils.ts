@@ -300,6 +300,8 @@ export async function world(options: {
         join?: boolean;
         /** The connector cursor the run ends with, per stream. */
         checkpoints?: Readonly<Record<string, JsonValue>>;
+        /** What the run observed per stream (for example a retryable skip). */
+        observe?: Readonly<Record<string, { retryableSkip?: boolean }>>;
         /** What happens on the device while the run collects, before it ends. */
         during?: () => Promise<unknown>;
       } = {},
@@ -342,6 +344,7 @@ export async function world(options: {
           skipped: selected.filter((name) => !covered.includes(name)),
           ...(opts.full === false ? {} : { provenFullStreams: selected }),
           ...(opts.checkpoints ? { checkpoints: opts.checkpoints } : {}),
+          ...(opts.observe ? { observe: opts.observe } : {}),
         }),
       );
       return begun;

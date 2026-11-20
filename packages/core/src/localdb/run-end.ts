@@ -640,8 +640,10 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           );
           // A stream the plan held back keeps the cursor it had. A run with no
           // generation yet has no committed rows: its cursor only waits to
-          // travel, and the checkpoint takes it once the publication carries it.
-          if (run.generation !== null || retryCanSave)
+          // travel, and the checkpoint takes it once the publication carries
+          // it. A retryable partial run is no exception: the next begin reads
+          // the checkpoint before any publication has carried these rows.
+          if (run.generation !== null)
             statements.push({
               sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
               params: [
