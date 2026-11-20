@@ -468,3 +468,130 @@ describe("run end", () => {
     ]);
   });
 });
+
+describe("the stream cursor at run end", () => {
+  const cursorState = async (db: SqlDriver) =>
+    (
+      await db.query<{
+        cursor_seq: number | null;
+        cursor_unpublished: string | null;
+        cursor_version: string | null;
+      }>(
+        "SELECT cursor_seq, cursor_unpublished, cursor_version FROM stream_state WHERE connection_id = 'c1' AND stream = 's'",
+      )
+    )[0]!;
+  const lastChange = async (db: SqlDriver) =>
+    (
+      await db.query<{ seq: number }>(
+        "SELECT MAX(seq) AS seq FROM record_changes WHERE connection_id = 'c1' AND stream = 's'",
+      )
+    )[0]!.seq;
+
+  it("a saved cursor waits to be published, with the seq of the stream's last change", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "run", 1, 3);
+    expect(
+      await store.end(
+        "run",
+        endRequest({ lastBatch: 0, live: ["s"], checkpoints: { s: "C3" } }),
+      ),
+    ).toMatchObject({ result: "queued" });
+    const seq = await lastChange(db);
+    expect(seq).toBeGreaterThan(0);
+    const state = await cursorState(db);
+    expect(state.cursor_seq).toBe(seq);
+    expect(JSON.parse(state.cursor_unpublished!)).toEqual({
+      state: "C3",
+      connectorVersion: "1.0.0",
+    });
+    expect(state.cursor_version).toBe("1.0.0");
+  });
+
+  it("a run with no record changes still leaves its new cursor to publish", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "run", 1, 0);
+    expect(await store.end("run", request("silent", true))).toMatchObject({
+      result: "checkpoint_only",
+    });
+    const state = await cursorState(db);
+    expect(state.cursor_seq).toBe(0);
+    expect(JSON.parse(state.cursor_unpublished!)).toEqual({
+      state: "cursor",
+      connectorVersion: "1.0.0",
+    });
+  });
+
+  it("a cursor the run held back is not left to publish", async () => {
+    const { db, store } = await fresh(0);
+    await begin(db, "run", 1, 2);
+    expect(
+      await store.end(
+        "run",
+        endRequest({
+          lastBatch: 0,
+          live: ["s"],
+          retry: true,
+          checkpoints: { s: "C2" },
+        }),
+      ),
+    ).toMatchObject({ outcome: "retry_pending" });
+    expect(await cursorState(db)).toEqual({
+      cursor_seq: null,
+      cursor_unpublished: null,
+      cursor_version: null,
+    });
+  });
+
+  it("a fenced run end drops the cursor waiting to be published", async () => {
+    const { db, store } = await fresh();
+    await db.batch([
+      {
+        sql: `UPDATE connections SET checkpoint = '{"s":"C0"}' WHERE connection_id = 'c1'`,
+      },
+      {
+        sql: `UPDATE stream_state SET cursor_seq = 7, cursor_version = '1.0.0',
+          cursor_unpublished = '{"state":"C0","connectorVersion":"1.0.0"}'
+          WHERE connection_id = 'c1' AND stream = 's'`,
+      },
+    ]);
+    await begin(db, "fenced", 1, 1);
+    vi.mocked(checkRunFence).mockResolvedValue([
+      { stream: "s", trip: "stream_deleted_after_start" },
+    ]);
+    expect(await store.end("fenced", request("live", true))).toMatchObject({
+      result: "discarded",
+    });
+    expect(await checkpoint(db)).toBeNull();
+    expect(await cursorState(db)).toEqual({
+      cursor_seq: null,
+      cursor_unpublished: null,
+      cursor_version: null,
+    });
+  });
+
+  it("every path that clears the checkpoint drops the cursors waiting to be published", async () => {
+    // Intake discard, purge and a deleted connection all clear the checkpoint
+    // by this one write; none of them may leave a cursor to publish.
+    const { db } = await fresh();
+    await db.batch([
+      {
+        sql: `UPDATE connections SET checkpoint = '{"s":"C0"}' WHERE connection_id = 'c1'`,
+      },
+      {
+        sql: `UPDATE stream_state SET cursor_seq = 7, cursor_version = '1.0.0',
+          cursor_unpublished = '{"state":"C0","connectorVersion":"1.0.0"}'
+          WHERE connection_id = 'c1' AND stream = 's'`,
+      },
+    ]);
+    await db.batch([
+      {
+        sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = 'c1'",
+      },
+    ]);
+    expect(await cursorState(db)).toEqual({
+      cursor_seq: null,
+      cursor_unpublished: null,
+      cursor_version: null,
+    });
+  });
+});

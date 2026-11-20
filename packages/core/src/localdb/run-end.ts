@@ -29,6 +29,7 @@ import {
   tombstoneRunDeletes,
 } from "./admit.js";
 import type { SqlStatement } from "./driver.js";
+import { cursorSaved, stateDescendants } from "./cursor.js";
 import { checkRunFence } from "./fence.js";
 import { planInputs } from "./plan-inputs.js";
 import { deleteRunRecords, mergeIncoming, withOrigin } from "./merge.js";
@@ -612,6 +613,38 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
               run.connection_id,
             ],
           });
+          // An entry this run changed waits to travel in the log. One it left
+          // as it was says nothing new, and a refused stream's entry is not
+          // this connector's to publish.
+          const descendants = stateDescendants(
+            Object.fromEntries(
+              Object.entries(declarations).map(([name, d]) => [
+                name,
+                d.stateParents ?? [],
+              ]),
+            ),
+          );
+          statements.push(
+            ...Object.entries(candidate)
+              .filter(
+                ([name, state]) =>
+                  !refused.includes(name) &&
+                  !(
+                    stored !== null &&
+                    Object.prototype.hasOwnProperty.call(stored, name) &&
+                    JSON.stringify(stored[name]) === JSON.stringify(state)
+                  ),
+              )
+              .map(([name, state]) =>
+                cursorSaved(
+                  run.connection_id,
+                  name,
+                  state,
+                  run.artifact_version,
+                  descendants[name] ?? [],
+                ),
+              ),
+          );
         }
         const acceptedCovered = raw
           ? plan.covered.filter((name) => results[name]?.state !== "discarded")

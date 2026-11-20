@@ -648,4 +648,28 @@ END`,
     SELECT connection_id FROM runs
     UNION SELECT connection_id FROM connections WHERE checkpoint IS NOT NULL)`,
   ],
+  [
+    // A stream's connector cursor travels in the log with the rows it covers.
+    //   cursor_unpublished: the stream's checkpoint entry a run end saved and
+    //     no segment has carried yet, as {state, connectorVersion}.
+    //   cursor_seq: the stream's last record_changes seq when it was saved; a
+    //     segment that closes the stream through that seq may carry it.
+    //   cursor_children: the streams whose rows the cursor also claims (its
+    //     state descendants, read through it), as a JSON array; the cursor
+    //     travels only in a segment that closes them too.
+    //   cursor_version: the connector version that wrote the stream's local
+    //     checkpoint entry, here or on the device whose segment set it.
+    `ALTER TABLE stream_state ADD COLUMN cursor_unpublished TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_seq INTEGER`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_children TEXT`,
+    `ALTER TABLE stream_state ADD COLUMN cursor_version TEXT`,
+    // Every path that drops the local checkpoint (a discarded or fenced run, a
+    // purge, a deleted connection) drops the cursors with it, so none of them
+    // can publish a cursor the device no longer resumes from.
+    `CREATE TRIGGER connections_checkpoint_cleared AFTER UPDATE OF checkpoint ON connections
+WHEN NEW.checkpoint IS NULL BEGIN
+  UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL, cursor_version = NULL
+  WHERE connection_id = NEW.connection_id;
+END`,
+  ],
 ];

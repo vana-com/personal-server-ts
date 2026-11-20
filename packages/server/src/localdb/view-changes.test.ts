@@ -68,6 +68,11 @@ const dropRawEndSchema = [
   { sql: "DROP TABLE IF EXISTS run_record_evidence" },
   { sql: "ALTER TABLE runs DROP COLUMN selected_streams" },
   { sql: "ALTER TABLE runs DROP COLUMN raw_end" },
+  // The stream cursor on its way into the log came after.
+  { sql: "DROP TRIGGER IF EXISTS connections_checkpoint_cleared" },
+  ...["unpublished", "seq", "children", "version"].map((column) => ({
+    sql: `ALTER TABLE stream_state DROP COLUMN cursor_${column}`,
+  })),
 ];
 const dropJoinSchema = [
   { sql: "DROP TABLE IF EXISTS connection_participation" },

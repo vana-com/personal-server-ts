@@ -1,4 +1,5 @@
 import type { LocalSyncDeps } from "./deps.js";
+import { dropUnpublishedCursors } from "./cursor.js";
 import type { SqlStatement } from "./driver.js";
 import { dropRunRows, withOrigin } from "./merge.js";
 
@@ -53,7 +54,7 @@ export async function unwriteRefusedRun(
     params: [input.reason, input.reason, input.runId, input.stream],
   };
   if (run.admitting === 1) {
-    await deps.db.batch([refuse]);
+    await deps.db.batch([refuse, dropUnpublishedCursors(input.connectionId)]);
     deps.logger.info(
       {
         connectionId: input.connectionId,
@@ -69,6 +70,7 @@ export async function unwriteRefusedRun(
     withOrigin("purge", [
       ...dropRunRows(input.connectionId, input.stream, run.o, input.runId),
       refuse,
+      dropUnpublishedCursors(input.connectionId),
     ]),
   );
   deps.logger.info(
