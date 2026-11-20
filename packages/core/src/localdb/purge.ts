@@ -15,6 +15,45 @@ export function connectionLifetime(db: object, connectionId: string): object {
 }
 
 /**
+ * Adopt a delete another device wrote (or this device wrote earlier) when a
+ * publish reads the tombstone: purge the connection once, then settle what the
+ * device still owed the registry for the lifetime the tombstone ended.
+ *
+ * Once: a connection already `deleted` here has nothing left to purge, and a
+ * second purge would end the local lifetime again and report the connection's
+ * streams as `purged` on every publish. Settled, whenever it is read: its
+ * pending runs end `superseded` (`connection_deleted`, the fate
+ * `publicationStatus` reports for a deleted connection), so a later publish
+ * owes the deleted connection nothing and never republishes its data.
+ */
+export async function adoptDelete(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  deleted: { readonly controlVersion: number },
+): Promise<void> {
+  const [row] = await deps.db.query<{ control_state: string }>(
+    "SELECT control_state FROM connections WHERE connection_id = ?",
+    [connectionId],
+  );
+  if (row?.control_state !== "deleted")
+    await purgeConnection(deps, connectionId, deleted);
+  // Changes nothing once the work is settled.
+  await deps.queue.run(connectionId, "purge", () =>
+    deps.db.batch([
+      {
+        sql: `UPDATE run_streams
+   SET publication_state = 'superseded', publication_reason = 'connection_deleted',
+       publish_blocked_reason = NULL
+   WHERE publication_state = 'pending'
+     AND run_id IN (SELECT run_id FROM runs
+       WHERE connection_id = ? AND state = 'ended')`,
+        params: [connectionId],
+      },
+    ]),
+  );
+}
+
+/**
  * F.5 step 1: the local purge of one connection, in the connection queue
  * (kind "purge"), in ONE batch with origin `purge`: delete the connection's
  * `records`, `run_rows`, `blob_refs`, `stream_partial` rows and
@@ -26,9 +65,10 @@ export function connectionLifetime(db: object, connectionId: string): object {
  * with the connection's other operations. One batch: a failing statement
  * rolls the whole purge back. The batch's origin is `purge`, so the
  * `record_changes` trigger logs every removed record with origin `purge`.
- * `last_delete_version` is the tombstone's control version, per stream in
- * `stream_state`: the fence (C.1) trips a run whose `delete_snapshot` is
- * below it. Blobs survive while any connection still references them; only
+ * The publish watermark passes every change logged so far: the rows they
+ * describe are gone, so none is left to publish. `last_delete_version` is the
+ * tombstone's control version, per stream in `stream_state`: the fence (C.1)
+ * trips a run whose `delete_snapshot` is below it. Blobs survive while any connection still references them; only
  * blobs with no `blob_refs` row left are deleted. `runs` and `run_streams`
  * rows are left alone: the purge removes staged rows, not run history.
  */
@@ -65,6 +105,20 @@ export async function purgeConnection(
         {
           sql: `UPDATE connections SET control_state = 'deleted', checkpoint = NULL
    WHERE connection_id = ?`,
+          params: [connectionId],
+        },
+        // Changes logged before the purge are moot: its lifetime's rows are
+        // gone, so none of them is left to publish. The watermark passes them
+        // (the purge's own changes included, which are not publishable).
+        {
+          sql: `UPDATE stream_state SET publish_watermark = (
+   SELECT MAX(seq) FROM record_changes
+    WHERE record_changes.connection_id = stream_state.connection_id
+      AND record_changes.stream = stream_state.stream)
+   WHERE connection_id = ? AND publish_watermark < COALESCE((
+   SELECT MAX(seq) FROM record_changes
+    WHERE record_changes.connection_id = stream_state.connection_id
+      AND record_changes.stream = stream_state.stream), 0)`,
           params: [connectionId],
         },
         // The log position and tombstones belong to the lifetime that ended.

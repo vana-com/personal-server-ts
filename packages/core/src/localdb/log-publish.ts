@@ -125,7 +125,7 @@ import {
   type StreamPlan,
 } from "./publish.js";
 import { BODY_BYTES } from "./part-layout.js";
-import { connectionLifetime, purgeConnection } from "./purge.js";
+import { adoptDelete, connectionLifetime } from "./purge.js";
 import {
   ELIGIBLE_CHANGE,
   PENDING_RUN,
@@ -433,7 +433,9 @@ async function completedResults(
       ? "purged"
       : deleting
         ? "deferred"
-        : connection?.control_state === "deleted"
+        : // A deleted connection owes nothing once its purge settled the work:
+          // only a stream that still held work reports the purge.
+          connection?.control_state === "deleted" && hadWork
           ? "purged"
           : pending
             ? blocked
@@ -1504,9 +1506,7 @@ async function readControl(
       ? "create"
       : "deferred";
   if (state.kind === "deleted") {
-    await purgeConnection(held, connectionId, {
-      controlVersion: state.version,
-    });
+    await adoptDelete(held, connectionId, { controlVersion: state.version });
     return "purged";
   }
   if (state.kind !== "active") return "deferred";
@@ -1576,7 +1576,7 @@ async function controlFailed(
 ): Promise<"purged" | "deferred"> {
   const verdict = failure ? settleRequirementFailure(failure, control) : null;
   if (verdict?.kind !== "purge") return "deferred";
-  await purgeConnection(held, connectionId, {
+  await adoptDelete(held, connectionId, {
     controlVersion: verdict.controlVersion,
   });
   return "purged";

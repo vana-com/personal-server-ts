@@ -29,7 +29,11 @@ export {
   type ReplaceInput,
 } from "./replace.js";
 export { applyConnection } from "./apply.js";
-export { type PublishResult, type PublicationReceipt } from "./publish.js";
+export {
+  leavesUnconfirmed,
+  type PublishResult,
+  type PublicationReceipt,
+} from "./publish.js";
 export {
   applyLog,
   LogDivergedError,
