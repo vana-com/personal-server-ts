@@ -2276,7 +2276,12 @@ async function commitRound(
     );
   }
   statements.push(
-    ...(await candidateAcknowledgements(held, connectionId, candidate)),
+    ...(await candidateAcknowledgements(
+      held,
+      connectionId,
+      candidate,
+      "direct",
+    )),
   );
   statements.push(
     writeLogState(connectionId, {
@@ -2325,10 +2330,20 @@ function publishedResults(
   }));
 }
 
+/**
+ * How the device learned that its candidate committed. `"direct"`: the
+ * registry answered the commit, so the candidate's segment is the newest the
+ * device holds. `"history"`: a reply was lost and the device applied the
+ * registry's history before it acknowledges; that apply staged the cursor of
+ * the candidate's segment and of every later one.
+ */
+type Acknowledged = "direct" | "history";
+
 async function candidateAcknowledgements(
   held: LocalSyncDeps,
   connectionId: string,
   candidate: Candidate,
+  acknowledged: Acknowledged,
 ): Promise<SqlStatement[]> {
   const statements: SqlStatement[] = [];
   const touched = candidate.planned.filter((p) => p.included);
@@ -2368,17 +2383,24 @@ async function candidateAcknowledgements(
           runIds: p.runIds,
         })),
       );
-    // The cursor this segment carried is published, and is the log's cursor
-    // for the stream: this device's entry takes it, as if it applied its own
-    // segment. A newer one a run end saved since (it changed the basis, so not
-    // before this commit) stays, and so does the entry that run wrote.
+    // The cursor this segment carried is published. After a direct commit it
+    // is the log's cursor for the stream: this device's entry takes it, as if
+    // it applied its own segment. After a history apply the staged cursor is
+    // already the log's (this segment's, or a later segment's that wins in log
+    // order), so it stays. A newer one a run end saved since (it changed the
+    // basis, so not before this commit) stays, and so does the entry that run
+    // wrote.
     if (p.included && p.cursor !== null)
       statements.push(
-        {
-          sql: `UPDATE stream_state SET cursor_applied = cursor_unpublished
-                 WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
-          params: [connectionId, p.stream, p.cursor],
-        },
+        ...(acknowledged === "direct"
+          ? [
+              {
+                sql: `UPDATE stream_state SET cursor_applied = cursor_unpublished
+                       WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
+                params: [connectionId, p.stream, p.cursor],
+              },
+            ]
+          : []),
         {
           sql: `UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL
                  WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
@@ -2447,7 +2469,12 @@ async function reconcileCandidate(
   transition(entry, "committed");
   await held.db.batch(
     withOrigin("refresh", [
-      ...(await candidateAcknowledgements(held, connectionId, candidate)),
+      ...(await candidateAcknowledgements(
+        held,
+        connectionId,
+        candidate,
+        "history",
+      )),
       ...(await compaction(held, connectionId, candidate.planned)),
     ]),
   );

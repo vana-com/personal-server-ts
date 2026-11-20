@@ -6,6 +6,7 @@ import {
   sName,
   world,
 } from "./log-world.test-utils.js";
+import { requestTrace } from "./request-trace.test-utils.js";
 
 // A device that reads a stream's rows from the log takes the stream's cursor
 // with them, so its next run reads on from where the writer's run stopped.
@@ -303,6 +304,82 @@ describe("a device that reads the log takes the stream's cursor", () => {
         expect(
           (await d.begin(`run-${name}-3`, { full: false })).start.state,
         ).toEqual(at(20));
+    });
+  });
+
+  // a's commit lands, but the reply to it and to its one resend are lost
+  // (503): a learns it committed only when it next reads the registry, after
+  // applying the registry's history.
+  describe("a commit whose reply was lost", () => {
+    async function lostReply(whileLost: (b: Device) => Promise<void>) {
+      let lose = 0;
+      let other = false;
+      const trace = requestTrace(0);
+      const track = trace.track;
+      trace.track = (kind, label, run) =>
+        track(kind, label, async () => {
+          const reply = await run();
+          if (lose === 0 || other || (kind !== "post" && kind !== "batch"))
+            return reply;
+          // The first lost reply is the commit's: b works before a hears.
+          if (lose-- === 2) {
+            other = true;
+            await whileLost(b).finally(() => (other = false));
+          }
+          return new Response("", { status: 503 }) as typeof reply;
+        });
+      const w = await world({ streams: 1, trace });
+      const a = await w.device("a");
+      await started(a);
+      const b = await w.device("b");
+      await b.cycle();
+      await a.run("run-a", [{ stream: S0, id: "x" }], {
+        full: false,
+        checkpoints: { [S0]: "ca" },
+      });
+      lose = 2;
+      await expect(a.cycle()).rejects.toThrow(/503/);
+      expect(lose).toBe(0);
+      // a's next cycle applies the registry's history, then acknowledges.
+      await a.cycle();
+      await b.cycle();
+      expect(await a.position()).toBe(await b.position());
+      return { w, a, b };
+    }
+
+    const resumesFrom = async (devices: Device[], state: string) => {
+      for (const [i, d] of devices.entries())
+        expect((await d.begin(`run-next-${i}`, { full: false })).start).toEqual(
+          {
+            collection_mode: "incremental",
+            state: { [S0]: state },
+          },
+        );
+    };
+
+    it("leaves every device at the later cursor another device committed", async () => {
+      const { w, a, b } = await lostReply(async (b) => {
+        await b.cycle();
+        await b.run("run-b", [{ stream: S0, id: "y" }], {
+          full: false,
+          checkpoints: { [S0]: "cb" },
+        });
+        await b.cycle();
+      });
+      expect(cursorOf(await headOf(w))).toEqual({
+        state: "cb",
+        connectorVersion: "1",
+      });
+      await resumesFrom([a, b], "cb");
+    });
+
+    it("leaves every device at its own cursor when nothing came after it", async () => {
+      const { w, a, b } = await lostReply(async () => {});
+      expect(cursorOf(await headOf(w))).toEqual({
+        state: "ca",
+        connectorVersion: "1",
+      });
+      await resumesFrom([a, b], "ca");
     });
   });
 
