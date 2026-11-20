@@ -21,6 +21,7 @@ import {
   isGrantExpired,
   McpInvalidScopeError,
 } from "./connection-api.js";
+import { isOwnAppRead } from "../payment/own-app.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ServerAccount } from "../keys/server-account.js";
 import {
@@ -408,6 +409,26 @@ export function createMcpSessionAuthPort(params: {
                 at: input.at,
               }),
         );
+        if (deps.ownAppAccountUrl) {
+          let ownAppRead: boolean;
+          try {
+            ownAppRead = await isOwnAppRead({
+              accountUrl: deps.ownAppAccountUrl,
+              appAddress: params.builderAddress,
+              dataOwner: params.serverOwner,
+              chainId: params.payment.gatewayConfig.chainId,
+            });
+          } catch {
+            throw new ProtocolError(
+              503,
+              "OWN_APP_ELIGIBILITY_UNAVAILABLE",
+              "Own-app fee eligibility could not be verified",
+            );
+          }
+          if (ownAppRead) {
+            return { builder: params.builderAddress, grantId: grant.id };
+          }
+        }
         const cycle = await handleX402Cycle({
           deps: params.payment.dataApiDeps,
           request: input.request,

@@ -12,6 +12,8 @@ This local Desktop candidate wires the setting through Node's config/bootstrap a
 
 This waives read-time data access payment, not unrelated transaction gas, storage, inference or registration costs incurred elsewhere. It creates no grant, funding allocation, credit or cross-network data transfer. Moksha test-credit funding (BUI-945) keeps normal fee metering and is independent of this exemption.
 
+Paid self-signing MCP sessions use the same Account eligibility check after live grant authorization and the deleted-scope gate, before any x402 challenge or settlement (BUI-969). An eligible app skips payment; a different Account's app follows the existing payment path. Unavailable or mismatched eligibility fails closed. Metadata-only reads retain their existing free behavior and still require the grant.
+
 ## Release-review candidate
 
 The implementation is forward-adopted from official dev revision `d87e6727d8160b1ec3a0593acf124b2357ae6f92` onto current upstream main `2df2ae99e4f0960c2337adf2f2c8984a8f3c6c68`. It retains the upstream storage, replica and recovery fixes, including #535 and #537. Desktop derives `payment.ownAppAccountUrl` from its selected Account configuration.

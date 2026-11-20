@@ -46,7 +46,8 @@ export async function isOwnAppRead(input: {
     evidence.appAddress !== appAddress ||
     evidence.dataOwner !== dataOwner ||
     evidence.network !== network ||
-    !["eligible", "not_eligible"].includes(String(evidence.eligibility))
+    (evidence.eligibility !== "eligible" &&
+      evidence.eligibility !== "not_eligible")
   ) {
     throw new Error("Mismatched own-app evidence");
   }

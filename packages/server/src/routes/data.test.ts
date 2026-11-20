@@ -3399,6 +3399,7 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     ["unavailable", 503],
     ["wrong-owner", 503],
     ["wrong-network", 503],
+    ["array-eligibility", 503],
     ["redirect", 503],
   ])(
     "keeps payment enforcement or fails closed for Account evidence %s",
@@ -3421,11 +3422,13 @@ describe("X402 payment on GET /v1/data/:scope", () => {
                   : ownerForX402.address.toLowerCase(),
               network: evidence === "wrong-network" ? "mainnet" : "moksha",
               eligibility:
-                evidence === "not_eligible"
-                  ? evidence
-                  : evidence === "unavailable"
+                evidence === "array-eligibility"
+                  ? ["eligible"]
+                  : evidence === "not_eligible"
                     ? evidence
-                    : "eligible",
+                    : evidence === "unavailable"
+                      ? evidence
+                      : "eligible",
             },
             { status: evidence === "unavailable" ? 503 : 200 },
           );
