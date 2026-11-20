@@ -65,6 +65,7 @@ import {
   type LogKey,
   type LogOmission,
   type LogOperation,
+  type LogCursor,
   type LogStreamMeta,
   type Segment,
   type SegmentRef,
@@ -212,6 +213,11 @@ type Planned = {
   readonly omitting: KeyRange | null;
   readonly omitted: readonly LogOmission[];
   readonly bytes: number;
+  /**
+   * The stream's unpublished cursor (`stream_state.cursor_unpublished`, as
+   * stored) when this round's segment carries it in the stream's meta.
+   */
+  readonly cursor: string | null;
 };
 
 type Candidate = {
@@ -925,6 +931,7 @@ async function snapshotRound(
       omitting: null,
       omitted: [],
       bytes: 0,
+      cursor: null,
     };
     if (plan.deferred) {
       unexamined.add(stream);
@@ -1170,6 +1177,14 @@ async function snapshotRound(
     });
   }
 
+  await carryCursors(
+    held,
+    connectionId,
+    connection.connector,
+    streams,
+    planned,
+  );
+
   // A stream that is no longer held warns again if it is held again.
   const warned = warnedHolds(held.db, connectionId);
   for (const stream of [...warned.keys()])
@@ -1317,6 +1332,95 @@ async function snapshotRound(
       createControl,
       prevHash: log.refs.at(-1)?.dataHash ?? null,
     },
+  };
+}
+
+/**
+ * A stream's unpublished cursor rides this round only when no row it covers
+ * is left for a later round: the stream publishes all its changes through the
+ * run end's `cursor_seq`, and every stream that lists it in `state_parents`,
+ * transitively, has nothing left either and is not deferred. A cursor on an
+ * earlier round of a publication that a crash cuts short would claim rows no
+ * device holds. A parent's cursor claims its children's rows too (a run reads
+ * them through it), so a round that closes the parent but leaves a child's
+ * rows for later, or a child the publisher defers, holds the parent's cursor
+ * back; the parent's rows still go. A stream whose rows are all published
+ * already carries its cursor in a meta of its own, with no operation.
+ */
+async function carryCursors(
+  held: LocalSyncDeps,
+  connectionId: string,
+  connector: string,
+  rows: readonly StreamRow[],
+  planned: Planned[],
+): Promise<void> {
+  const pending = await held.db.query<{
+    stream: string;
+    cursor_unpublished: string;
+    cursor_seq: number | null;
+    cursor_children: string | null;
+  }>(
+    `SELECT stream, cursor_unpublished, cursor_seq, cursor_children FROM stream_state
+      WHERE connection_id = ? AND cursor_unpublished IS NOT NULL`,
+    [connectionId],
+  );
+  if (pending.length === 0) return;
+  const at = new Map(planned.map((p, i) => [p.stream, i]));
+  const closed = (stream: string) => {
+    const i = at.get(stream);
+    if (i === undefined) return true;
+    const p = planned[i]!;
+    return !p.plan.deferred && !p.rest;
+  };
+  for (const row of pending) {
+    const i = at.get(row.stream);
+    if (i === undefined) continue;
+    const p = planned[i]!;
+    const children = JSON.parse(row.cursor_children ?? "[]") as string[];
+    if (
+      !closed(row.stream) ||
+      p.watermark < (row.cursor_seq ?? 0) ||
+      !children.every(closed)
+    )
+      continue;
+    const cursor = JSON.parse(row.cursor_unpublished) as LogCursor;
+    planned[i] = {
+      ...p,
+      included: true,
+      meta: {
+        ...(p.meta ?? cursorOnlyMeta(p, rows, connector)),
+        cursor,
+      },
+      cursor: row.cursor_unpublished,
+    };
+  }
+}
+
+/** The meta of a stream that carries only its cursor: what the log last said of it. */
+function cursorOnlyMeta(
+  p: Planned,
+  rows: readonly StreamRow[],
+  connector: string,
+): LogStreamMeta {
+  const head = p.plan.finalHead;
+  if (head)
+    return {
+      stream: p.stream,
+      primaryKey: head.primaryKey,
+      profile: head.profile as LogStreamMeta["profile"],
+      complete: head.complete,
+    };
+  const row = rows.find((r) => r.stream === p.stream)!;
+  const published = asPublished(row);
+  return {
+    stream: p.stream,
+    primaryKey: JSON.parse(published.primary_key) as string[],
+    profile: {
+      key: published.profile_key ?? connector,
+      version: published.profile_version ?? published.floor_version ?? "0",
+    },
+    // Never claimed complete without a head that said so.
+    complete: row.head_version > 0 && published.complete === 1,
   };
 }
 
@@ -1823,7 +1927,8 @@ async function basisOf(
   const streams: unknown[] = [];
   for (const p of planned) {
     const [state] = await deps.db.query(
-      `SELECT head_version, head_generation, head_data_hash, last_delete_version, publish_watermark
+      `SELECT head_version, head_generation, head_data_hash, last_delete_version, publish_watermark,
+              cursor_unpublished, cursor_seq
          FROM stream_state WHERE connection_id = ? AND stream = ?`,
       [connectionId, p.stream],
     );
@@ -2263,6 +2368,14 @@ async function candidateAcknowledgements(
           runIds: p.runIds,
         })),
       );
+    // The cursor this segment carried is published; a newer one a run end
+    // saved since (it changed the basis, so not before this commit) stays.
+    if (p.included && p.cursor !== null)
+      statements.push({
+        sql: `UPDATE stream_state SET cursor_unpublished = NULL, cursor_seq = NULL, cursor_children = NULL
+               WHERE connection_id = ? AND stream = ? AND cursor_unpublished = ?`,
+        params: [connectionId, p.stream, p.cursor],
+      });
     if (p.included || !p.rest)
       statements.push(
         {

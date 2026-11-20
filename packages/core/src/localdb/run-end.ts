@@ -605,6 +605,22 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           ? req.finish === "completed" && Object.keys(candidate).length > 0
           : canSave;
         if (saved) {
+          // A refused stream's rows are dropped, so its entry stays as it was,
+          // and so does every entry that reads through it (its state parents,
+          // transitively), which claims those rows too. A child whose parent
+          // keeps its old entry keeps its own.
+          const dependencies = Object.entries(declarations).map(
+            ([name, d]) => [name, d.stateParents ?? []] as const,
+          );
+          const blocked = new Set(refused);
+          blockUpward(blocked, dependencies);
+          const kept = new Set(
+            Object.keys(candidate).filter((name) => !blocked.has(name)),
+          );
+          pruneDownward(kept, dependencies);
+          candidate = Object.fromEntries(
+            Object.entries(candidate).filter(([name]) => kept.has(name)),
+          );
           // A stream the plan held back keeps the cursor it had.
           statements.push({
             sql: "UPDATE connections SET checkpoint = ? WHERE connection_id = ?",
@@ -614,8 +630,7 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             ],
           });
           // An entry this run changed waits to travel in the log. One it left
-          // as it was says nothing new, and a refused stream's entry is not
-          // this connector's to publish.
+          // as it was says nothing new.
           const descendants = stateDescendants(
             Object.fromEntries(
               Object.entries(declarations).map(([name, d]) => [
@@ -628,7 +643,6 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             ...Object.entries(candidate)
               .filter(
                 ([name, state]) =>
-                  !refused.includes(name) &&
                   !(
                     stored !== null &&
                     Object.prototype.hasOwnProperty.call(stored, name) &&

@@ -12,6 +12,7 @@ import {
   deriveKeyCheck,
   logScope,
   pkHash,
+  type JsonValue,
   type WireSegment,
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -63,6 +64,8 @@ export async function world(options: {
   trace?: RequestTrace;
   /** The `Batch-Policy` the gateway advertises and enforces (`FakeGatewayOptions.policy`). */
   policy?: FakeGatewayOptions["policy"];
+  /** Each stream's declared state parents (none: no parents). */
+  stateParents?: Readonly<Record<string, readonly string[]>>;
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
@@ -230,6 +233,9 @@ export async function world(options: {
           primaryKey: ["id"],
           coverageStrategy: "full_inventory" as const,
           ...(options.keyTypes ? { keyTypes: options.keyTypes } : {}),
+          ...(options.stateParents?.[name]
+            ? { stateParents: options.stateParents[name] }
+            : {}),
         })),
       }),
     });
@@ -265,6 +271,8 @@ export async function world(options: {
          * user has not asked to continue the connection.
          */
         join?: boolean;
+        /** The connector cursor the run ends with, per stream. */
+        checkpoints?: Readonly<Record<string, JsonValue>>;
       } = {},
     ) => {
       clock++;
@@ -316,6 +324,7 @@ export async function world(options: {
             .map((record) => record.stream),
           skipped: selected.filter((name) => !covered.includes(name)),
           ...(opts.full === false ? {} : { provenFullStreams: selected }),
+          ...(opts.checkpoints ? { checkpoints: opts.checkpoints } : {}),
         }),
       );
     };
