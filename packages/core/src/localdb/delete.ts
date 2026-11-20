@@ -641,8 +641,11 @@ export function createConnectionDeleter(
           const empty = planned.intent.pins.length === 0;
           // The lifetime it names has ended: nothing of it is left to delete,
           // and what is local now is not that connection's. Only the delete
-          // already recorded for this very lifetime is resumed.
-          if (named && empty)
+          // already recorded for this very lifetime is resumed. A token that
+          // names no row is not an ended lifetime: it was read for a
+          // connection with no control row (never published), and a delete
+          // of that one is a local purge, as with no token.
+          if (named && named.size > 0 && empty)
             return open &&
               open.pins.every((pin) => named.get(pin.ns) === pin.version)
               ? open

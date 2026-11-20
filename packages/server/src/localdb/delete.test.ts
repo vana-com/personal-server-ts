@@ -728,6 +728,70 @@ it("a connection with no control row has nothing to fence: the delete purges thi
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
 });
 
+it("the owner flow on a connection that was never published: the token it reads is accepted and the delete removes the local rows", async () => {
+  const f = await world(undefined, ["items"], false);
+  // A connection made on this device only: no control row, so no pin.
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state) VALUES ('local-only', 'fixture-source', '', 1, 'absent')",
+    },
+    {
+      sql: "INSERT INTO records(connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('local-only', 'items', 'pk', 'k', 1, 'r', '{}', 'h')",
+    },
+  ]);
+  const rows = () =>
+    f.a.db.query(
+      "SELECT connection_id FROM records WHERE connection_id = 'local-only'",
+    );
+  expect(await rows()).toHaveLength(1);
+  // The control row was never written: the token names no live row.
+  const lifetime = await f.a.deleter.readConnectionLifetime("fixture-source");
+  expect(lifetime).toBe("v2:fixture-source:");
+  const before = f.registry.log.length;
+  const started = await f.a.deleter.requestConnectionDelete("fixture-source", {
+    lifetime,
+  });
+  expect(started.fenced).toBe(true);
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(await rows()).toEqual([]);
+  // Nothing was published, so nothing is written to the registry.
+  expect(f.registry.log.length).toBe(before);
+  expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+it("a token that names no row still purges a local connection made after a published one was deleted, and a resend of the ended lifetime still writes nothing", async () => {
+  const f = await world();
+  const ended = await f.a.deleter.readConnectionLifetime("fixture-source");
+  await f.a.deleter.requestConnectionDelete("fixture-source", {
+    lifetime: ended,
+  });
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state) VALUES ('again', 'fixture-source', '', 2, 'absent')",
+    },
+    {
+      sql: "INSERT INTO records(connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('again', 'items', 'pk', 'k', 1, 'r', '{}', 'h')",
+    },
+  ]);
+  const rows = () =>
+    f.a.db.query("SELECT 1 FROM records WHERE connection_id = 'again'");
+  // The lifetime that ended names a row: a resend leaves the new rows alone.
+  await f.a.deleter.requestConnectionDelete("fixture-source", {
+    lifetime: ended,
+  });
+  expect(await rows()).toHaveLength(1);
+  // A token read now names no row (the tombstone is no live row): the delete
+  // is of the local connection.
+  const now = await f.a.deleter.readConnectionLifetime("fixture-source");
+  expect(now).toBe("v2:fixture-source:");
+  await f.a.deleter.requestConnectionDelete("fixture-source", {
+    lifetime: now,
+  });
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  expect(await rows()).toEqual([]);
+});
+
 it("a gateway without the batch route fails the delete closed: nothing is written, the intent stays and the cause is logged", async () => {
   const f = await world();
   f.registry.stopServingBatch();
