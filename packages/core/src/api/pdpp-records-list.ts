@@ -126,11 +126,17 @@ export async function localRecordPage(
   history: RecordHistory | undefined,
   candidate: boolean,
   eligibilityFields: string[] | undefined,
+  /**
+   * Also state the whole stream's record count across the instances, read with
+   * each instance's page. Only the owner's plain listing has one.
+   */
+  withTotal = false,
 ): Promise<{
   data: LocalRecord[];
   hasMore: boolean;
   nextCursor: string | null;
   nextChangesSince?: string;
+  total?: number;
 }> {
   const instances = [...new Set(instanceIds)].sort();
   const visible = (row: LocalRecord) =>
@@ -267,14 +273,17 @@ export async function localRecordPage(
   const after = localListCursors(input.cursor, stream, instances);
   const records: { index: number; record: StoredRecord }[] = [];
   let more = false;
+  let total = 0;
   for (const [index, instance] of instances.entries()) {
     const page = await query.listRecords({
       connectionId: instance,
       stream,
       cursor: after[index],
       limit: input.limit,
+      ...(withTotal && { withTotal }),
     });
     more ||= page.nextCursor !== null;
+    total += page.total ?? 0;
     for (const record of page.records) records.push({ index, record });
   }
   // SQLite record_key order is binary UTF-8, independent of locale or stamp_o.
@@ -310,6 +319,7 @@ export async function localRecordPage(
       .filter(visible),
     hasMore,
     nextCursor,
+    ...(withTotal && { total }),
   };
 }
 
@@ -434,23 +444,14 @@ export async function listPdppRecords(
     // A count is the whole stream across the read's connections, never the
     // page. Only the owner's plain listing has that one filter to count over;
     // a grant's visibility and a change feed have no such total.
-    let count: { kind: "exact"; value: number } | undefined;
-    if (requestedCountGrade(input.prefer) !== "none") {
-      if (owner && query.changesSince === undefined) {
-        let value = 0;
-        for (const instance of new Set(instanceIds))
-          value += await localQuery.countRecords({
-            connectionId: instance,
-            stream,
-          });
-        count = { kind: "exact", value };
-      } else {
-        warnings.push({
-          code: "count_downgraded",
-          message: "No exact count is available for this read",
-          param: "count",
-        });
-      }
+    const wantsCount = requestedCountGrade(input.prefer) !== "none";
+    const countable = owner && query.changesSince === undefined;
+    if (wantsCount && !countable) {
+      warnings.push({
+        code: "count_downgraded",
+        message: "No exact count is available for this read",
+        param: "count",
+      });
     }
     const page = await localRecordPage(
       localQuery,
@@ -462,7 +463,12 @@ export async function listPdppRecords(
       ports.recordHistory,
       candidate,
       candidate ? scope.streamGrant?.fields : scope.fields,
+      wantsCount && countable,
     );
+    const count =
+      page.total === undefined
+        ? undefined
+        : ({ kind: "exact", value: page.total } as const);
     return {
       feed: true,
       body: {

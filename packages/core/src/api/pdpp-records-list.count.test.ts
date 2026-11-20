@@ -28,7 +28,12 @@ afterEach(() => {
 });
 
 /** A real `records` table, so the count runs as SQL over the page's own filter. */
-function seeded(rows: Record<string, number>, other: Record<string, number>) {
+function seeded(
+  rows: Record<string, number>,
+  other: Record<string, number>,
+  /** Runs after each statement has read, before its caller resumes. */
+  afterStatement?: (sql: string, db: Database.Database) => void,
+) {
   const db = new Database(":memory:");
   open.push(db);
   db.exec(`CREATE TABLE records (
@@ -49,7 +54,11 @@ function seeded(rows: Record<string, number>, other: Record<string, number>) {
   add("posts", rows);
   add("comments", other);
   return createRecordQuery({
-    query: async (sql, params = []) => db.prepare(sql).all(...params) as never,
+    query: async (sql, params = []) => {
+      const result = db.prepare(sql).all(...params) as never;
+      afterStatement?.(sql, db);
+      return result;
+    },
   });
 }
 
@@ -120,6 +129,25 @@ describe("local record list count", () => {
     for (const prefer of [undefined, "", "count=none", "return=minimal"]) {
       expect((await list(p, "", prefer)).meta).toBeUndefined();
     }
+  });
+
+  it("counts the rows its page lists when a row is admitted mid-read", async () => {
+    let admitted = false;
+    const query = seeded({ a: 1 }, {}, (sql, db) => {
+      // The first read that counts has finished; a writer lands before the
+      // caller can issue its next read.
+      if (admitted || !/count\(\*\)/i.test(sql)) return;
+      admitted = true;
+      db.prepare(
+        "INSERT INTO records VALUES ('a', 'posts', 'pk-late', 'a-late', 1, 'r', '{}', 'h', NULL, NULL, NULL)",
+      ).run();
+    });
+    const page = await list(ports(query, ["a"]), "limit=100", "count=exact");
+    expect(admitted).toBe(true);
+    expect(page.meta?.count).toEqual({
+      kind: "exact",
+      value: page.data.length,
+    });
   });
 
   it("downgrades with a warning where it cannot count the whole stream", async () => {

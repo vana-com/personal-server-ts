@@ -418,8 +418,6 @@ export function createApp(deps: AppDeps): Hono {
       ? {
           listRecords: async (input) =>
             (await linkedQuery()).listRecords(input),
-          countRecords: async (input) =>
-            (await linkedQuery()).countRecords(input),
           getRecord: async (input) => (await linkedQuery()).getRecord(input),
           changesSince: async (input) =>
             (await linkedQuery()).changesSince(input),

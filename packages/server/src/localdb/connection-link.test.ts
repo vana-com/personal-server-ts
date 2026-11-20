@@ -10,6 +10,8 @@ import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { pdppBlobsRoutes } from "../routes/pdpp-blobs.js";
 import { grantBlobStore } from "./grant-blobs.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { listPdppRecords } from "@opendatalabs/personal-server-ts-core/api";
+import type { StreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records/stream-declaration";
 import { controlScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   createLinkedRecordQuery,
@@ -583,4 +585,60 @@ it("a delete intent that lands while rows are read expires the grant read", asyn
     read("selected", { instanceIds: ["handle-a"], limit: 10 }),
   ).rejects.toThrow();
   expect(inserted).toBe(true);
+});
+
+it("a relink during an exact-count list reads one target for count and page", async () => {
+  const { db } = await fixture();
+  const other = controlScope("other", "");
+  await run(
+    db,
+    "INSERT INTO connections(connection_id,connector,ns,generation,control_state,control_version) VALUES (?, 'other', '', 1, 'active', 1)",
+    [other],
+  );
+  for (const key of ["x", "y"])
+    await run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run','{}','hash')",
+      [other, "selected", key, key],
+    );
+  let connector = "fixture";
+  const guarded: SqlDriver = {
+    ...db,
+    query: async <R extends Record<string, SqlValue>>(
+      sql: string,
+      params?: readonly SqlValue[],
+    ) => {
+      const rows = await db.query<R>(sql, params);
+      // The first read of rows has finished; the host relinks the handle
+      // before the caller can issue another read.
+      if (sql.includes("FROM records")) connector = "other";
+      return rows;
+    },
+  };
+  const declaration = { name: "selected" } as never;
+  const declarations: StreamDeclarationRegistry = {
+    get: () => declaration,
+    forInstance: () => declaration,
+    declares: () => true,
+    list: () => [declaration],
+  };
+  const { body } = await listPdppRecords(
+    {
+      accountMode: { read: () => "switched" },
+      recordQuery: createLinkedRecordQuery(guarded, () => ({
+        connector,
+        namespace: "",
+      })),
+      declarations,
+      ownerInstances: () => ["handle-a"],
+    },
+    {
+      url: "https://ps.test/v1/streams/selected/records?limit=100",
+      stream: "selected",
+      context: { active: true, tokenKind: "owner", subjectId: "owner" },
+      prefer: "count=exact",
+    },
+  );
+  const count = (body.meta as { count: { value: number } }).count.value;
+  expect((body.data as unknown[]).length).toBe(count);
 });
