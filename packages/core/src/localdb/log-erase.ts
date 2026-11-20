@@ -275,18 +275,30 @@ async function eraseOne(
     const headName = head.found ? segmentBlobName(head.dataHash) : null;
     const inventory = await deps.versions.list(scope, { signal });
     if (inventory.complete !== true)
-      return { kind: "pending", why: "inventory", detail: "log version inventory is incomplete" };
+      return {
+        kind: "pending",
+        why: "inventory",
+        detail: "log version inventory is incomplete",
+      };
 
     const segments = new Set<string>();
     for (const v of inventory.versions)
       if (!v.isTombstone) segments.add(segmentBlobName(v.dataHash));
-    const opened = headName === null ? "absent" : await open(deps, scope, headName);
+    const opened =
+      headName === null ? "absent" : await open(deps, scope, headName);
     if (headName === null || opened === "absent") {
       // A finished pass leaves no listed segment in storage (the head went
       // last). Do not treat a missing head with surviving segments as proof.
       for (const name of segments) {
-        if (name !== headName && (await deps.blobs.get(`${scope}/${name}`)) !== null)
-          return { kind: "pending", why: "inventory", detail: "log head is missing with listed segments still present" };
+        if (
+          name !== headName &&
+          (await deps.blobs.get(`${scope}/${name}`)) !== null
+        )
+          return {
+            kind: "pending",
+            why: "inventory",
+            detail: "log head is missing with listed segments still present",
+          };
       }
       return { kind: "erased", deleted: 0, unenumerated: 0 };
     }
@@ -331,7 +343,11 @@ async function eraseOne(
     });
 
     if (unenumerated > 0)
-      return { kind: "pending", why: "inventory", detail: `${unenumerated} log objects could not be enumerated` };
+      return {
+        kind: "pending",
+        why: "inventory",
+        detail: `${unenumerated} log objects could not be enumerated`,
+      };
 
     const rest = [...segments].filter((name) => name !== headName);
     let deleted = 0;
@@ -361,9 +377,16 @@ async function eraseOne(
           };
         const acknowledged = [...outcome.deleted, ...outcome.missing];
         const names = new Set(acknowledged);
-        if (acknowledged.length !== batch.length || names.size !== batch.length ||
-            batch.some((name) => !names.has(name)))
-          return { kind: "pending", why: "storage", detail: "delete batch was not fully acknowledged" };
+        if (
+          acknowledged.length !== batch.length ||
+          names.size !== batch.length ||
+          batch.some((name) => !names.has(name))
+        )
+          return {
+            kind: "pending",
+            why: "storage",
+            detail: "delete batch was not fully acknowledged",
+          };
       }
     }
     return { kind: "erased", deleted, unenumerated };

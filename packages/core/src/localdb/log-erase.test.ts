@@ -516,7 +516,9 @@ describe("eraseDeletedConnectionLogs", () => {
       w.setControl("alpha", NS, 2, true);
       const first = await eraseDeletedConnectionLogs(w.deps);
       expect(first.connections[0]!.outcome).toEqual({
-        kind: "erased", deleted: 9, unenumerated: 0,
+        kind: "erased",
+        deleted: 9,
+        unenumerated: 0,
       });
       w.calls.length = 0;
       let inventories = 0;
@@ -568,7 +570,10 @@ describe("eraseDeletedConnectionLogs", () => {
       ...w.deps,
       versions: { list: async () => ({ complete: false, versions: [] }) },
     });
-    expect(incomplete.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "inventory" });
+    expect(incomplete.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "inventory",
+    });
     expect(w.calls).toEqual([]);
     expect(w.objects("alpha", NS)).toEqual(before);
 
@@ -576,14 +581,19 @@ describe("eraseDeletedConnectionLogs", () => {
     const bytes = w.store.get(`${scope}/${part}`)!;
     w.store.set(`${scope}/${part}`, new TextEncoder().encode("not json"));
     const unreadable = await eraseDeletedConnectionLogs(w.deps);
-    expect(unreadable.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "inventory" });
+    expect(unreadable.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "inventory",
+    });
     expect(w.calls).toEqual([]);
     expect(w.objects("alpha", NS)).toEqual(before);
 
     w.store.set(`${scope}/${part}`, bytes);
     const readable = await eraseDeletedConnectionLogs(w.deps);
     expect(readable.connections[0]!.outcome).toEqual({
-      kind: "erased", deleted: before.length, unenumerated: 0,
+      kind: "erased",
+      deleted: before.length,
+      unenumerated: 0,
     });
   });
 
@@ -599,10 +609,13 @@ describe("eraseDeletedConnectionLogs", () => {
     const report = await eraseDeletedConnectionLogs({
       ...w.deps,
       blobs: {
-        get: async (name) => name === head ? null : w.deps.blobs.get(name),
+        get: async (name) => (name === head ? null : w.deps.blobs.get(name)),
       },
     });
-    expect(report.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "inventory" });
+    expect(report.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "inventory",
+    });
     expect(w.calls).toEqual([]);
     expect(w.objects("alpha", NS)).toEqual(before);
   });
@@ -622,11 +635,15 @@ describe("eraseDeletedConnectionLogs", () => {
         },
       },
     });
-    expect(partial.connections[0]!.outcome).toMatchObject({ kind: "pending", why: "storage" });
+    expect(partial.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "storage",
+    });
     expect(batches).toHaveLength(1);
-    expect(batches[0]!.every(name => name.startsWith("v-"))).toBe(true);
-    expect(w.objects("alpha", NS).filter(name => !name.startsWith("v-")))
-      .toEqual(before.filter(name => !name.startsWith("v-")));
+    expect(batches[0]!.every((name) => name.startsWith("v-"))).toBe(true);
+    expect(
+      w.objects("alpha", NS).filter((name) => !name.startsWith("v-")),
+    ).toEqual(before.filter((name) => !name.startsWith("v-")));
   });
 
   it("does not delete a log whose newest segment is not under this key", async () => {
