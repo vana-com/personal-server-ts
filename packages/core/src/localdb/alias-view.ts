@@ -1,5 +1,5 @@
 import type { SqlDriver, SqlReader } from "./driver.js";
-import type { StatementGuard } from "./query.js";
+import { MAX_STATEMENT_PARAMS, type StatementGuard } from "./query.js";
 import { pinStream, readMark } from "./complete-read.js";
 import { PartialViewMoved } from "./partial-read.js";
 import type { Connection, Stream } from "./read-selection.js";
@@ -87,6 +87,11 @@ export function aliasViewCheck(
       epochs.get(s.stream) ?? 0,
     ]),
   ];
+  if (params.length > MAX_STATEMENT_PARAMS) {
+    throw new Error(
+      `alias view check: ${installed.length} streams need ${params.length} bound parameters, and a statement may bind ${MAX_STATEMENT_PARAMS}`,
+    );
+  }
   return Object.assign(
     async () => {
       const [row] = await db.query<{ ok: number }>(sql, params);

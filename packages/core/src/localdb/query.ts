@@ -155,9 +155,11 @@ const SIZE_PAGE_SIZE = 1000;
 /** A stored body's size in bytes; a row written before `body_bytes` has none. */
 const BODY_BYTES = "COALESCE(body_bytes, LENGTH(CAST(body AS BLOB)))";
 /**
- * Sized records per statement, three bound parameters each: SQLite before
- * 3.32 allows 999 bound parameters, and a guard takes some of them.
+ * Bound parameters one statement may carry: SQLite before 3.32 rejects more
+ * than 999 (the driver contract targets 3.22).
  */
+export const MAX_STATEMENT_PARAMS = 999;
+/** Sized records per statement at most, three bound parameters each. */
 const SIZED_PER_STATEMENT = 250;
 
 const LIST_CURSOR_PREFIX = "v2.";
@@ -407,8 +409,21 @@ export function createRecordQuery(db: SqlReader): AliasRecordQuery {
 
     async recordsByHash(connectionId, stream, sized, guard) {
       const out: StoredRecord[] = [];
-      for (let i = 0; i < sized.length; i += SIZED_PER_STATEMENT) {
-        const group = sized.slice(i, i + SIZED_PER_STATEMENT);
+      // A statement binds its sized rows, the connection and stream, and the
+      // guard's parameters; the rows take what the other two leave.
+      const perStatement = Math.min(
+        SIZED_PER_STATEMENT,
+        Math.floor(
+          (MAX_STATEMENT_PARAMS - 2 - (guard?.params.length ?? 0)) / 3,
+        ),
+      );
+      if (sized.length > 0 && perStatement < 1) {
+        throw new Error(
+          `recordsByHash: the guard binds ${guard?.params.length} parameters, and a statement may bind ${MAX_STATEMENT_PARAMS}`,
+        );
+      }
+      for (let i = 0; i < sized.length; i += perStatement) {
+        const group = sized.slice(i, i + perStatement);
         // The statement joins the rows it returns to what was sized: the
         // identity and the size are checked where the body is read.
         const rows = await db.query<RecordRow>(
