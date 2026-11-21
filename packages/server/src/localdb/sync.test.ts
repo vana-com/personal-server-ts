@@ -34,6 +34,9 @@ vi.mock("../../../core/src/localdb/delete.js", () => ({
   createConnectionDeleter: () => ({
     requestConnectionDelete: vi.fn(),
     resumeDeletes: vi.fn(async () => []),
+    erasureOwed: () => false,
+    resumeErasures: vi.fn(async () => false),
+    noteSettled: vi.fn(),
   }),
 }));
 vi.mock("../../../core/src/localdb/listing.js", () => ({

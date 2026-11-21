@@ -35,6 +35,24 @@ function passWatermark(connectionId: string): SqlStatement {
 }
 
 /**
+ * Who hears that a connection of a database was purged: the sync that owns the
+ * database (`createLocalSync`), by the database object, as the lifetime tokens
+ * above are kept. A host's `LocalSyncDeps` is shared and mutated by its
+ * owner, so the wake does not travel in it.
+ */
+const purgeListeners = new WeakMap<object, (connector: string) => void>();
+/** Hear every purge of `db`'s connections, until the returned function is called. */
+export function onConnectionPurged(
+  db: object,
+  listener: (connector: string) => void,
+): () => void {
+  purgeListeners.set(db, listener);
+  return () => {
+    if (purgeListeners.get(db) === listener) purgeListeners.delete(db);
+  };
+}
+
+/**
  * Adopt a delete another device wrote (or this device wrote earlier) when a
  * publish reads the tombstone: purge the connection once, then settle what the
  * device still owed the registry for the lifetime the tombstone ended.
@@ -176,5 +194,22 @@ export async function purgeConnection(
       },
       "purge connection",
     );
+    // Best effort, after the commit: the lookup and the listener are the
+    // erasure's wake, and neither may fail a purge that has committed. A host
+    // with no listener has nothing to wake and asks nothing.
+    const listener = purgeListeners.get(deps.db);
+    if (listener)
+      try {
+        const [row] = await deps.db.query<{ connector: string }>(
+          "SELECT connector FROM connections WHERE connection_id = ?",
+          [connectionId],
+        );
+        if (row) listener(row.connector);
+      } catch (error) {
+        deps.logger.warn(
+          { connectionId, error: String(error) },
+          "stream sync: the connection-purged listener failed",
+        );
+      }
   });
 }

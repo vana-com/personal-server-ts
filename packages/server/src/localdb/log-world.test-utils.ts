@@ -22,6 +22,7 @@ import {
   createLocalSync,
   openLocalDb,
   type LocalSyncDeps,
+  type LogErasurePorts,
   type SqlDriver,
 } from "../../../core/src/localdb/index.js";
 import {
@@ -115,6 +116,10 @@ export async function world(options: {
       maxBytesInFlight?: number;
       /** The host's hash and cipher port (`LocalSyncDeps.streamCrypto`). */
       streamCrypto?: StreamCryptoPort;
+      /** The host's ports for erasing a deleted connection's log objects. */
+      erasure?: () => LogErasurePorts | undefined;
+      /** Waits between retries of a delete or erasure (shortened for tests). */
+      deleteRetryMs?: { first: number; max: number };
     } = {},
   ) {
     const db = await openLocalDb(openBetterSqlite3(":memory:"), {
@@ -222,6 +227,8 @@ export async function world(options: {
         : {}),
     };
     const sync = createLocalSync(deps, {
+      ...(hooks.erasure ? { erasure: hooks.erasure } : {}),
+      ...(hooks.deleteRetryMs ? { deleteRetryMs: hooks.deleteRetryMs } : {}),
       // A digest `<connector>@<version>` names a connector version; a bare
       // connector name is version 1.
       resolveArtifact: (digest) => ({

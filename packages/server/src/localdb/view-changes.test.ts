@@ -83,6 +83,10 @@ const dropJoinSchema = [
 const dropStampIndexSchema = [
   { sql: "DROP INDEX IF EXISTS log_tombstones_by_stamp" },
 ];
+// A later migration's table of the body pieces an erasure left in storage.
+const dropRetainedPiecesSchema = [
+  { sql: "DROP TABLE IF EXISTS retained_log_pieces" },
+];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
@@ -1061,6 +1065,7 @@ describe("view changes", () => {
       ...dropJoinSchema,
       ...dropBootstrapSchema,
       ...dropStampIndexSchema,
+      ...dropRetainedPiecesSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_version" },
@@ -1181,6 +1186,7 @@ describe("view changes", () => {
       ...dropJoinSchema,
       ...dropBootstrapSchema,
       ...dropStampIndexSchema,
+      ...dropRetainedPiecesSchema,
       { sql: "ALTER TABLE stream_versions DROP COLUMN primary_key" },
       { sql: "ALTER TABLE stream_versions DROP COLUMN profile_key" },
       // A later migration made the mark of a stream's changes.

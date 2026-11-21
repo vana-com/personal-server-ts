@@ -59,6 +59,20 @@ export {
   type DeleteIntent,
   type PendingDelete,
 } from "./delete.js";
+export {
+  eraseDeletedConnectionLogs,
+  inventoryVersionLister,
+  retainedPiecesIn,
+  type LogErasurePorts,
+  type ConnectionErasure,
+  type ErasureOutcome,
+  type ErasureReport,
+  type LogErasureDeps,
+  type LogObjectEraser,
+  type LogVersionLister,
+  type RetainedPieces,
+  type TombstoneFinality,
+} from "./log-erase.js";
 export { createBlobStore, type BlobStore } from "./blobs.js";
 export {
   createRecordQuery,
