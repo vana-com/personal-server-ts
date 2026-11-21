@@ -346,8 +346,9 @@ const completeRows = (records: PdppRecord[]): PdppRecord[] =>
 
 /**
  * The smallest governor (a power of two from 4 KiB) that holds the largest
- * window of `records`: below it a read is refused as too large, and the fixture
- * is cut into the smallest windows the limit allows.
+ * window of `records` and still windows the read: below it the read is not
+ * windowed (it is built whole, in one projection), and the fixture would not
+ * be cut into the smallest windows the limit allows.
  */
 async function tightBudget(
   target: LocalAliasTarget,
@@ -356,12 +357,14 @@ async function tightBudget(
 ): Promise<number> {
   for (let limit = 4 * 1024; limit <= 64 * 1024 * 1024; limit *= 2) {
     const f = await fixture(limit);
+    const { wrapped, calls } = counting(target);
     await f.seed(target, records);
-    const decision = await read(f.resolverFor(target, scope), scope);
+    const decision = await read(f.resolverFor(wrapped, scope), scope);
     if (decision.kind === "view") await decision.body.cancel();
-    if (decision.kind !== "too_large") return limit;
+    // A windowed read projects once per window; a whole read, once.
+    if (calls.filter((n) => n > 0).length > 1) return limit;
   }
-  throw new Error("no budget holds the fixture");
+  throw new Error("no budget windows the fixture");
 }
 
 /** The target, counting every projection it is asked for. */
@@ -1766,7 +1769,8 @@ const MiB = 1024 * 1024;
 /**
  * Rule 1: no read holds more than a fixed ceiling, whatever the data. A parent
  * and its children are one window, so a conversation larger than the governor
- * allows is refused before it is built, the way a body above `ARRAY_BUDGET` is.
+ * allows is not windowed. It is read whole, as main reads it: served when main
+ * served it (below `ARRAY_BUDGET`), refused when main refused it.
  */
 describe("a windowed read never asks the governor for more than its limit", () => {
   const scope = "chatgpt.conversations";
@@ -1776,50 +1780,87 @@ describe("a windowed read never asks the governor for more than its limit", () =
     ) as LocalAliasTarget;
   const limit = 24 * MiB;
 
-  for (const c of [
-    { label: "one 74 MB conversation", messages: 740 },
-    { label: "one 20 MB conversation (main served it)", messages: 200 },
-  ]) {
-    it(`${c.label}: refused as too_large, within the ceiling, with an upload served`, async () => {
-      const f = await fixture(limit);
-      await f.seed(chatgpt(), chatgptConversation(0, c.messages, 100 * 1024));
-      const window = f.governor.window();
-      const audit = f.audited();
-      const decision = await read(
-        f.resolverFor(chatgpt(), scope, audit.query),
-        scope,
-      );
-      expect(decision.kind).toBe("too_large");
-      // The governor never saw a request above its limit, so it never
-      // granted one: nothing else was kept from an upload while it built.
-      expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(limit);
-      expect(audit.unheld).toEqual([]);
-      expect(f.inUse()).toBe(0);
-      expect(await f.spool!.list("")).toEqual([]);
-      const upload = await f.governor.reserve(16 * MiB);
-      upload();
-    }, 120_000);
-  }
+  /** What main served for these rows: the whole projection, in one call. */
+  const mainBody = (records: PdppRecord[]) => {
+    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const projected = chatgpt().project(records, NOW, binding.pdppStreams);
+    if (!projected.ok) throw new Error("whole projection failed");
+    return envelopeOf(scope, projected.payload);
+  };
 
-  it("refuses from the sizes alone, before a body is read, when one child cannot fit", async () => {
+  it("one 74 MB conversation: refused as main refuses it, within the ceiling, with an upload served", async () => {
+    const f = await fixture(limit);
+    await f.seed(chatgpt(), chatgptConversation(0, 740, 100 * 1024));
+    const window = f.governor.window();
+    const audit = f.audited();
+    const decision = await read(
+      f.resolverFor(chatgpt(), scope, audit.query),
+      scope,
+    );
+    expect(decision.kind).toBe("too_large");
+    if (decision.kind === "too_large") {
+      expect(decision.bytes).toBeGreaterThan(ARRAY_BUDGET);
+    }
+    // The governor never saw a request above its limit, so it never granted
+    // one: nothing else was kept from an upload while it built.
+    expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(limit);
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+    expect(await f.spool!.list("")).toEqual([]);
+    const upload = await f.governor.reserve(16 * MiB);
+    upload();
+  }, 120_000);
+
+  it("one 20 MB conversation: served, byte for byte what main serves, within the ceiling", async () => {
+    // Its group needs about 80 MB of heap, above the 24 MiB budget, but the
+    // read is below `ARRAY_BUDGET`: main served it, so the read is built whole
+    // in memory, as main built it.
+    const records = chatgptConversation(0, 200, 100 * 1024);
+    const f = await fixture(limit);
+    await f.seed(chatgpt(), records);
+    const window = f.governor.window();
+    const audit = f.audited();
+    const decision = await read(
+      f.resolverFor(chatgpt(), scope, audit.query),
+      scope,
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(mainBody(records));
+    expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(limit);
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+    // Built in memory: no file was written.
+    expect(await f.spool!.list("")).toEqual([]);
+  }, 120_000);
+
+  it("a child too large for a scan batch is served whole, as main serves it, before any index is built", async () => {
     const tree = treeTarget("p");
     const f = await fixture(limit);
     // One 8 MiB child: its scan batch alone is 32 MiB of heap, above 24 MiB.
-    await f.seed(tree, [
+    const records = [
       { stream: "parents", data: { id: "p0" } },
       {
         stream: "kids",
         data: { id: "k0", parent: "p0", pad: "y".repeat(8 * MiB) },
       },
-    ]);
-    const audit = f.audited();
+    ];
+    await f.seed(tree, records);
+    const window = f.governor.window();
     const decision = await read(
-      f.resolverFor(tree, "tree.items", audit.query),
+      f.resolverFor(tree, "tree.items"),
       "tree.items",
     );
-    expect(decision.kind).toBe("too_large");
-    expect(audit.reads().readsOfBodies).toBe(0);
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    const projected = tree.project(records, NOW, tree.streams);
+    if (!projected.ok) throw new Error("whole projection failed");
+    expect(await new Response(decision.body).text()).toBe(
+      envelopeOf("tree.items", projected.payload),
+    );
+    expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(limit);
     expect(f.inUse()).toBe(0);
+    expect(await f.spool!.list("")).toEqual([]);
   }, 60_000);
 
   it("still serves a group that fits, byte for byte what the in-memory read serves", async () => {

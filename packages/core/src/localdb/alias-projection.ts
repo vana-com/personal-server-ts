@@ -431,9 +431,12 @@ async function paged(
       signal: env.signal,
     });
   } catch (error) {
-    // Refused on its sizes, as a body above `ARRAY_BUDGET` is: nothing loaded.
+    // A group that does not fit the window ceiling is read as main read it:
+    // whole, in memory, charged as any in-memory read is, and refused above
+    // `ARRAY_BUDGET`. It holds what main held for the same read, so a read main
+    // served is served and one main refused is refused.
     if (error instanceof AliasTooLarge) {
-      return { kind: "too_large", bytes: error.bytes };
+      return whole(binding, view, query, now, env);
     }
     throw error;
   }

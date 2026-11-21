@@ -28,8 +28,9 @@ import { holdMemory } from "./transfer-memory.js";
  * waits for its turn. The window is a chunk of that reservation: a parent whose
  * own rows are larger than a chunk is a window of its own, and takes the
  * larger reservation it needs, up to the governor's limit. Past the limit the
- * read is refused (`AliasTooLarge`) before it loads the group: a parent and its
- * children are one window, and a read never asks for more than the limit.
+ * read is not windowed (`AliasTooLarge`) and the caller reads the input whole,
+ * as main does: a parent and its children are one window, and a windowed read
+ * never asks for more than the limit.
  *
  * Nothing is held before it is reserved. The children are indexed a batch of
  * bodies at a time (their join key is read from the body: shared SQL has no
@@ -83,8 +84,9 @@ const READ_SHARE = 0.5;
  * data: the governor grants a request above its limit when it is idle, and an
  * alias read must never be that request. A read that would need more (an index
  * larger than the limit, or one parent whose rows with their children are) is
- * refused before it loads them: `bytes` are the stored bytes it would hold, and
- * the host answers `too_large`, as it does for a body above `ARRAY_BUDGET`.
+ * not windowed, and is decided before the group is loaded. `bytes` are the
+ * stored bytes the window would hold. The caller reads the input whole, which
+ * serves what main served and refuses (`too_large`) what main refused.
  */
 export class AliasTooLarge extends Error {
   constructor(readonly bytes: number) {
