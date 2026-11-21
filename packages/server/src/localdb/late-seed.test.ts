@@ -337,6 +337,78 @@ it("a delete that a log compaction folded into a snapshot keeps a late seed out 
   expect(await a.keys()).toContain("Z");
 });
 
+it("a seed whose recovery cannot read the log writes no rows and no receipt; once the log reads, a retry fills only the keys no deletion covers", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("delete", ["A"], { remove: true });
+  await a.publish();
+  await a.publish();
+  await asBuiltBefore(a);
+  // The log's segments are in storage, but this read cannot find them.
+  const stored = a.deps.blobs;
+  let hidden = true;
+  (a.deps as { blobs: typeof stored }).blobs = {
+    ...stored,
+    get: async (key) =>
+      hidden && key.includes("/s-") ? null : stored.get(key),
+  };
+  const before = await state(a);
+
+  // The recovery of the log's deletions fails the import before it writes.
+  await expect(a.seed("install-2", ["A", "Z"])).rejects.toThrow(
+    "missing log segment",
+  );
+  // Neither a fill nor a receipt: A could come back from a log that was not read.
+  expect(await state(a)).toEqual(before);
+  expect(await a.keys()).toEqual(["B"]);
+  expect(await a.db.query("SELECT * FROM import_ledger")).toEqual([]);
+
+  hidden = false;
+  expect((await a.seed("install-2", ["A", "Z"])).kind).toBe("imported");
+  // Z was never in the stream and fills; A was deleted and stays out.
+  expect(await a.keys()).toEqual(["B", "Z"]);
+  expect(
+    await a.db.query(
+      "SELECT state, rows FROM import_ledger WHERE stream = 'items'",
+    ),
+  ).toEqual([{ state: "imported", rows: 2 }]);
+});
+
+it("the first retry of a reopened seed_window_closed receipt is `imported`, though every key is already held; a repeat is `already-imported`", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  // The earlier build's receipt for this very upload: it named no rows.
+  const empty = await importFingerprint((async function* () {})());
+  await a.db.batch([
+    {
+      sql: `INSERT INTO import_ledger (source, connection_id, stream, state, rows, fingerprint, reason, at, revision, generation, highest_seq)
+            VALUES (?, ?, 'items', 'excluded', ?, ?, 'seed_window_closed', 1, 'install-3-upload', 1, 0)`,
+      params: [
+        JSON.stringify(["install-3", "fixture"]),
+        connectionId,
+        empty.rows,
+        empty.fingerprint,
+      ],
+    },
+  ]);
+  const before = await state(a);
+
+  // Every key is held: nothing fills, but this call writes the first receipt
+  // that completed the revision.
+  const first = await a.seed("install-3", ["A", "B"]);
+  expect(first.kind).toBe("imported");
+  expect(await state(a)).toEqual(before);
+  expect(
+    await a.db.query("SELECT state, reason, rows FROM import_ledger"),
+  ).toEqual([{ state: "imported", reason: null, rows: 2 }]);
+
+  expect((await a.seed("install-3", ["A", "B"])).kind).toBe("already-imported");
+});
+
 it("an explicit delete that has not published yet keeps a seed out", async () => {
   const w = await world();
   const a = await w.device("a");

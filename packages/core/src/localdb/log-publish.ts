@@ -101,6 +101,7 @@ import {
 } from "./log-publish-phases.js";
 import { readLogState, writeLogState, type LogState } from "./log-apply.js";
 import {
+  appendAll,
   prepareOperations,
   rowsPerStatement,
   tombstoneStatements,
@@ -2366,8 +2367,9 @@ async function candidateAcknowledgements(
   // the same rows through `operationStatements`.
   for (const p of touched)
     if (p.meta)
-      statements.push(
-        ...tombstoneStatements(
+      appendAll(
+        statements,
+        tombstoneStatements(
           connectionId,
           await prepareOperations(
             [p.meta],
