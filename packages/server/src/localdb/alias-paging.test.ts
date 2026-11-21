@@ -1163,6 +1163,98 @@ describe("a resolver called the way main calls it", () => {
   }, 60_000);
 });
 
+/**
+ * A windowed alias whose parents are `parents` and whose children are `kids`,
+ * with a `profile` object in its payload beside the array.
+ */
+function treeTarget(profileName: string): LocalAliasTarget {
+  return {
+    connector: "tree",
+    streams: ["parents", "kids"],
+    window: {
+      parentStream: "parents",
+      parentKey: "id",
+      childStream: "kids",
+      childKey: "parent",
+      arrayKey: "items",
+      sumKeys: ["kids"],
+      parentOrder: (a, b) => String(a.id).localeCompare(String(b.id)),
+    },
+    project: (records) => {
+      const parents = records.filter((r) => r.stream === "parents");
+      return {
+        ok: true as const,
+        payload: {
+          profile: { name: profileName },
+          items: parents.map((p) => p.data),
+          kids: records.length - parents.length,
+        },
+      };
+    },
+  };
+}
+
+describe("the envelope of a paged body is built from its fields", () => {
+  it("serves a profile whose name is the text the old placeholder used", async () => {
+    const marker = "\u0000alias-window-array\u0000";
+    const tree = treeTarget(marker);
+    const rows = Array.from({ length: 5 }, (_, p) => [
+      { stream: "parents", data: { id: `p${p}` } },
+      ...[0, 1].map((k) => ({
+        stream: "kids",
+        data: { id: `p${p}:k${k}`, parent: `p${p}`, pad: "y".repeat(500) },
+      })),
+    ]).flat();
+    // A governor of 2 KiB forces a window of one parent.
+    const f = await fixture(2 * 1024);
+    await f.seed(tree, rows);
+    const decision = await read(
+      f.resolverFor(tree, "tree.items"),
+      "tree.items",
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(
+      envelopeOf("tree.items", {
+        profile: { name: marker },
+        items: [0, 1, 2, 3, 4].map((p) => ({ id: `p${p}` })),
+        kids: 10,
+      }),
+    );
+  }, 60_000);
+});
+
+describe("the window index is charged for the objects it keeps", () => {
+  it("holds, for many small parents, at least the heap they take", async () => {
+    // Measured: 100,000 parents of body {"id":"c0000000"} (17 stored bytes)
+    // grew the live heap by 173 bytes each after a full collection, over the
+    // parsed body, the Parent, its Map slot and its group. 4x the stored JSON
+    // is 68.
+    const heapPerParent = 173;
+    const parentCount = 2000;
+    const tree = treeTarget("p");
+    const rows = Array.from({ length: parentCount }, (_, p) => ({
+      stream: "parents",
+      data: { id: `p${String(p).padStart(7, "0")}` },
+    }));
+    const f = await fixture(8 * 1024 * 1024);
+    await f.seed(tree, rows);
+    const decision = await read(
+      f.resolverFor(tree, "tree.items"),
+      "tree.items",
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    const reader = decision.body.getReader();
+    // The envelope's head, then the array's opening: the read now holds its index.
+    await reader.read();
+    await reader.read();
+    expect(f.inUse()).toBeGreaterThanOrEqual(parentCount * heapPerParent);
+    await reader.cancel();
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+});
+
 describe("a payload that is cut into pieces keeps every character whole", () => {
   it("does not split a surrogate pair at a piece boundary", async () => {
     // The payload's JSON is `{"pad":"` (8 characters), the padding, then an

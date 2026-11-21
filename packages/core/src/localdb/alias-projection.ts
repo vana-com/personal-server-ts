@@ -287,6 +287,7 @@ async function paged(
   const sums = new Map(window.sumKeys.map((key) => [key, 0]));
   const tallies = new Map<string, Tally>();
   let template: Record<string, unknown> | undefined;
+  let keyOrder: string[] = [];
   try {
     for await (const outcome of session.windows()) {
       if (!outcome.ok) {
@@ -297,8 +298,9 @@ async function paged(
       // The first window's payload shapes the whole: its other keys equal
       // every window's. Its array is not kept.
       if (template === undefined) {
+        keyOrder = Object.keys(outcome.payload);
         template = { ...outcome.payload };
-        template[window.arrayKey] = PLACEHOLDER;
+        delete template[window.arrayKey];
       }
       for (const key of window.sumKeys) {
         sums.set(key, sums.get(key)! + (outcome.payload[key] as number));
@@ -324,21 +326,39 @@ async function paged(
     return whole(binding, connectionId, fetched, query, now, env, current);
   }
   for (const key of window.sumKeys) template[key] = sums.get(key);
-  const text = JSON.stringify(template);
-  const marker = JSON.stringify(PLACEHOLDER);
-  const at = text.indexOf(marker);
-  if (at < 0 || text.indexOf(marker, at + 1) >= 0) {
-    throw new Error("alias window: the payload's array could not be placed");
-  }
-  const prefix = `${text.slice(0, at)}[`;
-  const suffix = `]${text.slice(at + marker.length)}`;
+  const [prefix, suffix] = envelopeAround(template, window.arrayKey, keyOrder);
   return {
     kind: "ok",
     body: () => pagedBody(open, window.arrayKey, prefix, suffix),
   };
 }
 
-const PLACEHOLDER = "\u0000alias-window-array\u0000";
+/**
+ * The JSON of the payload before its array's elements and after them, built
+ * from its fields: each field is serialized on its own, and the array's key
+ * is where the elements go. No text of any field is searched, so no value can
+ * be taken for a marker.
+ */
+function envelopeAround(
+  fields: Record<string, unknown>,
+  arrayKey: string,
+  order: readonly string[],
+): [prefix: string, suffix: string] {
+  const entry = (key: string): string[] => {
+    const value = JSON.stringify(fields[key]);
+    return value === undefined ? [] : [`${JSON.stringify(key)}:${value}`];
+  };
+  const at = order.indexOf(arrayKey);
+  if (at < 0) {
+    throw new Error("alias window: the payload has no array to place");
+  }
+  const before = order.slice(0, at).flatMap(entry);
+  const after = order.slice(at + 1).flatMap(entry);
+  return [
+    `{${before.map((e) => `${e},`).join("")}${JSON.stringify(arrayKey)}:[`,
+    `]${after.map((e) => `,${e}`).join("")}}`,
+  ];
+}
 
 function tally(into: Map<string, Tally>, d: AliasDiagnostic): void {
   if (d.kind !== "records_dropped" && d.kind !== "records_partial") return;

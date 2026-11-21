@@ -48,6 +48,19 @@ export type AliasMemory = Pick<StreamSyncBlobs, "governor">;
 export const HEAP_PER_STORED_BYTE = 4;
 
 /**
+ * Heap bytes the index keeps for each parent beyond what 4x its stored JSON
+ * covers: the `Parent` object, its slot in the key map and that slot's group.
+ * A parent whose body is a few bytes costs more than four times its body.
+ * Measured with `node --expose-gc`: 100,000 parents of body `{"id":"c0000000"}`
+ * (17 stored bytes, charged 68) grew the live heap by 173 bytes each, after
+ * a full collection, over `JSON.parse`, the `Parent` object, a `Map` slot and
+ * an empty `ChildGroup`. The next multiple of 64 above that, so a larger
+ * parent, which the 4x already over-covers, is charged a little too much and
+ * a small one is not charged too little.
+ */
+const OBJECT_BYTES_PER_PARENT = 192;
+
+/**
  * Heap bytes one child row costs the index: its sized record (a 64-character
  * key hash and a 64-character body hash, which the body statement checks) and
  * the slot that holds it.
@@ -148,6 +161,7 @@ export async function openWindowed(
   // chunk: what is left of the read's share, as source bytes of one window.
   const fixed =
     (parentStats.bytes + otherBytes) * HEAP_PER_STORED_BYTE +
+    parentStats.rows * OBJECT_BYTES_PER_PARENT +
     childStats.rows * INDEX_BYTES_PER_CHILD;
   const share = Math.floor(input.memory.governor.limitBytes * READ_SHARE);
   const chunk = Math.max(0, Math.floor((share - fixed) / HEAP_PER_STORED_BYTE));
