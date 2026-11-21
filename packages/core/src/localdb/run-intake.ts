@@ -30,6 +30,7 @@ import {
   type BatchResponse,
   type BeginRequest,
   type BeginResponse,
+  type ConnectionCheckpoint,
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
@@ -56,6 +57,61 @@ export interface RunIntakeStore {
     declarations: IntakeDeclarations,
   ): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
+  /** The connection's saved cursors (`ConnectionCheckpoint`), or null. */
+  checkpoint(connector: string): Promise<ConnectionCheckpoint | null>;
+}
+
+/**
+ * What `begin` reads as a connector's START state, without a run: the
+ * connection's checkpoint entry per stream, with the connector version that
+ * wrote it. The applied cursors are folded first, as before every read of the
+ * checkpoint, so a cursor another device published is included. A stream
+ * flagged `needs_full` is left out, as `begin` would read it in full. A
+ * deleted connection, or one with no checkpoint, has none.
+ */
+async function readConnectionCheckpoint(
+  db: LocalSyncDeps["db"],
+  connector: string,
+): Promise<ConnectionCheckpoint | null> {
+  const id = controlScope(connector, "");
+  await foldAppliedCursors(db, id);
+  const [row] = await db.query<{
+    checkpoint: string | null;
+    control_state: string;
+  }>(
+    "SELECT checkpoint, control_state FROM connections WHERE connection_id=?",
+    [id],
+  );
+  if (!row || row.checkpoint === null || row.control_state === "deleted")
+    return null;
+  const stored: unknown = JSON.parse(row.checkpoint);
+  if (!isPlainObject(stored)) return null;
+  const versions = new Map(
+    (
+      await db.query<{
+        stream: string;
+        cursor_version: string | null;
+        needs_full: number;
+      }>(
+        "SELECT stream, cursor_version, needs_full FROM stream_state WHERE connection_id=?",
+        [id],
+      )
+    ).map((entry) => [entry.stream, entry]),
+  );
+  const streams: Record<
+    string,
+    { state: JsonValue; cursorVersion: string | null }
+  > = {};
+  for (const [stream, state] of Object.entries(
+    stored as Record<string, JsonValue>,
+  )) {
+    if (state === undefined || versions.get(stream)?.needs_full === 1) continue;
+    streams[stream] = {
+      state,
+      cursorVersion: versions.get(stream)?.cursor_version ?? null,
+    };
+  }
+  return Object.keys(streams).length ? { connectionId: id, streams } : null;
 }
 
 type Run = {
@@ -189,6 +245,7 @@ export function createRunIntakeStore(
     return run;
   }
   return {
+    checkpoint: (connector) => readConnectionCheckpoint(deps.db, connector),
     begin: (runId, req, declarations) =>
       serial(runId, async () => {
         if (

@@ -330,11 +330,41 @@ export interface RunPublicationStatus {
 /** The observation request is retained until every host has migrated to V1. */
 export type RunEndRequest = EndRequest | RawEndV1;
 
+/**
+ * The connection's saved cursors, as the last run (on this device or another)
+ * left them: what `begin` would hand a connector as its START state, before
+ * any run exists and without a verified artifact. A host that runs the
+ * connector elsewhere (a remote run) reads it to resume from the same place,
+ * and ends the run it opens here with the cursors that run returns.
+ */
+export interface ConnectionCheckpoint {
+  readonly connectionId: string;
+  /**
+   * Per stream with a saved cursor: the connector's STATE for it and the
+   * version of the connector that wrote it (here or on another device), or
+   * null when no run has stamped one yet. A stream marked to be read in full
+   * next is left out: its cursor would not be handed to a run either.
+   */
+  readonly streams: Readonly<
+    Record<
+      string,
+      { readonly state: JsonValue; readonly cursorVersion: string | null }
+    >
+  >;
+}
+
 export interface RunIntake {
   begin(runId: string, req: BeginRequest): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
   end(runId: string, req: RunEndRequest): Promise<EndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
+  /**
+   * The connection's saved cursors for `connector`, or null when it has none
+   * (no connection, no checkpoint, or a deleted connection). A read: it opens
+   * no run and needs no artifact. Optional: a host over an older writer has
+   * none, and reads in full.
+   */
+  checkpoint?(connector: string): Promise<ConnectionCheckpoint | null>;
   /**
    * Whether an ended run is saved, from durable local state. An unknown run
    * answers `gone`. With `binding`, another owner answers `owner_mismatch` and

@@ -250,6 +250,9 @@ export function createLocalSync(
       await endStore.abort(runId, reason);
       bindings.delete(runId);
     },
+    checkpoint(connector) {
+      return intake().checkpoint(connector);
+    },
     async publicationStatus(runId, binding) {
       if (
         binding?.owner !== undefined &&
