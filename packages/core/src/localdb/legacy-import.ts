@@ -282,9 +282,15 @@ async function importSource(
             ])),
         ...ledger.statements(receipt),
       ]);
+      // `already-imported` says an earlier call completed this very revision.
+      // A reopened `seed_window_closed` receipt is `excluded`: it completed
+      // nothing, so this call writes the first receipt that did, however few
+      // keys it filled.
+      const completedBefore =
+        prior?.revision === source.revision && prior.state !== "excluded";
       return {
         kind:
-          prior?.revision === source.revision && high!.seq === before!.seq
+          completedBefore && high!.seq === before!.seq
             ? "already-imported"
             : "imported",
         receipt,

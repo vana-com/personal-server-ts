@@ -69,6 +69,16 @@ const chunks = <T>(items: readonly T[], size: number): T[][] => {
   return out;
 };
 
+/**
+ * `target.push(...items)` as a loop. A spread passes every item as an argument
+ * and throws a `RangeError` once there are more than the engine allows (about
+ * a hundred thousand): a segment's tombstones are two statements per deletion
+ * or omission, so a large refresh gets there, after the registry accepted it.
+ */
+export function appendAll<T>(target: T[], items: readonly T[]): void {
+  for (const item of items) target.push(item);
+}
+
 /** What `stageBatch` needs of a segment or of a snapshot part. */
 export interface OperationBatch {
   readonly generation: number;
@@ -318,7 +328,7 @@ export function operationStatements(
   const statements: SqlStatement[] = [];
 
   // 1. Tombstones first, so the upserts of this very segment see them.
-  statements.push(...tombstoneStatements(connectionId, operations));
+  appendAll(statements, tombstoneStatements(connectionId, operations));
 
   // 2. Deletes and omissions of rows this device holds, before the upserts: a
   // resurrection that follows a deletion then merges into no row, so its row
@@ -582,7 +592,10 @@ export async function stageBatch(
   const begins = new Map<string, readonly SqlStatement[]>();
   for (const [stream, step] of steps)
     if (step.begin) begins.set(stream, hideStoredRows(connectionId, stream));
-  statements.push(...operationStatements(connectionId, op, operations, steps));
+  appendAll(
+    statements,
+    operationStatements(connectionId, op, operations, steps),
+  );
   // A stream still loading progressively has no head yet; its last batch
   // writes it, with `complete`.
   statements.push(

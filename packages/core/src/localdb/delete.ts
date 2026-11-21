@@ -109,6 +109,8 @@ export interface ConnectionDeleter {
 export type EraseLogs = (
   connector: string,
   signal: AbortSignal,
+  /** Namespaces of the connector whose delete has not settled here: not erased. */
+  options?: { readonly skipNamespaces: ReadonlySet<string> },
 ) => Promise<ErasureReport>;
 /** One running landing: when its fences ended, and when all of it did. */
 interface Landing {
@@ -134,8 +136,9 @@ export function createConnectionDeleter(
     /**
      * Physically erases the log objects of a deleted connection from storage.
      * It runs only once the delete is settled: no delete of the connector is
-     * in flight (its intent is cleared) and every local connection of it is
-     * purged, so a lifetime that is not deleted here is never erased. It runs
+     * in flight (its intent is cleared), and per namespace: a namespace with
+     * a local connection that is not purged is another lifetime and is never
+     * erased, while the connector's other deleted namespaces are. It runs
      * after the delete, never inside it: a connection added again must not
      * wait for storage, and a failure leaves the delete done. An erasure that
      * is not finished is resumed by `resumeErasures` (the sync's retry loop),
@@ -606,21 +609,26 @@ export function createConnectionDeleter(
     }
   }
   /**
-   * Whether the delete of `connector` is settled here: no intent in flight, and
-   * every local connection of it purged. A connection added again (or one the
-   * purge has not reached) is another lifetime, and is not erased.
+   * The namespaces of `connector` whose delete has not settled here: a local
+   * connection in them is not purged (a connection added again, or one the
+   * purge has not reached, is another lifetime). `null` while a delete of the
+   * connector is in flight: nothing of it is settled. One namespace's live
+   * connection never holds back another's erasure: a delete that names a
+   * lifetime leaves a local connection no pin names, by design.
    */
-  async function deleteSettled(connector: string): Promise<boolean> {
+  async function unsettledNamespaces(
+    connector: string,
+  ): Promise<ReadonlySet<string> | null> {
     const [intent] = await deps.db.query(
       "SELECT 1 FROM delete_intents WHERE connector=?",
       [connector],
     );
-    if (intent) return false;
-    const [live] = await deps.db.query(
-      "SELECT 1 FROM connections WHERE connector=? AND control_state<>'deleted'",
+    if (intent) return null;
+    const live = await deps.db.query<{ ns: string }>(
+      "SELECT DISTINCT ns FROM connections WHERE connector=? AND control_state<>'deleted'",
       [connector],
     );
-    return !live;
+    return new Set(live.map((row) => row.ns));
   }
   /**
    * One erasure pass for `connector`; answers whether it is unfinished. The
@@ -629,9 +637,12 @@ export function createConnectionDeleter(
    */
   async function eraseSettled(connector: string): Promise<boolean> {
     try {
-      if (stop.signal.aborted || !(await deleteSettled(connector)))
-        return false;
-      return (await options.eraseLogs!(connector, stop.signal)).pending;
+      if (stop.signal.aborted) return false;
+      const skipNamespaces = await unsettledNamespaces(connector);
+      if (skipNamespaces === null) return false;
+      return (
+        await options.eraseLogs!(connector, stop.signal, { skipNamespaces })
+      ).pending;
     } catch (error) {
       // The eraser reports a failure as pending; this is its own bug or a
       // database that went away. Try again later, never fail the delete.
@@ -834,6 +845,13 @@ export function createConnectionDeleter(
     /** A connection of the connector was purged here: its erasure may be owed. */
     noteSettled(connector: string) {
       if (options.eraseLogs) erasing.add(connector);
+    },
+    /**
+     * A connection was purged and its connector is unknown: the sweep of
+     * every deleted connection is owed again.
+     */
+    noteSweepOwed() {
+      if (options.eraseLogs) sweepOwed = true;
     },
     /** Whether erasure work is owed: the start sweep, or an unfinished erasure. */
     erasureOwed: () => sweepOwed || erasing.size > 0,

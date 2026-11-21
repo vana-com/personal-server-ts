@@ -264,7 +264,7 @@ export function createLocalSync(
     createConnectionDeleter(deps, {
       ...(options.eraseLegacy && { eraseLegacy: options.eraseLegacy }),
       ...(options.erasure && {
-        eraseLogs: async (connector, signal) => {
+        eraseLogs: async (connector, signal, gate) => {
           const ports = options.erasure!();
           return ports
             ? eraseDeletedConnectionLogs(
@@ -277,7 +277,11 @@ export function createLocalSync(
                   retained: retainedPiecesIn(deps.db),
                   ...ports,
                 },
-                { connector, signal },
+                {
+                  connector,
+                  signal,
+                  ...(gate && { skipNamespaces: gate.skipNamespaces }),
+                },
               )
             : { connections: [], pending: false };
         },
@@ -308,7 +312,8 @@ export function createLocalSync(
   // the retry loop runs the erasure (and decides whether it is time).
   const stopHearingPurges = options.erasure
     ? onConnectionPurged(deps.db, (connector) => {
-        deletes().noteSettled(connector);
+        if (connector === null) deletes().noteSweepOwed();
+        else deletes().noteSettled(connector);
         armRetry();
       })
     : () => {};

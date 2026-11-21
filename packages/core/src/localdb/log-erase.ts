@@ -82,6 +82,7 @@ import {
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { VersionInventoryClient } from "../additions/version-inventory.js";
+import type { DeleteDataPort } from "../ports/index.js";
 import type { SqlDriver } from "./driver.js";
 import { keccakOf, type StreamCryptoPort } from "../stream-sync/crypto-port.js";
 import type {
@@ -127,18 +128,9 @@ export interface TombstoneFinality {
  * The owner-signed per-object storage delete (`DeleteDataPort.deleteBlobVersions`):
  * `names` are blob names under `scope`. An absent object is reported as
  * `missing`, which counts as deleted; a failure is reported per name, never
- * thrown for the batch.
+ * thrown for the batch. The legacy delete's own port, so the contract is one.
  */
-export interface LogObjectEraser {
-  deleteBlobVersions(
-    scope: string,
-    names: string[],
-  ): Promise<{
-    readonly deleted: readonly string[];
-    readonly missing: readonly string[];
-    readonly failed: readonly { readonly version: string; error: string }[];
-  }>;
-}
+export type LogObjectEraser = Pick<DeleteDataPort, "deleteBlobVersions">;
 
 /**
  * Where the pass writes down the body pieces it leaves in storage (see 3
@@ -272,10 +264,17 @@ const DELETE_BATCH = 15;
  * calls it once the delete has settled on this device (`delete.ts`,
  * `eraseLogs`), and again to resume. It never throws and never touches the delete itself: a failure
  * comes back as a `pending` outcome for the caller to repeat later.
+ * `skipNamespaces` are namespaces of `connector` whose delete has not settled
+ * here (a local connection of theirs is not deleted): they are left alone and
+ * do not appear in the report, and the rest are erased.
  */
 export async function eraseDeletedConnectionLogs(
   deps: LogErasureDeps,
-  options: { readonly connector?: string; readonly signal?: AbortSignal } = {},
+  options: {
+    readonly connector?: string;
+    readonly skipNamespaces?: ReadonlySet<string>;
+    readonly signal?: AbortSignal;
+  } = {},
 ): Promise<ErasureReport> {
   const connections: ConnectionErasure[] = [];
   try {
@@ -293,6 +292,7 @@ export async function eraseDeletedConnectionLogs(
       const state = classifyControl(read, hashes);
       if (state.kind !== "deleted") continue;
       const { connector, ns } = parsed;
+      if (options.skipNamespaces?.has(ns)) continue;
       const outcome = await eraseOne(
         deps,
         { connector, ns, keyCheck, hashes, tombstone: state.version },
@@ -421,6 +421,10 @@ async function eraseOne(
       { readonly dataHash: string; readonly position: number }
     >();
     const pieces = new Set<string>();
+    // Objects storage answered "none" for. A listed name can be gone already
+    // (an earlier pass deleted it); sending it again only spends the owner's
+    // DELETE quota, so a rate-limited retry never reaches the rest.
+    const gone = new Set<string>();
     let unenumerated = 0;
     const note = (references: Iterable<WireOperation | WireEntry>) => {
       for (const op of references)
@@ -428,9 +432,12 @@ async function eraseOne(
           for (const piece of op.body.pieces)
             pieces.add(bodyPieceBlobName(piece));
     };
-    await each([...segments.values()], async (expected) => {
+    await each([...segments.entries()], async ([name, expected]) => {
       const segment = await openSegment(deps, scope, target, expected);
-      if (segment === "absent") return;
+      if (segment === "absent") {
+        gone.add(name);
+        return;
+      }
       if (segment === "unreadable") {
         unenumerated += 1;
         return;
@@ -442,9 +449,12 @@ async function eraseOne(
         });
       note(segment.operations);
     });
-    await each([...parts.values()], async (expected) => {
+    await each([...parts.entries()], async ([name, expected]) => {
       const part = await openPart(deps, scope, target, expected);
-      if (part === "absent") return;
+      if (part === "absent") {
+        gone.add(name);
+        return;
+      }
       if (part === "unreadable") {
         unenumerated += 1;
         return;
@@ -462,9 +472,12 @@ async function eraseOne(
     // Written down before anything that names them is deleted (see 3 above).
     if (pieces.size > 0) await deps.retained.keep(scope, [...pieces]);
 
-    const rest = [...segments.keys()].filter((name) => name !== headName);
+    const rest = [...segments.keys()].filter(
+      (name) => name !== headName && !gone.has(name),
+    );
+    const present = [...parts.keys()].filter((name) => !gone.has(name));
     let deleted = 0;
-    for (const phase of [[...parts.keys()], rest, [headName]]) {
+    for (const phase of [present, rest, [headName]]) {
       for (let at = 0; at < phase.length; at += DELETE_BATCH) {
         signal?.throwIfAborted();
         await stillTombstoned(deps, target, signal);

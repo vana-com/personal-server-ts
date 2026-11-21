@@ -203,6 +203,51 @@ describe("erasing a log the real publisher wrote", () => {
     void w;
   });
 
+  it("finishes under a per-owner delete quota smaller than the log: names storage already lacks are not sent again", async () => {
+    const { keys, deps, before } = await deletedCompactedLog();
+    const QUOTA = 3;
+    const objects = before.filter(
+      (key) => key.includes("/s-") || key.includes("/q-"),
+    ).length;
+    expect(objects).toBeGreaterThan(QUOTA * 2);
+    const base = deps();
+    let used = 0;
+    const limited = deps({
+      objects: {
+        // vana-storage rate-limits DELETE per owner: every name sent costs one,
+        // one storage already lacks included.
+        deleteBlobVersions: async (scope, names) => {
+          const allowed = names.slice(0, Math.max(0, QUOTA - used));
+          used += allowed.length;
+          const out = await base.objects.deleteBlobVersions(scope, allowed);
+          return {
+            ...out,
+            failed: [
+              ...out.failed,
+              ...names
+                .slice(allowed.length)
+                .map((version) => ({ version, error: "429 rate limited" })),
+            ],
+          };
+        },
+      },
+    });
+    let report: Awaited<ReturnType<typeof eraseDeletedConnectionLogs>>;
+    let passes = 0;
+    do {
+      used = 0; // each pass is a fresh quota window: the retry loop's wait
+      report = await eraseDeletedConnectionLogs(limited, {
+        connector: CONNECTOR,
+      });
+      passes += 1;
+    } while (report.pending && passes < objects);
+
+    expect(report.connections.map((c) => c.outcome.kind)).toEqual(["erased"]);
+    expect(
+      keys(LOG).filter((key) => key.includes("/s-") || key.includes("/q-")),
+    ).toEqual([]);
+  });
+
   it("leaves the log alone before the control tombstone is final", async () => {
     const { keys, before, deps, calls } = await deletedCompactedLog();
     const report = await eraseDeletedConnectionLogs(
@@ -415,6 +460,40 @@ describe("erasure wired into the connection delete", () => {
     await vi.waitFor(() => expect(erasable(w, LOG)).toEqual([]));
   });
 
+  it("a delete adopted while the purge's connector lookup fails once is erased all the same, without a restart", async () => {
+    const state = { finalized: "99" };
+    const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+    const { erasure } = ports(w, state);
+    const phone = await w.device("phone");
+    const desktop = await w.device("desktop", {
+      erasure: () => erasure,
+      deleteRetryMs: RETRY,
+    });
+    await phone.run("run-1", [big], { observedAt: 1100 });
+    await phone.cycle();
+    await desktop.cycle();
+    // The start sweep has run (nothing was deleted yet): it will not run again.
+    await desktop.sync.deleter.resumeDeletes();
+    await phone.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await vi.waitFor(async () => expect(await intents(phone)).toEqual([]));
+    expect(erasable(w, LOG).length).toBeGreaterThan(0);
+
+    const query = desktop.db.query.bind(desktop.db);
+    let lookups = 0;
+    desktop.db.query = ((sql: string, params?: readonly unknown[]) => {
+      if (sql.includes("SELECT connector FROM connections WHERE")) {
+        lookups += 1;
+        if (lookups === 1)
+          return Promise.reject(new Error("database is locked"));
+      }
+      return query(sql, params as never);
+    }) as typeof desktop.db.query;
+    await desktop.cycle();
+
+    expect(lookups).toBeGreaterThan(0);
+    await vi.waitFor(() => expect(erasable(w, LOG)).toEqual([]));
+  });
+
   it("does nothing for a delete this device has not adopted yet", async () => {
     const state = { finalized: "99" };
     const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
@@ -514,7 +593,11 @@ describe("erasure wired into the connection delete", () => {
       await deleter.resumeErasures();
 
       // The connector that was deleted before this process started is swept.
-      expect(eraseLogs).toHaveBeenCalledWith(CONNECTOR, expect.anything());
+      expect(eraseLogs).toHaveBeenCalledWith(
+        CONNECTOR,
+        expect.anything(),
+        expect.anything(),
+      );
     });
 
     it("a purge that cannot look up the connector still commits, with or without a listener", async () => {
@@ -544,21 +627,25 @@ describe("erasure wired into the connection delete", () => {
         ),
       ).toEqual([{ control_state: "deleted" }]);
 
-      // With a listener the lookup is made and its failure is only logged.
-      const heard: string[] = [];
+      // With a listener the lookup is made; its failure is logged and the
+      // listener hears of a purge with no connector, to sweep for it.
+      const heard: (string | null)[] = [];
       const stop = onConnectionPurged(db, (connector) => heard.push(connector));
       await purgeConnection(flaky, row!.connection_id, { controlVersion: 2 });
       stop();
-      expect(heard).toEqual([]);
+      expect(heard).toEqual([null]);
     });
   });
 
   describe("the gate on a delete that has not settled here", () => {
     const owed = async (a: Awaited<ReturnType<World["device"]>>) => {
-      const eraseLogs = vi.fn(async () => ({
-        connections: [],
-        pending: false,
-      }));
+      const eraseLogs = vi.fn(
+        async (
+          _connector: string,
+          _signal: AbortSignal,
+          _gate?: { skipNamespaces: ReadonlySet<string> },
+        ) => ({ connections: [], pending: false }),
+      );
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
       // The sweep that runs first once per process, then the owed connector.
       await deleter.resumeErasures();
@@ -568,9 +655,13 @@ describe("erasure wired into the connection delete", () => {
       return eraseLogs;
     };
 
-    it("does not erase while a local connection of the connector is live", async () => {
+    it("does not erase a namespace while a local connection of it is live", async () => {
       const { a } = await collected({ finalized: "99" });
-      expect(await owed(a)).not.toHaveBeenCalled();
+      const eraseLogs = await owed(a);
+      // Every pass holds the live namespace back (the default one here).
+      expect(eraseLogs).toHaveBeenCalled();
+      for (const [, , gate] of eraseLogs.mock.calls)
+        expect(gate?.skipNamespaces).toEqual(new Set([""]));
     });
 
     it("does not erase while a delete of the connector is in flight", async () => {
@@ -584,6 +675,29 @@ describe("erasure wired into the connection delete", () => {
         },
       ]);
       expect(await owed(a)).not.toHaveBeenCalled();
+    });
+
+    it("erases a deleted namespace though a local connection of another namespace is not deleted", async () => {
+      const { w, a } = await collected({ finalized: "99" });
+      const otherBefore = logKeys(w, OTHER_LOG);
+      // A local connection in a namespace the delete's lifetime does not name
+      // (no control row): the delete leaves it, by design.
+      await a.db.batch([
+        {
+          sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state) VALUES ('stray', ?, ?, 1, 'absent')",
+          params: [CONNECTOR, "b".repeat(16)],
+        },
+      ]);
+      const lifetime = await a.sync.deleter.readConnectionLifetime(CONNECTOR);
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR, { lifetime });
+
+      await vi.waitFor(() => expect(erasable(w, LOG)).toEqual([]));
+      expect(logKeys(w, OTHER_LOG)).toEqual(otherBefore);
+      expect(
+        await a.db.query(
+          "SELECT control_state FROM connections WHERE connection_id = 'stray'",
+        ),
+      ).toEqual([{ control_state: "absent" }]);
     });
 
     it("erases once the delete is settled: every local connection purged and no intent", async () => {
