@@ -204,6 +204,7 @@ async function fixture() {
       );
   const resolver = createLocalResolver(deps, {
     query,
+    aliasQuery: query,
     aliasScopes: () => ["fixture.alias", "fixture.unsupported"].values(),
     aliasTargets,
   });
@@ -397,6 +398,7 @@ describe("local resolve", () => {
     };
     const resolver = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       ...aliases,
     });
     const listing = createLocalListing({ ...f.deps, ...aliases });
@@ -545,6 +547,7 @@ describe("local resolve", () => {
     };
     const resolver = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       ...aliases,
     });
     const listing = createLocalListing({ ...f.deps, ...aliases });
@@ -749,6 +752,7 @@ describe("local resolve", () => {
       const deps = { ...f.deps, progressiveFirstLoad: true };
       const resolver = createLocalResolver(deps, {
         query: f.query,
+        aliasQuery: f.query,
         ...aliases,
       });
       const listing = createLocalListing({ ...deps, ...aliases });
@@ -877,7 +881,11 @@ describe("local resolve", () => {
       ],
     };
     const deps = { ...f.deps, progressiveFirstLoad: true };
-    const resolver = createLocalResolver(deps, { query: f.query, ...aliases });
+    const resolver = createLocalResolver(deps, {
+      query: f.query,
+      aliasQuery: f.query,
+      ...aliases,
+    });
     const listing = createLocalListing({ ...deps, ...aliases });
     const history = createLocalHistory(deps, aliases);
     for (const scope of ["pdpp.fixture-source.x", "fixture.copy"]) {
@@ -926,6 +934,7 @@ describe("local resolve", () => {
     });
     const resolver = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       aliasScopes: () => ["fixture.multi"],
       aliasTargets: () =>
         [CONNECTOR, "other-source"].map((connector) => ({
@@ -1076,6 +1085,7 @@ describe("local resolve", () => {
     await f.record();
     const isolated = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       aliasTargets: () => {
         throw new Error("Unlisted alias target consulted");
       },
@@ -1504,14 +1514,16 @@ describe("local resolve through the host's real legacy alias port", () => {
         },
       ]);
     }
-    const resolver = createLocalResolver(f.deps, {
-      query: {
-        ...f.query,
-        streamRecords: (connectionId, stream) => {
-          readStreams.push(stream);
-          return f.query.streamRecords(connectionId, stream);
-        },
+    const query: AliasRecordQuery = {
+      ...f.query,
+      streamRecords: (connectionId, stream, guard) => {
+        readStreams.push(stream);
+        return f.query.streamRecords(connectionId, stream, guard);
       },
+    };
+    const resolver = createLocalResolver(f.deps, {
+      query,
+      aliasQuery: query,
       olderVersions: f.olderVersions,
       aliasScopes: () => ["icloud_notes.notes"].values(),
       aliasTargets: legacyAliasScopes,

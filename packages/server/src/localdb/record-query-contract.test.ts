@@ -8,8 +8,8 @@ import { describe, expect, it } from "vitest";
  * it, and must not have to implement what only the local alias resolver asks
  * of the database. The build does not compile test files, so this compiles a
  * probe module in the test: the four methods a `RecordQuery` had before alias
- * paging must still satisfy it, and the resolver's `AliasRecordQuery` must
- * ask for the rest.
+ * paging must still satisfy it, the resolver must still be callable with one,
+ * and the resolver's `AliasRecordQuery` must ask for the rest.
  */
 const here = dirname(fileURLToPath(import.meta.url));
 const probe = join(here, "record-query-contract.probe.ts");
@@ -38,6 +38,8 @@ function diagnosticsOf(source: string): string[] {
 }
 
 const QUERY = "../../../core/src/localdb/query.js";
+const DEPS = "../../../core/src/localdb/deps.js";
+const RESOLVE = "../../../core/src/localdb/resolve.js";
 const FOUR = `
   listRecords: null as never,
   getRecord: null as never,
@@ -52,6 +54,35 @@ describe("the exported RecordQuery contract", () => {
          export const downstream: RecordQuery = {${FOUR}};`,
       ),
     ).toEqual([]);
+  }, 60_000);
+
+  it("is met by a resolver call that passes a RecordQuery and no alias query", () => {
+    // How the resolver was called before alias paging: it must still compile,
+    // and an alias read is given its own query beside it.
+    expect(
+      diagnosticsOf(
+        `import type { RecordQuery, AliasRecordQuery } from "${QUERY}";
+         import type { LocalSyncDeps } from "${DEPS}";
+         import { createLocalResolver } from "${RESOLVE}";
+         declare const deps: LocalSyncDeps;
+         declare const query: RecordQuery;
+         declare const aliasQuery: AliasRecordQuery;
+         export const existing = createLocalResolver(deps, { query });
+         export const paged = createLocalResolver(deps, { query, aliasQuery });`,
+      ),
+    ).toEqual([]);
+  }, 60_000);
+
+  it("refuses a plain RecordQuery where the alias query goes", () => {
+    const messages = diagnosticsOf(
+      `import type { RecordQuery } from "${QUERY}";
+       import type { LocalSyncDeps } from "${DEPS}";
+       import { createLocalResolver } from "${RESOLVE}";
+       declare const deps: LocalSyncDeps;
+       declare const query: RecordQuery;
+       export const wrong = createLocalResolver(deps, { query, aliasQuery: query });`,
+    );
+    expect(messages.join("\n")).toMatch(/streamStats/);
   }, 60_000);
 
   it("leaves the alias read's extra methods to AliasRecordQuery", () => {

@@ -20,7 +20,7 @@ import { pinAliasStreams } from "./alias-view.js";
 import { projectAlias } from "./alias-projection.js";
 import { completeBody, pinStream } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
-import type { AliasRecordQuery } from "./query.js";
+import type { AliasRecordQuery, RecordQuery } from "./query.js";
 import {
   chooseCandidate,
   invalidAliasBinding,
@@ -189,7 +189,15 @@ function validCursor(text: string): boolean {
   }
 }
 
-function bodyStream(chunks: AsyncIterable<string>): ReadableStream<Uint8Array> {
+/**
+ * `onCancel` runs first when the reader cancels: a generator ends only after
+ * the `next()` it is running, so a body that waits for memory is told to stop
+ * waiting before it is asked to return.
+ */
+function bodyStream(
+  chunks: AsyncIterable<string>,
+  onCancel?: () => void,
+): ReadableStream<Uint8Array> {
   const iterator = chunks[Symbol.asyncIterator]();
   return new ReadableStream({
     async pull(controller) {
@@ -202,6 +210,7 @@ function bodyStream(chunks: AsyncIterable<string>): ReadableStream<Uint8Array> {
       }
     },
     async cancel() {
+      onCancel?.();
       await iterator.return?.(undefined);
     },
   });
@@ -220,7 +229,13 @@ async function* envelope(
 export function createLocalResolver(
   deps: LocalSyncDeps,
   parts: {
-    readonly query: AliasRecordQuery;
+    readonly query: RecordQuery;
+    /**
+     * What a legacy alias is read through, with its sizes and by key hash.
+     * Without it no alias is served: `aliasScopes` and `aliasTargets` are
+     * ignored and an alias scope names nothing.
+     */
+    readonly aliasQuery?: AliasRecordQuery;
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
   },
@@ -441,6 +456,9 @@ export function createLocalResolver(
       return { kind: "read_not_registered" };
 
     let payload: AsyncIterable<string>;
+    // Ends the waits of this read's alias body: the request's own signal, or
+    // the reader cancelling the body (see `bodyStream`).
+    const stop = new AbortController();
     const binding = candidate.target.alias;
     if (!binding) {
       const only = installed[0]!;
@@ -457,13 +475,24 @@ export function createLocalResolver(
         pin,
       );
     } else {
-      const projected = await projectAlias(
-        binding,
-        current,
-        parts.query,
-        new Date(deps.now()).toISOString(),
-        { db: deps.db, memory: deps.blobs, epochs },
-      );
+      if (!parts.aliasQuery) return noData();
+      const signal = input.signal
+        ? AbortSignal.any([input.signal, stop.signal])
+        : stop.signal;
+      let projected: Awaited<ReturnType<typeof projectAlias>>;
+      try {
+        projected = await projectAlias(
+          binding,
+          current,
+          parts.aliasQuery,
+          new Date(deps.now()).toISOString(),
+          { db: deps.db, memory: deps.blobs, epochs, signal },
+        );
+      } catch (error) {
+        // The request ended while the check waited for memory.
+        if (input.signal?.aborted) return { kind: "read_aborted" };
+        throw error;
+      }
       if (projected.kind === "invalid_binding") return projected;
       if (projected.kind === "incomplete") {
         return { kind: "incomplete", diagnostics: projected.diagnostics };
@@ -495,6 +524,7 @@ export function createLocalResolver(
           Math.max(...installed.map((s) => s.observed_at ?? 0)),
           payload,
         ),
+        () => stop.abort(),
       ),
     };
   }
@@ -512,8 +542,8 @@ export function createLocalResolver(
       const scope = streamReadScope(input.scope) ?? input.scope;
       const targets = targetsForScope(
         scope,
-        new Set(parts.aliasScopes?.() ?? []),
-        parts.aliasTargets,
+        new Set(parts.aliasQuery ? (parts.aliasScopes?.() ?? []) : []),
+        parts.aliasQuery ? parts.aliasTargets : undefined,
       );
       if (
         targets.some(

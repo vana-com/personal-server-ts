@@ -72,8 +72,14 @@ export interface WindowedInput {
   readonly fetched: readonly string[];
   readonly now: string;
   readonly memory: AliasMemory;
-  /** Whether the rows read are still those the read was decided on. */
+  /**
+   * Whether the rows read are still those the read was decided on. Every read
+   * of bodies carries its `guard`, so a body is read from the state it was
+   * sized in or not at all.
+   */
   readonly current: AliasViewCheck;
+  /** Ends a wait for memory: the read leaves the governor's line. */
+  readonly signal?: AbortSignal;
 }
 
 export interface WindowedRead {
@@ -140,6 +146,7 @@ export async function openWindowed(
     input.memory,
     held,
     0,
+    input.signal,
   );
   const release = () => {
     reservation?.();
@@ -157,6 +164,8 @@ export async function openWindowed(
         held,
       );
       if (attempt.kind === "unwindowable") {
+        // Rows a moved view hid can only make the input look unwindowable.
+        await assertViewCurrent(input.current);
         release();
         return null;
       }
@@ -185,7 +194,7 @@ export async function openWindowed(
       await assertViewCurrent(input.current);
       release();
       held = attempt.need;
-      reservation = await holdMemory(input.memory, held, 0);
+      reservation = await holdMemory(input.memory, held, 0, input.signal);
     }
   } catch (error) {
     release();
@@ -247,6 +256,7 @@ async function indexInput(
   for await (const row of query.streamRecords(
     connectionId,
     window.parentStream,
+    input.current.guard,
   )) {
     const data: unknown = JSON.parse(row.body);
     if (!isObject(data)) return null;
@@ -260,7 +270,11 @@ async function indexInput(
   }
   const otherRecords: LocalAliasRecord[] = [];
   for (const stream of others) {
-    for await (const row of query.streamRecords(connectionId, stream)) {
+    for await (const row of query.streamRecords(
+      connectionId,
+      stream,
+      input.current.guard,
+    )) {
       otherRecords.push({
         stream,
         data: JSON.parse(row.body) as Record<string, unknown>,
@@ -285,9 +299,12 @@ async function indexChildren(
   let batch = new Map<string, number>();
   let batchBytes = 0;
   const flush = async (): Promise<boolean> => {
-    const rows = await query.recordsByHash(connectionId, window.childStream, [
-      ...batch.keys(),
-    ]);
+    const rows = await query.recordsByHash(
+      connectionId,
+      window.childStream,
+      [...batch.keys()],
+      input.current.guard,
+    );
     // A row gone since its size was read: the view moved.
     if (rows.length !== batch.size) throw await moved(input);
     for (const row of rows) {
@@ -358,7 +375,12 @@ async function* runWindows(
     const hashes = inWindow.flatMap((p) => children.get(p.key)!.hashes);
     const rows =
       hasChildren && hashes.length > 0
-        ? await query.recordsByHash(connectionId, window.childStream, hashes)
+        ? await query.recordsByHash(
+            connectionId,
+            window.childStream,
+            hashes,
+            input.current.guard,
+          )
         : [];
     // A row gone since the index was read: the view moved.
     if (rows.length !== hashes.length) throw await moved(input);

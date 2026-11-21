@@ -32,6 +32,12 @@ export interface AliasEnv {
    * (`pinAliasStreams`). Absent: pinned here, after them.
    */
   readonly epochs?: ReadonlyMap<string, number>;
+  /**
+   * Ends the read: a wait for memory stops, and its place in the governor's
+   * line is given up. A read that holds memory gives it back when its body
+   * is cancelled.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export type AliasProjection =
@@ -144,13 +150,17 @@ async function whole(
     for (const stream of fetched) {
       bytes += (await query.streamStats(connectionId, stream)).bytes;
     }
-    return holdMemory(env.memory, bytes * HEAP_PER_STORED_BYTE, 0);
+    return holdMemory(env.memory, bytes * HEAP_PER_STORED_BYTE, 0, env.signal);
   };
   /** Project every row. Call it with the memory held. */
   const project = async () => {
     const records: LocalAliasRecord[] = [];
     for (const stream of fetched) {
-      for await (const record of query.streamRecords(connectionId, stream)) {
+      for await (const record of query.streamRecords(
+        connectionId,
+        stream,
+        current.guard,
+      )) {
         records.push({
           stream,
           data: JSON.parse(record.body) as Record<string, unknown>,
@@ -175,8 +185,10 @@ async function whole(
       const text = JSON.stringify(projected.payload);
       // A piece at a time, with the memory held until the last is taken: a
       // consumer that pauses, or stops, leaves the payload in memory under it.
-      for (let at = 0; at < text.length; at += OUTPUT_PIECE_CHARS) {
-        yield text.slice(at, at + OUTPUT_PIECE_CHARS);
+      for (let at = 0; at < text.length;) {
+        const end = pieceEnd(text, at);
+        yield text.slice(at, end);
+        at = end;
       }
     } finally {
       release();
@@ -197,6 +209,19 @@ async function whole(
   } finally {
     release();
   }
+}
+
+/**
+ * Where the piece of `text` that starts at `at` ends: `OUTPUT_PIECE_CHARS`
+ * later, but never between the two halves of a surrogate pair. Each piece is
+ * encoded to UTF-8 on its own, and half a pair encodes as U+FFFD. (`text` is
+ * `JSON.stringify` output, so every surrogate in it is part of a pair.)
+ */
+function pieceEnd(text: string, at: number): number {
+  const end = Math.min(at + OUTPUT_PIECE_CHARS, text.length);
+  if (end === text.length) return end;
+  const last = text.charCodeAt(end - 1);
+  return last >= 0xd800 && last <= 0xdbff ? end - 1 : end;
 }
 
 /** A diagnostic of one kind on one stream, summed over windows. */
@@ -227,6 +252,7 @@ async function paged(
       now,
       memory: env.memory,
       current,
+      signal: env.signal,
     });
   const session = await open();
   // A child names no parent, or a row has no key to join on: not windowable.

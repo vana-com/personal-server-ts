@@ -12,7 +12,7 @@ import {
 } from "../storage/pdpp-records/types.js";
 import type { ConnectionLink } from "./connection-link.js";
 
-import type { SqlReader } from "./driver.js";
+import type { SqlReader, SqlValue } from "./driver.js";
 import { SEEN_O, seenStamp } from "./merge.js";
 
 /**
@@ -91,6 +91,17 @@ export interface RecordQuery {
  */
 export interface AliasRecordQuery extends RecordQuery {
   /**
+   * The records of a stream, in `pk_hash` order, a page of bodies at a time.
+   * With a `guard`, each page's statement returns rows only while the guard
+   * holds, so a caller that sized the stream sees no row of a later state:
+   * the page is empty once the guard fails.
+   */
+  streamRecords(
+    connectionId: string,
+    stream: string,
+    guard?: StatementGuard,
+  ): AsyncIterable<StoredRecord>;
+  /**
    * How many records a stream holds, how many bytes their bodies take and the
    * largest body, from one statement over the stored sizes: no body is read.
    */
@@ -118,7 +129,19 @@ export interface AliasRecordQuery extends RecordQuery {
     connectionId: string,
     stream: string,
     pkHashes: readonly string[],
+    guard?: StatementGuard,
   ): Promise<StoredRecord[]>;
+}
+
+/**
+ * A condition on the database's state, as SQL with its `?` parameters, that a
+ * read of bodies carries in its own statement (`AND (sql)`). The statement
+ * reads one snapshot: if the condition holds, the rows are the rows it was
+ * decided on, and if it does not the statement returns none.
+ */
+export interface StatementGuard {
+  readonly sql: string;
+  readonly params: readonly SqlValue[];
 }
 
 type RecordRow = {
@@ -319,17 +342,22 @@ export function createRecordQuery(db: SqlReader): AliasRecordQuery {
       };
     },
 
-    async *streamRecords(connectionId, stream) {
+    async *streamRecords(connectionId, stream, guard) {
       let cursor: string | undefined;
       for (;;) {
         const page = await db.query<RecordRow>(
           `SELECT ${RECORD_COLUMNS} FROM records
            WHERE connection_id = ? AND stream = ?
              ${cursor === undefined ? "" : "AND pk_hash > ?"}
+             ${guard ? `AND ${guard.sql}` : ""}
            ORDER BY pk_hash LIMIT ?`,
-          cursor === undefined
-            ? [connectionId, stream, STREAM_PAGE_SIZE]
-            : [connectionId, stream, cursor, STREAM_PAGE_SIZE],
+          [
+            connectionId,
+            stream,
+            ...(cursor === undefined ? [] : [cursor]),
+            ...(guard?.params ?? []),
+            STREAM_PAGE_SIZE,
+          ],
         );
         for (const row of page) yield stored(row);
         if (page.length < STREAM_PAGE_SIZE) return;
@@ -375,15 +403,16 @@ export function createRecordQuery(db: SqlReader): AliasRecordQuery {
       }
     },
 
-    async recordsByHash(connectionId, stream, pkHashes) {
+    async recordsByHash(connectionId, stream, pkHashes, guard) {
       const out: StoredRecord[] = [];
       for (let i = 0; i < pkHashes.length; i += HASHES_PER_STATEMENT) {
         const group = pkHashes.slice(i, i + HASHES_PER_STATEMENT);
         const rows = await db.query<RecordRow>(
           `SELECT ${RECORD_COLUMNS} FROM records
            WHERE connection_id = ? AND stream = ?
-             AND pk_hash IN (${group.map(() => "?").join(",")})`,
-          [connectionId, stream, ...group],
+             AND pk_hash IN (${group.map(() => "?").join(",")})
+             ${guard ? `AND ${guard.sql}` : ""}`,
+          [connectionId, stream, ...group, ...(guard?.params ?? [])],
         );
         for (const row of rows) out.push(stored(row));
       }

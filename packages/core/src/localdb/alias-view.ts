@@ -1,4 +1,5 @@
 import type { SqlDriver, SqlReader } from "./driver.js";
+import type { StatementGuard } from "./query.js";
 import { pinStream } from "./complete-read.js";
 import { PartialViewMoved } from "./partial-read.js";
 import type { Connection, Stream } from "./read-selection.js";
@@ -23,8 +24,16 @@ export async function pinAliasStreams(
   return epochs;
 }
 
-/** True while every installed head, its epoch and the connection are as pinned. */
-export type AliasViewCheck = () => Promise<boolean>;
+/**
+ * True while every installed head, its epoch and the connection are as pinned.
+ * `guard` is the same test as a condition of one statement: a read of bodies
+ * that carries it returns none once the view has moved, so a body is never
+ * read from rows that changed after they were sized.
+ */
+export interface AliasViewCheck {
+  (): Promise<boolean>;
+  readonly guard: StatementGuard;
+}
 
 export function aliasViewCheck(
   db: SqlReader,
@@ -38,11 +47,12 @@ export function aliasViewCheck(
          AND COALESCE((SELECT m.epoch FROM stream_change_marks m
                         WHERE m.connection_id = ? AND m.stream = ?), 0) = ?`,
   );
-  const sql = `SELECT (
+  const condition = `(
        EXISTS (SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.generation = ?
                  AND c.control_state = 'active' AND c.deleted_at IS NULL
                  AND NOT EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector))
-       ${heads.map((h) => `AND ${h}`).join("\n       ")}) AS ok`;
+       ${heads.map((h) => `AND ${h}`).join("\n       ")})`;
+  const sql = `SELECT ${condition} AS ok`;
   const params = [
     connection.connection_id,
     connection.generation,
@@ -56,10 +66,13 @@ export function aliasViewCheck(
       epochs.get(s.stream) ?? 0,
     ]),
   ];
-  return async () => {
-    const [row] = await db.query<{ ok: number }>(sql, params);
-    return row?.ok === 1;
-  };
+  return Object.assign(
+    async () => {
+      const [row] = await db.query<{ ok: number }>(sql, params);
+      return row?.ok === 1;
+    },
+    { guard: { sql: condition, params } },
+  );
 }
 
 /** Ends a body whose view moved: the reader sees an aborted read and asks again. */

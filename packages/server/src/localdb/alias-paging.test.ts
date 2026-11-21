@@ -64,8 +64,8 @@ function ledgerOf(real: ReturnType<typeof governorOf>) {
   let held = 0;
   const governor: ReturnType<typeof governorOf> = {
     ...real,
-    async reserve(bytes, objectBytes) {
-      const inner = await real.reserve(bytes, objectBytes);
+    async reserve(bytes, objectBytes, signal) {
+      const inner = await real.reserve(bytes, objectBytes, signal);
       let mine = Math.max(0, bytes);
       let released = false;
       held += mine;
@@ -169,6 +169,7 @@ async function fixture(limit: number) {
   ) =>
     createLocalResolver(deps, {
       query,
+      aliasQuery: query,
       aliasScopes: () => [scope],
       aliasTargets: () => [target],
     });
@@ -180,6 +181,8 @@ async function fixture(limit: number) {
    */
   function audited() {
     const unheld: string[] = [];
+    /** Run once, right after the first statement that sizes records. */
+    let afterSizes: (() => Promise<void>) | undefined;
     let readsOfBodies = 0;
     let largest = 0;
     const reader = {
@@ -188,6 +191,11 @@ async function fixture(limit: number) {
         params?: readonly SqlValue[],
       ): Promise<R[]> {
         const rows = await db.query<R>(sql, params);
+        if (afterSizes && /AS bytes FROM records/.test(sql)) {
+          const hook = afterSizes;
+          afterSizes = undefined;
+          await hook();
+        }
         let bytes = 0;
         for (const row of rows) {
           const body = (row as Record<string, SqlValue>).body;
@@ -207,6 +215,9 @@ async function fixture(limit: number) {
     };
     return {
       query: createRecordQuery(reader),
+      onceSized(hook: () => Promise<void>) {
+        afterSizes = hook;
+      },
       unheld,
       reads: () => ({ readsOfBodies, largest }),
     };
@@ -217,6 +228,7 @@ async function fixture(limit: number) {
 const read = (
   resolver: ReturnType<typeof createLocalResolver>,
   scope: string,
+  signal?: AbortSignal,
 ): Promise<ReadDecision> =>
   resolver.resolve({
     scope,
@@ -224,6 +236,7 @@ const read = (
     cursor: null,
     legacyFile: false,
     isOwnerView: true,
+    ...(signal ? { signal } : {}),
   });
 
 /** The envelope a read writes around `payload`. */
@@ -779,6 +792,239 @@ describe("a read that is not windowed holds its payload from the governor", () =
     expect(await new Response(decision.body).text()).toBe(expected);
     expect(f.inUse()).toBe(0);
   });
+});
+
+/**
+ * A read sizes the rows it is about to read, takes that much memory (waiting
+ * for it, if the budget is busy), and then reads the bodies. A write that
+ * lands between the two must not give the read a body larger than the memory
+ * it holds: the read's statements carry the pinned view as a condition, so
+ * they return rows of the state that was sized, or none.
+ */
+describe("a row that grows after it was sized is not read past what is held", () => {
+  const scope = "chatgpt.conversations";
+  const chatgpt = () =>
+    legacyAliasScopes(scope).find(
+      (t) => t.connector === "chatgpt",
+    ) as LocalAliasTarget;
+  const conversations = () =>
+    [0, 1, 2].flatMap((c) => chatgptConversation(c, 3, 10_000));
+  const plain: LocalAliasTarget = {
+    connector: "plain",
+    streams: ["items"],
+    project: (records) => ({
+      ok: true as const,
+      payload: { items: records.map((r) => r.data) },
+    }),
+  };
+  const items = Array.from({ length: 10 }, (_, i) => ({
+    stream: "items",
+    data: { id: `i${i}`, pad: "y".repeat(1000) },
+  }));
+  /** A write to the first row of a stream that makes its body `bytes` larger. */
+  const grow = (
+    f: Awaited<ReturnType<typeof fixture>>,
+    stream: string,
+    bytes: number,
+  ) =>
+    f.db.batch([
+      {
+        // A write of a body writes its hash, which is what logs the change.
+        sql: `UPDATE records SET body = substr(body, 1, length(body) - 1) || ',"pad":"' || ? || '"}',
+                body_sha256 = 'grown'
+              WHERE connection_id = 'c1' AND stream = ?
+                AND pk_hash = (SELECT MIN(pk_hash) FROM records WHERE connection_id = 'c1' AND stream = ?)`,
+        params: ["z".repeat(bytes), stream, stream],
+      },
+    ]);
+  const waiting = (pending: Promise<unknown>) =>
+    Promise.race([
+      pending.then(() => "served"),
+      sleep(200).then(() => "waiting"),
+    ]);
+
+  it("windowed: a parent grown while the read waits for its memory", async () => {
+    const target = chatgpt();
+    const f = await fixture(2 * 1024 * 1024);
+    await f.seed(target, conversations());
+    const audit = f.audited();
+    const blocker = await f.governor.reserve(f.governor.limitBytes);
+    const pending = read(f.resolverFor(target, scope, audit.query), scope);
+    expect(await waiting(pending)).toBe("waiting");
+    await grow(f, "conversations", 1024 * 1024);
+    blocker();
+    // The rows it sized are gone: it asks the caller to try again.
+    expect(await pending).toMatchObject({ kind: "busy" });
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("windowed: a child grown between its size and its body", async () => {
+    const target = chatgpt();
+    const f = await fixture(2 * 1024 * 1024);
+    await f.seed(target, conversations());
+    const audit = f.audited();
+    audit.onceSized(async () => {
+      await grow(f, "messages", 1024 * 1024);
+    });
+    const decision = await read(
+      f.resolverFor(target, scope, audit.query),
+      scope,
+    );
+    expect(decision).toMatchObject({ kind: "busy" });
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("not windowed: a row grown while the read waits for its memory", async () => {
+    const f = await fixture(1024 * 1024);
+    await f.seed(plain, items);
+    const audit = f.audited();
+    const blocker = await f.governor.reserve(f.governor.limitBytes);
+    const pending = read(
+      f.resolverFor(plain, "plain.items", audit.query),
+      "plain.items",
+    );
+    expect(await waiting(pending)).toBe("waiting");
+    await grow(f, "items", 2 * 1024 * 1024);
+    blocker();
+    expect(await pending).toMatchObject({ kind: "busy" });
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("still serves a view that no write touched", async () => {
+    const target = chatgpt();
+    const f = await fixture(2 * 1024 * 1024);
+    await f.seed(target, conversations());
+    const audit = f.audited();
+    const decision = await read(
+      f.resolverFor(target, scope, audit.query),
+      scope,
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    await new Response(decision.body).text();
+    expect(audit.unheld).toEqual([]);
+  }, 60_000);
+});
+
+describe("a payload that is cut into pieces keeps every character whole", () => {
+  it("does not split a surrogate pair at a piece boundary", async () => {
+    // The payload's JSON is `{"pad":"` (8 characters), the padding, then an
+    // emoji: with 65 527 characters of padding its high surrogate is the 65 536th
+    // character, the last of the first piece, and its low surrogate the first
+    // of the second.
+    const payload = { pad: `${"x".repeat(65_527)}\u{1F600}tail` };
+    const text = JSON.stringify(payload);
+    expect(text.charCodeAt(65_535)).toBeGreaterThanOrEqual(0xd800);
+    expect(text.charCodeAt(65_535)).toBeLessThanOrEqual(0xdbff);
+    const target: LocalAliasTarget = {
+      connector: "plain",
+      streams: ["items"],
+      project: () => ({ ok: true as const, payload }),
+    };
+    const f = await fixture(1024 * 1024);
+    await f.seed(target, [{ stream: "items", data: { id: "i0" } }]);
+    const decision = await read(
+      f.resolverFor(target, "plain.items"),
+      "plain.items",
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    const bytes = Buffer.from(await new Response(decision.body).arrayBuffer());
+    const expected = Buffer.from(envelopeOf("plain.items", payload), "utf8");
+    expect(bytes.equals(expected)).toBe(true);
+    expect(bytes.toString("utf8")).not.toContain("\uFFFD");
+  });
+});
+
+/**
+ * A read waits in the governor's line for its memory. A request that ends
+ * stops waiting: it leaves the line and the connection's queue, and is never
+ * granted memory it would not release.
+ */
+describe("a read that is cancelled stops waiting for memory", () => {
+  const scope = "chatgpt.conversations";
+  const chatgpt = () =>
+    legacyAliasScopes(scope).find(
+      (t) => t.connector === "chatgpt",
+    ) as LocalAliasTarget;
+  const plain: LocalAliasTarget = {
+    connector: "plain",
+    streams: ["items"],
+    project: (records) => ({
+      ok: true as const,
+      payload: { items: records.map((r) => r.data) },
+    }),
+  };
+  const cases = [
+    {
+      label: "windowed",
+      scope,
+      target: chatgpt(),
+      rows: () => [0, 1, 2].flatMap((c) => chatgptConversation(c, 2, 1000)),
+    },
+    {
+      label: "not windowed",
+      scope: "plain.items",
+      target: plain,
+      rows: () =>
+        Array.from({ length: 5 }, (_, i) => ({
+          stream: "items",
+          data: { id: `i${i}`, pad: "y".repeat(1000) },
+        })),
+    },
+  ];
+  const settles = <T>(promise: Promise<T>) =>
+    Promise.race([promise, sleep(1000).then(() => "still waiting" as const)]);
+
+  for (const c of cases) {
+    it(`${c.label}: the check gives up its place, and the next read is served`, async () => {
+      const f = await fixture(1024 * 1024);
+      await f.seed(c.target, c.rows());
+      const blocker = await f.governor.reserve(f.governor.limitBytes);
+      const resolver = f.resolverFor(c.target, c.scope);
+      const stop = new AbortController();
+      const first = read(resolver, c.scope, stop.signal);
+      // The same connection: this read waits in the queue behind the first.
+      const second = read(resolver, c.scope);
+      await sleep(100);
+      stop.abort();
+      expect(await settles(first)).toEqual({ kind: "read_aborted" });
+      // The first read's place in the line is gone: only the blocker holds.
+      expect(f.inUse()).toBe(f.governor.limitBytes);
+      blocker();
+      const decision = await second;
+      expect(decision.kind).toBe("view");
+      if (decision.kind !== "view") return;
+      await new Response(decision.body).text();
+      expect(f.inUse()).toBe(0);
+    }, 30_000);
+
+    it(`${c.label}: a body cancelled while it waits returns at once and holds nothing`, async () => {
+      const f = await fixture(1024 * 1024);
+      await f.seed(c.target, c.rows());
+      const decision = await read(f.resolverFor(c.target, c.scope), c.scope);
+      expect(decision.kind).toBe("view");
+      if (decision.kind !== "view") return;
+      const reader = decision.body.getReader();
+      // The envelope's head is ready; the payload's first piece must wait for
+      // memory, because another holder has the whole budget.
+      await reader.read();
+      const blocker = await f.governor.reserve(f.governor.limitBytes);
+      const next = reader.read();
+      await sleep(100);
+      expect(await settles(reader.cancel())).toBeUndefined();
+      expect(await settles(next)).toMatchObject({ done: true });
+      expect(f.inUse()).toBe(f.governor.limitBytes);
+      blocker();
+      // Nothing was granted to the cancelled body: the budget is free.
+      expect(f.inUse()).toBe(0);
+      const all = await f.governor.reserve(f.governor.limitBytes);
+      all();
+    }, 30_000);
+  }
 });
 
 /** The engine's collector, switched on at run time when the process has none. */
