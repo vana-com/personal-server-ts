@@ -1,4 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as v8 from "node:v8";
@@ -43,6 +50,7 @@ import {
 } from "../../../core/src/stream-sync/storage-retry.js";
 import type { StreamSyncFiles } from "../../../core/src/stream-sync/ports.js";
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
+import { openAliasSpool } from "./alias-spool.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 // The resolver applies registry heads before it reads; the rows below are
@@ -647,6 +655,30 @@ describe("an alias body written to the spool", () => {
     const decision = await read(f.resolverFor(target, scope), scope);
     expect(landed).toBe(true);
     expect(decision).toMatchObject({ kind: "busy" });
+    expect(await real.list("")).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  });
+
+  it("ends aborted, with no file left, when the request ends during the last append", async () => {
+    const real = await newSpool();
+    const stop = new AbortController();
+    // The fixture is small: its one append is the last, and the request ends
+    // while it is in flight, after every check inside the windows.
+    const delaying: StreamSyncFiles = {
+      ...real,
+      async appendMany(entries) {
+        await real.appendMany(entries);
+        stop.abort();
+      },
+    };
+    const f = await fixture(TIGHT, delaying);
+    await f.seed(target, records);
+    const decision = await read(
+      f.resolverFor(target, scope),
+      scope,
+      stop.signal,
+    );
+    expect(decision).toEqual({ kind: "read_aborted" });
     expect(await real.list("")).toEqual([]);
     expect(f.inUse()).toBe(0);
   });
@@ -1728,6 +1760,38 @@ describe("the spool is swept when the server starts", () => {
     expect(
       await readFile(join(parent, "alias-spool-neighbour", "keep"), "utf8"),
     ).toBe("nor this");
+  });
+});
+
+describe("a spool whose startup sweep fails", () => {
+  it("is not opened, and an alias read is served on the capped in-memory path", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "alias-spool-sweepfail-"));
+    // A root that is a symbolic link is refused by the sweep: it throws.
+    await mkdir(join(parent, "elsewhere"));
+    await symlink(join(parent, "elsewhere"), join(parent, "alias-spool"));
+    const warnings: unknown[][] = [];
+    const spool = await openAliasSpool(parent, {
+      warn: (...args) => void warnings.push(args),
+    });
+    expect(spool).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    // As the host composes it: no spool, so main's capped in-memory read.
+    const scope = "instagram.posts";
+    const target = legacyAliasScopes(scope)[0] as LocalAliasTarget;
+    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const records = WINDOW_FIXTURES[scope]!(binding);
+    const whole = target.project(records, NOW, binding.pdppStreams);
+    if (!whole.ok) throw new Error("whole projection failed");
+    const f = await fixture(24 * 1024 * 1024, spool ?? false);
+    await f.seed(target, records);
+    const decision = await read(f.resolverFor(target, scope), scope);
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(
+      envelopeOf(scope, whole.payload),
+    );
+    expect(f.inUse()).toBe(0);
+    await rm(parent, { recursive: true, force: true });
   });
 });
 

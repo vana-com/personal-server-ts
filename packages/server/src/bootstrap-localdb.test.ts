@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   link,
+  mkdir,
   readdir,
+  symlink,
   access,
   mkdtemp,
   rm,
@@ -388,6 +390,32 @@ describe("Node database composition", () => {
         })
       ).status,
     ).toBe(410);
+  });
+
+  it("starts local sync without an alias spool when the spool's startup sweep fails", async () => {
+    const root = await directory();
+    // A spool root that is a symbolic link makes the sweep throw.
+    await mkdir(join(root, "elsewhere"));
+    await symlink(join(root, "elsewhere"), join(root, "alias-spool"));
+    const remote = await remoteFixture(
+      createStreamSyncKeyPorts(await signature()),
+    );
+    await remote.head("items", [{ id: "item", value: "database" }]);
+    const context = await boot(root, createMemoryModeRecordStore(), remote);
+    await context.accountModeAuthority.submitEvidence({
+      owner: context.serverOwner!,
+      state: "on",
+    });
+    const sync = await context.getLocalSync!();
+    await sync.apply();
+    const response = await context.app.request(
+      "/v1/data/pdpp.fixture-source.items",
+      { headers },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      data: { records: [{ id: "item", value: "database" }] },
+    });
   });
 
   it("tells the caller a database file with a second hard link cannot be opened", async () => {

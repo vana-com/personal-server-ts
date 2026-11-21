@@ -994,10 +994,11 @@ async function bootstrapServer(
             : {}),
         };
         // The bodies of windowed aliases are written here for the length of a
-        // response.
-        const aliasSpool = await openAliasSpool(storageRoot);
+        // response. Without it (its startup sweep failed) aliases are read in
+        // memory, capped, as before.
+        const aliasSpool = await openAliasSpool(storageRoot, logger);
         const facade = createServerLocalSync(deps, {
-          aliasSpool,
+          ...(aliasSpool ? { aliasSpool } : {}),
           resolveArtifact: (digest) =>
             manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
           eraseLegacy: (connector) =>

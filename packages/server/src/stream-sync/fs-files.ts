@@ -72,14 +72,15 @@ export function createFsStreamSyncFiles(
   const dirMode = options.private ? PRIVATE_DIR_MODE : undefined;
   const fileMode = options.private ? PRIVATE_FILE_MODE : undefined;
   // A private root is the directory itself, never a link to one: checked on
-  // every operation, since a link can be put in its place at any time.
-  const guardRoot = async (): Promise<void> => {
-    if (!options.private) return;
+  // every operation, since a link can be put in its place at any time. Returns
+  // the directory's identity, or undefined if it does not exist.
+  const guardRoot = async (): Promise<string | undefined> => {
+    if (!options.private) return undefined;
     let found;
     try {
       found = await lstat(base);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
     if (!found.isDirectory()) {
@@ -87,20 +88,35 @@ export function createFsStreamSyncFiles(
         `private stream-sync root ${base} is not a directory (a symbolic link is refused)`,
       );
     }
+    return `${found.dev}:${found.ino}`;
   };
-  // Made 0700 once, before the first file is created in it.
-  let privateRoot: Promise<void> | undefined;
+  // Made 0700 before the first file is created in it, and again whenever the
+  // directory is missing or is not the one that was set up: one recreated by
+  // `mkdir` alone has the umask's modes.
+  // The setup, and the identity of the directory it made once it has settled.
+  let privateRoot:
+    { readonly setup: Promise<string>; identity?: string } | undefined;
+  const setupRoot = async (): Promise<string> => {
+    await mkdir(base, { recursive: true, mode: PRIVATE_DIR_MODE });
+    await chmod(base, PRIVATE_DIR_MODE);
+    const found = await lstat(base);
+    return `${found.dev}:${found.ino}`;
+  };
   const ensureRoot = async (): Promise<void> => {
     if (!options.private) return;
-    await guardRoot();
-    privateRoot ??= (async () => {
-      await mkdir(base, { recursive: true, mode: PRIVATE_DIR_MODE });
-      await chmod(base, PRIVATE_DIR_MODE);
-    })();
-    try {
-      await privateRoot;
-    } catch (error) {
+    const identity = await guardRoot();
+    // A setup still in flight has no identity yet: it is awaited, not redone.
+    if (
+      privateRoot?.identity !== undefined &&
+      privateRoot.identity !== identity
+    ) {
       privateRoot = undefined;
+    }
+    const current = (privateRoot ??= { setup: setupRoot() });
+    try {
+      current.identity = await current.setup;
+    } catch (error) {
+      if (privateRoot === current) privateRoot = undefined;
       throw error;
     }
   };
@@ -162,6 +178,10 @@ export function createFsStreamSyncFiles(
       handle = await openFile(full, "a");
     } catch (error) {
       if (!missing(error)) throw error;
+      // A missing directory may be the root itself, removed after the check
+      // above: `mkdir` alone would recreate it with the umask's modes.
+      privateRoot = undefined;
+      await ensureRoot();
       await mkdir(dirname(full), { recursive: true, mode: dirMode });
       handle = await openFile(full, "a");
     }

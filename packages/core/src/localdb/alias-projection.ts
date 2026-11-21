@@ -529,6 +529,10 @@ async function paged(
       // A write can commit while the last append is in flight: the file is
       // kept only if the view it was projected from is still the view.
       await assertViewCurrent(current);
+      // The request can end during that append too. Checked here, while the
+      // `finally` below still owns the file, so an aborted read removes it
+      // and never goes on to a body or to settlement.
+      env.signal?.throwIfAborted();
       for (const key of window.sumKeys) template[key] = sums.get(key);
       const [head, tail] = envelopeAround(template, window.arrayKey, keyOrder);
       result = {

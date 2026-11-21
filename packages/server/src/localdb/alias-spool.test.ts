@@ -9,7 +9,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openAliasSpool } from "./alias-spool.js";
 
 /**
@@ -27,10 +27,11 @@ describe("the server's alias spool", () => {
     process.umask(previousMask);
     await rm(storageRoot, { recursive: true, force: true });
   });
+  const logger = { warn: vi.fn() };
   const modeOf = async (path: string) => (await stat(path)).mode & 0o777;
 
   it("writes a directory only its owner can enter and files only its owner can read", async () => {
-    const spool = await openAliasSpool(storageRoot);
+    const spool = (await openAliasSpool(storageRoot, logger))!;
     await spool.appendMany([
       { path: "alias-one", bytes: new TextEncoder().encode("body") },
     ]);
@@ -45,7 +46,7 @@ describe("the server's alias spool", () => {
     const dir = join(storageRoot, "alias-spool");
     await mkdir(dir, { mode: 0o755 });
     await writeFile(join(dir, "alias-left"), "half a body");
-    const spool = await openAliasSpool(storageRoot);
+    const spool = (await openAliasSpool(storageRoot, logger))!;
     expect(await spool.list("")).toEqual([]);
     await spool.appendMany([
       { path: "alias-two", bytes: new TextEncoder().encode("body") },
@@ -54,7 +55,7 @@ describe("the server's alias spool", () => {
   });
 
   it("keeps a file readable by its owner under a umask that would leave it 0000", async () => {
-    const spool = await openAliasSpool(storageRoot);
+    const spool = (await openAliasSpool(storageRoot, logger))!;
     const file = join(storageRoot, "alias-spool", "alias-masked");
     // `open` applies the umask to the creating mode: with 0777 it is 0000.
     process.umask(0o777);
@@ -77,13 +78,40 @@ describe("the server's alias spool", () => {
     }
   });
 
-  it("refuses a root that is a symbolic link, and leaves the files of its target alone", async () => {
+  it("recreates a directory removed mid-process with its own modes, whatever the umask", async () => {
+    const spool = (await openAliasSpool(storageRoot, logger))!;
+    const dir = join(storageRoot, "alias-spool");
+    await spool.appendMany([
+      { path: "alias-first", bytes: new TextEncoder().encode("one") },
+    ]);
+    await spool.sync("");
+    await rm(dir, { recursive: true, force: true });
+    // With 0777 `mkdir` alone leaves the recreated directory 0000.
+    process.umask(0o777);
+    try {
+      await spool.appendMany([
+        { path: "alias-second", bytes: new TextEncoder().encode("two") },
+      ]);
+      await spool.sync("");
+      expect(await modeOf(dir)).toBe(0o700);
+      expect(await modeOf(join(dir, "alias-second"))).toBe(0o600);
+      expect(
+        new TextDecoder().decode((await spool.read("alias-second"))!),
+      ).toBe("two");
+    } finally {
+      process.umask(0o022);
+    }
+  });
+
+  it("is not opened, and says why, when it cannot sweep: a root that is a symbolic link", async () => {
     const target = join(storageRoot, "somewhere-else");
     await mkdir(target, { mode: 0o755 });
     await writeFile(join(target, "precious"), "not the spool's");
     await symlink(target, join(storageRoot, "alias-spool"));
-    await expect(openAliasSpool(storageRoot)).rejects.toThrow(
-      /not a directory/,
+    expect(await openAliasSpool(storageRoot, logger)).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      { error: expect.stringMatching(/not a directory/) },
+      expect.stringContaining("alias spool could not be opened"),
     );
     // Neither the sweep nor the tighten followed the link.
     expect(await readFile(join(target, "precious"), "utf8")).toBe(
