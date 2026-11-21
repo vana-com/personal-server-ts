@@ -411,3 +411,29 @@ describe("an alias read whose projection dropped rows", () => {
     await response.body?.cancel();
   });
 });
+
+/**
+ * A host with no spool (Lite) builds an alias read in memory, as main does,
+ * and refuses one whose stored bytes exceed 64 MiB. The status and the error
+ * code are main's own: this test runs unchanged on main.
+ */
+describe("a switched alias read above 64 MiB, on a host with no spool", () => {
+  it("answers 503 TOO_LARGE", async () => {
+    const { deps, seed } = await switchedFixture();
+    await seed("plain", "c1", { items: [1] });
+    await drivers[0]!.batch([
+      {
+        sql: "UPDATE records SET body = ? WHERE connection_id = 'c1' AND stream = 'items'",
+        params: [
+          JSON.stringify({ id: "key", pad: "y".repeat(65 * 1024 * 1024) }),
+        ],
+      },
+    ]);
+    const response = await get(deps, "/plain.items");
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as {
+      error: { code: number; errorCode: string; message: string };
+    };
+    expect(body.error).toMatchObject({ code: 503, errorCode: "TOO_LARGE" });
+  }, 60_000);
+});

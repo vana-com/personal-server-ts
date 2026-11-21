@@ -16,6 +16,7 @@ import {
 } from "./alias-window.js";
 import { readerOf, type SqlDriver } from "./driver.js";
 import { PartialViewMoved } from "./partial-read.js";
+import type { StreamSyncFiles } from "../stream-sync/ports.js";
 import type { AliasRecordQuery } from "./query.js";
 import { invalidAliasBinding, type Candidate } from "./read-selection.js";
 import type {
@@ -42,23 +43,19 @@ export interface AliasEnv {
   readonly epochs?: ReadonlyMap<string, number>;
   /**
    * Ends the read: a wait for memory stops, and its place in the governor's
-   * line is given up. A read that holds memory gives it back when its body
-   * is cancelled.
+   * line is given up. A read that holds memory gives it back when it ends.
    */
   readonly signal?: AbortSignal;
+  /**
+   * Where a windowed read writes its body before serving it (`projectAlias`).
+   * The directory holds nothing else; `sweepAliasSpool` empties it at startup.
+   * Absent: a body is built in memory, and one above `ARRAY_BUDGET` is refused.
+   */
+  readonly spool?: StreamSyncFiles;
 }
 
-export type AliasProjection =
-  | {
-      readonly kind: "ok";
-      /**
-       * The payload's JSON, a piece at a time. Nothing is read or held until
-       * the first piece is asked for. From then until the last piece is taken
-       * (or the body is cancelled) the memory it needs is held from the
-       * governor, and then it is given back.
-       */
-      readonly body: () => AsyncIterable<string>;
-    }
+/** Why a projection has no body, or is not served as asked. */
+type Refusal =
   | { readonly kind: "no_data" }
   | { readonly kind: "invalid_binding" }
   | {
@@ -66,24 +63,73 @@ export type AliasProjection =
       readonly diagnostics: readonly IncompleteAliasDiagnostic[];
     }
   /** The rows changed while the projection was checked: ask again. */
-  | { readonly kind: "moved" };
+  | { readonly kind: "moved" }
+  /** Above `ARRAY_BUDGET`, and not windowed into a spool: refused, as main does. */
+  | { readonly kind: "too_large"; readonly bytes: number };
 
-/** Characters of a windowed body's elements joined before they are yielded. */
-const OUTPUT_PIECE_CHARS = 64 * 1024;
+/** What `checkAlias` says: a body can be built, or why not. */
+export type AliasCheck = { readonly kind: "ok" } | Refusal;
+
+export type AliasProjection =
+  | {
+      readonly kind: "ok";
+      /**
+       * The payload's JSON, a piece at a time. The projection is complete
+       * before the first piece is asked for, and no piece takes memory from
+       * the governor: what a body keeps while its reader pauses is the text of
+       * a read below `ARRAY_BUDGET` (as main holds it), or a file.
+       */
+      readonly body: () => AsyncIterable<string | Uint8Array>;
+      /**
+       * Remove what the body keeps outside memory, whether or not it was read.
+       * Safe to call twice; the body calls it when it ends or fails.
+       */
+      readonly discard: () => Promise<void>;
+    }
+  | Refusal;
 
 /**
- * Project the installed records of an alias scope, or say why it has no body.
- * Reads the local database only; `query` may be wrapped by the caller to
- * substitute retained heads.
+ * The most stored bytes an alias read builds in memory: a read above it, which
+ * is not windowed into a spool, is refused (`too_large`). Main's limit.
+ */
+export const ARRAY_BUDGET = 64 * 1024 * 1024;
+
+/** Characters of a windowed body's elements joined before they are written. */
+const OUTPUT_PIECE_CHARS = 64 * 1024;
+const encoder = new TextEncoder();
+
+/** The input a projection works on, decided and pinned. */
+interface View {
+  readonly connectionId: string;
+  readonly fetched: readonly string[];
+  readonly current: AliasViewCheck;
+}
+
+/** A body built: its text before the elements of a spooled array, the file of those elements, the text after. */
+interface Built {
+  readonly head: string;
+  readonly file?: { readonly files: StreamSyncFiles; readonly path: string };
+  readonly tail: string;
+}
+
+type Outcome = Refusal | { readonly kind: "ok"; readonly built: Built };
+
+/**
+ * Project the installed records of an alias scope for a read, or say why it
+ * has no body. Reads the local database only; `query` may be wrapped by the
+ * caller to substitute retained heads.
  *
- * A windowed binding is projected a window of parents at a time, twice: once
- * here, to learn its diagnostics and totals before any byte is promised, and
- * once in `body`, which writes each window as it is projected. Any other
- * binding is projected whole, also twice: the check here keeps nothing, and
- * `body` projects again and holds its payload's memory until it is delivered.
- * Both take the memory they hold from `env.memory` and wait for it; none
- * refuses a size. Neither pass is held between calls, so a result whose body
- * is never read holds nothing.
+ * The projection is done once, before a byte is promised, and the body is then
+ * a result, not a computation. With `env.spool`, a windowed binding is
+ * projected a window of parents at a time and each window's elements are
+ * written to a file; the index and the window are held from the governor while
+ * that runs, which is the server's pace and not the client's, and are given
+ * back before the body is returned. The body then streams the file, and a
+ * reader that pauses holds a file and no memory. Any other read is projected
+ * whole, holding the memory of its rows and of its projection from the
+ * governor until its text is built; the text is what the body keeps, as main
+ * keeps it, and a read above `ARRAY_BUDGET` is refused. A result whose body is
+ * never read has a file to remove: `discard`.
  */
 export async function projectAlias(
   binding: LocalAliasTarget,
@@ -92,6 +138,47 @@ export async function projectAlias(
   now: string,
   env: AliasEnv,
 ): Promise<AliasProjection> {
+  const outcome = await inView(binding, candidate, now, env, (view) =>
+    binding.window && env.spool
+      ? paged(binding, binding.window, view, query, now, env, env.spool)
+      : whole(binding, view, query, now, env),
+  );
+  return outcome.kind === "ok" ? bodyOf(outcome.built) : outcome;
+}
+
+/**
+ * Whether a body can be built from the installed records, and nothing kept:
+ * for a listing, which only reads. A windowed binding is checked a window at a
+ * time whatever its size, since nothing is held after the check.
+ */
+export async function checkAlias(
+  binding: LocalAliasTarget,
+  candidate: Candidate,
+  query: AliasRecordQuery,
+  now: string,
+  env: AliasEnv,
+): Promise<AliasCheck> {
+  const outcome = await inView(binding, candidate, now, env, (view) =>
+    binding.window
+      ? paged(binding, binding.window, view, query, now, env, undefined)
+      : whole(binding, view, query, now, env),
+  );
+  return outcome.kind === "ok" ? { kind: "ok" } : outcome;
+}
+
+/** Remove every file of a spool: the leftovers of a server that stopped mid-read. */
+export async function sweepAliasSpool(spool: StreamSyncFiles): Promise<void> {
+  for (const path of await spool.list("")) await spool.remove(path);
+}
+
+/** The checks every projection starts with, and a read that finds its rows moved. */
+async function inView(
+  binding: LocalAliasTarget,
+  candidate: Candidate,
+  now: string,
+  env: AliasEnv,
+  work: (view: View) => Promise<Outcome>,
+): Promise<Outcome> {
   if (invalidAliasBinding(binding)) return { kind: "invalid_binding" };
   // Check all input heads, before reading even one record or creating a body.
   if (
@@ -118,62 +205,69 @@ export async function projectAlias(
     epochs,
   );
   try {
-    return binding.window
-      ? await paged(
-          binding,
-          binding.window,
-          connectionId,
-          fetched,
-          query,
-          now,
-          env,
-          current,
-        )
-      : await whole(binding, connectionId, fetched, query, now, env, current);
+    return await work({ connectionId, fetched, current });
   } catch (error) {
     if (error instanceof PartialViewMoved) return { kind: "moved" };
     throw error;
   }
 }
 
+/** The result of a body that is built: its text, then its file, then its tail. */
+function bodyOf(built: Built): AliasProjection {
+  const discard = async () => {
+    if (!built.file) return;
+    try {
+      await built.file.files.remove(built.file.path);
+    } catch {
+      // The file is left for the startup sweep; a failed removal must not
+      // fail a response that was served.
+    }
+  };
+  async function* chunks(): AsyncGenerator<string | Uint8Array> {
+    try {
+      for (let at = 0; at < built.head.length;) {
+        const end = pieceEnd(built.head, at);
+        yield built.head.slice(at, end);
+        at = end;
+      }
+      if (built.file) yield* built.file.files.readChunks(built.file.path);
+      if (built.tail !== "") yield built.tail;
+    } finally {
+      await discard();
+    }
+  }
+  return { kind: "ok", body: chunks, discard };
+}
+
 /**
- * Every row projected in one call. The check holds the memory of the rows and
- * of their projection while it runs, and keeps none of it. The body takes that
- * memory again and keeps it until its last piece is taken, or it is cancelled:
- * the payload it serializes is built and held under that reservation, and no
- * other copy outlives the check.
+ * Every row projected in one call. The memory of the rows and of their
+ * projection is held from the governor while they are read and projected and
+ * the text is built; the text is then the only copy, and is not held from the
+ * governor.
  */
 async function whole(
   binding: LocalAliasTarget,
-  connectionId: string,
-  fetched: readonly string[],
+  view: View,
   query: AliasRecordQuery,
   now: string,
   env: AliasEnv,
-  current: AliasViewCheck,
-): Promise<AliasProjection> {
-  /**
-   * The memory of every row and of its projection, from the governor, and the
-   * sizes it was taken for: `project` reads no more than these.
-   */
-  const hold = async () => {
-    const sizes = new Map<string, StreamLimits>();
-    let bytes = 0;
-    for (const stream of fetched) {
-      const stats = await query.streamStats(connectionId, stream);
-      sizes.set(stream, stats);
-      bytes += stats.bytes;
-    }
-    const release = await holdMemory(
-      env.memory,
-      bytes * HEAP_PER_STORED_BYTE,
-      0,
-      env.signal,
-    );
-    return { release, sizes };
-  };
-  /** Project every row. Call it with the memory held, for `sizes`. */
-  const project = async (sizes: ReadonlyMap<string, StreamLimits>) => {
+): Promise<Outcome> {
+  const { connectionId, fetched, current } = view;
+  const sizes = new Map<string, StreamLimits>();
+  let bytes = 0;
+  for (const stream of fetched) {
+    const stats = await query.streamStats(connectionId, stream);
+    sizes.set(stream, stats);
+    bytes += stats.bytes;
+  }
+  if (bytes > ARRAY_BUDGET) return { kind: "too_large", bytes };
+  const release = await holdMemory(
+    env.memory,
+    bytes * HEAP_PER_STORED_BYTE,
+    0,
+    env.signal,
+  );
+  try {
     const records: LocalAliasRecord[] = [];
     for (const stream of fetched) {
       for await (const batch of sizedBodies(
@@ -194,34 +288,7 @@ async function whole(
     }
     // Checked after the rows are read, so every one of them is a pinned row.
     await assertViewCurrent(current);
-    return binding.project(records, now, fetched);
-  };
-  async function* body(): AsyncGenerator<string> {
-    const { release, sizes } = await hold();
-    try {
-      const projected = await project(sizes);
-      // The view is the one the check saw, so this is the payload it passed.
-      if (
-        !projected.ok ||
-        incompleteDiagnostics(projected.diagnostics).length > 0
-      ) {
-        throw new Error("alias projection changed since it was checked");
-      }
-      const text = JSON.stringify(projected.payload);
-      // A piece at a time, with the memory held until the last is taken: a
-      // consumer that pauses, or stops, leaves the payload in memory under it.
-      for (let at = 0; at < text.length;) {
-        const end = pieceEnd(text, at);
-        yield text.slice(at, end);
-        at = end;
-      }
-    } finally {
-      release();
-    }
-  }
-  const { release, sizes } = await hold();
-  try {
-    const projected = await project(sizes);
+    const projected = binding.project(records, now, fetched);
     if (!projected.ok && projected.error.kind === "invalid_binding")
       return { kind: "invalid_binding" };
     if (!projected.ok) return { kind: "no_data" };
@@ -230,7 +297,10 @@ async function whole(
     const incomplete = incompleteDiagnostics(projected.diagnostics);
     return incomplete.length > 0
       ? { kind: "incomplete", diagnostics: incomplete }
-      : { kind: "ok", body };
+      : {
+          kind: "ok",
+          built: { head: JSON.stringify(projected.payload), tail: "" },
+        };
   } finally {
     release();
   }
@@ -257,43 +327,61 @@ interface Tally {
   readonly reasons: string[];
 }
 
+/**
+ * A windowed read, a window of parents at a time, once. The payload's other
+ * keys and the diagnostics are summed over the windows; with `spool`, each
+ * window's elements are appended to a file as they are projected, so nothing
+ * of a window outlives it. A file is removed unless the result keeps it.
+ */
 async function paged(
   binding: LocalAliasTarget,
   window: AliasWindow,
-  connectionId: string,
-  fetched: readonly string[],
+  view: View,
   query: AliasRecordQuery,
   now: string,
   env: AliasEnv,
-  current: AliasViewCheck,
-): Promise<AliasProjection> {
-  const open = () =>
-    openWindowed({
-      query,
-      connectionId,
-      binding,
-      window,
-      fetched,
-      now,
-      memory: env.memory,
-      current,
-      signal: env.signal,
-    });
-  const session = await open();
+  spool: StreamSyncFiles | undefined,
+): Promise<Outcome> {
+  const { connectionId, fetched, current } = view;
+  const session = await openWindowed({
+    query,
+    connectionId,
+    binding,
+    window,
+    fetched,
+    now,
+    memory: env.memory,
+    current,
+    signal: env.signal,
+  });
   // A child names no parent, or a row has no key to join on: not windowable.
-  if (session === null) {
-    return whole(binding, connectionId, fetched, query, now, env, current);
-  }
+  if (session === null) return whole(binding, view, query, now, env);
+  const file = spool && {
+    files: spool,
+    path: `alias-${globalThis.crypto.randomUUID()}`,
+  };
   const sums = new Map(window.sumKeys.map((key) => [key, 0]));
   const tallies = new Map<string, Tally>();
   let template: Record<string, unknown> | undefined;
   let keyOrder: string[] = [];
+  let piece = "";
+  let first = true;
+  const write = async () => {
+    await file!.files.appendMany([
+      { path: file!.path, bytes: encoder.encode(piece) },
+    ]);
+    piece = "";
+  };
+  let result: Outcome | undefined;
   try {
     for await (const outcome of session.windows()) {
+      env.signal?.throwIfAborted();
       if (!outcome.ok) {
-        return outcome.error.kind === "invalid_binding"
-          ? { kind: "invalid_binding" }
-          : { kind: "no_data" };
+        result =
+          outcome.error.kind === "invalid_binding"
+            ? { kind: "invalid_binding" }
+            : { kind: "no_data" };
+        break;
       }
       // The first window's payload shapes the whole: its other keys equal
       // every window's. Its array is not kept.
@@ -306,31 +394,41 @@ async function paged(
         sums.set(key, sums.get(key)! + (outcome.payload[key] as number));
       }
       for (const d of outcome.diagnostics) tally(tallies, d);
+      if (!file) continue;
+      for (const item of outcome.payload[window.arrayKey] as unknown[]) {
+        piece += (first ? "" : ",") + (JSON.stringify(item) ?? "null");
+        first = false;
+        if (piece.length >= OUTPUT_PIECE_CHARS) await write();
+      }
+    }
+    const incomplete = incompleteDiagnostics(
+      [...tallies.values()].map((t): AliasDiagnostic => ({
+        kind: t.kind,
+        stream: t.stream,
+        count: t.count,
+        reasons: t.reasons,
+      })),
+    );
+    if (result === undefined && incomplete.length > 0) {
+      result = { kind: "incomplete", diagnostics: incomplete };
+    }
+    // `template` is undefined only if every window was empty: the parents were
+    // the whole input. Unreachable for a plan with a window, but never serve an
+    // empty body for it: it is projected whole.
+    if (result === undefined && template !== undefined) {
+      if (file && piece !== "") await write();
+      for (const key of window.sumKeys) template[key] = sums.get(key);
+      const [head, tail] = envelopeAround(template, window.arrayKey, keyOrder);
+      result = { kind: "ok", built: { head, file, tail } };
     }
   } finally {
     session.release();
+    // Anything but a kept file is removed, a failure of the read included.
+    if (file && result?.kind !== "ok") {
+      await file.files.remove(file.path).catch(() => undefined);
+    }
   }
-  const incomplete = incompleteDiagnostics(
-    [...tallies.values()].map((t): AliasDiagnostic => ({
-      kind: t.kind,
-      stream: t.stream,
-      count: t.count,
-      reasons: t.reasons,
-    })),
-  );
-  if (incomplete.length > 0)
-    return { kind: "incomplete", diagnostics: incomplete };
-  if (template === undefined) {
-    // Every window was empty: the parents were the whole input. Unreachable
-    // for a plan with a window, but never serve an empty body for it.
-    return whole(binding, connectionId, fetched, query, now, env, current);
-  }
-  for (const key of window.sumKeys) template[key] = sums.get(key);
-  const [prefix, suffix] = envelopeAround(template, window.arrayKey, keyOrder);
-  return {
-    kind: "ok",
-    body: () => pagedBody(open, window.arrayKey, prefix, suffix),
-  };
+  return result ?? whole(binding, view, query, now, env);
 }
 
 /**
@@ -374,46 +472,6 @@ function tally(into: Map<string, Tally>, d: AliasDiagnostic): void {
     if (!entry.reasons.includes(reason)) entry.reasons.push(reason);
   }
   into.set(key, entry);
-}
-
-/**
- * The payload's JSON: `prefix`, the elements of every window joined by commas,
- * `suffix`. An error after the first piece ends the body in that error, so a
- * reader sees a failed read and never a short, valid document.
- */
-async function* pagedBody(
-  open: () => Promise<Awaited<ReturnType<typeof openWindowed>>>,
-  arrayKey: string,
-  prefix: string,
-  suffix: string,
-): AsyncGenerator<string> {
-  const session = await open();
-  // The rows no longer window as they did when the read was checked.
-  if (session === null) throw new PartialViewMoved();
-  try {
-    yield prefix;
-    let first = true;
-    let piece = "";
-    for await (const outcome of session.windows()) {
-      if (!outcome.ok) {
-        throw new Error(
-          `alias window projection failed: ${outcome.error.kind}`,
-        );
-      }
-      for (const item of outcome.payload[arrayKey] as unknown[]) {
-        piece += (first ? "" : ",") + (JSON.stringify(item) ?? "null");
-        first = false;
-        if (piece.length >= OUTPUT_PIECE_CHARS) {
-          yield piece;
-          piece = "";
-        }
-      }
-    }
-    if (piece !== "") yield piece;
-    yield suffix;
-  } finally {
-    session.release();
-  }
 }
 
 /** The rows a payload leaves out or serves short, as a read names them. */

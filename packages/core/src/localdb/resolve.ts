@@ -7,7 +7,10 @@ import {
   type ResolveInput,
 } from "../stream-sync-read/service.js";
 import { streamReadScope } from "../stream-sync-read/routing.js";
-import { RegistryUnavailableBeforeWriteError } from "../stream-sync/ports.js";
+import {
+  RegistryUnavailableBeforeWriteError,
+  type StreamSyncFiles,
+} from "../stream-sync/ports.js";
 import {
   ensureRegisteredRead,
   registeredReadPosition,
@@ -192,11 +195,12 @@ function validCursor(text: string): boolean {
 /**
  * `onCancel` runs first when the reader cancels: a generator ends only after
  * the `next()` it is running, so a body that waits for memory is told to stop
- * waiting before it is asked to return.
+ * waiting before it is asked to return. A chunk that is already bytes is sent
+ * as it is.
  */
 function bodyStream(
-  chunks: AsyncIterable<string>,
-  onCancel?: () => void,
+  chunks: AsyncIterable<string | Uint8Array>,
+  onCancel?: () => void | Promise<void>,
 ): ReadableStream<Uint8Array> {
   const iterator = chunks[Symbol.asyncIterator]();
   return new ReadableStream({
@@ -204,13 +208,18 @@ function bodyStream(
       try {
         const next = await iterator.next();
         if (next.done) controller.close();
-        else controller.enqueue(encoder.encode(next.value));
+        else
+          controller.enqueue(
+            typeof next.value === "string"
+              ? encoder.encode(next.value)
+              : next.value,
+          );
       } catch (error) {
         controller.error(error);
       }
     },
     async cancel() {
-      onCancel?.();
+      await onCancel?.();
       await iterator.return?.(undefined);
     },
   });
@@ -219,8 +228,8 @@ function bodyStream(
 async function* envelope(
   scope: string,
   observedAt: number,
-  payload: AsyncIterable<string>,
-): AsyncGenerator<string> {
+  payload: AsyncIterable<string | Uint8Array>,
+): AsyncGenerator<string | Uint8Array> {
   yield `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(new Date(observedAt).toISOString())},"data":`;
   yield* payload;
   yield "}";
@@ -242,6 +251,10 @@ interface PinnedAlias {
  * callers had before alias paging). `aliasScopes` and `aliasTargets` come only
  * with such a query: a caller that names aliases and a plain `RecordQuery`
  * would serve none.
+ *
+ * `aliasSpool` is a host's file space for the bodies of windowed aliases (see
+ * `projectAlias`). A host without one (a phone or a browser) builds alias
+ * bodies in memory, and refuses one above `ARRAY_BUDGET`, as before alias paging.
  */
 export type LocalResolverParts =
   | {
@@ -249,18 +262,21 @@ export type LocalResolverParts =
       readonly aliasQuery?: undefined;
       readonly aliasScopes?: undefined;
       readonly aliasTargets?: undefined;
+      readonly aliasSpool?: undefined;
     }
   | {
       readonly query: RecordQuery;
       readonly aliasQuery: AliasRecordQuery;
       readonly aliasScopes?: AliasScopes;
       readonly aliasTargets?: AliasTargets;
+      readonly aliasSpool?: StreamSyncFiles;
     }
   | {
       readonly query: AliasRecordQuery;
       readonly aliasQuery?: undefined;
       readonly aliasScopes?: AliasScopes;
       readonly aliasTargets?: AliasTargets;
+      readonly aliasSpool?: StreamSyncFiles;
     };
 
 const isAliasRecordQuery = (query: RecordQuery): query is AliasRecordQuery => {
@@ -506,8 +522,8 @@ export function createLocalResolver(
     const servedStream = servedStreamOf(candidate.target);
     const head = installed.find((s) => s.stream === servedStream)!;
     const view = (
-      payload: AsyncIterable<string>,
-      onCancel?: () => void,
+      payload: AsyncIterable<string | Uint8Array>,
+      onCancel?: () => void | Promise<void>,
     ): ReadDecision => ({
       kind: "view",
       connector: connection.connector,
@@ -563,7 +579,13 @@ export function createLocalResolver(
             current,
             aliasQuery,
             new Date(deps.now()).toISOString(),
-            { db: deps.db, memory: deps.blobs, epochs, signal },
+            {
+              db: deps.db,
+              memory: deps.blobs,
+              epochs,
+              signal,
+              spool: parts.aliasSpool,
+            },
           );
         } catch (error) {
           // The request ended while the check waited for memory.
@@ -578,8 +600,14 @@ export function createLocalResolver(
         if (projected.kind === "moved") {
           return { kind: "busy", retryAfterSeconds: 5 };
         }
+        if (projected.kind === "too_large") {
+          return { kind: "too_large", bytes: projected.bytes };
+        }
         if (projected.kind === "no_data") return noData();
-        return view(projected.body(), () => stop.abort());
+        return view(projected.body(), () => {
+          stop.abort();
+          return projected.discard();
+        });
       },
     };
   }

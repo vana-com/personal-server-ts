@@ -3,6 +3,7 @@ import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
   DeltaApplyResult,
   RegistryChangeDelta,
+  StreamSyncFiles,
 } from "../stream-sync/ports.js";
 import { applyRegistryDelta } from "./delta-apply.js";
 import {
@@ -116,6 +117,8 @@ export function createLocalSync(
   options: {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
+    /** A file space for the bodies of windowed aliases (`projectAlias`). */
+    readonly aliasSpool?: StreamSyncFiles;
     readonly resolveArtifact: ResolveArtifact;
     readonly eraseLegacy?: (connector: string) => Promise<void>;
     /**
@@ -390,6 +393,7 @@ export function createLocalSync(
       aliasQuery: query,
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
+      aliasSpool: options.aliasSpool,
     }),
     listing: {
       ...listing,

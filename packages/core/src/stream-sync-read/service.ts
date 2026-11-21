@@ -157,6 +157,7 @@ export type ReadDecision =
   | { readonly kind: "cursor_stale" }
   | { readonly kind: "invalid_cursor" }
   | { readonly kind: "invalid_connection" }
+  | { readonly kind: "too_large"; readonly bytes: number }
   /**
    * The projection left rows out or served them short of detail. Nothing is
    * served: the flag-off path refuses the same way.

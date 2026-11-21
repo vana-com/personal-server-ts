@@ -8,6 +8,7 @@ import {
   type LocalSyncDeps,
   type LogErasurePorts,
   type SqlDriver,
+  sweepAliasSpool,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { accountStorageModeFor } from "@opendatalabs/personal-server-ts-core/api";
@@ -992,7 +993,15 @@ async function bootstrapServer(
             ? { publishWhileCollecting: true }
             : {}),
         };
+        // The bodies of windowed aliases are written here for the length of a
+        // response. This process holds the database, so no other reads from
+        // the directory: whatever is in it is left by a server that stopped.
+        const aliasSpool = createFsStreamSyncFiles(
+          join(storageRoot, "alias-spool"),
+        );
+        await sweepAliasSpool(aliasSpool);
         const facade = createServerLocalSync(deps, {
+          aliasSpool,
           resolveArtifact: (digest) =>
             manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
           eraseLegacy: (connector) =>

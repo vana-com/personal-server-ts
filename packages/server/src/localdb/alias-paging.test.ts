@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as v8 from "node:v8";
 import * as vm from "node:vm";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -13,6 +16,10 @@ import type {
 } from "../../../core/src/legacy-projection/types.js";
 import { WINDOW_FIXTURES } from "../../../core/src/legacy-projection/__fixtures__/window-records.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
+import {
+  ARRAY_BUDGET,
+  sweepAliasSpool,
+} from "../../../core/src/localdb/alias-projection.js";
 import { HEAP_PER_STORED_BYTE } from "../../../core/src/localdb/alias-window.js";
 import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
@@ -28,6 +35,8 @@ import {
   createStorageAccess,
   DEFAULT_STORAGE_ACCESS_POLICY,
 } from "../../../core/src/stream-sync/storage-retry.js";
+import type { StreamSyncFiles } from "../../../core/src/stream-sync/ports.js";
+import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 // The resolver applies registry heads before it reads; the rows below are
@@ -46,9 +55,20 @@ const NOW = new Date(NOW_MS).toISOString();
 const OBSERVED_MS = 1000;
 
 const drivers: SqlDriver[] = [];
+const spoolDirs: string[] = [];
 afterEach(async () => {
   for (const driver of drivers.splice(0)) await driver.close();
+  for (const dir of spoolDirs.splice(0)) {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
+
+/** A spool on a directory of its own, removed after the test. */
+async function newSpool(): Promise<StreamSyncFiles> {
+  const dir = await mkdtemp(join(tmpdir(), "alias-spool-test-"));
+  spoolDirs.push(dir);
+  return createFsStreamSyncFiles(dir);
+}
 
 /** One governor of `limit` bytes, as the store's adapter would keep. */
 const governorOf = (limit: number) =>
@@ -63,6 +83,8 @@ const governorOf = (limit: number) =>
  */
 function ledgerOf(real: ReturnType<typeof governorOf>) {
   let held = 0;
+  /** Each size a reservation was shrunk to. */
+  const kept: number[] = [];
   const governor: ReturnType<typeof governorOf> = {
     ...real,
     async reserve(bytes, objectBytes, signal) {
@@ -83,23 +105,30 @@ function ledgerOf(real: ReturnType<typeof governorOf>) {
             const next = Math.max(0, Math.min(mine, keep));
             held -= mine - next;
             mine = next;
+            kept.push(keep);
             inner.shrink(keep);
           },
         },
       );
     },
   };
-  return { governor, inUse: () => held };
+  return { governor, inUse: () => held, kept };
 }
 
-async function fixture(limit: number) {
+/**
+ * `spool`: the file space the resolver writes windowed bodies to, as the
+ * server's is. `false` is a host that has none (Lite).
+ */
+async function fixture(limit: number, spoolOption?: StreamSyncFiles | false) {
+  const spool =
+    spoolOption === false ? undefined : (spoolOption ?? (await newSpool()));
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: "0xabc",
     network: "test",
     deviceId: "alias-paging",
   });
   drivers.push(db);
-  const { governor, inUse } = ledgerOf(governorOf(limit));
+  const { governor, inUse, kept } = ledgerOf(governorOf(limit));
   const poison = new Proxy(
     {},
     {
@@ -173,6 +202,7 @@ async function fixture(limit: number) {
       aliasQuery: query,
       aliasScopes: () => [scope],
       aliasTargets: () => [target],
+      aliasSpool: spool,
     });
   /**
    * The database as a read sees it, with every result set that carries record
@@ -231,7 +261,7 @@ async function fixture(limit: number) {
       reads: () => ({ readsOfBodies, largest }),
     };
   }
-  return { db, deps, governor, inUse, seed, resolverFor, audited };
+  return { db, deps, governor, inUse, kept, seed, resolverFor, audited, spool };
 }
 
 const read = (
@@ -333,10 +363,12 @@ describe("a paged alias read equals the whole projection, byte for byte", () => 
       if (decision.kind !== "view") return;
       const text = await new Response(decision.body).text();
       expect(text).toBe(envelopeOf(scope, whole.payload));
-      // Several windows: the paged read projects more than once, over each of
-      // the parents' windows, twice (the check, then the body).
+      // Several windows: the read projects over each of the parents' windows
+      // once (the probe counts too), because the body is written to the spool
+      // as it is projected, not projected again to be served.
       expect(parents).toBeGreaterThan(5);
-      expect(calls.length).toBeGreaterThanOrEqual(2 * parents);
+      expect(calls.length).toBeGreaterThanOrEqual(parents);
+      expect(calls.length).toBeLessThan(2 * parents);
       expect(Math.max(...calls)).toBeLessThan(records.length);
     });
   }
@@ -454,40 +486,43 @@ describe("a read above the old 64 MiB budget", () => {
   }, 120_000);
 });
 
-describe("an alias read that fails after its first byte", () => {
-  async function failingRead() {
-    const scope = "instagram.posts";
-    const target = legacyAliasScopes(scope)[0] as LocalAliasTarget;
-    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
-    const records = WINDOW_FIXTURES[scope]!(binding);
-    const f = await fixture(2 * 1024);
-    await f.seed(target, records);
-    const { wrapped, calls } = counting(target);
-    // The read's check passes over every window; the body fails in its third.
-    let failAt = Infinity;
-    const failing: LocalAliasTarget = {
-      ...wrapped,
-      project: (rs, now, fetched) => {
-        if (calls.length + 1 >= failAt) throw new Error("injected failure");
-        return wrapped.project(rs, now, fetched);
+/**
+ * A windowed read is written to the spool before its first byte goes out, so a
+ * failure of the projection fails the read, and a failure of the file ends the
+ * body in an error. Either way nothing is left behind.
+ */
+describe("an alias body written to the spool", () => {
+  const scope = "instagram.posts";
+  const target = legacyAliasScopes(scope)[0] as LocalAliasTarget;
+  const records = WINDOW_FIXTURES[scope]!(LEGACY_SCOPE_BINDINGS.get(scope)!);
+
+  /** A spool whose file reads fail after the first bytes of the first chunk. */
+  async function failingSpool() {
+    const real = await newSpool();
+    const failing: StreamSyncFiles = {
+      ...real,
+      async *readChunks(path) {
+        for await (const chunk of real.readChunks(path)) {
+          yield chunk.slice(0, 16);
+          throw new Error("injected failure");
+        }
       },
     };
-    const resolver = f.resolverFor(failing, scope);
-    // First learn how many projections the check takes.
-    const probe = await read(f.resolverFor(wrapped, scope), scope);
-    expect(probe.kind).toBe("view");
-    if (probe.kind === "view") await probe.body.cancel();
-    // The second read's check projects as often as the probe did; its body
-    // then fails on its third window.
-    failAt = calls.length * 2 + 3;
-    const decision = await read(resolver, scope);
+    return { real, failing };
+  }
+
+  async function failingRead() {
+    const { real, failing } = await failingSpool();
+    const f = await fixture(2 * 1024, failing);
+    await f.seed(target, records);
+    const decision = await read(f.resolverFor(target, scope), scope);
     expect(decision.kind).toBe("view");
     if (decision.kind !== "view") throw new Error("not a view");
-    return decision;
+    return { decision, real, f };
   }
 
   it("ends its body in an error, never a short valid body", async () => {
-    const decision = await failingRead();
+    const { decision, real } = await failingRead();
     const reader = decision.body.getReader();
     let text = "";
     let failure: unknown;
@@ -507,21 +542,40 @@ describe("an alias read that fails after its first byte", () => {
     // Some bytes went out, and what went out is not a whole JSON document.
     expect(text.length).toBeGreaterThan(0);
     expect(() => JSON.parse(text)).toThrow();
+    // The body failed, and its file is gone.
+    expect(await real.list("")).toEqual([]);
   });
 
   it("rejects the response a client reads, so it sees a failed request", async () => {
-    const decision = await failingRead();
+    const { decision } = await failingRead();
     await expect(new Response(decision.body).text()).rejects.toThrow(
       "injected failure",
     );
   });
 
+  it("fails the read, and leaves no file and no memory held, when its projection fails", async () => {
+    const real = await newSpool();
+    const f = await fixture(2 * 1024, real);
+    await f.seed(target, records);
+    // The projection fails in its third window, after a file has been begun.
+    let calls = 0;
+    const failing: LocalAliasTarget = {
+      ...target,
+      project: (rs, now, fetched) => {
+        if (++calls === 4) throw new Error("injected failure");
+        return target.project(rs, now, fetched);
+      },
+    };
+    await expect(read(f.resolverFor(failing, scope), scope)).rejects.toThrow(
+      "injected failure",
+    );
+    expect(await real.list("")).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  });
+
   it("does not leave the governor's memory held", async () => {
-    const scope = "instagram.posts";
-    const target = legacyAliasScopes(scope)[0] as LocalAliasTarget;
-    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
     const f = await fixture(2 * 1024);
-    await f.seed(target, WINDOW_FIXTURES[scope]!(binding));
+    await f.seed(target, records);
     const window = f.governor.window();
     const decision = await read(f.resolverFor(target, scope), scope);
     if (decision.kind !== "view") throw new Error("not a view");
@@ -532,6 +586,68 @@ describe("an alias read that fails after its first byte", () => {
     const release = await f.governor.reserve(f.governor.limitBytes);
     release();
     window.end();
+  });
+
+  describe("removes its file when the body ends", () => {
+    const opened = async () => {
+      const f = await fixture(2 * 1024);
+      await f.seed(target, records);
+      const decision = await read(f.resolverFor(target, scope), scope);
+      if (decision.kind !== "view") throw new Error("not a view");
+      // The projection is done and written: the response is a file.
+      expect(await f.spool!.list("")).toHaveLength(1);
+      return { f, decision };
+    };
+
+    it("when it is read to the end", async () => {
+      const { f, decision } = await opened();
+      await new Response(decision.body).text();
+      expect(await f.spool!.list("")).toEqual([]);
+    });
+
+    it("when it is cancelled after some bytes", async () => {
+      const { f, decision } = await opened();
+      const reader = decision.body.getReader();
+      await reader.read();
+      await reader.read();
+      expect(await f.spool!.list("")).toHaveLength(1);
+      await reader.cancel();
+      expect(await f.spool!.list("")).toEqual([]);
+    });
+
+    it("when it is cancelled before any byte is read", async () => {
+      const { f, decision } = await opened();
+      await decision.body.cancel();
+      expect(await f.spool!.list("")).toEqual([]);
+    });
+
+    it("when its projection is refused as incomplete", async () => {
+      const f = await fixture(2 * 1024);
+      const refusing: LocalAliasTarget = {
+        ...target,
+        project: (rs, now, fetched) => {
+          const projected = target.project(rs, now, fetched);
+          return projected.ok
+            ? {
+                ...projected,
+                diagnostics: [
+                  {
+                    kind: "records_dropped",
+                    stream: "posts",
+                    count: 1,
+                    reasons: ["x"],
+                  },
+                ],
+              }
+            : projected;
+        },
+      };
+      await f.seed(target, records);
+      const decision = await read(f.resolverFor(refusing, scope), scope);
+      expect(decision.kind).toBe("incomplete");
+      expect(await f.spool!.list("")).toEqual([]);
+      expect(f.inUse()).toBe(0);
+    });
   });
 });
 
@@ -752,7 +868,7 @@ describe("a windowed read holds nothing the governor does not count", () => {
   }, 60_000);
 });
 
-describe("a read that is not windowed holds its payload from the governor", () => {
+describe("a read that is not windowed holds its payload as main does", () => {
   const plain: LocalAliasTarget = {
     connector: "plain",
     streams: ["items"],
@@ -771,34 +887,26 @@ describe("a read that is not windowed holds its payload from the governor", () =
   const items = (f: Awaited<ReturnType<typeof fixture>>) =>
     f.resolverFor(plain, "plain.items");
 
-  it("keeps the payload's memory held until the body is delivered or cancelled", async () => {
-    // 400 KB of rows under a 1 MiB governor: the payload takes 1.6 MB, more
-    // than the budget, so a second such read must wait for the first to end.
+  it("holds the projection's memory only while it builds the text, never for a paused reader", async () => {
+    // 400 KB of rows under a 1 MiB governor: the projection takes 1.6 MB, more
+    // than the budget, so it runs alone, and ends before the body is served.
     const f = await fixture(1024 * 1024);
     await f.seed(plain, rows);
     const first = await read(items(f), "plain.items");
     expect(first.kind).toBe("view");
     if (first.kind !== "view") return;
-    // A body nobody has begun to read holds nothing.
     expect(f.inUse()).toBe(0);
     const reader = first.body.getReader();
-    // The envelope's head, then the first piece of the payload; the consumer
-    // pauses with the rest of the payload built and waiting to be written.
     await reader.read();
     await reader.read();
-    expect(f.inUse()).toBeGreaterThan(0);
-    const second = read(items(f), "plain.items");
-    const state = await Promise.race([
-      second.then(() => "served"),
-      sleep(200).then(() => "waiting"),
-    ]);
-    expect(state).toBe("waiting");
-    // Cancelling the body gives its memory back: the waiting read now runs.
+    // Paused with the rest of the text unread: the governor holds nothing, so
+    // a second such read is served.
+    expect(f.inUse()).toBe(0);
+    const second = await read(items(f), "plain.items");
+    expect(second.kind).toBe("view");
+    if (second.kind !== "view") return;
+    expect(await new Response(second.body).text()).toBe(expected);
     await reader.cancel();
-    const decision = await second;
-    expect(decision.kind).toBe("view");
-    if (decision.kind !== "view") return;
-    expect(await new Response(decision.body).text()).toBe(expected);
     expect(f.inUse()).toBe(0);
   });
 });
@@ -1245,12 +1353,12 @@ describe("the window index is charged for the objects it keeps", () => {
     );
     expect(decision.kind).toBe("view");
     if (decision.kind !== "view") return;
-    const reader = decision.body.getReader();
-    // The envelope's head, then the array's opening: the read now holds its index.
-    await reader.read();
-    await reader.read();
-    expect(f.inUse()).toBeGreaterThanOrEqual(parentCount * heapPerParent);
-    await reader.cancel();
+    await new Response(decision.body).text();
+    // The read held its index while it projected: the reservation it kept
+    // after sizing its largest window is what the index and that window need.
+    expect(Math.max(...f.kept)).toBeGreaterThanOrEqual(
+      parentCount * heapPerParent,
+    );
     expect(f.inUse()).toBe(0);
   }, 60_000);
 });
@@ -1347,37 +1455,9 @@ describe("a read that is cancelled stops waiting for memory", () => {
       await new Response(decision.body).text();
       expect(f.inUse()).toBe(0);
     }, 30_000);
-
-    it(`${c.label}: a body cancelled while it waits returns at once and holds nothing`, async () => {
-      const f = await fixture(1024 * 1024);
-      await f.seed(c.target, c.rows());
-      const decision = await read(f.resolverFor(c.target, c.scope), c.scope);
-      expect(decision.kind).toBe("view");
-      if (decision.kind !== "view") return;
-      const reader = decision.body.getReader();
-      // The envelope's head is ready; the payload's first piece must wait for
-      // memory, because another holder has the whole budget.
-      await reader.read();
-      const blocker = await f.governor.reserve(f.governor.limitBytes);
-      const next = reader.read();
-      await sleep(100);
-      expect(await settles(reader.cancel())).toBeUndefined();
-      expect(await settles(next)).toMatchObject({ done: true });
-      expect(f.inUse()).toBe(f.governor.limitBytes);
-      blocker();
-      // Nothing was granted to the cancelled body: the budget is free.
-      expect(f.inUse()).toBe(0);
-      const all = await f.governor.reserve(f.governor.limitBytes);
-      all();
-    }, 30_000);
   }
 });
 
-/**
- * A read that waits for memory must not hold its connection's queue: a paused
- * client keeps its body's memory until it reads on or goes away, and every
- * apply and read of the connection would wait for that client.
- */
 describe("a read that waits for memory does not hold its connection's queue", () => {
   const plain: LocalAliasTarget = {
     connector: "plain",
@@ -1392,26 +1472,15 @@ describe("a read that waits for memory does not hold its connection's queue", ()
     data: { id: `i${i}`, pad: "y".repeat(10_000) },
   }));
 
-  it("lets an apply finish behind a paused body, and ends the read busy if a write lands meanwhile", async () => {
-    // 400 KB of rows under a 1 MiB governor: the payload takes 1.6 MB, so the
-    // paused body holds the whole budget.
+  it("lets an apply finish behind a waiting read, and ends the read busy if a write lands meanwhile", async () => {
     const f = await fixture(1024 * 1024);
     await f.seed(plain, rows);
-    const first = await read(
-      f.resolverFor(plain, "plain.items"),
-      "plain.items",
-    );
-    expect(first.kind).toBe("view");
-    if (first.kind !== "view") return;
-    const reader = first.body.getReader();
-    await reader.read();
-    await reader.read();
-    expect(f.inUse()).toBeGreaterThan(0);
-    // A second read of the same connection waits for that memory.
-    const second = read(f.resolverFor(plain, "plain.items"), "plain.items");
+    // Another holder has the whole budget, so the read waits for memory.
+    const blocker = await f.governor.reserve(f.governor.limitBytes);
+    const waiting = read(f.resolverFor(plain, "plain.items"), "plain.items");
     expect(
       await Promise.race([
-        second.then(() => "served"),
+        waiting.then(() => "served"),
         sleep(200).then(() => "waiting"),
       ]),
     ).toBe("waiting");
@@ -1421,17 +1490,173 @@ describe("a read that waits for memory does not hold its connection's queue", ()
       sleep(1000).then(() => "stalled"),
     ]);
     expect(applied).toBe("applied");
-    // A write lands while the second read still waits.
+    // A write lands while the read still waits.
     await f.db.batch([
       {
         sql: "UPDATE records SET stamp_o = 9 WHERE connection_id = 'c1' AND stream = 'items' AND pk_hash = (SELECT MIN(pk_hash) FROM records WHERE connection_id = 'c1')",
       },
     ]);
-    await reader.cancel();
+    blocker();
     // The view it was decided on is gone: it asks the caller to try again.
-    expect(await second).toMatchObject({ kind: "busy" });
+    expect(await waiting).toMatchObject({ kind: "busy" });
     expect(f.inUse()).toBe(0);
   }, 30_000);
+});
+
+/**
+ * What a client that stops reading holds. The invariant: no client's pace can
+ * hold memory from the shared budget that an upload or a listing needs. A
+ * windowed read is written to the spool before its first byte goes out, so a
+ * paused body is a file and a handle.
+ */
+describe("a client that never reads holds no shared memory budget", () => {
+  const scope = "chatgpt.conversations";
+  const chatgpt = () =>
+    legacyAliasScopes(scope).find(
+      (t) => t.connector === "chatgpt",
+    ) as LocalAliasTarget;
+  // 60 conversations of three 10 KB messages: 1.8 MB, above a 1 MiB budget.
+  const rows = () =>
+    Array.from({ length: 60 }, (_, c) =>
+      chatgptConversation(c, 3, 10_000),
+    ).flat();
+  const wholeBody = (records: PdppRecord[]) => {
+    const projected = chatgpt().project(
+      records,
+      NOW,
+      LEGACY_SCOPE_BINDINGS.get(scope)!.pdppStreams,
+    );
+    if (!projected.ok) throw new Error("whole projection failed");
+    return envelopeOf(scope, projected.payload);
+  };
+  const within = <T>(promise: Promise<T>, ms: number) =>
+    Promise.race([promise, sleep(ms).then(() => "waiting" as const)]);
+
+  it("lets an unrelated upload and an alias listing finish while its body is paused", async () => {
+    const target = chatgpt();
+    const records = rows();
+    const f = await fixture(1024 * 1024);
+    await f.seed(target, records);
+    const decision = await read(f.resolverFor(target, scope), scope);
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    const reader = decision.body.getReader();
+    const decoder = new TextDecoder();
+    // The envelope's head and the array's opening: the client pauses here.
+    let text = "";
+    for (let i = 0; i < 2; i++) {
+      text += decoder.decode((await reader.read()).value, { stream: true });
+    }
+    expect(f.inUse()).toBe(0);
+    // An unrelated upload asks for 768 KiB of the 1 MiB budget.
+    const upload = await within(
+      f.governor.reserve(768 * 1024).then((release) => {
+        release();
+        return "served" as const;
+      }),
+      1000,
+    );
+    expect(upload).toBe("served");
+    // So does a scope listing of the alias, on another connection of the db.
+    const listing = createLocalListing({
+      ...f.deps,
+      aliasScopes: () => [scope],
+      aliasTargets: () => [target],
+    });
+    const listed = await within(
+      listing.listScopes({ canRead: () => true }),
+      3000,
+    );
+    expect(listed).not.toBe("waiting");
+    expect(
+      (listed as readonly { scope: string }[]).map((s) => s.scope),
+    ).toContain(scope);
+    // The paused body is a file. Its size is the response's own: the text of
+    // the array's elements, a little less than the whole body.
+    const [file] = await f.spool!.list("");
+    const expected = wholeBody(records);
+    const total = Buffer.byteLength(expected);
+    expect(file).toBeDefined();
+    expect(await f.spool!.size(file!)).toBeLessThanOrEqual(total);
+    expect(await f.spool!.size(file!)).toBeGreaterThan(total - 1024);
+    // And the client that resumes reads the whole body.
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      text += decoder.decode(next.value, { stream: true });
+    }
+    expect(text).toBe(expected);
+    expect(await f.spool!.list("")).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+});
+
+describe("the spool is swept when the server starts", () => {
+  it("removes what a stopped server left, and nothing outside its directory", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "alias-spool-sweep-"));
+    spoolDirs.push(parent);
+    const dir = join(parent, "alias-spool");
+    await mkdir(join(dir, "nested"), { recursive: true });
+    await writeFile(join(dir, "alias-leftover"), "half a body");
+    await writeFile(join(dir, "nested", "alias-deeper"), "more");
+    await writeFile(join(parent, "keep.txt"), "not the spool's");
+    await mkdir(join(parent, "alias-spool-neighbour"));
+    await writeFile(join(parent, "alias-spool-neighbour", "keep"), "nor this");
+    const spool = createFsStreamSyncFiles(dir);
+    expect((await spool.list("")).sort()).toEqual([
+      "alias-leftover",
+      "nested/alias-deeper",
+    ]);
+    await sweepAliasSpool(spool);
+    expect(await spool.list("")).toEqual([]);
+    expect(await readFile(join(parent, "keep.txt"), "utf8")).toBe(
+      "not the spool's",
+    );
+    expect(
+      await readFile(join(parent, "alias-spool-neighbour", "keep"), "utf8"),
+    ).toBe("nor this");
+  });
+});
+
+describe("a host without a spool refuses a large alias read, as main does", () => {
+  const tree = treeTarget("p");
+  /** `bytes` of stored child text under one parent. */
+  const sized = (bytes: number) => [
+    { stream: "parents", data: { id: "p0" } },
+    ...Array.from({ length: Math.ceil(bytes / (1024 * 1024)) }, (_, k) => ({
+      stream: "kids",
+      data: { id: `k${k}`, parent: "p0", pad: "y".repeat(1024 * 1024) },
+    })),
+  ];
+
+  it("answers too_large above the 64 MiB budget, and holds nothing", async () => {
+    const f = await fixture(24 * 1024 * 1024, false);
+    await f.seed(tree, sized(65 * 1024 * 1024));
+    const decision = await read(
+      f.resolverFor(tree, "tree.items"),
+      "tree.items",
+    );
+    expect(decision.kind).toBe("too_large");
+    if (decision.kind !== "too_large") return;
+    expect(decision.bytes).toBeGreaterThan(ARRAY_BUDGET);
+    expect(f.inUse()).toBe(0);
+  }, 120_000);
+
+  it("serves a read below the budget in memory, and a paused reader holds no budget", async () => {
+    const f = await fixture(24 * 1024 * 1024, false);
+    await f.seed(tree, sized(3 * 1024 * 1024));
+    const decision = await read(
+      f.resolverFor(tree, "tree.items"),
+      "tree.items",
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    const reader = decision.body.getReader();
+    await reader.read();
+    await reader.read();
+    expect(f.inUse()).toBe(0);
+    await reader.cancel();
+  }, 60_000);
 });
 
 /** The engine's collector, switched on at run time when the process has none. */

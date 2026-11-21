@@ -6,7 +6,7 @@ import { readerOf } from "./driver.js";
 import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { SEEN_O } from "./merge.js";
 import { streamDigest } from "./stream-digest.js";
-import { projectAlias, type AliasProjection } from "./alias-projection.js";
+import { checkAlias, type AliasCheck } from "./alias-projection.js";
 import { readAliasEpochs } from "./alias-view.js";
 import { createRecordQuery } from "./query.js";
 import {
@@ -317,9 +317,9 @@ export function createLocalListing(
     chosen: Candidate,
   ): Promise<boolean> {
     if (!target.alias) return true;
-    let projected: AliasProjection;
+    let projected: AliasCheck;
     for (let attempt = 0; ; attempt++) {
-      projected = await projectAlias(
+      projected = await checkAlias(
         target.alias,
         chosen,
         createRecordQuery(reads.db),
