@@ -81,15 +81,35 @@ export interface RecordQuery {
     connectionId: string,
     stream: string,
   ): AsyncIterable<StoredRecord>;
+}
+
+/**
+ * What a paged alias read needs of the database beyond a `RecordQuery`: the
+ * sizes of rows, so the read sizes its memory before it holds any body, and
+ * rows by key hash. Only the local resolver asks for it; a host that serves
+ * the records routes implements `RecordQuery` alone.
+ */
+export interface AliasRecordQuery extends RecordQuery {
   /**
-   * How many records a stream holds and how many bytes their bodies take, from
-   * one statement over the stored sizes: no body is read. A caller sizes its
-   * memory with it before it reads.
+   * How many records a stream holds, how many bytes their bodies take and the
+   * largest body, from one statement over the stored sizes: no body is read.
    */
   streamStats(
     connectionId: string,
     stream: string,
-  ): Promise<{ readonly rows: number; readonly bytes: number }>;
+  ): Promise<{
+    readonly rows: number;
+    readonly bytes: number;
+    readonly maxBytes: number;
+  }>;
+  /**
+   * Every record of a stream as its key hash and the bytes of its body, in
+   * `pk_hash` order: no body is read.
+   */
+  recordSizes(
+    connectionId: string,
+    stream: string,
+  ): AsyncIterable<{ readonly pkHash: string; readonly bytes: number }>;
   /**
    * The records of a stream with these key hashes, in `pk_hash` order. A hash
    * the stream no longer holds is absent from the answer.
@@ -111,6 +131,10 @@ type RecordRow = {
 
 const RECORD_COLUMNS = `stream, record_key, pk_hash, body, ${SEEN_O} AS stamp_o`;
 const STREAM_PAGE_SIZE = 100;
+/** Sizes per statement: a row of them is a hash and a number, not a body. */
+const SIZE_PAGE_SIZE = 1000;
+/** A stored body's size in bytes; a row written before `body_bytes` has none. */
+const BODY_BYTES = "COALESCE(body_bytes, LENGTH(CAST(body AS BLOB)))";
 /** Hashes per statement: SQLite before 3.32 allows 999 bound parameters. */
 const HASHES_PER_STATEMENT = 500;
 
@@ -168,7 +192,7 @@ function stored(row: RecordRow): StoredRecord {
   };
 }
 
-export function createRecordQuery(db: SqlReader): RecordQuery {
+export function createRecordQuery(db: SqlReader): AliasRecordQuery {
   return {
     async listRecords({ connectionId, stream, cursor, limit, withTotal }) {
       const size = pageLimit(limit);
@@ -314,14 +338,41 @@ export function createRecordQuery(db: SqlReader): RecordQuery {
     },
 
     async streamStats(connectionId, stream) {
-      // A row written before `body_bytes` was kept has none: size its body.
-      const [row] = await db.query<{ rows: number; bytes: number | null }>(
-        `SELECT COUNT(*) AS rows,
-                SUM(COALESCE(body_bytes, LENGTH(CAST(body AS BLOB)))) AS bytes
+      const [row] = await db.query<{
+        rows: number;
+        bytes: number | null;
+        max_bytes: number | null;
+      }>(
+        `SELECT COUNT(*) AS rows, SUM(${BODY_BYTES}) AS bytes,
+                MAX(${BODY_BYTES}) AS max_bytes
          FROM records WHERE connection_id = ? AND stream = ?`,
         [connectionId, stream],
       );
-      return { rows: Number(row?.rows ?? 0), bytes: Number(row?.bytes ?? 0) };
+      return {
+        rows: Number(row?.rows ?? 0),
+        bytes: Number(row?.bytes ?? 0),
+        maxBytes: Number(row?.max_bytes ?? 0),
+      };
+    },
+
+    async *recordSizes(connectionId, stream) {
+      let cursor: string | undefined;
+      for (;;) {
+        const page = await db.query<{ pk_hash: string; bytes: number }>(
+          `SELECT pk_hash, ${BODY_BYTES} AS bytes FROM records
+           WHERE connection_id = ? AND stream = ?
+             ${cursor === undefined ? "" : "AND pk_hash > ?"}
+           ORDER BY pk_hash LIMIT ?`,
+          cursor === undefined
+            ? [connectionId, stream, SIZE_PAGE_SIZE]
+            : [connectionId, stream, cursor, SIZE_PAGE_SIZE],
+        );
+        for (const row of page) {
+          yield { pkHash: row.pk_hash, bytes: Number(row.bytes) };
+        }
+        if (page.length < SIZE_PAGE_SIZE) return;
+        cursor = page[page.length - 1]!.pk_hash;
+      }
     },
 
     async recordsByHash(connectionId, stream, pkHashes) {

@@ -20,7 +20,7 @@ import { pinAliasStreams } from "./alias-view.js";
 import { projectAlias } from "./alias-projection.js";
 import { completeBody, pinStream } from "./complete-read.js";
 import { partialBody } from "./partial-read.js";
-import type { RecordQuery } from "./query.js";
+import type { AliasRecordQuery } from "./query.js";
 import {
   chooseCandidate,
   invalidAliasBinding,
@@ -220,7 +220,7 @@ async function* envelope(
 export function createLocalResolver(
   deps: LocalSyncDeps,
   parts: {
-    readonly query: RecordQuery;
+    readonly query: AliasRecordQuery;
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
   },
@@ -376,17 +376,17 @@ export function createLocalResolver(
    * A complete read, decided while it holds the connection's queue and
    * finished once its headers are decided: the body holds nothing. A body of
    * the database pages through the stream and checks its head on every page
-   * (see `completeBody`); one from a retained head or a projected alias is
-   * built in memory here, so nothing it reads can change.
+   * (see `completeBody`); a projected alias is checked here and read again as
+   * its body is taken, against the epochs pinned below (see `projectAlias`).
    */
   async function build(
     input: ResolveInput,
     candidate: Candidate,
   ): Promise<ReadDecision> {
     // A body of the database is pinned before the head is read: see
-    // `pinStream`. An alias projected in one call is built here, under the
-    // queue, and needs no pin; a paged one is read after the queue is
-    // released, and pins every stream it reads.
+    // `pinStream`. An alias is read again after the queue is released, when
+    // its body is taken (a paged one, window by window; any other, whole), so
+    // it pins every stream it reads.
     const alias = candidate.target.alias;
     const pin = alias
       ? 0
@@ -395,7 +395,7 @@ export function createLocalResolver(
           candidate.connection.connection_id,
           candidate.target.streams[0]!,
         );
-    const epochs = alias?.window
+    const epochs = alias
       ? await pinAliasStreams(
           deps.db,
           candidate.connection.connection_id,

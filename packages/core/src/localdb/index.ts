@@ -78,6 +78,7 @@ export {
   createRecordQuery,
   createGrantHistory,
   listCursor,
+  type AliasRecordQuery,
   type ChangePage,
   type RecordPage,
   type RecordQuery,

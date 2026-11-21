@@ -1,7 +1,7 @@
 import type { Reservation } from "../stream-sync/send-gate.js";
 import type { StreamSyncBlobs } from "../stream-sync/ports.js";
 import { assertViewCurrent, type AliasViewCheck } from "./alias-view.js";
-import type { RecordQuery } from "./query.js";
+import type { AliasRecordQuery } from "./query.js";
 import type {
   AliasDiagnostic,
   AliasWindow,
@@ -22,6 +22,13 @@ import { holdMemory } from "./transfer-memory.js";
  * waits for its turn, and no size makes it fail. The window is a chunk of that
  * reservation, never a limit: a parent whose own rows are larger than a chunk
  * is a window of its own, and takes the larger reservation it needs.
+ *
+ * Nothing is held before it is reserved. The children are indexed a batch of
+ * bodies at a time (their join key is read from the body: shared SQL has no
+ * JSON functions), each batch no larger than the reservation's chunk, so the
+ * bodies in memory are the ones the reservation was taken for. A larger
+ * reservation is asked for with the index dropped, then the index is built
+ * again under it: a read that waits holds neither a reservation nor an index.
  */
 export type AliasMemory = Pick<StreamSyncBlobs, "governor">;
 
@@ -57,7 +64,7 @@ export type WindowOutcome =
   | { readonly ok: false; readonly error: { readonly kind: string } };
 
 export interface WindowedInput {
-  readonly query: RecordQuery;
+  readonly query: AliasRecordQuery;
   readonly connectionId: string;
   readonly binding: LocalAliasTarget;
   readonly window: AliasWindow;
@@ -114,7 +121,7 @@ export async function openWindowed(
   const parentStats = await stat(window.parentStream);
   const childStats = hasChildren
     ? await stat(window.childStream)
-    : { rows: 0, bytes: 0 };
+    : { rows: 0, bytes: 0, maxBytes: 0 };
   let otherBytes = 0;
   for (const stream of others) otherBytes += (await stat(stream)).bytes;
 
@@ -125,9 +132,13 @@ export async function openWindowed(
     childStats.rows * INDEX_BYTES_PER_CHILD;
   const share = Math.floor(input.memory.governor.limitBytes * READ_SHARE);
   const chunk = Math.max(0, Math.floor((share - fixed) / HEAP_PER_STORED_BYTE));
+  // While the children are indexed, a batch of their bodies is in memory: no
+  // more than a chunk, or one body if that is larger.
+  const scan = Math.max(chunk, childStats.maxBytes);
+  let held = fixed + scan * HEAP_PER_STORED_BYTE;
   let reservation: Reservation | undefined = await holdMemory(
     input.memory,
-    fixed + chunk * HEAP_PER_STORED_BYTE,
+    held,
     0,
   );
   const release = () => {
@@ -135,41 +146,96 @@ export async function openWindowed(
     reservation = undefined;
   };
   try {
-    const indexed = await indexInput(input, others, hasChildren);
-    if (indexed === null) {
+    for (;;) {
+      const attempt = await indexAndPlan(
+        input,
+        others,
+        hasChildren,
+        scan,
+        chunk,
+        fixed,
+        held,
+      );
+      if (attempt.kind === "unwindowable") {
+        release();
+        return null;
+      }
+      if (attempt.kind === "fits") {
+        // The reservation is what the largest window needs, no more.
+        reservation?.shrink(attempt.need);
+        await assertViewCurrent(input.current);
+        const { parents, children, otherRecords, plan } = attempt;
+        return {
+          windows: () =>
+            runWindows(
+              input,
+              parents,
+              children,
+              otherRecords,
+              plan,
+              hasChildren,
+            ),
+          release,
+        };
+      }
+      // The largest window needs more than is held. The index was dropped
+      // with the attempt: hold nothing while the larger reservation waits,
+      // then build the index again under it. On a view that has not moved the
+      // same rows give the same plan, so the second attempt fits.
+      await assertViewCurrent(input.current);
       release();
-      return null;
+      held = attempt.need;
+      reservation = await holdMemory(input.memory, held, 0);
     }
-    const { parents, children, otherRecords } = indexed;
-    parents.sort((a, b) => window.parentOrder(a.data, b.data));
-    const plan = planWindows(parents, children, chunk);
-    // The reservation is what the largest window needs, no more: give back
-    // the rest, or take a larger one, holding nothing while it waits.
-    const need =
-      fixed +
-      HEAP_PER_STORED_BYTE * plan.reduce((m, w) => Math.max(m, w.chars), 0);
-    const held = fixed + chunk * HEAP_PER_STORED_BYTE;
-    if (need <= held) reservation?.shrink(need);
-    else {
-      release();
-      reservation = await holdMemory(input.memory, need, 0);
-    }
-    await assertViewCurrent(input.current);
-    return {
-      windows: () =>
-        runWindows(input, parents, children, otherRecords, plan, hasChildren),
-      release,
-    };
   } catch (error) {
     release();
     throw error;
   }
 }
 
+interface Indexed {
+  readonly parents: Parent[];
+  readonly children: Map<unknown, ChildGroup>;
+  readonly otherRecords: LocalAliasRecord[];
+  readonly plan: PlannedWindow[];
+}
+
+/**
+ * Index the input and plan its windows under `held` bytes. When the largest
+ * window needs more than that, the answer is the size alone: the index is the
+ * frame's, and gone when it returns.
+ */
+async function indexAndPlan(
+  input: WindowedInput,
+  others: readonly string[],
+  hasChildren: boolean,
+  scan: number,
+  chunk: number,
+  fixed: number,
+  held: number,
+): Promise<
+  | { readonly kind: "unwindowable" }
+  | { readonly kind: "larger"; readonly need: number }
+  | ({ readonly kind: "fits"; readonly need: number } & Indexed)
+> {
+  const indexed = await indexInput(input, others, hasChildren, scan);
+  if (indexed === null) return { kind: "unwindowable" };
+  const { parents, children } = indexed;
+  parents.sort((a, b) => input.window.parentOrder(a.data, b.data));
+  const plan = planWindows(parents, children, chunk);
+  const need =
+    fixed +
+    HEAP_PER_STORED_BYTE * plan.reduce((m, w) => Math.max(m, w.chars), 0);
+  return need <= held
+    ? { kind: "fits", need, ...indexed, plan }
+    : { kind: "larger", need };
+}
+
 async function indexInput(
   input: WindowedInput,
   others: readonly string[],
   hasChildren: boolean,
+  scan: number,
 ): Promise<{
   parents: Parent[];
   children: Map<unknown, ChildGroup>;
@@ -189,18 +255,8 @@ async function indexInput(
     children.set(key, { hashes: [], chars: 0 });
     parents.push({ data, key, chars: row.body.length });
   }
-  if (hasChildren) {
-    for await (const row of query.streamRecords(
-      connectionId,
-      window.childStream,
-    )) {
-      const data: unknown = JSON.parse(row.body);
-      if (!isObject(data)) return null;
-      const group = children.get(data[window.childKey]);
-      if (!group) return null;
-      group.hashes.push(row.pkHash);
-      group.chars += row.body.length;
-    }
+  if (hasChildren && !(await indexChildren(input, children, scan))) {
+    return null;
   }
   const otherRecords: LocalAliasRecord[] = [];
   for (const stream of others) {
@@ -212,6 +268,51 @@ async function indexInput(
     }
   }
   return { parents, children, otherRecords };
+}
+
+/**
+ * Add each child's key hash and size to its parent's group. The bodies are
+ * read, to find the key they name, `scan` stored bytes at a time (a body
+ * larger than that, alone) and are not kept. False when a child names no
+ * parent or is not an object.
+ */
+async function indexChildren(
+  input: WindowedInput,
+  children: ReadonlyMap<unknown, ChildGroup>,
+  scan: number,
+): Promise<boolean> {
+  const { query, connectionId, window } = input;
+  let batch = new Map<string, number>();
+  let batchBytes = 0;
+  const flush = async (): Promise<boolean> => {
+    const rows = await query.recordsByHash(connectionId, window.childStream, [
+      ...batch.keys(),
+    ]);
+    // A row gone since its size was read: the view moved.
+    if (rows.length !== batch.size) throw await moved(input);
+    for (const row of rows) {
+      const data: unknown = JSON.parse(row.body);
+      if (!isObject(data)) return false;
+      const group = children.get(data[window.childKey]);
+      if (!group) return false;
+      group.hashes.push(row.pkHash);
+      group.chars += batch.get(row.pkHash)!;
+    }
+    batch = new Map();
+    batchBytes = 0;
+    return true;
+  };
+  for await (const size of query.recordSizes(
+    connectionId,
+    window.childStream,
+  )) {
+    if (batch.size > 0 && batchBytes + size.bytes > scan && !(await flush())) {
+      return false;
+    }
+    batch.set(size.pkHash, size.bytes);
+    batchBytes += size.bytes;
+  }
+  return batch.size === 0 || (await flush());
 }
 
 interface PlannedWindow {

@@ -31,7 +31,7 @@ import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
 import {
   createRecordQuery,
-  type RecordQuery,
+  type AliasRecordQuery,
 } from "../../../core/src/localdb/query.js";
 import { COMPLETE_PAGE_SIZE } from "../../../core/src/localdb/complete-read.js";
 import {
@@ -137,13 +137,15 @@ async function fixture() {
     deviceId: "fixture",
   });
   const visited = vi.fn();
-  const query: RecordQuery = {
+  const query: AliasRecordQuery = {
     listRecords: vi.fn(),
     getRecord: vi.fn(),
     changesSince: vi.fn(),
     // The alias read sizes and pages its rows with the real queries.
     streamStats: (connectionId, stream) =>
       createRecordQuery(db).streamStats(connectionId, stream),
+    recordSizes: (connectionId, stream) =>
+      createRecordQuery(db).recordSizes(connectionId, stream),
     recordsByHash: (connectionId, stream, hashes) =>
       createRecordQuery(db).recordsByHash(connectionId, stream, hashes),
     async *streamRecords(connectionId, stream) {
@@ -956,7 +958,11 @@ describe("local resolve", () => {
       "c1",
       "c2",
     ]);
-    expect(f.visited.mock.calls).toEqual([["c1", "items"]]);
+    // Only the chosen target's stream is read (a projected alias is read to
+    // check it and again as its body is taken).
+    expect(
+      new Set(f.visited.mock.calls.map(([id, stream]) => `${id}/${stream}`)),
+    ).toEqual(new Set(["c1/items"]));
     await f.head("items", { version: 8, floor: 8 });
     mocked.apply.mockRejectedValue(
       new RegistryUnavailableBeforeWriteError(
@@ -1590,7 +1596,8 @@ describe("local resolve through the host's real legacy alias port", () => {
       readStreams,
     );
     expect(await userNameOf(await readOf(resolver))).toBeNull();
-    expect(readStreams.sort()).toEqual(["folders", "notes"]);
+    // Read to check the alias and again as its body is taken.
+    expect([...new Set(readStreams)].sort()).toEqual(["folders", "notes"]);
   });
 
   it("reports iCloud Notes deleted when a required stream is deleted", async () => {

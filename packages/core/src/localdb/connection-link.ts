@@ -99,19 +99,5 @@ export function createLinkedRecordQuery(
         yield row;
       }
     },
-    async streamStats(instance, stream) {
-      const selected = await target(instance, stream);
-      if (!selected) return { rows: 0, bytes: 0 };
-      const stats = await query.streamStats(selected.id, stream);
-      return (await valid(selected, instance, stream))
-        ? stats
-        : { rows: 0, bytes: 0 };
-    },
-    async recordsByHash(instance, stream, pkHashes) {
-      const selected = await target(instance, stream);
-      if (!selected) return [];
-      const rows = await query.recordsByHash(selected.id, stream, pkHashes);
-      return (await valid(selected, instance, stream)) ? rows : [];
-    },
   };
 }

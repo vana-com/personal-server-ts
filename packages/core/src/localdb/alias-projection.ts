@@ -1,5 +1,6 @@
 import {
   aliasViewCheck,
+  assertViewCurrent,
   pinAliasStreams,
   type AliasViewCheck,
 } from "./alias-view.js";
@@ -10,7 +11,7 @@ import {
 } from "./alias-window.js";
 import type { SqlDriver } from "./driver.js";
 import { PartialViewMoved } from "./partial-read.js";
-import type { RecordQuery } from "./query.js";
+import type { AliasRecordQuery } from "./query.js";
 import { invalidAliasBinding, type Candidate } from "./read-selection.js";
 import type {
   AliasDiagnostic,
@@ -38,8 +39,9 @@ export type AliasProjection =
       readonly kind: "ok";
       /**
        * The payload's JSON, a piece at a time. Nothing is read or held until
-       * the first piece is asked for, and a body that stops being read gives
-       * its memory back.
+       * the first piece is asked for. From then until the last piece is taken
+       * (or the body is cancelled) the memory it needs is held from the
+       * governor, and then it is given back.
        */
       readonly body: () => AsyncIterable<string>;
     }
@@ -55,10 +57,6 @@ export type AliasProjection =
 /** Characters of a windowed body's elements joined before they are yielded. */
 const OUTPUT_PIECE_CHARS = 64 * 1024;
 
-async function* single(text: string): AsyncGenerator<string> {
-  yield text;
-}
-
 /**
  * Project the installed records of an alias scope, or say why it has no body.
  * Reads the local database only; `query` may be wrapped by the caller to
@@ -67,13 +65,16 @@ async function* single(text: string): AsyncGenerator<string> {
  * A windowed binding is projected a window of parents at a time, twice: once
  * here, to learn its diagnostics and totals before any byte is promised, and
  * once in `body`, which writes each window as it is projected. Any other
- * binding is projected in one call. Both take the memory they hold from
- * `env.memory` and wait for it; none refuses a size.
+ * binding is projected whole, also twice: the check here keeps nothing, and
+ * `body` projects again and holds its payload's memory until it is delivered.
+ * Both take the memory they hold from `env.memory` and wait for it; none
+ * refuses a size. Neither pass is held between calls, so a result whose body
+ * is never read holds nothing.
  */
 export async function projectAlias(
   binding: LocalAliasTarget,
   candidate: Candidate,
-  query: RecordQuery,
+  query: AliasRecordQuery,
   now: string,
   env: AliasEnv,
 ): Promise<AliasProjection> {
@@ -94,9 +95,6 @@ export async function projectAlias(
     }
   }
   const connectionId = candidate.connection.connection_id;
-  if (!binding.window) {
-    return inMemory(binding, connectionId, fetched, query, now, env);
-  }
   const epochs =
     env.epochs ?? (await pinAliasStreams(env.db, connectionId, fetched));
   const current = aliasViewCheck(
@@ -106,37 +104,50 @@ export async function projectAlias(
     epochs,
   );
   try {
-    return await paged(
-      binding,
-      binding.window,
-      connectionId,
-      fetched,
-      query,
-      now,
-      env,
-      current,
-    );
+    return binding.window
+      ? await paged(
+          binding,
+          binding.window,
+          connectionId,
+          fetched,
+          query,
+          now,
+          env,
+          current,
+        )
+      : await whole(binding, connectionId, fetched, query, now, env, current);
   } catch (error) {
     if (error instanceof PartialViewMoved) return { kind: "moved" };
     throw error;
   }
 }
 
-/** Every row projected in one call, its memory held from the governor. */
-async function inMemory(
+/**
+ * Every row projected in one call. The check holds the memory of the rows and
+ * of their projection while it runs, and keeps none of it. The body takes that
+ * memory again and keeps it until its last piece is taken, or it is cancelled:
+ * the payload it serializes is built and held under that reservation, and no
+ * other copy outlives the check.
+ */
+async function whole(
   binding: LocalAliasTarget,
   connectionId: string,
   fetched: readonly string[],
-  query: RecordQuery,
+  query: AliasRecordQuery,
   now: string,
   env: AliasEnv,
+  current: AliasViewCheck,
 ): Promise<AliasProjection> {
-  let bytes = 0;
-  for (const stream of fetched) {
-    bytes += (await query.streamStats(connectionId, stream)).bytes;
-  }
-  const release = await holdMemory(env.memory, bytes * HEAP_PER_STORED_BYTE, 0);
-  try {
+  /** The memory of every row and of its projection, from the governor. */
+  const hold = async () => {
+    let bytes = 0;
+    for (const stream of fetched) {
+      bytes += (await query.streamStats(connectionId, stream)).bytes;
+    }
+    return holdMemory(env.memory, bytes * HEAP_PER_STORED_BYTE, 0);
+  };
+  /** Project every row. Call it with the memory held. */
+  const project = async () => {
     const records: LocalAliasRecord[] = [];
     for (const stream of fetched) {
       for await (const record of query.streamRecords(connectionId, stream)) {
@@ -146,7 +157,34 @@ async function inMemory(
         });
       }
     }
-    const projected = binding.project(records, now, fetched);
+    // Checked after the rows are read, so every one of them is a pinned row.
+    await assertViewCurrent(current);
+    return binding.project(records, now, fetched);
+  };
+  async function* body(): AsyncGenerator<string> {
+    const release = await hold();
+    try {
+      const projected = await project();
+      // The view is the one the check saw, so this is the payload it passed.
+      if (
+        !projected.ok ||
+        incompleteDiagnostics(projected.diagnostics).length > 0
+      ) {
+        throw new Error("alias projection changed since it was checked");
+      }
+      const text = JSON.stringify(projected.payload);
+      // A piece at a time, with the memory held until the last is taken: a
+      // consumer that pauses, or stops, leaves the payload in memory under it.
+      for (let at = 0; at < text.length; at += OUTPUT_PIECE_CHARS) {
+        yield text.slice(at, at + OUTPUT_PIECE_CHARS);
+      }
+    } finally {
+      release();
+    }
+  }
+  const release = await hold();
+  try {
+    const projected = await project();
     if (!projected.ok && projected.error.kind === "invalid_binding")
       return { kind: "invalid_binding" };
     if (!projected.ok) return { kind: "no_data" };
@@ -155,10 +193,7 @@ async function inMemory(
     const incomplete = incompleteDiagnostics(projected.diagnostics);
     return incomplete.length > 0
       ? { kind: "incomplete", diagnostics: incomplete }
-      : {
-          kind: "ok",
-          body: () => single(JSON.stringify(projected.payload)),
-        };
+      : { kind: "ok", body };
   } finally {
     release();
   }
@@ -177,7 +212,7 @@ async function paged(
   window: AliasWindow,
   connectionId: string,
   fetched: readonly string[],
-  query: RecordQuery,
+  query: AliasRecordQuery,
   now: string,
   env: AliasEnv,
   current: AliasViewCheck,
@@ -196,7 +231,7 @@ async function paged(
   const session = await open();
   // A child names no parent, or a row has no key to join on: not windowable.
   if (session === null) {
-    return inMemory(binding, connectionId, fetched, query, now, env);
+    return whole(binding, connectionId, fetched, query, now, env, current);
   }
   const sums = new Map(window.sumKeys.map((key) => [key, 0]));
   const tallies = new Map<string, Tally>();
@@ -235,7 +270,7 @@ async function paged(
   if (template === undefined) {
     // Every window was empty: the parents were the whole input. Unreachable
     // for a plan with a window, but never serve an empty body for it.
-    return inMemory(binding, connectionId, fetched, query, now, env);
+    return whole(binding, connectionId, fetched, query, now, env, current);
   }
   for (const key of window.sumKeys) template[key] = sums.get(key);
   const text = JSON.stringify(template);

@@ -1,3 +1,6 @@
+import * as v8 from "node:v8";
+import * as vm from "node:vm";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   alternateLegacyBindingsForScope,
@@ -10,7 +13,8 @@ import type {
 } from "../../../core/src/legacy-projection/types.js";
 import { WINDOW_FIXTURES } from "../../../core/src/legacy-projection/__fixtures__/window-records.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
-import type { SqlDriver } from "../../../core/src/localdb/driver.js";
+import { HEAP_PER_STORED_BYTE } from "../../../core/src/localdb/alias-window.js";
+import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
@@ -52,6 +56,41 @@ const governorOf = (limit: number) =>
     maxBytesInFlight: limit,
   });
 
+/**
+ * The governor, and a count of the bytes held from it right now: a reservation
+ * counts from its grant to its release, less what `shrink` gave back.
+ */
+function ledgerOf(real: ReturnType<typeof governorOf>) {
+  let held = 0;
+  const governor: ReturnType<typeof governorOf> = {
+    ...real,
+    async reserve(bytes, objectBytes) {
+      const inner = await real.reserve(bytes, objectBytes);
+      let mine = Math.max(0, bytes);
+      let released = false;
+      held += mine;
+      return Object.assign(
+        () => {
+          if (released) return;
+          released = true;
+          held -= mine;
+          inner();
+        },
+        {
+          shrink(keep: number) {
+            if (released) return;
+            const next = Math.max(0, Math.min(mine, keep));
+            held -= mine - next;
+            mine = next;
+            inner.shrink(keep);
+          },
+        },
+      );
+    },
+  };
+  return { governor, inUse: () => held };
+}
+
 async function fixture(limit: number) {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: "0xabc",
@@ -59,7 +98,7 @@ async function fixture(limit: number) {
     deviceId: "alias-paging",
   });
   drivers.push(db);
-  const governor = governorOf(limit);
+  const { governor, inUse } = ledgerOf(governorOf(limit));
   const poison = new Proxy(
     {},
     {
@@ -123,13 +162,56 @@ async function fixture(limit: number) {
       await db.batch(rows.slice(i, i + 400));
     }
   }
-  const resolverFor = (target: LocalAliasTarget, scope: string) =>
+  const resolverFor = (
+    target: LocalAliasTarget,
+    scope: string,
+    query: ReturnType<typeof createRecordQuery> = createRecordQuery(db),
+  ) =>
     createLocalResolver(deps, {
-      query: createRecordQuery(db),
+      query,
       aliasScopes: () => [scope],
       aliasTargets: () => [target],
     });
-  return { db, deps, governor, seed, resolverFor };
+  /**
+   * The database as a read sees it, with every result set that carries record
+   * bodies checked against the ledger: the heap those bodies take
+   * (`HEAP_PER_STORED_BYTE` for each) must be held from the governor at the
+   * moment they are read, so no read holds rows the governor does not know.
+   */
+  function audited() {
+    const unheld: string[] = [];
+    let readsOfBodies = 0;
+    let largest = 0;
+    const reader = {
+      async query<R extends Record<string, SqlValue>>(
+        sql: string,
+        params?: readonly SqlValue[],
+      ): Promise<R[]> {
+        const rows = await db.query<R>(sql, params);
+        let bytes = 0;
+        for (const row of rows) {
+          const body = (row as Record<string, SqlValue>).body;
+          if (typeof body === "string") bytes += body.length;
+        }
+        if (bytes > 0) {
+          readsOfBodies++;
+          largest = Math.max(largest, bytes);
+          if (bytes * HEAP_PER_STORED_BYTE > inUse()) {
+            unheld.push(
+              `${bytes} stored bytes of bodies read while ${inUse()} bytes were held`,
+            );
+          }
+        }
+        return rows;
+      },
+    };
+    return {
+      query: createRecordQuery(reader),
+      unheld,
+      reads: () => ({ readsOfBodies, largest }),
+    };
+  }
+  return { db, deps, governor, inUse, seed, resolverFor, audited };
 }
 
 const read = (
@@ -238,47 +320,60 @@ describe("a paged alias read equals the whole projection, byte for byte", () => 
   }
 });
 
+/**
+ * One chatgpt conversation of `messages` messages that each hold `messageBytes`
+ * of text, as the rows of its two streams.
+ */
+function chatgptConversation(
+  c: number,
+  messages: number,
+  messageBytes: number,
+): PdppRecord[] {
+  const id = `c${String(c).padStart(3, "0")}`;
+  const filler = "x".repeat(messageBytes);
+  const records: PdppRecord[] = [];
+  let parent: string | null = null;
+  for (let m = 0; m < messages; m++) {
+    const node = `n${m}`;
+    records.push({
+      stream: "messages",
+      data: {
+        id: `${id}:${node}`,
+        conversation_id: id,
+        parent_id: parent ? `${id}:${parent}` : null,
+        role: m % 2 ? "assistant" : "user",
+        content: `${m}:${id}:${filler}`,
+        content_type: "text",
+        model_slug: null,
+        create_time: "2026-01-01T00:00:00.000Z",
+        on_current_branch: true,
+      },
+    });
+    parent = node;
+  }
+  records.push({
+    stream: "conversations",
+    data: {
+      id,
+      title: `conversation ${id}`,
+      create_time: "2026-01-01T00:00:00.000Z",
+      update_time: `2026-01-${String(1 + (c % 28)).padStart(2, "0")}T00:00:${String(c % 60).padStart(2, "0")}.000Z`,
+      current_node: parent,
+      message_count_on_current_branch: messages,
+    },
+  });
+  return records;
+}
+
 describe("a read above the old 64 MiB budget", () => {
   /** One chatgpt account whose messages total more than 64 MiB. */
   function bigAccount() {
     const messageBytes = 100 * 1024;
     const conversations = 12;
     const perConversation = 60;
-    const filler = "x".repeat(messageBytes);
-    const records: PdppRecord[] = [];
-    for (let c = 0; c < conversations; c++) {
-      const id = `c${String(c).padStart(2, "0")}`;
-      let parent: string | null = null;
-      for (let m = 0; m < perConversation; m++) {
-        const node = `n${m}`;
-        records.push({
-          stream: "messages",
-          data: {
-            id: `${id}:${node}`,
-            conversation_id: id,
-            parent_id: parent ? `${id}:${parent}` : null,
-            role: m % 2 ? "assistant" : "user",
-            content: `${m}:${id}:${filler}`,
-            content_type: "text",
-            model_slug: null,
-            create_time: "2026-01-01T00:00:00.000Z",
-            on_current_branch: true,
-          },
-        });
-        parent = node;
-      }
-      records.push({
-        stream: "conversations",
-        data: {
-          id,
-          title: `conversation ${id}`,
-          create_time: "2026-01-01T00:00:00.000Z",
-          update_time: `2026-01-${String(1 + c).padStart(2, "0")}T00:00:00.000Z`,
-          current_node: parent,
-          message_count_on_current_branch: perConversation,
-        },
-      });
-    }
+    const records = Array.from({ length: conversations }, (_, c) =>
+      chatgptConversation(c, perConversation, messageBytes),
+    ).flat();
     return { records, conversations, perConversation, messageBytes };
   }
 
@@ -295,7 +390,11 @@ describe("a read above the old 64 MiB budget", () => {
     const f = await fixture(limit);
     await f.seed(target, big.records);
     const window = f.governor.window();
-    const decision = await read(f.resolverFor(target, scope), scope);
+    const audit = f.audited();
+    const decision = await read(
+      f.resolverFor(target, scope, audit.query),
+      scope,
+    );
     expect(decision.kind).toBe("view");
     if (decision.kind !== "view") return;
     // Read the body as a client would, a chunk at a time, and keep only what
@@ -325,6 +424,8 @@ describe("a read above the old 64 MiB budget", () => {
     expect(tail.endsWith(`"total":${big.conversations}}}`)).toBe(true);
     expect(stats.peakBytesInFlight).toBeGreaterThan(0);
     expect(stats.peakBytesInFlight).toBeLessThanOrEqual(limit);
+    // Every row the read took from the database was held from the governor.
+    expect(audit.unheld).toEqual([]);
     console.log(
       `large read: ${bytes} bytes in ${chunks} chunks; governor limit ${limit}; peak held ${stats.peakBytesInFlight}; heap grew ${heapPeak - heapBefore} bytes over the read (live, when run with --expose-gc)`,
     );
@@ -523,3 +624,167 @@ describe("a read that is not windowed", () => {
     expect(window.end().peakBytesInFlight).toBeGreaterThan(0);
   });
 });
+
+/**
+ * The three places a read could hold bytes the governor does not know, each
+ * in the scenario that shows it. `audited()` counts the heap of every body a
+ * statement returns against what the read holds at that moment.
+ */
+describe("a windowed read holds nothing the governor does not count", () => {
+  const scope = "chatgpt.conversations";
+  const chatgpt = () =>
+    legacyAliasScopes(scope).find(
+      (t) => t.connector === "chatgpt",
+    ) as LocalAliasTarget;
+  const whole = (target: LocalAliasTarget, records: PdppRecord[]) => {
+    const projected = target.project(
+      records,
+      NOW,
+      LEGACY_SCOPE_BINDINGS.get(scope)!.pdppStreams,
+    );
+    if (!projected.ok) throw new Error("whole projection failed");
+    return envelopeOf(scope, projected.payload);
+  };
+
+  it("indexes children a bounded batch at a time, never a page of whole bodies", async () => {
+    // 120 conversations, each with one 64 KiB message: a page of 100 bodies
+    // is 6.4 MB of stored text, 25 MB of heap, under a 2 MiB read share.
+    const records = Array.from({ length: 120 }, (_, c) =>
+      chatgptConversation(c, 1, 64 * 1024),
+    ).flat();
+    const target = chatgpt();
+    const f = await fixture(4 * 1024 * 1024);
+    await f.seed(target, records);
+    const audit = f.audited();
+    const decision = await read(
+      f.resolverFor(target, scope, audit.query),
+      scope,
+    );
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    // Byte-identical to the whole projection, as before.
+    expect(await new Response(decision.body).text()).toBe(
+      whole(target, records),
+    );
+    expect(audit.reads().readsOfBodies).toBeGreaterThan(10);
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("holds no index while it waits for a larger reservation", async () => {
+    // One conversation of three 300 KiB messages is a window of its own, and
+    // needs more than the whole 2 MiB budget: its read must wait to run alone.
+    // Another holder keeps the budget busy, so the wait is real.
+    const records = [
+      ...chatgptConversation(0, 3, 300 * 1024),
+      ...chatgptConversation(1, 1, 100),
+      ...chatgptConversation(2, 1, 100),
+    ];
+    const real = chatgpt();
+    const f = await fixture(2 * 1024 * 1024);
+    await f.seed(real, records);
+    const gc = collector();
+    const seen: WeakRef<object>[] = [];
+    let phase: "first" | "later" | undefined;
+    let blocker: (() => void) | undefined;
+    const target: LocalAliasTarget = {
+      ...real,
+      window: {
+        ...real.window!,
+        // The parents are sorted once the index is built, before the read
+        // asks for its larger reservation: watch the parsed parents there,
+        // and take the budget's last bytes so that the ask must wait.
+        parentOrder: (a, b) => {
+          if (phase === undefined) {
+            phase = "first";
+            queueMicrotask(() => (phase = "later"));
+            void f.governor.reserve(1024).then((release) => {
+              blocker = release;
+            });
+          }
+          if (phase === "first") seen.push(new WeakRef(a), new WeakRef(b));
+          return real.window!.parentOrder(a, b);
+        },
+      },
+    };
+    const pending = read(f.resolverFor(target, scope), scope);
+    const state = await Promise.race([
+      pending.then(() => "served"),
+      sleep(300).then(() => "waiting"),
+    ]);
+    expect(state).toBe("waiting");
+    expect(seen.length).toBeGreaterThan(0);
+    // While it waits it holds no reservation of its own, so it must hold none
+    // of the rows the reservation was for.
+    expect(f.inUse()).toBe(1024);
+    gc();
+    await sleep(10);
+    gc();
+    expect(seen.filter((ref) => ref.deref() !== undefined)).toHaveLength(0);
+    blocker!();
+    const decision = await pending;
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(whole(real, records));
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+});
+
+describe("a read that is not windowed holds its payload from the governor", () => {
+  const plain: LocalAliasTarget = {
+    connector: "plain",
+    streams: ["items"],
+    project: (records) => ({
+      ok: true as const,
+      payload: { items: records.map((r) => r.data) },
+    }),
+  };
+  const rows = Array.from({ length: 40 }, (_, i) => ({
+    stream: "items",
+    data: { id: `i${i}`, pad: "y".repeat(10_000) },
+  }));
+  const expected = envelopeOf("plain.items", {
+    items: rows.map((r) => r.data),
+  });
+  const items = (f: Awaited<ReturnType<typeof fixture>>) =>
+    f.resolverFor(plain, "plain.items");
+
+  it("keeps the payload's memory held until the body is delivered or cancelled", async () => {
+    // 400 KB of rows under a 1 MiB governor: the payload takes 1.6 MB, more
+    // than the budget, so a second such read must wait for the first to end.
+    const f = await fixture(1024 * 1024);
+    await f.seed(plain, rows);
+    const first = await read(items(f), "plain.items");
+    expect(first.kind).toBe("view");
+    if (first.kind !== "view") return;
+    // A body nobody has begun to read holds nothing.
+    expect(f.inUse()).toBe(0);
+    const reader = first.body.getReader();
+    // The envelope's head, then the first piece of the payload; the consumer
+    // pauses with the rest of the payload built and waiting to be written.
+    await reader.read();
+    await reader.read();
+    expect(f.inUse()).toBeGreaterThan(0);
+    const second = read(items(f), "plain.items");
+    const state = await Promise.race([
+      second.then(() => "served"),
+      sleep(200).then(() => "waiting"),
+    ]);
+    expect(state).toBe("waiting");
+    // Cancelling the body gives its memory back: the waiting read now runs.
+    await reader.cancel();
+    const decision = await second;
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(expected);
+    expect(f.inUse()).toBe(0);
+  });
+});
+
+/** The engine's collector, switched on at run time when the process has none. */
+function collector(): () => void {
+  const existing = (globalThis as { gc?: () => void }).gc;
+  if (existing) return existing;
+  v8.setFlagsFromString("--expose-gc");
+  return vm.runInNewContext("gc") as () => void;
+}
