@@ -106,6 +106,7 @@ import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import type {
   OwnerNotes,
   ReadDecision,
+  StreamedReadDecision,
   ResolveInput,
   StreamSyncReadStatus,
   WithheldRun,
@@ -363,7 +364,13 @@ export interface PersonalServerIngestSyncManager {
 
 /** The read side of stream sync, as the data API uses it. */
 export interface StreamSyncReadPort {
+  /** A body in memory: the consumers that read it whole take this one. */
   resolve(input: ResolveInput): Promise<ReadDecision>;
+  /**
+   * For the one consumer that streams the body to a client: the body of a large
+   * windowed alias may wait in a file (`SpooledView`). Absent: `resolve`.
+   */
+  resolveStreaming?(input: ResolveInput): Promise<StreamedReadDecision>;
   /** Per-stream counts and open import problems, for owner diagnostics. */
   status?(): StreamSyncReadStatus;
   listScopes?: LocalListing["listScopes"];
@@ -795,7 +802,7 @@ const readAbortedBody = () => ({
 });
 
 /** The response for a stream-sync decision that serves nothing; `null` otherwise. */
-function streamSyncRefusal(decision: ReadDecision): Response | null {
+function streamSyncRefusal(decision: StreamedReadDecision): Response | null {
   switch (decision.kind) {
     case "read_aborted":
       return jsonResponse(readAbortedBody(), { status: 503 });
@@ -956,7 +963,7 @@ async function serveStreamSyncView(
     authResult: Awaited<
       ReturnType<PersonalServerApiAuthPort["authorizeBuilderRead"]>
     >;
-    decision: Extract<ReadDecision, { kind: "view" }>;
+    decision: Extract<StreamedReadDecision, { kind: "view" }>;
     paymentResponseHeader: string | undefined;
     inProcess: PersonalServerInProcessRead | undefined;
   },
@@ -3413,7 +3420,7 @@ export async function handlePersonalServerDataRequest(
           ownApp instanceof Response
             ? null
             : readCharge(deps, scopeResult.scope, authResult, ownApp);
-        const decision = await deps.streamSyncRead.resolve({
+        const readInput = {
           scope: scopeResult.scope,
           connection: url.searchParams.get("connection"),
           cursor: url.searchParams.get("cursor"),
@@ -3421,7 +3428,15 @@ export async function handlePersonalServerDataRequest(
           isOwnerView: isOwnerView(authResult),
           requireRegistered: charge !== null,
           signal: request.signal,
-        });
+        };
+        // An in-process caller (MCP) reads the body whole, to check or parse
+        // it: it takes the body in memory, and a large alias is refused as it
+        // was before alias paging. Only a read answered to a client streams a
+        // body that waits in a file.
+        const decision: StreamedReadDecision =
+          !inProcess && deps.streamSyncRead.resolveStreaming
+            ? await deps.streamSyncRead.resolveStreaming(readInput)
+            : await deps.streamSyncRead.resolve(readInput);
         if (decision.kind === "local_pending") {
           await decision.body.cancel();
           return errorResponse(
@@ -3487,16 +3502,28 @@ export async function handlePersonalServerDataRequest(
               paymentResponseHeader = paid.paymentResponseHeader;
             }
           }
-          const checked = await validateStreamBody(decision, inProcess);
-          await settle(decision.served);
-          return serveStreamSyncView(deps, request, {
-            scope: scopeResult.scope,
-            grantId,
-            authResult,
-            decision: checked,
-            paymentResponseHeader,
-            inProcess,
-          });
+          // The body may be a file already written (a spooled alias). Any
+          // failure before it is served cancels it, which removes the file.
+          let checked = decision;
+          try {
+            // A spooled body is never validated whole: only a memory body is.
+            if (!decision.spooled) {
+              checked = await validateStreamBody(decision, inProcess);
+            }
+            await settle(decision.served);
+            return await serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision: checked,
+              paymentResponseHeader,
+              inProcess,
+            });
+          } catch (error) {
+            // A body already read or locked rejects the cancel: it has ended.
+            await checked.body.cancel().catch(() => undefined);
+            throw error;
+          }
         }
         return errorResponse(
           404,

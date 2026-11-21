@@ -685,6 +685,34 @@ describe("createByteBudget", () => {
     expect(budget.inUse()).toBe(0);
   });
 
+  it("lets a waiter leave when its signal aborts: nothing held, the line moves on", async () => {
+    const budget = createByteBudget(10);
+    const first = await budget.reserve(8);
+    const gone = new AbortController();
+    const leaving = budget.reserve(6, gone.signal);
+    // Behind it, a request that would fit now but is served in order.
+    let behind = false;
+    void budget.reserve(2).then(() => (behind = true));
+    await flush();
+    expect(behind).toBe(false);
+    gone.abort(new Error("gone"));
+    await expect(leaving).rejects.toThrow("gone");
+    await flush();
+    // The aborted wait took nothing, and the one behind it was served.
+    expect(behind).toBe(true);
+    expect(budget.inUse()).toBe(8 + 2);
+    first();
+    expect(budget.inUse()).toBe(2);
+  });
+
+  it("refuses at once a wait whose signal has already aborted", async () => {
+    const budget = createByteBudget(10);
+    const gone = new AbortController();
+    gone.abort(new Error("already"));
+    await expect(budget.reserve(1, gone.signal)).rejects.toThrow("already");
+    expect(budget.inUse()).toBe(0);
+  });
+
   it("serves waiters in order and ignores a second release", async () => {
     const budget = createByteBudget(10);
     const first = await budget.reserve(10);

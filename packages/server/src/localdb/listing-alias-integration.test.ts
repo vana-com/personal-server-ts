@@ -110,3 +110,53 @@ it("does not resolve aliases without a caller and checks grants before projectio
   expect(await listing.listScopes({ canRead: () => false })).toEqual([]);
   expect(f.project).not.toHaveBeenCalled();
 });
+it("lists an alias while the database writer is busy", async () => {
+  const f = await fixture();
+  // A write left the stream's change mark set, as every first change does.
+  const marks = await f.deps.db.query<{ dirty: number }>(
+    "SELECT dirty FROM stream_change_marks WHERE stream = 'items'",
+  );
+  expect(marks.map((m) => m.dirty)).toEqual([1]);
+  // The writer is held by a long batch: nothing that writes finishes.
+  let finish!: () => void;
+  const held = new Promise<void>((resolve) => (finish = resolve));
+  const real = f.deps.db;
+  // Its queries wait behind the writer too, as they do on a real connection.
+  // Only the read connection answers while the writer is held.
+  const stalled: SqlDriver = {
+    info: real.info,
+    query: async (sql, params) => {
+      await held;
+      return real.query(sql, params);
+    },
+    batch: async (statements) => {
+      await held;
+      return real.batch(statements);
+    },
+    close: () => real.close(),
+    reads: real,
+  };
+  const listing = createLocalListing(
+    { ...f.deps, db: stalled, ...f.aliases },
+    () => ({ served: 0, gone: 0, off: 0 }),
+  );
+  try {
+    const listed = await Promise.race([
+      listing.listScopes({ canRead: () => true }),
+      new Promise<"stalled">((resolve) =>
+        setTimeout(() => resolve("stalled"), 1500),
+      ),
+    ]);
+    expect(listed).not.toBe("stalled");
+    expect(
+      (listed as readonly { scope: string }[]).map((s) => s.scope),
+    ).toEqual(["fixture.summary", "pdpp.fixture-source.items"]);
+    // Listing is a read: it left the mark as it found it.
+    const after = await real.query<{ dirty: number }>(
+      "SELECT dirty FROM stream_change_marks WHERE stream = 'items'",
+    );
+    expect(after.map((m) => m.dirty)).toEqual([1]);
+  } finally {
+    finish();
+  }
+});

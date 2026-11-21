@@ -451,9 +451,11 @@ export interface ByteBudget {
   /**
    * Resolves with a reservation once `bytes` fit under the budget. A request
    * larger than the whole budget waits until nothing else is held, then runs
-   * alone: it never waits for ever. Waiters are served in order.
+   * alone: it never waits for ever. Waiters are served in order. A wait that
+   * `signal` aborts leaves the line at once, rejects with the signal's reason
+   * and holds nothing; the waiters behind it are served as if it never came.
    */
-  reserve(bytes: number): Promise<Reservation>;
+  reserve(bytes: number, signal?: AbortSignal): Promise<Reservation>;
   readonly inUse: () => number;
 }
 
@@ -477,7 +479,8 @@ export function createByteBudget(
   };
   return {
     inUse: () => inUse,
-    reserve(bytes) {
+    reserve(bytes, signal) {
+      if (signal?.aborted) return Promise.reject(signal.reason);
       const requested = Math.max(0, bytes);
       const hold = (): Reservation => {
         let held = requested;
@@ -504,8 +507,24 @@ export function createByteBudget(
         onChange?.(inUse);
         return Promise.resolve(hold());
       }
-      return new Promise((resolve) => {
-        waiting.push({ bytes: requested, grant: () => resolve(hold()) });
+      return new Promise((resolve, reject) => {
+        const entry = {
+          bytes: requested,
+          grant: () => {
+            signal?.removeEventListener("abort", leave);
+            resolve(hold());
+          },
+        };
+        const leave = () => {
+          const at = waiting.indexOf(entry);
+          if (at < 0) return;
+          waiting.splice(at, 1);
+          reject(signal!.reason);
+          // A waiter that did not fit may have been what held the others back.
+          drain();
+        };
+        signal?.addEventListener("abort", leave, { once: true });
+        waiting.push(entry);
       });
     },
   };

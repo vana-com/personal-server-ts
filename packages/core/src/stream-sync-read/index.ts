@@ -6,6 +6,8 @@ export {
 export { liveStreamCounts } from "./service.js";
 export type {
   ReadDecision,
+  SpooledView,
+  StreamedReadDecision,
   ResolveInput,
   StreamSyncConnectionStatus,
   StreamSyncReadStatus,

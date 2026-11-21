@@ -22,8 +22,10 @@ export async function referenceListScopes(
   canRead: (scope: string) => boolean | Promise<boolean>,
 ): Promise<ListedScope[]> {
   const aliasNames = [...(deps.aliasScopes?.() ?? [])];
+  const query = createRecordQuery(deps.db);
   const resolver = createLocalResolver(deps, {
-    query: createRecordQuery(deps.db),
+    query,
+    aliasQuery: query,
     aliasScopes: () => aliasNames,
     aliasTargets: deps.aliasTargets,
   });

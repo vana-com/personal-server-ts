@@ -3,6 +3,10 @@ import {
   handlePersonalServerDataRequest,
   type PersonalServerDataApiDeps,
 } from "../../../core/src/api/index.js";
+import {
+  createStorageAccess,
+  DEFAULT_STORAGE_ACCESS_POLICY,
+} from "../../../core/src/stream-sync/storage-retry.js";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   dataRegistryDomain,
@@ -25,7 +29,10 @@ import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { readerOf, type SqlDriver } from "../../../core/src/localdb/driver.js";
-import type { RecordQuery } from "../../../core/src/localdb/query.js";
+import {
+  createRecordQuery,
+  type AliasRecordQuery,
+} from "../../../core/src/localdb/query.js";
 import { COMPLETE_PAGE_SIZE } from "../../../core/src/localdb/complete-read.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -130,12 +137,27 @@ async function fixture() {
     deviceId: "fixture",
   });
   const visited = vi.fn();
-  const query: RecordQuery = {
+  const query: AliasRecordQuery = {
     listRecords: vi.fn(),
     getRecord: vi.fn(),
     changesSince: vi.fn(),
-    async *streamRecords(connectionId, stream) {
+    // The alias read sizes and pages its rows with the real queries.
+    streamStats: (connectionId, stream) =>
+      createRecordQuery(db).streamStats(connectionId, stream),
+    recordSizes: (connectionId, stream) =>
+      createRecordQuery(db).recordSizes(connectionId, stream),
+    // The alias read reads bodies by their sizes: a stream is visited when
+    // its bodies are.
+    recordsByHash: (connectionId, stream, sized, guard) => {
       visited(connectionId, stream);
+      return createRecordQuery(db).recordsByHash(
+        connectionId,
+        stream,
+        sized,
+        guard,
+      );
+    },
+    async *streamRecords(connectionId, stream) {
       const records = await db.query<{
         stream: string;
         recordKey: string;
@@ -157,7 +179,10 @@ async function fixture() {
     queue: connectionQueue(),
     ownerAddress: "0x1234",
     registry: {},
-    blobs: { get: async (key: string) => blobs.get(key) ?? null },
+    blobs: {
+      get: async (key: string) => blobs.get(key) ?? null,
+      governor: createStorageAccess(DEFAULT_STORAGE_ACCESS_POLICY),
+    },
     keys: {
       namespaceHmac: async () => new Uint8Array(32),
       decrypt: async (_scope: string, bytes: Uint8Array) => bytes,
@@ -187,6 +212,7 @@ async function fixture() {
       );
   const resolver = createLocalResolver(deps, {
     query,
+    aliasQuery: query,
     aliasScopes: () => ["fixture.alias", "fixture.unsupported"].values(),
     aliasTargets,
   });
@@ -380,6 +406,7 @@ describe("local resolve", () => {
     };
     const resolver = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       ...aliases,
     });
     const listing = createLocalListing({ ...f.deps, ...aliases });
@@ -528,6 +555,7 @@ describe("local resolve", () => {
     };
     const resolver = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       ...aliases,
     });
     const listing = createLocalListing({ ...f.deps, ...aliases });
@@ -732,6 +760,7 @@ describe("local resolve", () => {
       const deps = { ...f.deps, progressiveFirstLoad: true };
       const resolver = createLocalResolver(deps, {
         query: f.query,
+        aliasQuery: f.query,
         ...aliases,
       });
       const listing = createLocalListing({ ...deps, ...aliases });
@@ -860,7 +889,11 @@ describe("local resolve", () => {
       ],
     };
     const deps = { ...f.deps, progressiveFirstLoad: true };
-    const resolver = createLocalResolver(deps, { query: f.query, ...aliases });
+    const resolver = createLocalResolver(deps, {
+      query: f.query,
+      aliasQuery: f.query,
+      ...aliases,
+    });
     const listing = createLocalListing({ ...deps, ...aliases });
     const history = createLocalHistory(deps, aliases);
     for (const scope of ["pdpp.fixture-source.x", "fixture.copy"]) {
@@ -909,6 +942,7 @@ describe("local resolve", () => {
     });
     const resolver = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       aliasScopes: () => ["fixture.multi"],
       aliasTargets: () =>
         [CONNECTOR, "other-source"].map((connector) => ({
@@ -941,7 +975,11 @@ describe("local resolve", () => {
       "c1",
       "c2",
     ]);
-    expect(f.visited.mock.calls).toEqual([["c1", "items"]]);
+    // Only the chosen target's stream is read (a projected alias is read to
+    // check it and again as its body is taken).
+    expect(
+      new Set(f.visited.mock.calls.map(([id, stream]) => `${id}/${stream}`)),
+    ).toEqual(new Set(["c1/items"]));
     await f.head("items", { version: 8, floor: 8 });
     mocked.apply.mockRejectedValue(
       new RegistryUnavailableBeforeWriteError(
@@ -1055,6 +1093,7 @@ describe("local resolve", () => {
     await f.record();
     const isolated = createLocalResolver(f.deps, {
       query: f.query,
+      aliasQuery: f.query,
       aliasTargets: () => {
         throw new Error("Unlisted alias target consulted");
       },
@@ -1483,14 +1522,17 @@ describe("local resolve through the host's real legacy alias port", () => {
         },
       ]);
     }
-    const resolver = createLocalResolver(f.deps, {
-      query: {
-        ...f.query,
-        streamRecords: (connectionId, stream) => {
-          readStreams.push(stream);
-          return f.query.streamRecords(connectionId, stream);
-        },
+    const query: AliasRecordQuery = {
+      ...f.query,
+      // The alias read names the streams whose bodies it reads.
+      recordsByHash: (connectionId, stream, sized, guard) => {
+        readStreams.push(stream);
+        return f.query.recordsByHash(connectionId, stream, sized, guard);
       },
+    };
+    const resolver = createLocalResolver(f.deps, {
+      query,
+      aliasQuery: query,
       olderVersions: f.olderVersions,
       aliasScopes: () => ["icloud_notes.notes"].values(),
       aliasTargets: legacyAliasScopes,
@@ -1575,7 +1617,8 @@ describe("local resolve through the host's real legacy alias port", () => {
       readStreams,
     );
     expect(await userNameOf(await readOf(resolver))).toBeNull();
-    expect(readStreams.sort()).toEqual(["folders", "notes"]);
+    // Read to check the alias and again as its body is taken.
+    expect([...new Set(readStreams)].sort()).toEqual(["folders", "notes"]);
   });
 
   it("reports iCloud Notes deleted when a required stream is deleted", async () => {

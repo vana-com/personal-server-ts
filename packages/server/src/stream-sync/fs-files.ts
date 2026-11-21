@@ -11,6 +11,8 @@
 
 import { createReadStream } from "node:fs";
 import {
+  chmod,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -46,8 +48,98 @@ async function fsyncDir(dir: string): Promise<void> {
 
 const IDLE_CLOSE_MS = 200;
 
-export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
+/** Modes of a private tree: its owner alone may enter its directories and read its files. */
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+export interface FsStreamSyncFilesOptions {
+  /**
+   * Create directories 0700 and files 0600, whatever the umask, and tighten
+   * the root if it exists with wider modes before the first write. For files
+   * that hold the owner's data in plain text. A root that is a symbolic link
+   * (or any file that is not a directory) is refused by every operation: a
+   * tighten, a sweep or a removal must not reach the files of its target.
+   * Absent: the process defaults.
+   */
+  readonly private?: boolean;
+}
+
+export function createFsStreamSyncFiles(
+  root: string,
+  options: FsStreamSyncFilesOptions = {},
+): StreamSyncFiles {
   const base = resolve(root);
+  const dirMode = options.private ? PRIVATE_DIR_MODE : undefined;
+  const fileMode = options.private ? PRIVATE_FILE_MODE : undefined;
+  // A private root is the directory itself, never a link to one: checked on
+  // every operation, since a link can be put in its place at any time. Returns
+  // the directory's identity, or undefined if it does not exist.
+  const guardRoot = async (): Promise<string | undefined> => {
+    if (!options.private) return undefined;
+    let found;
+    try {
+      found = await lstat(base);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    if (!found.isDirectory()) {
+      throw new Error(
+        `private stream-sync root ${base} is not a directory (a symbolic link is refused)`,
+      );
+    }
+    return `${found.dev}:${found.ino}`;
+  };
+  // Made 0700 before the first file is created in it, and again whenever the
+  // directory is missing or is not the one that was set up: one recreated by
+  // `mkdir` alone has the umask's modes.
+  // The setup, and the identity of the directory it made once it has settled.
+  let privateRoot:
+    { readonly setup: Promise<string>; identity?: string } | undefined;
+  const setupRoot = async (): Promise<string> => {
+    await mkdir(base, { recursive: true, mode: PRIVATE_DIR_MODE });
+    await chmod(base, PRIVATE_DIR_MODE);
+    const found = await lstat(base);
+    return `${found.dev}:${found.ino}`;
+  };
+  const ensureRoot = async (): Promise<void> => {
+    if (!options.private) return;
+    const identity = await guardRoot();
+    // A setup still in flight has no identity yet: it is awaited, not redone.
+    if (
+      privateRoot?.identity !== undefined &&
+      privateRoot.identity !== identity
+    ) {
+      privateRoot = undefined;
+    }
+    const current = (privateRoot ??= { setup: setupRoot() });
+    try {
+      current.identity = await current.setup;
+    } catch (error) {
+      if (privateRoot === current) privateRoot = undefined;
+      throw error;
+    }
+  };
+  /**
+   * Open `path`, and give a file this call created `fileMode` through its own
+   * handle: `open` applies the umask to the mode it creates with, so under a
+   * restrictive umask a file could be created 0000 and no longer be reopened.
+   */
+  const openFile = async (
+    path: string,
+    flags: "a" | "w",
+  ): Promise<FileHandle> => {
+    const handle = await open(path, flags, fileMode);
+    if (fileMode !== undefined) {
+      try {
+        await handle.chmod(fileMode);
+      } catch (error) {
+        await handle.close();
+        throw error;
+      }
+    }
+    return handle;
+  };
   let tmpCounter = 0;
   const abs = (path: string): string => {
     const full = resolve(base, path);
@@ -78,15 +170,20 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       handles.delete(oldest);
       await handle.close();
     }
+    await ensureRoot();
     // The directory exists after the first append of a run; create it only
     // when `open` says it does not.
     let handle: FileHandle;
     try {
-      handle = await open(full, "a");
+      handle = await openFile(full, "a");
     } catch (error) {
       if (!missing(error)) throw error;
-      await mkdir(dirname(full), { recursive: true });
-      handle = await open(full, "a");
+      // A missing directory may be the root itself, removed after the check
+      // above: `mkdir` alone would recreate it with the umask's modes.
+      privateRoot = undefined;
+      await ensureRoot();
+      await mkdir(dirname(full), { recursive: true, mode: dirMode });
+      handle = await openFile(full, "a");
     }
     handles.set(full, handle);
     return handle;
@@ -159,13 +256,15 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
 
   return {
     async write(path, bytes) {
+      await guardRoot();
       const full = abs(path);
       // The rename replaces the inode; an append handle would write to the old one.
       await release(full);
-      await mkdir(dirname(full), { recursive: true });
+      await ensureRoot();
+      await mkdir(dirname(full), { recursive: true, mode: dirMode });
       tmpCounter += 1;
       const tmp = `${full}.tmp-${process.pid}-${tmpCounter}`;
-      const handle = await open(tmp, "w");
+      const handle = await openFile(tmp, "w");
       try {
         await handle.writeFile(bytes);
         await handle.sync();
@@ -176,6 +275,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       await fsyncDir(dirname(full));
     },
     async read(path) {
+      await guardRoot();
       try {
         return new Uint8Array(await readFile(abs(path)));
       } catch (error) {
@@ -184,6 +284,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async appendMany(entries) {
+      await guardRoot();
       appending += 1;
       try {
         for (const { path, bytes } of entries) {
@@ -207,6 +308,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async *readChunks(path) {
+      await guardRoot();
       const full = abs(path);
       try {
         await stat(full);
@@ -220,6 +322,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async size(path) {
+      await guardRoot();
       try {
         return (await stat(abs(path))).size;
       } catch (error) {
@@ -228,6 +331,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async list(prefix) {
+      await guardRoot();
       const dir = abs(prefix);
       try {
         const entries = await readdir(dir, {
@@ -246,6 +350,7 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       }
     },
     async remove(prefix) {
+      await guardRoot();
       await release(abs(prefix));
       await rm(abs(prefix), { recursive: true, force: true });
     },

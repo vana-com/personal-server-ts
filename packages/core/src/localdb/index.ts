@@ -78,6 +78,7 @@ export {
   createRecordQuery,
   createGrantHistory,
   listCursor,
+  type AliasRecordQuery,
   type ChangePage,
   type RecordPage,
   type RecordQuery,
@@ -97,6 +98,7 @@ export {
   type LocalListing,
 } from "./listing.js";
 export { createLocalSync, type LocalSync } from "./sync.js";
+export { sweepAliasSpool } from "./alias-projection.js";
 export {
   createViewChanges,
   NO_VIEW_CHANGES,

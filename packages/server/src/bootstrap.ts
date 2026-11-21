@@ -21,6 +21,7 @@ import {
 import { createLocalSeed } from "./localdb/seed.js";
 import { createSeedStaging } from "./stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "./stream-sync/fs-files.js";
+import { openAliasSpool } from "./localdb/alias-spool.js";
 import { openBetterSqlite3 } from "./localdb/better-sqlite3-driver.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
@@ -992,7 +993,12 @@ async function bootstrapServer(
             ? { publishWhileCollecting: true }
             : {}),
         };
+        // The bodies of windowed aliases are written here for the length of a
+        // response. Without it (its startup sweep failed) aliases are read in
+        // memory, capped, as before.
+        const aliasSpool = await openAliasSpool(storageRoot, logger);
         const facade = createServerLocalSync(deps, {
+          ...(aliasSpool ? { aliasSpool } : {}),
           resolveArtifact: (digest) =>
             manifestArtifactResolver(pdppAuth?.retainedManifests ?? [])(digest),
           eraseLegacy: (connector) =>

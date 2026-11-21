@@ -3,6 +3,7 @@ import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
   DeltaApplyResult,
   RegistryChangeDelta,
+  StreamSyncFiles,
 } from "../stream-sync/ports.js";
 import { applyRegistryDelta } from "./delta-apply.js";
 import {
@@ -116,6 +117,8 @@ export function createLocalSync(
   options: {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
+    /** A file space for the bodies of windowed aliases (`projectAlias`). */
+    readonly aliasSpool?: StreamSyncFiles;
     readonly resolveArtifact: ResolveArtifact;
     readonly eraseLegacy?: (connector: string) => Promise<void>;
     /**
@@ -366,6 +369,7 @@ export function createLocalSync(
     ...deps,
     aliasScopes: options.aliasScopes,
     aliasTargets: options.aliasTargets,
+    aliasSpool: options.aliasSpool,
   };
   // Completion belongs to this owner/network database runtime, not a UI read.
   // A local listing (including an empty one) says nothing about remote data.
@@ -387,8 +391,10 @@ export function createLocalSync(
     deleter,
     resolver: createLocalResolver(deps, {
       query,
+      aliasQuery: query,
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
+      aliasSpool: options.aliasSpool,
     }),
     listing: {
       ...listing,

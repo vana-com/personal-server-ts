@@ -12,12 +12,14 @@ import type { Reservation } from "../stream-sync/send-gate.js";
  *
  * `objectBytes` is the size of the stored object when the memory held is
  * larger (an attachment or a part is in memory as plain and as encrypted bytes). The
- * governor refuses an object larger than the store accepts.
+ * governor refuses an object larger than the store accepts. `signal` ends the
+ * wait for the bytes: the call rejects with its reason and holds nothing.
  */
 export async function holdMemory(
   blobs: Pick<StreamSyncBlobs, "governor">,
   bytes: number,
   objectBytes?: number,
+  signal?: AbortSignal,
 ): Promise<Reservation> {
-  return blobs.governor.reserve(bytes, objectBytes);
+  return blobs.governor.reserve(bytes, objectBytes, signal);
 }

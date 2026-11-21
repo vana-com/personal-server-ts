@@ -301,9 +301,14 @@ export interface SendGovernor {
    * `objectBytes` is the size of the object this memory becomes, when that
    * differs (an attachment is held twice, as plain and as encrypted bytes).
    * Rejects with `StorageObjectTooLargeError` when that object is over the
-   * store's limit.
+   * store's limit. `signal` ends the wait for memory: it rejects with the
+   * signal's reason and the request leaves the line holding nothing.
    */
-  reserve(bytes: number, objectBytes?: number): Promise<Reservation>;
+  reserve(
+    bytes: number,
+    objectBytes?: number,
+    signal?: AbortSignal,
+  ): Promise<Reservation>;
   /**
    * The most `reserve` holds at once (`maxBytesInFlight`). A reader that sizes
    * its working set to the budget (the keyed first load, `log-keyed.ts`) needs
@@ -401,13 +406,13 @@ export function createStorageAccess(policy: StorageAccessPolicy): SendGovernor {
   });
   return {
     limitBytes: policy.maxBytesInFlight,
-    reserve(bytes, objectBytes = bytes) {
+    reserve(bytes, objectBytes = bytes, signal) {
       if (objectBytes > policy.maxObjectBytes) {
         return Promise.reject(
           new StorageObjectTooLargeError(objectBytes, policy.maxObjectBytes),
         );
       }
-      return budget.reserve(bytes);
+      return budget.reserve(bytes, signal);
     },
     follow: (source) =>
       source.onRateLimitPolicy?.((quota) => gate.setQuota(quota)) ?? (() => {}),

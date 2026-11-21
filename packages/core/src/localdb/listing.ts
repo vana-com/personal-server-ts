@@ -1,17 +1,19 @@
 import { sha256 } from "@noble/hashes/sha2";
 import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
 import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
+import type { StreamSyncFiles } from "../stream-sync/ports.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { SEEN_O } from "./merge.js";
 import { streamDigest } from "./stream-digest.js";
+import { checkAlias, type AliasCheck } from "./alias-projection.js";
+import { readAliasEpochs } from "./alias-view.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
   effectiveControl,
   loadStreams,
-  projectAlias,
   selectForTarget,
   servedStreamOf,
   targetsForScope,
@@ -21,6 +23,9 @@ import {
   type Target,
 } from "./read-selection.js";
 import type { AliasScopes, AliasTargets } from "./resolve.js";
+
+/** Reads of one alias body a listing makes before it calls the alias changing. */
+const ALIAS_LISTING_TRIES = 3;
 
 /** One listed scope of `GET /v1/data` (D.2). */
 export interface ListedScope {
@@ -130,6 +135,11 @@ export function createLocalListing(
   deps: LocalSyncDeps & {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
+    /**
+     * The host's alias spool, as the resolver has it: the check of a body
+     * decides as its read does (see `checkAlias`).
+     */
+    readonly aliasSpool?: StreamSyncFiles;
   },
 ): LocalListing {
   // Listing and status only read: they take the read connection, so they do
@@ -303,19 +313,40 @@ export function createLocalListing(
     return entries;
   }
 
-  /** Can a read build this alias body from the records installed now? */
+  /**
+   * Can a read build this alias body from the records installed now? A read
+   * that finds its rows changed under it (`moved`) is asked again, with the
+   * change marks read anew, and answers from the rows as they then stand.
+   */
   async function aliasBodyBuilds(
     target: Target,
     chosen: Candidate,
   ): Promise<boolean> {
     if (!target.alias) return true;
-    const projected = await projectAlias(
-      target.alias,
-      chosen,
-      createRecordQuery(reads.db),
-      new Date(deps.now()).toISOString(),
-    );
-    return projected.kind === "ok";
+    let projected: AliasCheck;
+    for (let attempt = 0; ; attempt++) {
+      projected = await checkAlias(
+        target.alias,
+        chosen,
+        createRecordQuery(reads.db),
+        new Date(deps.now()).toISOString(),
+        {
+          db: deps.db,
+          memory: deps.blobs,
+          spool: deps.aliasSpool,
+          // Listing only reads: a pin that cleared the marks would write, and
+          // wait for the writer behind a long batch.
+          epochs: await readAliasEpochs(
+            deps.db,
+            chosen.connection.connection_id,
+            chosen.streams.map((s) => s.stream),
+          ),
+        },
+      );
+      if (projected.kind !== "moved" || attempt + 1 >= ALIAS_LISTING_TRIES) {
+        return projected.kind === "ok";
+      }
+    }
   }
 
   /** What a stream's head says about it, given its connection's control state. */

@@ -310,6 +310,7 @@ describe("paid reads of registered log folds", () => {
     );
     const resolver = createLocalResolver(a.deps, {
       query: a.sync.query,
+      aliasQuery: a.sync.query,
       aliasScopes: () => ["fixture.alias"],
       aliasTargets: () => [
         {
