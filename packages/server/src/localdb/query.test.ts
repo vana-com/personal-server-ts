@@ -1,4 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -10,7 +9,10 @@ import {
   listCursor,
   type StoredRecord,
 } from "../../../core/src/localdb/query.js";
-import { run } from "../../../core/src/test-support/memory-oracle.js";
+import {
+  createTempRoot,
+  run,
+} from "../../../core/src/test-support/memory-oracle.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 const ROWS = 131_072;
@@ -61,19 +63,32 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.mjs")) {
   const { openLocalDb } =
     await import("@opendatalabs/personal-server-ts-core/localdb");
   const opened = new Set<SqlDriver>();
-  const dirs: string[] = [];
+  const dirs: Array<ReturnType<typeof createTempRoot>> = [];
   const fresh = async () => {
-    const dir = mkdtempSync(join(process.cwd(), ".query-test-"));
-    dirs.push(dir);
-    const file = join(dir, "records.sqlite");
-    const db = openBetterSqlite3(file);
-    opened.add(db);
-    await openLocalDb(db, {
-      owner: "0xabc",
-      network: "moksha",
-      deviceId: "query-test",
-    });
-    return { db, file };
+    const dir = createTempRoot(".query-test-", process.cwd());
+    let db: SqlDriver | undefined;
+    let ready = false;
+    try {
+      const file = join(dir.root, "records.sqlite");
+      db = openBetterSqlite3(file);
+      await openLocalDb(db, {
+        owner: "0xabc",
+        network: "moksha",
+        deviceId: "query-test",
+      });
+      opened.add(db);
+      dirs.push(dir);
+      ready = true;
+      return { db, file };
+    } finally {
+      if (!ready) {
+        try {
+          await db?.close();
+        } finally {
+          dir.dispose();
+        }
+      }
+    }
   };
   const insert = (
     recordKey: string,
@@ -89,10 +104,15 @@ if (!process.argv[1]?.endsWith("/memory-oracle-child.mjs")) {
     params: [connection, stream, pkHash, recordKey, stamp, body],
   });
   afterEach(async () => {
-    for (const db of opened) await db.close();
-    opened.clear();
-    for (const dir of dirs.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
+    try {
+      const results = await Promise.allSettled(
+        [...opened].map(async (db) => db.close()),
+      );
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+    } finally {
+      opened.clear();
+      for (const dir of dirs.splice(0)) dir.dispose();
     }
   });
 

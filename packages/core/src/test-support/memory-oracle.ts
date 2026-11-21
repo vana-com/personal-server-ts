@@ -33,7 +33,174 @@
  */
 
 import { spawn } from "node:child_process";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const TEMP_ROOT_OWNER = ".memory-oracle-owner";
+const LEGACY_TEMP_ROOT_AGE_MS = 24 * 60 * 60 * 1000;
+const SIGNALS = ["SIGINT", "SIGTERM"] as const;
+type CleanupSignal = (typeof SIGNALS)[number];
+type RootIdentity = Readonly<{ dev: bigint; ino: bigint }>;
+
+function errorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function removeTempRoot(root: string, owner: RootIdentity): void {
+  try {
+    const stat = lstatSync(root, { bigint: true });
+    if (!stat.isDirectory() || stat.dev !== owner.dev || stat.ino !== owner.ino)
+      return;
+    rmSync(root, { recursive: true, force: true });
+  } catch {
+    // Cleanup must not mask a test error or prevent the process from exiting.
+  }
+}
+
+function ownerIsGone(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fffffff) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM (and any other failure) is not evidence the process died.
+    return errorCode(error) === "ESRCH";
+  }
+}
+
+function staleTempRoot(root: string, mtimeMs: number): boolean {
+  let marker: number;
+  try {
+    marker = openSync(
+      join(root, TEMP_ROOT_OWNER),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    return (
+      errorCode(error) === "ENOENT" &&
+      Date.now() - mtimeMs > LEGACY_TEMP_ROOT_AGE_MS
+    );
+  }
+  try {
+    const stat = fstatSync(marker);
+    if (!stat.isFile() || stat.size > 32) return false;
+    const bytes = Buffer.alloc(33);
+    const length = readSync(marker, bytes, 0, bytes.length, 0);
+    const value = bytes.toString("utf8", 0, length);
+    return (
+      length === stat.size &&
+      /^[1-9]\d*\n?$/.test(value) &&
+      ownerIsGone(Number(value))
+    );
+  } finally {
+    closeSync(marker);
+  }
+}
+
+function sweepTempRoots(parent: string, prefix: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(parent);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    // mkdtemp appends exactly six characters; never touch prefix lookalikes.
+    if (
+      !name.startsWith(prefix) ||
+      !/^[\da-z]{6}$/i.test(name.slice(prefix.length))
+    )
+      continue;
+    const candidate = join(parent, name);
+    try {
+      const stat = lstatSync(candidate, { bigint: true });
+      // Only private directories made by this user are eligible. Never follow
+      // a sibling symlink or presume that another user's marker is ours.
+      if (
+        !stat.isDirectory() ||
+        stat.uid !== BigInt(process.getuid?.() ?? -1) ||
+        (stat.mode & 0o077n) !== 0n
+      )
+        continue;
+      if (staleTempRoot(candidate, Number(stat.mtimeMs))) {
+        removeTempRoot(candidate, stat);
+      }
+    } catch {
+      // A disappearing, unreadable, or otherwise uncertain entry is kept.
+    }
+  }
+}
+
+const tempRoots = new Set<() => void>();
+
+function disposeTempRoots(): void {
+  for (const dispose of tempRoots) dispose();
+}
+
+const tempRootSignalHandlers: Record<CleanupSignal, () => void> = {
+  SIGINT: () => cleanupOnSignal("SIGINT"),
+  SIGTERM: () => cleanupOnSignal("SIGTERM"),
+};
+
+function cleanupOnSignal(signal: CleanupSignal): void {
+  // Let pre-existing handlers preserve their behavior. If we intercepted the
+  // default action, restore it and re-send the signal instead of exiting 0.
+  const handledElsewhere = process.listenerCount(signal) > 1;
+  disposeTempRoots();
+  if (!handledElsewhere) process.kill(process.pid, signal);
+}
+
+/** Allocate a private test root and clear proven stale siblings of this kind. */
+export function createTempRoot(
+  prefix: string,
+  parent = tmpdir(),
+): { root: string; dispose: () => void } {
+  if (!prefix || /[\\/\0]/.test(prefix))
+    throw new Error("Invalid temp-root prefix");
+  const directory = realpathSync(parent);
+  sweepTempRoots(directory, prefix);
+  const root = mkdtempSync(join(directory, prefix));
+  const stat = lstatSync(root, { bigint: true });
+  try {
+    writeFileSync(join(root, TEMP_ROOT_OWNER), `${process.pid}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch (error) {
+    removeTempRoot(root, stat);
+    throw error;
+  }
+  const dispose = () => {
+    if (!tempRoots.delete(dispose)) return;
+    if (tempRoots.size === 0) {
+      process.removeListener("exit", disposeTempRoots);
+      for (const signal of SIGNALS)
+        process.removeListener(signal, tempRootSignalHandlers[signal]);
+    }
+    removeTempRoot(root, stat);
+  };
+  if (tempRoots.size === 0) {
+    process.on("exit", disposeTempRoots);
+    for (const signal of SIGNALS)
+      process.prependListener(signal, tempRootSignalHandlers[signal]);
+  }
+  tempRoots.add(dispose);
+  return { root, dispose };
+}
 
 export interface Workload {
   /** Absolute path of a module (`.ts` or `.js`). */

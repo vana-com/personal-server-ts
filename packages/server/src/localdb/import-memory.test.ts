@@ -3,7 +3,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { IMPORT_CHUNK_BYTES } from "../../../core/src/localdb/legacy-import.js";
-import { run } from "../../../core/src/test-support/memory-oracle.js";
+import {
+  createTempRoot,
+  run,
+} from "../../../core/src/test-support/memory-oracle.js";
 import {
   createImportMemoryFixture,
   buildImportMemoryChild,
@@ -14,16 +17,25 @@ import {
 import type { ImportMemoryResult } from "./import-memory.child.js";
 
 let root: string;
+let tempRoot: ReturnType<typeof createTempRoot> | undefined;
 let childModule: string;
 let sample = 0;
 beforeAll(() => {
   const temporary = join(homedir(), ".tmp");
   mkdirSync(temporary, { recursive: true });
-  root = mkdtempSync(join(temporary, "ps3-import-memory-"));
-  childModule = buildImportMemoryChild(root);
+  const created = createTempRoot("ps3-import-memory-", temporary);
+  let ready = false;
+  try {
+    root = created.root;
+    childModule = buildImportMemoryChild(root);
+    tempRoot = created;
+    ready = true;
+  } finally {
+    if (!ready) created.dispose();
+  }
 }, 600_000);
 afterAll(() => {
-  if (root) rmSync(root, { recursive: true, force: true });
+  tempRoot?.dispose();
 });
 
 /** What the child keeps reachable through the final HWM read. Default: nothing. */
