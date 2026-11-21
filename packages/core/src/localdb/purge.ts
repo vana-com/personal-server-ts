@@ -40,11 +40,17 @@ function passWatermark(connectionId: string): SqlStatement {
  * above are kept. A host's `LocalSyncDeps` is shared and mutated by its
  * owner, so the wake does not travel in it.
  */
-const purgeListeners = new WeakMap<object, (connector: string) => void>();
+const purgeListeners = new WeakMap<object, PurgeListener>();
+/**
+ * `connector` is the purged connection's connector, or `null` when the
+ * lookup failed after the purge committed: some connection was purged and the
+ * listener must find which (the erasure sweep reads every deleted connection).
+ */
+export type PurgeListener = (connector: string | null) => void;
 /** Hear every purge of `db`'s connections, until the returned function is called. */
 export function onConnectionPurged(
   db: object,
-  listener: (connector: string) => void,
+  listener: PurgeListener,
 ): () => void {
   purgeListeners.set(db, listener);
   return () => {
@@ -194,22 +200,36 @@ export async function purgeConnection(
       },
       "purge connection",
     );
-    // Best effort, after the commit: the lookup and the listener are the
-    // erasure's wake, and neither may fail a purge that has committed. A host
-    // with no listener has nothing to wake and asks nothing.
+    // After the commit: the lookup and the listener are the erasure's wake,
+    // and neither may fail a purge that has committed. A host with no
+    // listener has nothing to wake and asks nothing. A lookup that fails
+    // wakes the listener without a connector: a later adoption sees the row
+    // already `deleted` and does not purge again, so no other call would
+    // ever queue this connection's erasure.
     const listener = purgeListeners.get(deps.db);
-    if (listener)
+    if (listener) {
+      let connector: string | null = null;
       try {
         const [row] = await deps.db.query<{ connector: string }>(
           "SELECT connector FROM connections WHERE connection_id = ?",
           [connectionId],
         );
-        if (row) listener(row.connector);
+        if (row) connector = row.connector;
+        else return;
+      } catch (error) {
+        deps.logger.warn(
+          { connectionId, error: String(error) },
+          "stream sync: the connection-purged lookup failed; erasures are swept again",
+        );
+      }
+      try {
+        listener(connector);
       } catch (error) {
         deps.logger.warn(
           { connectionId, error: String(error) },
           "stream sync: the connection-purged listener failed",
         );
       }
+    }
   });
 }

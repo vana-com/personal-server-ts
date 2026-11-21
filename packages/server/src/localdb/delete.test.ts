@@ -1300,9 +1300,11 @@ it("a delete that names a lifetime purges the connections its pins name, and lea
       params: [HOME],
     },
   ]);
-  const lifetime = await f.a.deleter.readConnectionLifetime("fixture-source");
-  await f.a.deleter.requestConnectionDelete("fixture-source", { lifetime });
-  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  const eraseLogs = vi.fn(async () => ({ connections: [], pending: false }));
+  const deleter = createConnectionDeleter(f.a.deps, { eraseLogs });
+  const lifetime = await deleter.readConnectionLifetime("fixture-source");
+  await deleter.requestConnectionDelete("fixture-source", { lifetime });
+  expect(await deleter.resumeDeletes()).toEqual([]);
   expect(
     await f.a.db.query(
       "SELECT connection_id, control_state, deleted_at FROM connections WHERE ns = ?",
@@ -1312,6 +1314,13 @@ it("a delete that names a lifetime purges the connections its pins name, and lea
     { connection_id: "stray", control_state: "absent", deleted_at: null },
   ]);
   expect(await f.registry.read(f.control)).toMatchObject({ version: 2 });
+  // The tombstoned namespace is erased; only the stray's own is held back.
+  await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalled());
+  expect(eraseLogs).toHaveBeenLastCalledWith(
+    "fixture-source",
+    expect.anything(),
+    { skipNamespaces: new Set([HOME]) },
+  );
 });
 
 it("a lifetime read for one connector is refused for another, before any intent is saved or row written", async () => {

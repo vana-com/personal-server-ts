@@ -37,6 +37,7 @@ vi.mock("../../../core/src/localdb/delete.js", () => ({
     erasureOwed: () => false,
     resumeErasures: vi.fn(async () => false),
     noteSettled: vi.fn(),
+    noteSweepOwed: vi.fn(),
   }),
 }));
 vi.mock("../../../core/src/localdb/listing.js", () => ({
