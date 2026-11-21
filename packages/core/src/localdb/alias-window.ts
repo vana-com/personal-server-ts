@@ -1,7 +1,13 @@
 import type { Reservation } from "../stream-sync/send-gate.js";
 import type { StreamSyncBlobs } from "../stream-sync/ports.js";
+import {
+  sizedBodies,
+  WHOLE_STREAM_BATCH_BYTES,
+  type StreamLimits,
+} from "./alias-sized.js";
 import { assertViewCurrent, type AliasViewCheck } from "./alias-view.js";
-import type { AliasRecordQuery } from "./query.js";
+import { PartialViewMoved } from "./partial-read.js";
+import type { AliasRecordQuery, SizedRecord } from "./query.js";
 import type {
   AliasDiagnostic,
   AliasWindow,
@@ -42,10 +48,11 @@ export type AliasMemory = Pick<StreamSyncBlobs, "governor">;
 export const HEAP_PER_STORED_BYTE = 4;
 
 /**
- * Heap bytes one child row costs the index: its 64-character key hash and the
- * slot that holds it.
+ * Heap bytes one child row costs the index: its sized record (a 64-character
+ * key hash and a 64-character body hash, which the body statement checks) and
+ * the slot that holds it.
  */
-const INDEX_BYTES_PER_CHILD = 128;
+const INDEX_BYTES_PER_CHILD = 256;
 
 /**
  * The share of the budget one windowed read takes for its working set. The
@@ -96,7 +103,7 @@ interface Parent {
 }
 
 interface ChildGroup {
-  readonly hashes: string[];
+  readonly sized: SizedRecord[];
   chars: number;
 }
 
@@ -123,13 +130,19 @@ export async function openWindowed(
   const others = fetched.filter(
     (s) => s !== window.parentStream && s !== window.childStream,
   );
-  const stat = (stream: string) => query.streamStats(connectionId, stream);
-  const parentStats = await stat(window.parentStream);
+  // What each stream was sized at: the reservation is taken for these, and
+  // every body statement below stays inside them.
+  const limits = new Map<string, StreamLimits>();
+  for (const stream of [window.parentStream, ...others]) {
+    limits.set(stream, await query.streamStats(connectionId, stream));
+  }
   const childStats = hasChildren
-    ? await stat(window.childStream)
+    ? await query.streamStats(connectionId, window.childStream)
     : { rows: 0, bytes: 0, maxBytes: 0 };
+  limits.set(window.childStream, childStats);
   let otherBytes = 0;
-  for (const stream of others) otherBytes += (await stat(stream)).bytes;
+  for (const stream of others) otherBytes += limits.get(stream)!.bytes;
+  const parentStats = limits.get(window.parentStream)!;
 
   // What the index and the whole of the other streams cost, and then the
   // chunk: what is left of the read's share, as source bytes of one window.
@@ -158,6 +171,7 @@ export async function openWindowed(
         input,
         others,
         hasChildren,
+        limits,
         scan,
         chunk,
         fixed,
@@ -218,6 +232,7 @@ async function indexAndPlan(
   input: WindowedInput,
   others: readonly string[],
   hasChildren: boolean,
+  limits: ReadonlyMap<string, StreamLimits>,
   scan: number,
   chunk: number,
   fixed: number,
@@ -227,7 +242,7 @@ async function indexAndPlan(
   | { readonly kind: "larger"; readonly need: number }
   | ({ readonly kind: "fits"; readonly need: number } & Indexed)
 > {
-  const indexed = await indexInput(input, others, hasChildren, scan);
+  const indexed = await indexInput(input, others, hasChildren, limits, scan);
   if (indexed === null) return { kind: "unwindowable" };
   const { parents, children } = indexed;
   parents.sort((a, b) => input.window.parentOrder(a.data, b.data));
@@ -244,6 +259,7 @@ async function indexInput(
   input: WindowedInput,
   others: readonly string[],
   hasChildren: boolean,
+  limits: ReadonlyMap<string, StreamLimits>,
   scan: number,
 ): Promise<{
   parents: Parent[];
@@ -253,83 +269,82 @@ async function indexInput(
   const { query, connectionId, window } = input;
   const parents: Parent[] = [];
   const children = new Map<unknown, ChildGroup>();
-  for await (const row of query.streamRecords(
-    connectionId,
-    window.parentStream,
-    input.current.guard,
-  )) {
-    const data: unknown = JSON.parse(row.body);
-    if (!isObject(data)) return null;
-    const key = data[window.parentKey];
-    if (!joinable(key) || children.has(key)) return null;
-    children.set(key, { hashes: [], chars: 0 });
-    parents.push({ data, key, chars: row.body.length });
+  // Parents and other streams are held whole, under the memory reserved for
+  // their stored size: each is read by sized batches inside that size.
+  const bodies = (stream: string) =>
+    sizedBodies(
+      query,
+      connectionId,
+      stream,
+      limits.get(stream)!,
+      WHOLE_STREAM_BATCH_BYTES,
+      input.current,
+    );
+  for await (const batch of bodies(window.parentStream)) {
+    for (const { record } of batch) {
+      const data: unknown = JSON.parse(record.body);
+      if (!isObject(data)) return null;
+      const key = data[window.parentKey];
+      if (!joinable(key) || children.has(key)) return null;
+      children.set(key, { sized: [], chars: 0 });
+      parents.push({ data, key, chars: record.body.length });
+    }
   }
-  if (hasChildren && !(await indexChildren(input, children, scan))) {
+  if (hasChildren && !(await indexChildren(input, children, limits, scan))) {
     return null;
   }
   const otherRecords: LocalAliasRecord[] = [];
   for (const stream of others) {
-    for await (const row of query.streamRecords(
-      connectionId,
-      stream,
-      input.current.guard,
-    )) {
-      otherRecords.push({
-        stream,
-        data: JSON.parse(row.body) as Record<string, unknown>,
-      });
+    for await (const batch of bodies(stream)) {
+      for (const { record } of batch) {
+        otherRecords.push({
+          stream,
+          data: JSON.parse(record.body) as Record<string, unknown>,
+        });
+      }
     }
   }
   return { parents, children, otherRecords };
 }
 
 /**
- * Add each child's key hash and size to its parent's group. The bodies are
- * read, to find the key they name, `scan` stored bytes at a time (a body
- * larger than that, alone) and are not kept. False when a child names no
- * parent or is not an object.
+ * Add each child's sized record to its parent's group. The bodies are read,
+ * to find the key they name, `scan` stored bytes at a time (a body larger than
+ * that, alone) and are not kept. False when a child names no parent or is not
+ * an object.
  */
 async function indexChildren(
   input: WindowedInput,
   children: ReadonlyMap<unknown, ChildGroup>,
+  limits: ReadonlyMap<string, StreamLimits>,
   scan: number,
 ): Promise<boolean> {
   const { query, connectionId, window } = input;
-  let batch = new Map<string, number>();
-  let batchBytes = 0;
-  const flush = async (): Promise<boolean> => {
-    const rows = await query.recordsByHash(
-      connectionId,
-      window.childStream,
-      [...batch.keys()],
-      input.current.guard,
-    );
-    // A row gone since its size was read: the view moved.
-    if (rows.length !== batch.size) throw await moved(input);
-    for (const row of rows) {
-      const data: unknown = JSON.parse(row.body);
+  // The children's bodies are not held whole: only a batch of them, so no
+  // limit on their total, but their count (what the index was charged for)
+  // and each one's size (what `scan` was taken for) stay inside what was sized.
+  const childLimits: StreamLimits = {
+    ...limits.get(window.childStream)!,
+    bytes: Number.POSITIVE_INFINITY,
+  };
+  for await (const batch of sizedBodies(
+    query,
+    connectionId,
+    window.childStream,
+    childLimits,
+    scan,
+    input.current,
+  )) {
+    for (const { record, sized } of batch) {
+      const data: unknown = JSON.parse(record.body);
       if (!isObject(data)) return false;
       const group = children.get(data[window.childKey]);
       if (!group) return false;
-      group.hashes.push(row.pkHash);
-      group.chars += batch.get(row.pkHash)!;
+      group.sized.push(sized);
+      group.chars += sized.bytes;
     }
-    batch = new Map();
-    batchBytes = 0;
-    return true;
-  };
-  for await (const size of query.recordSizes(
-    connectionId,
-    window.childStream,
-  )) {
-    if (batch.size > 0 && batchBytes + size.bytes > scan && !(await flush())) {
-      return false;
-    }
-    batch.set(size.pkHash, size.bytes);
-    batchBytes += size.bytes;
   }
-  return batch.size === 0 || (await flush());
+  return true;
 }
 
 interface PlannedWindow {
@@ -372,18 +387,18 @@ async function* runWindows(
   const { query, connectionId, window, binding, now, fetched } = input;
   for (const { from, to } of plan) {
     const inWindow = parents.slice(from, to);
-    const hashes = inWindow.flatMap((p) => children.get(p.key)!.hashes);
+    const sized = inWindow.flatMap((p) => children.get(p.key)!.sized);
     const rows =
-      hasChildren && hashes.length > 0
+      hasChildren && sized.length > 0
         ? await query.recordsByHash(
             connectionId,
             window.childStream,
-            hashes,
+            sized,
             input.current.guard,
           )
         : [];
-    // A row gone since the index was read: the view moved.
-    if (rows.length !== hashes.length) throw await moved(input);
+    // A row gone, changed or grown since the index was read: the view moved.
+    if (rows.length !== sized.length) throw new PartialViewMoved();
     // Checked after the rows are read, so every one of them is a pinned row.
     await assertViewCurrent(input.current);
     const records: LocalAliasRecord[] = [
@@ -403,11 +418,4 @@ async function* runWindows(
         }
       : projected;
   }
-}
-
-async function moved(input: WindowedInput): Promise<Error> {
-  await assertViewCurrent(input.current);
-  // The view reads as current but a row is missing: the index and the rows
-  // disagree, which no pinned read can see. Fail the read; do not serve it.
-  return new Error("alias window: an indexed row is missing");
 }

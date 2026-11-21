@@ -15,6 +15,7 @@ import { WINDOW_FIXTURES } from "../../../core/src/legacy-projection/__fixtures_
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
 import { HEAP_PER_STORED_BYTE } from "../../../core/src/localdb/alias-window.js";
 import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
+import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
@@ -183,6 +184,7 @@ async function fixture(limit: number) {
     const unheld: string[] = [];
     /** Run once, right after the first statement that sizes records. */
     let afterSizes: (() => Promise<void>) | undefined;
+    let sizedStream: string | undefined;
     let readsOfBodies = 0;
     let largest = 0;
     const reader = {
@@ -191,7 +193,11 @@ async function fixture(limit: number) {
         params?: readonly SqlValue[],
       ): Promise<R[]> {
         const rows = await db.query<R>(sql, params);
-        if (afterSizes && /AS bytes FROM records/.test(sql)) {
+        if (
+          afterSizes &&
+          /AS bytes FROM records/.test(sql) &&
+          (sizedStream === undefined || params?.[1] === sizedStream)
+        ) {
           const hook = afterSizes;
           afterSizes = undefined;
           await hook();
@@ -215,8 +221,11 @@ async function fixture(limit: number) {
     };
     return {
       query: createRecordQuery(reader),
-      onceSized(hook: () => Promise<void>) {
+      reader,
+      /** Run `hook` right after the first sizing of `stream` (any stream: the first). */
+      onceSized(hook: () => Promise<void>, stream?: string) {
         afterSizes = hook;
+        sizedStream = stream;
       },
       unheld,
       reads: () => ({ readsOfBodies, largest }),
@@ -866,7 +875,7 @@ describe("a row that grows after it was sized is not read past what is held", ()
     const audit = f.audited();
     audit.onceSized(async () => {
       await grow(f, "messages", 1024 * 1024);
-    });
+    }, "messages");
     const decision = await read(
       f.resolverFor(target, scope, audit.query),
       scope,
@@ -906,6 +915,251 @@ describe("a row that grows after it was sized is not read past what is held", ()
     if (decision.kind !== "view") return;
     await new Response(decision.body).text();
     expect(audit.unheld).toEqual([]);
+  }, 60_000);
+});
+
+/**
+ * A row can change under a view that the change mark cannot see move: a mark
+ * whose flag is already set does not move its epoch for a later change. Each
+ * body statement must then prove for itself that it reads what was sized
+ * (the row's hash and a size no larger), so these tests put the mark back as
+ * it was read after each write: the epoch is blind, and only the statement is
+ * left to catch the change.
+ */
+describe("a body statement proves it reads what was sized, whatever the change mark says", () => {
+  const scope = "chatgpt.conversations";
+  const chatgpt = () =>
+    legacyAliasScopes(scope).find(
+      (t) => t.connector === "chatgpt",
+    ) as LocalAliasTarget;
+  const conversations = () =>
+    [0, 1, 2].flatMap((c) => chatgptConversation(c, 3, 10_000));
+  const plain: LocalAliasTarget = {
+    connector: "plain",
+    streams: ["items"],
+    project: (records) => ({
+      ok: true as const,
+      payload: { items: records.map((r) => r.data) },
+    }),
+  };
+  const items = Array.from({ length: 10 }, (_, i) => ({
+    stream: "items",
+    data: { id: `i${i}`, pad: "y".repeat(1000) },
+  }));
+  const firstOf = (stream: string) =>
+    `connection_id = 'c1' AND stream = '${stream}'
+     AND pk_hash = (SELECT MIN(pk_hash) FROM records WHERE connection_id = 'c1' AND stream = '${stream}')`;
+  /** Make the first row of `stream` `bytes` larger, as a write of a new body does. */
+  const grow = (stream: string, bytes: number) => ({
+    sql: `UPDATE records SET body = substr(body, 1, length(body) - 1) || ',"pad":"' || ? || '"}',
+            body_sha256 = 'grown' WHERE ${firstOf(stream)}`,
+    params: ["z".repeat(bytes)],
+  });
+  const remove = (stream: string) => ({
+    sql: `DELETE FROM records WHERE ${firstOf(stream)}`,
+    params: [],
+  });
+  /** A write the epoch cannot see: the stream's mark is put back as it was. */
+  async function unseen(
+    f: Awaited<ReturnType<typeof fixture>>,
+    stream: string,
+    write: ReturnType<typeof grow>,
+  ) {
+    const [mark] = await f.db.query<{ epoch: number }>(
+      "SELECT epoch FROM stream_change_marks WHERE connection_id = 'c1' AND stream = ?",
+      [stream],
+    );
+    await f.db.batch([
+      write,
+      {
+        sql: "UPDATE stream_change_marks SET epoch = ?, dirty = 1 WHERE connection_id = 'c1' AND stream = ?",
+        params: [mark!.epoch, stream],
+      },
+    ]);
+  }
+
+  const cases = [
+    {
+      label: "windowed: a child replaced by a larger body",
+      stream: "messages",
+      change: () => grow("messages", 1024 * 1024),
+    },
+    {
+      label: "windowed: a child deleted",
+      stream: "messages",
+      change: () => remove("messages"),
+    },
+    {
+      label: "windowed: a parent replaced by a larger body",
+      stream: "conversations",
+      change: () => grow("conversations", 1024 * 1024),
+    },
+  ];
+  for (const c of cases) {
+    it(`${c.label}: the read ends busy and holds what it reserved`, async () => {
+      const target = chatgpt();
+      const f = await fixture(2 * 1024 * 1024);
+      await f.seed(target, conversations());
+      const audit = f.audited();
+      audit.onceSized(() => unseen(f, c.stream, c.change()), c.stream);
+      const decision = await read(
+        f.resolverFor(target, scope, audit.query),
+        scope,
+      );
+      expect(decision).toMatchObject({ kind: "busy" });
+      expect(audit.unheld).toEqual([]);
+      expect(f.inUse()).toBe(0);
+    }, 60_000);
+  }
+
+  it("not windowed: a row replaced by a larger body", async () => {
+    const f = await fixture(1024 * 1024);
+    await f.seed(plain, items);
+    const audit = f.audited();
+    audit.onceSized(() => unseen(f, "items", grow("items", 2 * 1024 * 1024)));
+    const decision = await read(
+      f.resolverFor(plain, "plain.items", audit.query),
+      "plain.items",
+    );
+    expect(decision).toMatchObject({ kind: "busy" });
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("not windowed: a row deleted", async () => {
+    const f = await fixture(1024 * 1024);
+    await f.seed(plain, items);
+    const audit = f.audited();
+    audit.onceSized(() => unseen(f, "items", remove("items")));
+    const decision = await read(
+      f.resolverFor(plain, "plain.items", audit.query),
+      "plain.items",
+    );
+    expect(decision).toMatchObject({ kind: "busy" });
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  /** A listing over `f`, whose reads go through `audit` and whose writer is `f.db`. */
+  function listingOf(
+    f: Awaited<ReturnType<typeof fixture>>,
+    audit: ReturnType<Awaited<ReturnType<typeof fixture>>["audited"]>,
+    target: LocalAliasTarget,
+    aliasScope: string,
+  ) {
+    const db: SqlDriver = {
+      info: f.db.info,
+      query: (sql, params) => f.db.query(sql, params),
+      batch: (statements) => f.db.batch(statements),
+      close: () => f.db.close(),
+      reads: audit.reader,
+    };
+    return createLocalListing({
+      ...f.deps,
+      db,
+      aliasScopes: () => [aliasScope],
+      aliasTargets: () => [target],
+    });
+  }
+
+  it("listing: a child replaced by a larger body, under the mark a write left set", async () => {
+    const target = chatgpt();
+    const f = await fixture(2 * 1024 * 1024);
+    await f.seed(target, conversations());
+    // Seeding left every stream's mark set, as a first change does: a change
+    // from here moves no epoch.
+    const marks = await f.db.query<{ dirty: number }>(
+      "SELECT dirty FROM stream_change_marks",
+    );
+    expect(marks.every((m) => m.dirty === 1)).toBe(true);
+    const audit = f.audited();
+    audit.onceSized(async () => {
+      await f.db.batch([grow("messages", 1024 * 1024)]);
+    }, "messages");
+    const listed = await listingOf(f, audit, target, scope).listScopes({
+      canRead: () => true,
+    });
+    // The read saw the change and asked again: the alias is listed.
+    expect(listed.map((s) => s.scope)).toContain(scope);
+    expect(audit.unheld).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("listing: a child deleted between its size and its body does not throw", async () => {
+    // A windowed alias that serves whatever children are there, so a deleted
+    // child leaves it complete.
+    const tree: LocalAliasTarget = {
+      connector: "tree",
+      streams: ["parents", "kids"],
+      window: {
+        parentStream: "parents",
+        parentKey: "id",
+        childStream: "kids",
+        childKey: "parent",
+        arrayKey: "items",
+        sumKeys: ["kids"],
+        parentOrder: (a, b) => String(a.id).localeCompare(String(b.id)),
+      },
+      project: (records) => {
+        const parents = records.filter((r) => r.stream === "parents");
+        return {
+          ok: true as const,
+          payload: {
+            items: parents.map((p) => p.data),
+            kids: records.length - parents.length,
+          },
+        };
+      },
+    };
+    const rows = Array.from({ length: 5 }, (_, p) => [
+      { stream: "parents", data: { id: `p${p}` } },
+      ...[0, 1, 2].map((k) => ({
+        stream: "kids",
+        data: { id: `p${p}:k${k}`, parent: `p${p}`, pad: "y".repeat(2000) },
+      })),
+    ]).flat();
+    const f = await fixture(2 * 1024 * 1024);
+    await f.seed(tree, rows);
+    const audit = f.audited();
+    audit.onceSized(async () => {
+      await f.db.batch([remove("kids")]);
+    }, "kids");
+    const listed = await listingOf(f, audit, tree, "tree.items").listScopes({
+      canRead: () => true,
+    });
+    // The read saw the change and asked again: the alias is listed.
+    expect(listed.map((s) => s.scope)).toContain("tree.items");
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+});
+
+describe("a resolver called the way main calls it", () => {
+  it("serves an alias from a query that already has the alias methods", async () => {
+    const plain: LocalAliasTarget = {
+      connector: "plain",
+      streams: ["items"],
+      project: (records) => ({
+        ok: true as const,
+        payload: { items: records.map((r) => r.data) },
+      }),
+    };
+    const f = await fixture(1024 * 1024);
+    await f.seed(plain, [
+      { stream: "items", data: { id: "a" } },
+      { stream: "items", data: { id: "b" } },
+    ]);
+    // `{ query: createRecordQuery(db), aliasScopes, aliasTargets }`, with no
+    // `aliasQuery`: the shape every caller had on main.
+    const resolver = createLocalResolver(f.deps, {
+      query: createRecordQuery(f.db),
+      aliasScopes: () => ["plain.items"],
+      aliasTargets: () => [plain],
+    });
+    const decision = await read(resolver, "plain.items");
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(
+      envelopeOf("plain.items", { items: [{ id: "a" }, { id: "b" }] }),
+    );
   }, 60_000);
 });
 

@@ -1,4 +1,9 @@
 import {
+  sizedBodies,
+  WHOLE_STREAM_BATCH_BYTES,
+  type StreamLimits,
+} from "./alias-sized.js";
+import {
   aliasViewCheck,
   assertViewCurrent,
   pinAliasStreams,
@@ -9,7 +14,7 @@ import {
   openWindowed,
   type AliasMemory,
 } from "./alias-window.js";
-import type { SqlDriver } from "./driver.js";
+import { readerOf, type SqlDriver } from "./driver.js";
 import { PartialViewMoved } from "./partial-read.js";
 import type { AliasRecordQuery } from "./query.js";
 import { invalidAliasBinding, type Candidate } from "./read-selection.js";
@@ -24,7 +29,10 @@ import { holdMemory } from "./transfer-memory.js";
 
 /** What a projection reads and the memory it is charged to. */
 export interface AliasEnv {
-  /** The database the rows are read from: pins and checks run on it. */
+  /**
+   * The database a pin writes through. Checks of the view run on its read
+   * connection, so they do not wait behind its writer.
+   */
   readonly db: SqlDriver;
   readonly memory: AliasMemory;
   /**
@@ -104,7 +112,7 @@ export async function projectAlias(
   const epochs =
     env.epochs ?? (await pinAliasStreams(env.db, connectionId, fetched));
   const current = aliasViewCheck(
-    env.db,
+    readerOf(env.db),
     candidate.connection,
     candidate.streams,
     epochs,
@@ -144,27 +152,44 @@ async function whole(
   env: AliasEnv,
   current: AliasViewCheck,
 ): Promise<AliasProjection> {
-  /** The memory of every row and of its projection, from the governor. */
+  /**
+   * The memory of every row and of its projection, from the governor, and the
+   * sizes it was taken for: `project` reads no more than these.
+   */
   const hold = async () => {
+    const sizes = new Map<string, StreamLimits>();
     let bytes = 0;
     for (const stream of fetched) {
-      bytes += (await query.streamStats(connectionId, stream)).bytes;
+      const stats = await query.streamStats(connectionId, stream);
+      sizes.set(stream, stats);
+      bytes += stats.bytes;
     }
-    return holdMemory(env.memory, bytes * HEAP_PER_STORED_BYTE, 0, env.signal);
+    const release = await holdMemory(
+      env.memory,
+      bytes * HEAP_PER_STORED_BYTE,
+      0,
+      env.signal,
+    );
+    return { release, sizes };
   };
-  /** Project every row. Call it with the memory held. */
-  const project = async () => {
+  /** Project every row. Call it with the memory held, for `sizes`. */
+  const project = async (sizes: ReadonlyMap<string, StreamLimits>) => {
     const records: LocalAliasRecord[] = [];
     for (const stream of fetched) {
-      for await (const record of query.streamRecords(
+      for await (const batch of sizedBodies(
+        query,
         connectionId,
         stream,
-        current.guard,
+        sizes.get(stream)!,
+        WHOLE_STREAM_BATCH_BYTES,
+        current,
       )) {
-        records.push({
-          stream,
-          data: JSON.parse(record.body) as Record<string, unknown>,
-        });
+        for (const { record } of batch) {
+          records.push({
+            stream,
+            data: JSON.parse(record.body) as Record<string, unknown>,
+          });
+        }
       }
     }
     // Checked after the rows are read, so every one of them is a pinned row.
@@ -172,9 +197,9 @@ async function whole(
     return binding.project(records, now, fetched);
   };
   async function* body(): AsyncGenerator<string> {
-    const release = await hold();
+    const { release, sizes } = await hold();
     try {
-      const projected = await project();
+      const projected = await project(sizes);
       // The view is the one the check saw, so this is the payload it passed.
       if (
         !projected.ok ||
@@ -194,9 +219,9 @@ async function whole(
       release();
     }
   }
-  const release = await hold();
+  const { release, sizes } = await hold();
   try {
-    const projected = await project();
+    const projected = await project(sizes);
     if (!projected.ok && projected.error.kind === "invalid_binding")
       return { kind: "invalid_binding" };
     if (!projected.ok) return { kind: "no_data" };

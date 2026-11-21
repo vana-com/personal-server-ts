@@ -146,10 +146,18 @@ async function fixture() {
       createRecordQuery(db).streamStats(connectionId, stream),
     recordSizes: (connectionId, stream) =>
       createRecordQuery(db).recordSizes(connectionId, stream),
-    recordsByHash: (connectionId, stream, hashes) =>
-      createRecordQuery(db).recordsByHash(connectionId, stream, hashes),
-    async *streamRecords(connectionId, stream) {
+    // The alias read reads bodies by their sizes: a stream is visited when
+    // its bodies are.
+    recordsByHash: (connectionId, stream, sized, guard) => {
       visited(connectionId, stream);
+      return createRecordQuery(db).recordsByHash(
+        connectionId,
+        stream,
+        sized,
+        guard,
+      );
+    },
+    async *streamRecords(connectionId, stream) {
       const records = await db.query<{
         stream: string;
         recordKey: string;
@@ -1516,9 +1524,10 @@ describe("local resolve through the host's real legacy alias port", () => {
     }
     const query: AliasRecordQuery = {
       ...f.query,
-      streamRecords: (connectionId, stream, guard) => {
+      // The alias read names the streams whose bodies it reads.
+      recordsByHash: (connectionId, stream, sized, guard) => {
         readStreams.push(stream);
-        return f.query.streamRecords(connectionId, stream, guard);
+        return f.query.recordsByHash(connectionId, stream, sized, guard);
       },
     };
     const resolver = createLocalResolver(f.deps, {

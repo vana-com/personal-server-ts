@@ -91,17 +91,6 @@ export interface RecordQuery {
  */
 export interface AliasRecordQuery extends RecordQuery {
   /**
-   * The records of a stream, in `pk_hash` order, a page of bodies at a time.
-   * With a `guard`, each page's statement returns rows only while the guard
-   * holds, so a caller that sized the stream sees no row of a later state:
-   * the page is empty once the guard fails.
-   */
-  streamRecords(
-    connectionId: string,
-    stream: string,
-    guard?: StatementGuard,
-  ): AsyncIterable<StoredRecord>;
-  /**
    * How many records a stream holds, how many bytes their bodies take and the
    * largest body, from one statement over the stored sizes: no body is read.
    */
@@ -114,23 +103,30 @@ export interface AliasRecordQuery extends RecordQuery {
     readonly maxBytes: number;
   }>;
   /**
-   * Every record of a stream as its key hash and the bytes of its body, in
+   * Every record of a stream as the identity and size of its body, in
    * `pk_hash` order: no body is read.
    */
-  recordSizes(
-    connectionId: string,
-    stream: string,
-  ): AsyncIterable<{ readonly pkHash: string; readonly bytes: number }>;
+  recordSizes(connectionId: string, stream: string): AsyncIterable<SizedRecord>;
   /**
-   * The records of a stream with these key hashes, in `pk_hash` order. A hash
-   * the stream no longer holds is absent from the answer.
+   * The bodies of records that were sized, in `pk_hash` order. The statement
+   * that returns a body checks it against its `SizedRecord`: the row must
+   * still have the sized hash and be no larger. A record that was deleted,
+   * changed or grown since it was sized is absent from the answer, so no
+   * statement returns more bytes than the sizes it was given add up to.
    */
   recordsByHash(
     connectionId: string,
     stream: string,
-    pkHashes: readonly string[],
+    sized: readonly SizedRecord[],
     guard?: StatementGuard,
   ): Promise<StoredRecord[]>;
+}
+
+/** A record as it was sized: its key hash, its body's hash and its body's bytes. */
+export interface SizedRecord {
+  readonly pkHash: string;
+  readonly sha256: string;
+  readonly bytes: number;
 }
 
 /**
@@ -158,8 +154,11 @@ const STREAM_PAGE_SIZE = 100;
 const SIZE_PAGE_SIZE = 1000;
 /** A stored body's size in bytes; a row written before `body_bytes` has none. */
 const BODY_BYTES = "COALESCE(body_bytes, LENGTH(CAST(body AS BLOB)))";
-/** Hashes per statement: SQLite before 3.32 allows 999 bound parameters. */
-const HASHES_PER_STATEMENT = 500;
+/**
+ * Sized records per statement, three bound parameters each: SQLite before
+ * 3.32 allows 999 bound parameters, and a guard takes some of them.
+ */
+const SIZED_PER_STATEMENT = 250;
 
 const LIST_CURSOR_PREFIX = "v2.";
 
@@ -342,22 +341,17 @@ export function createRecordQuery(db: SqlReader): AliasRecordQuery {
       };
     },
 
-    async *streamRecords(connectionId, stream, guard) {
+    async *streamRecords(connectionId, stream) {
       let cursor: string | undefined;
       for (;;) {
         const page = await db.query<RecordRow>(
           `SELECT ${RECORD_COLUMNS} FROM records
            WHERE connection_id = ? AND stream = ?
              ${cursor === undefined ? "" : "AND pk_hash > ?"}
-             ${guard ? `AND ${guard.sql}` : ""}
            ORDER BY pk_hash LIMIT ?`,
-          [
-            connectionId,
-            stream,
-            ...(cursor === undefined ? [] : [cursor]),
-            ...(guard?.params ?? []),
-            STREAM_PAGE_SIZE,
-          ],
+          cursor === undefined
+            ? [connectionId, stream, STREAM_PAGE_SIZE]
+            : [connectionId, stream, cursor, STREAM_PAGE_SIZE],
         );
         for (const row of page) yield stored(row);
         if (page.length < STREAM_PAGE_SIZE) return;
@@ -386,8 +380,12 @@ export function createRecordQuery(db: SqlReader): AliasRecordQuery {
     async *recordSizes(connectionId, stream) {
       let cursor: string | undefined;
       for (;;) {
-        const page = await db.query<{ pk_hash: string; bytes: number }>(
-          `SELECT pk_hash, ${BODY_BYTES} AS bytes FROM records
+        const page = await db.query<{
+          pk_hash: string;
+          body_sha256: string;
+          bytes: number;
+        }>(
+          `SELECT pk_hash, body_sha256, ${BODY_BYTES} AS bytes FROM records
            WHERE connection_id = ? AND stream = ?
              ${cursor === undefined ? "" : "AND pk_hash > ?"}
            ORDER BY pk_hash LIMIT ?`,
@@ -396,23 +394,37 @@ export function createRecordQuery(db: SqlReader): AliasRecordQuery {
             : [connectionId, stream, cursor, SIZE_PAGE_SIZE],
         );
         for (const row of page) {
-          yield { pkHash: row.pk_hash, bytes: Number(row.bytes) };
+          yield {
+            pkHash: row.pk_hash,
+            sha256: row.body_sha256,
+            bytes: Number(row.bytes),
+          };
         }
         if (page.length < SIZE_PAGE_SIZE) return;
         cursor = page[page.length - 1]!.pk_hash;
       }
     },
 
-    async recordsByHash(connectionId, stream, pkHashes, guard) {
+    async recordsByHash(connectionId, stream, sized, guard) {
       const out: StoredRecord[] = [];
-      for (let i = 0; i < pkHashes.length; i += HASHES_PER_STATEMENT) {
-        const group = pkHashes.slice(i, i + HASHES_PER_STATEMENT);
+      for (let i = 0; i < sized.length; i += SIZED_PER_STATEMENT) {
+        const group = sized.slice(i, i + SIZED_PER_STATEMENT);
+        // The statement joins the rows it returns to what was sized: the
+        // identity and the size are checked where the body is read.
         const rows = await db.query<RecordRow>(
-          `SELECT ${RECORD_COLUMNS} FROM records
+          `WITH sized(want_hash, want_sha, want_bytes) AS (VALUES ${group
+            .map(() => "(?, ?, ?)")
+            .join(", ")})
+           SELECT ${RECORD_COLUMNS} FROM records JOIN sized ON want_hash = pk_hash
            WHERE connection_id = ? AND stream = ?
-             AND pk_hash IN (${group.map(() => "?").join(",")})
+             AND body_sha256 = want_sha AND ${BODY_BYTES} <= want_bytes
              ${guard ? `AND ${guard.sql}` : ""}`,
-          [connectionId, stream, ...group, ...(guard?.params ?? [])],
+          [
+            ...group.flatMap((r) => [r.pkHash, r.sha256, r.bytes]),
+            connectionId,
+            stream,
+            ...(guard?.params ?? []),
+          ],
         );
         for (const row of rows) out.push(stored(row));
       }

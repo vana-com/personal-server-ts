@@ -6,7 +6,7 @@ import { readerOf } from "./driver.js";
 import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { SEEN_O } from "./merge.js";
 import { streamDigest } from "./stream-digest.js";
-import { projectAlias } from "./alias-projection.js";
+import { projectAlias, type AliasProjection } from "./alias-projection.js";
 import { readAliasEpochs } from "./alias-view.js";
 import { createRecordQuery } from "./query.js";
 import {
@@ -22,6 +22,9 @@ import {
   type Target,
 } from "./read-selection.js";
 import type { AliasScopes, AliasTargets } from "./resolve.js";
+
+/** Reads of one alias body a listing makes before it calls the alias changing. */
+const ALIAS_LISTING_TRIES = 3;
 
 /** One listed scope of `GET /v1/data` (D.2). */
 export interface ListedScope {
@@ -304,30 +307,39 @@ export function createLocalListing(
     return entries;
   }
 
-  /** Can a read build this alias body from the records installed now? */
+  /**
+   * Can a read build this alias body from the records installed now? A read
+   * that finds its rows changed under it (`moved`) is asked again, with the
+   * change marks read anew, and answers from the rows as they then stand.
+   */
   async function aliasBodyBuilds(
     target: Target,
     chosen: Candidate,
   ): Promise<boolean> {
     if (!target.alias) return true;
-    const projected = await projectAlias(
-      target.alias,
-      chosen,
-      createRecordQuery(reads.db),
-      new Date(deps.now()).toISOString(),
-      {
-        db: deps.db,
-        memory: deps.blobs,
-        // Listing only reads: a pin that cleared the marks would write, and
-        // wait for the writer behind a long batch.
-        epochs: await readAliasEpochs(
-          deps.db,
-          chosen.connection.connection_id,
-          chosen.streams.map((s) => s.stream),
-        ),
-      },
-    );
-    return projected.kind === "ok";
+    let projected: AliasProjection;
+    for (let attempt = 0; ; attempt++) {
+      projected = await projectAlias(
+        target.alias,
+        chosen,
+        createRecordQuery(reads.db),
+        new Date(deps.now()).toISOString(),
+        {
+          db: deps.db,
+          memory: deps.blobs,
+          // Listing only reads: a pin that cleared the marks would write, and
+          // wait for the writer behind a long batch.
+          epochs: await readAliasEpochs(
+            deps.db,
+            chosen.connection.connection_id,
+            chosen.streams.map((s) => s.stream),
+          ),
+        },
+      );
+      if (projected.kind !== "moved" || attempt + 1 >= ALIAS_LISTING_TRIES) {
+        return projected.kind === "ok";
+      }
+    }
   }
 
   /** What a stream's head says about it, given its connection's control state. */

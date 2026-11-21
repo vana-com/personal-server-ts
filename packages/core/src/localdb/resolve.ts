@@ -236,31 +236,50 @@ interface PinnedAlias {
 }
 
 /**
- * What a resolver is made of. Legacy aliases are read through `aliasQuery`
- * (sizes, and records by key hash), so `aliasScopes` and `aliasTargets` come
- * only with it: a caller that names aliases and no query to read them would
- * serve none.
+ * What a resolver is made of. Legacy aliases are read through a query that
+ * also answers sizes and records by key hash (`AliasRecordQuery`): `aliasQuery`,
+ * or `query` itself when it is one, as `createRecordQuery` makes it (the shape
+ * callers had before alias paging). `aliasScopes` and `aliasTargets` come only
+ * with such a query: a caller that names aliases and a plain `RecordQuery`
+ * would serve none.
  */
-export type LocalResolverParts = {
-  readonly query: RecordQuery;
-} & (
+export type LocalResolverParts =
   | {
+      readonly query: RecordQuery;
       readonly aliasQuery?: undefined;
       readonly aliasScopes?: undefined;
       readonly aliasTargets?: undefined;
     }
   | {
+      readonly query: RecordQuery;
       readonly aliasQuery: AliasRecordQuery;
       readonly aliasScopes?: AliasScopes;
       readonly aliasTargets?: AliasTargets;
     }
-);
+  | {
+      readonly query: AliasRecordQuery;
+      readonly aliasQuery?: undefined;
+      readonly aliasScopes?: AliasScopes;
+      readonly aliasTargets?: AliasTargets;
+    };
+
+const isAliasRecordQuery = (query: RecordQuery): query is AliasRecordQuery => {
+  const candidate = query as Partial<AliasRecordQuery>;
+  return (
+    typeof candidate.streamStats === "function" &&
+    typeof candidate.recordSizes === "function" &&
+    typeof candidate.recordsByHash === "function"
+  );
+};
 
 export function createLocalResolver(
   deps: LocalSyncDeps,
   parts: LocalResolverParts,
 ): LocalResolver {
-  if (!parts.aliasQuery && (parts.aliasScopes || parts.aliasTargets)) {
+  const aliasQuery =
+    parts.aliasQuery ??
+    (isAliasRecordQuery(parts.query) ? parts.query : undefined);
+  if (!aliasQuery && (parts.aliasScopes || parts.aliasTargets)) {
     // Not reachable from typed code (see `LocalResolverParts`).
     throw new Error(
       "createLocalResolver: aliasScopes and aliasTargets need an aliasQuery to read their records",
@@ -528,7 +547,6 @@ export function createLocalResolver(
         ),
       );
     }
-    const aliasQuery = parts.aliasQuery;
     if (!aliasQuery) throw new Error("an alias target without an aliasQuery");
     return {
       finish: async () => {

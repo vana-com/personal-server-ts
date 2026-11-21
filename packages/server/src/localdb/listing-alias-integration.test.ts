@@ -121,14 +121,20 @@ it("lists an alias while the database writer is busy", async () => {
   let finish!: () => void;
   const held = new Promise<void>((resolve) => (finish = resolve));
   const real = f.deps.db;
+  // Its queries wait behind the writer too, as they do on a real connection.
+  // Only the read connection answers while the writer is held.
   const stalled: SqlDriver = {
     info: real.info,
-    query: (sql, params) => real.query(sql, params),
+    query: async (sql, params) => {
+      await held;
+      return real.query(sql, params);
+    },
     batch: async (statements) => {
       await held;
       return real.batch(statements);
     },
     close: () => real.close(),
+    reads: real,
   };
   const listing = createLocalListing(
     { ...f.deps, db: stalled, ...f.aliases },

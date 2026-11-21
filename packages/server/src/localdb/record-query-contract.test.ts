@@ -109,6 +109,25 @@ describe("the exported RecordQuery contract", () => {
     ).toEqual([]);
   }, 60_000);
 
+  it("accepts main's call shape: a query that already has the alias methods", () => {
+    // On main a caller passes `{ query: createRecordQuery(db), aliasScopes }`
+    // and that query implements the alias methods. It stays a valid call, with
+    // no `aliasQuery` beside it; a plain RecordQuery with alias configuration
+    // is still refused (the test above).
+    expect(
+      diagnosticsOf(
+        `import type { AliasRecordQuery } from "${QUERY}";
+         import type { LocalSyncDeps } from "${DEPS}";
+         import { createLocalResolver } from "${RESOLVE}";
+         declare const deps: LocalSyncDeps;
+         declare const query: AliasRecordQuery;
+         export const main = createLocalResolver(deps, {
+           query, aliasScopes: () => [], aliasTargets: () => [],
+         });`,
+      ),
+    ).toEqual([]);
+  }, 60_000);
+
   it("throws at construction when alias configuration comes without an alias query", () => {
     const deps = {} as never;
     const query = {} as never;
