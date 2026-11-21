@@ -1,6 +1,6 @@
 import type { SqlDriver, SqlReader } from "./driver.js";
 import type { StatementGuard } from "./query.js";
-import { pinStream } from "./complete-read.js";
+import { pinStream, readMark } from "./complete-read.js";
 import { PartialViewMoved } from "./partial-read.js";
 import type { Connection, Stream } from "./read-selection.js";
 
@@ -20,6 +20,27 @@ export async function pinAliasStreams(
   const epochs = new Map<string, number>();
   for (const stream of streams) {
     epochs.set(stream, await pinStream(db, connectionId, stream));
+  }
+  return epochs;
+}
+
+/**
+ * The epochs of the streams' change marks, read and nothing written: for a
+ * check that must not wait for the database's writer (a scope listing).
+ * `pinAliasStreams` also clears a mark's flag, so that any later change moves
+ * the epoch. Here a flag that is set stays set, and a change after the read
+ * moves the epoch only once another reader has cleared it: the check is exact
+ * against the heads and the connection, and best effort against a row that
+ * changes under an unchanged head.
+ */
+export async function readAliasEpochs(
+  db: SqlDriver,
+  connectionId: string,
+  streams: readonly string[],
+): Promise<ReadonlyMap<string, number>> {
+  const epochs = new Map<string, number>();
+  for (const stream of streams) {
+    epochs.set(stream, (await readMark(db, connectionId, stream)).epoch);
   }
   return epochs;
 }

@@ -7,6 +7,7 @@ import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { SEEN_O } from "./merge.js";
 import { streamDigest } from "./stream-digest.js";
 import { projectAlias } from "./alias-projection.js";
+import { readAliasEpochs } from "./alias-view.js";
 import { createRecordQuery } from "./query.js";
 import {
   chooseCandidate,
@@ -314,7 +315,17 @@ export function createLocalListing(
       chosen,
       createRecordQuery(reads.db),
       new Date(deps.now()).toISOString(),
-      { db: deps.db, memory: deps.blobs },
+      {
+        db: deps.db,
+        memory: deps.blobs,
+        // Listing only reads: a pin that cleared the marks would write, and
+        // wait for the writer behind a long batch.
+        epochs: await readAliasEpochs(
+          deps.db,
+          chosen.connection.connection_id,
+          chosen.streams.map((s) => s.stream),
+        ),
+      },
     );
     return projected.kind === "ok";
   }

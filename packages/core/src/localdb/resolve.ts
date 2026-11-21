@@ -226,20 +226,46 @@ async function* envelope(
   yield "}";
 }
 
+/**
+ * An alias read decided under the connection's queue: its heads and epochs are
+ * pinned and its headers are known. `finish` projects it and makes the view,
+ * and runs after the queue is released.
+ */
+interface PinnedAlias {
+  readonly finish: () => Promise<ReadDecision>;
+}
+
+/**
+ * What a resolver is made of. Legacy aliases are read through `aliasQuery`
+ * (sizes, and records by key hash), so `aliasScopes` and `aliasTargets` come
+ * only with it: a caller that names aliases and no query to read them would
+ * serve none.
+ */
+export type LocalResolverParts = {
+  readonly query: RecordQuery;
+} & (
+  | {
+      readonly aliasQuery?: undefined;
+      readonly aliasScopes?: undefined;
+      readonly aliasTargets?: undefined;
+    }
+  | {
+      readonly aliasQuery: AliasRecordQuery;
+      readonly aliasScopes?: AliasScopes;
+      readonly aliasTargets?: AliasTargets;
+    }
+);
+
 export function createLocalResolver(
   deps: LocalSyncDeps,
-  parts: {
-    readonly query: RecordQuery;
-    /**
-     * What a legacy alias is read through, with its sizes and by key hash.
-     * Without it no alias is served: `aliasScopes` and `aliasTargets` are
-     * ignored and an alias scope names nothing.
-     */
-    readonly aliasQuery?: AliasRecordQuery;
-    readonly aliasScopes?: AliasScopes;
-    readonly aliasTargets?: AliasTargets;
-  },
+  parts: LocalResolverParts,
 ): LocalResolver {
+  if (!parts.aliasQuery && (parts.aliasScopes || parts.aliasTargets)) {
+    // Not reachable from typed code (see `LocalResolverParts`).
+    throw new Error(
+      "createLocalResolver: aliasScopes and aliasTargets need an aliasQuery to read their records",
+    );
+  }
   const streams = (connectionId: string): Promise<Stream[]> =>
     loadStreams(deps, connectionId);
 
@@ -391,17 +417,20 @@ export function createLocalResolver(
    * A complete read, decided while it holds the connection's queue and
    * finished once its headers are decided: the body holds nothing. A body of
    * the database pages through the stream and checks its head on every page
-   * (see `completeBody`); a projected alias is checked here and read again as
-   * its body is taken, against the epochs pinned below (see `projectAlias`).
+   * (see `completeBody`).
+   *
+   * A projected alias is not projected here. Its heads and epochs are pinned
+   * under the queue, and `build` returns what finishes the read: the caller
+   * calls it after the queue is released (see `PinnedAlias`).
    */
   async function build(
     input: ResolveInput,
     candidate: Candidate,
-  ): Promise<ReadDecision> {
+  ): Promise<ReadDecision | PinnedAlias> {
     // A body of the database is pinned before the head is read: see
-    // `pinStream`. An alias is read again after the queue is released, when
-    // its body is taken (a paged one, window by window; any other, whole), so
-    // it pins every stream it reads.
+    // `pinStream`. An alias is projected after the queue is released (a paged
+    // one, window by window; any other, whole), so it pins every stream it
+    // reads.
     const alias = candidate.target.alias;
     const pin = alias
       ? 0
@@ -455,58 +484,12 @@ export function createLocalResolver(
     if (input.requireRegistered && position === null)
       return { kind: "read_not_registered" };
 
-    let payload: AsyncIterable<string>;
-    // Ends the waits of this read's alias body: the request's own signal, or
-    // the reader cancelling the body (see `bodyStream`).
-    const stop = new AbortController();
-    const binding = candidate.target.alias;
-    if (!binding) {
-      const only = installed[0]!;
-      payload = completeBody(
-        readerOf(deps.db),
-        {
-          connectionId: connection.connection_id,
-          generation: connection.generation,
-          stream: only.stream,
-          // The stream's installed head: the identity every page checks.
-          version: only.installed_version,
-          dataHash: only.head_data_hash!,
-        },
-        pin,
-      );
-    } else {
-      if (!parts.aliasQuery) return noData();
-      const signal = input.signal
-        ? AbortSignal.any([input.signal, stop.signal])
-        : stop.signal;
-      let projected: Awaited<ReturnType<typeof projectAlias>>;
-      try {
-        projected = await projectAlias(
-          binding,
-          current,
-          parts.aliasQuery,
-          new Date(deps.now()).toISOString(),
-          { db: deps.db, memory: deps.blobs, epochs, signal },
-        );
-      } catch (error) {
-        // The request ended while the check waited for memory.
-        if (input.signal?.aborted) return { kind: "read_aborted" };
-        throw error;
-      }
-      if (projected.kind === "invalid_binding") return projected;
-      if (projected.kind === "incomplete") {
-        return { kind: "incomplete", diagnostics: projected.diagnostics };
-      }
-      // The rows changed while the read was checked: ask again.
-      if (projected.kind === "moved") {
-        return { kind: "busy", retryAfterSeconds: 5 };
-      }
-      if (projected.kind === "no_data") return noData();
-      payload = projected.body();
-    }
     const servedStream = servedStreamOf(candidate.target);
     const head = installed.find((s) => s.stream === servedStream)!;
-    return {
+    const view = (
+      payload: AsyncIterable<string>,
+      onCancel?: () => void,
+    ): ReadDecision => ({
       kind: "view",
       connector: connection.connector,
       ns: connection.ns,
@@ -524,8 +507,62 @@ export function createLocalResolver(
           Math.max(...installed.map((s) => s.observed_at ?? 0)),
           payload,
         ),
-        () => stop.abort(),
+        onCancel,
       ),
+    });
+    const binding = candidate.target.alias;
+    if (!binding) {
+      const only = installed[0]!;
+      return view(
+        completeBody(
+          readerOf(deps.db),
+          {
+            connectionId: connection.connection_id,
+            generation: connection.generation,
+            stream: only.stream,
+            // The stream's installed head: the identity every page checks.
+            version: only.installed_version,
+            dataHash: only.head_data_hash!,
+          },
+          pin,
+        ),
+      );
+    }
+    const aliasQuery = parts.aliasQuery;
+    if (!aliasQuery) throw new Error("an alias target without an aliasQuery");
+    return {
+      finish: async () => {
+        // Ends the waits of this read's alias body: the request's own signal,
+        // or the reader cancelling the body (see `bodyStream`).
+        const stop = new AbortController();
+        const signal = input.signal
+          ? AbortSignal.any([input.signal, stop.signal])
+          : stop.signal;
+        let projected: Awaited<ReturnType<typeof projectAlias>>;
+        try {
+          projected = await projectAlias(
+            binding,
+            current,
+            aliasQuery,
+            new Date(deps.now()).toISOString(),
+            { db: deps.db, memory: deps.blobs, epochs, signal },
+          );
+        } catch (error) {
+          // The request ended while the check waited for memory.
+          if (input.signal?.aborted) return { kind: "read_aborted" };
+          throw error;
+        }
+        if (projected.kind === "invalid_binding") return projected;
+        if (projected.kind === "incomplete") {
+          return { kind: "incomplete", diagnostics: projected.diagnostics };
+        }
+        // The rows changed while the read was checked: ask again.
+        if (projected.kind === "moved") {
+          return { kind: "busy", retryAfterSeconds: 5 };
+        }
+        if (projected.kind === "no_data") return noData();
+        return view(projected.body(), () => stop.abort());
+      },
     };
   }
 
@@ -542,8 +579,8 @@ export function createLocalResolver(
       const scope = streamReadScope(input.scope) ?? input.scope;
       const targets = targetsForScope(
         scope,
-        new Set(parts.aliasQuery ? (parts.aliasScopes?.() ?? []) : []),
-        parts.aliasQuery ? parts.aliasTargets : undefined,
+        new Set(parts.aliasScopes?.() ?? []),
+        parts.aliasTargets,
       );
       if (
         targets.some(
@@ -689,10 +726,18 @@ export function createLocalResolver(
       // until its reader finished or cancelled, which a reader that stopped
       // pulling never did, and every apply and read of the connection waited.
       // The body checks its head itself, on every page.
-      const decide = () =>
-        deps.queue.run(chosen.connection.connection_id, "end", () =>
-          build({ ...input, scope }, chosen),
+      const decide = async (): Promise<ReadDecision> => {
+        const built = await deps.queue.run(
+          chosen.connection.connection_id,
+          "end",
+          () => build({ ...input, scope }, chosen),
         );
+        // An alias is projected outside the queue: its check may wait for
+        // memory that a paused client holds, and the queue must not wait with
+        // it. Its statements carry the pinned view, so a write that lands
+        // after the queue is released ends the read as `busy`.
+        return "finish" in built ? built.finish() : built;
+      };
       const decision = await decide();
       // A collector can commit between the early coverage check and build.
       // Publish outside the queue and reselect the body once in that case.

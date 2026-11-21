@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -84,6 +85,41 @@ describe("the exported RecordQuery contract", () => {
     );
     expect(messages.join("\n")).toMatch(/streamStats/);
   }, 60_000);
+
+  it("refuses alias configuration without an alias query", () => {
+    // The old call shape, with alias scopes, used to compile and then serve no
+    // alias. It no longer compiles, and an untyped caller is refused at
+    // construction.
+    expect(
+      diagnosticsOf(
+        `import type { RecordQuery, AliasRecordQuery } from "${QUERY}";
+         import type { LocalSyncDeps } from "${DEPS}";
+         import { createLocalResolver } from "${RESOLVE}";
+         declare const deps: LocalSyncDeps;
+         declare const query: RecordQuery;
+         declare const aliasQuery: AliasRecordQuery;
+         // @ts-expect-error alias scopes need the query that reads them
+         export const scopes = createLocalResolver(deps, { query, aliasScopes: () => [] });
+         // @ts-expect-error alias targets need the query that reads them
+         export const targets = createLocalResolver(deps, { query, aliasTargets: () => [] });
+         export const both = createLocalResolver(deps, {
+           query, aliasQuery, aliasScopes: () => [], aliasTargets: () => [],
+         });`,
+      ),
+    ).toEqual([]);
+  }, 60_000);
+
+  it("throws at construction when alias configuration comes without an alias query", () => {
+    const deps = {} as never;
+    const query = {} as never;
+    expect(() =>
+      createLocalResolver(deps, { query, aliasScopes: () => [] } as never),
+    ).toThrow(/aliasQuery/);
+    expect(() =>
+      createLocalResolver(deps, { query, aliasTargets: () => [] } as never),
+    ).toThrow(/aliasQuery/);
+    expect(() => createLocalResolver(deps, { query })).not.toThrow();
+  });
 
   it("leaves the alias read's extra methods to AliasRecordQuery", () => {
     const messages = diagnosticsOf(

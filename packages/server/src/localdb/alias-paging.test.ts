@@ -1027,6 +1027,67 @@ describe("a read that is cancelled stops waiting for memory", () => {
   }
 });
 
+/**
+ * A read that waits for memory must not hold its connection's queue: a paused
+ * client keeps its body's memory until it reads on or goes away, and every
+ * apply and read of the connection would wait for that client.
+ */
+describe("a read that waits for memory does not hold its connection's queue", () => {
+  const plain: LocalAliasTarget = {
+    connector: "plain",
+    streams: ["items"],
+    project: (records) => ({
+      ok: true as const,
+      payload: { items: records.map((r) => r.data) },
+    }),
+  };
+  const rows = Array.from({ length: 40 }, (_, i) => ({
+    stream: "items",
+    data: { id: `i${i}`, pad: "y".repeat(10_000) },
+  }));
+
+  it("lets an apply finish behind a paused body, and ends the read busy if a write lands meanwhile", async () => {
+    // 400 KB of rows under a 1 MiB governor: the payload takes 1.6 MB, so the
+    // paused body holds the whole budget.
+    const f = await fixture(1024 * 1024);
+    await f.seed(plain, rows);
+    const first = await read(
+      f.resolverFor(plain, "plain.items"),
+      "plain.items",
+    );
+    expect(first.kind).toBe("view");
+    if (first.kind !== "view") return;
+    const reader = first.body.getReader();
+    await reader.read();
+    await reader.read();
+    expect(f.inUse()).toBeGreaterThan(0);
+    // A second read of the same connection waits for that memory.
+    const second = read(f.resolverFor(plain, "plain.items"), "plain.items");
+    expect(
+      await Promise.race([
+        second.then(() => "served"),
+        sleep(200).then(() => "waiting"),
+      ]),
+    ).toBe("waiting");
+    // An apply of the same connection is not held up by it.
+    const applied = await Promise.race([
+      f.deps.queue.run("c1", "apply", async () => "applied"),
+      sleep(1000).then(() => "stalled"),
+    ]);
+    expect(applied).toBe("applied");
+    // A write lands while the second read still waits.
+    await f.db.batch([
+      {
+        sql: "UPDATE records SET stamp_o = 9 WHERE connection_id = 'c1' AND stream = 'items' AND pk_hash = (SELECT MIN(pk_hash) FROM records WHERE connection_id = 'c1')",
+      },
+    ]);
+    await reader.cancel();
+    // The view it was decided on is gone: it asks the caller to try again.
+    expect(await second).toMatchObject({ kind: "busy" });
+    expect(f.inUse()).toBe(0);
+  }, 30_000);
+});
+
 /** The engine's collector, switched on at run time when the process has none. */
 function collector(): () => void {
   const existing = (globalThis as { gc?: () => void }).gc;
