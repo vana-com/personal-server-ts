@@ -69,6 +69,9 @@ function world() {
   let finalized: string | null = "99";
   let rolledBack: unknown = null;
   const hooks: { afterDelete?: (batchNo: number) => Promise<void> } = {};
+  /** The piece names written down, and how many deletes had been sent by then. */
+  const kept: { scope: string; names: string[]; callsBefore: number }[] = [];
+  let keepFails = false;
   const logger = { info() {}, warn() {} };
 
   const setControl = (
@@ -212,6 +215,12 @@ function world() {
     },
     blobs: { get: async (key) => store.get(key) ?? null },
     keys,
+    retained: {
+      keep: async (scope, names) => {
+        if (keepFails) throw new Error("database is locked");
+        kept.push({ scope, names: [...names], callsBefore: calls.length });
+      },
+    },
     objects: {
       deleteBlobVersions: async (scope, names) => {
         calls.push([...names]);
@@ -239,6 +248,10 @@ function world() {
     calls,
     failing,
     hooks,
+    kept,
+    failKeep(on = true) {
+      keepFails = on;
+    },
     deps,
     setControl,
     segment,
@@ -248,6 +261,10 @@ function world() {
     setFinality(f: string | null, r: unknown = null) {
       finalized = f;
       rolledBack = r;
+    },
+    /** The names of every object stored under a log scope except body pieces. */
+    erasable(connector: string, ns: string) {
+      return this.objects(connector, ns).filter((n) => n[0] !== "v");
     },
     /** The names of every object stored under a log scope. */
     objects(connector: string, ns: string) {
@@ -260,7 +277,7 @@ function world() {
 }
 
 describe("eraseDeletedConnectionLogs", () => {
-  it("deletes every segment, part and piece of a deleted connection and nothing of another", async () => {
+  it("deletes every segment and part of a deleted connection, and no body piece, and nothing of another", async () => {
     const w = world();
     await w.compactedLog("alpha", NS);
     await w.compactedLog("alpha", OTHER_NS, 10);
@@ -275,7 +292,9 @@ describe("eraseDeletedConnectionLogs", () => {
       connector: "alpha",
     });
 
-    expect(w.objects("alpha", NS)).toEqual([]);
+    expect(w.erasable("alpha", NS)).toEqual([]);
+    // The four pieces (a, b, c, d) are left in storage.
+    expect(w.objects("alpha", NS)).toHaveLength(4);
     expect(w.objects("alpha", OTHER_NS)).toHaveLength(9);
     expect(w.objects("beta", NS)).toHaveLength(9);
     expect(report.pending).toBe(false);
@@ -283,7 +302,7 @@ describe("eraseDeletedConnectionLogs", () => {
       {
         connector: "alpha",
         ns: NS,
-        outcome: { kind: "erased", deleted: 9, unenumerated: 0 },
+        outcome: { kind: "erased", deleted: 5, retained: 4, unenumerated: 0 },
       },
     ]);
   });
@@ -298,7 +317,7 @@ describe("eraseDeletedConnectionLogs", () => {
     expect(w.objects("alpha", NS)).toHaveLength(9);
   });
 
-  it("deletes pieces, then parts, then segments, and the newest segment last", async () => {
+  it("deletes parts, then segments, and the newest segment last", async () => {
     const w = world();
     await w.compactedLog("alpha", NS);
     w.setControl("alpha", NS, 2, true);
@@ -308,8 +327,46 @@ describe("eraseDeletedConnectionLogs", () => {
     await eraseDeletedConnectionLogs(w.deps);
 
     const kinds = w.calls.flat().map((name) => name[0]);
-    expect(kinds).toEqual(["v", "v", "v", "v", "q", "s", "s", "s", "s"]);
+    expect(kinds).toEqual(["q", "s", "s", "s", "s"]);
     expect(w.calls.at(-1)).toEqual([`s-${head.slice(2)}`]);
+  });
+
+  it("never sends a body piece to storage, and writes every piece name down before the first delete", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const pieces = w.objects("alpha", NS).filter((n) => n[0] === "v");
+    expect(pieces).toHaveLength(4);
+
+    await eraseDeletedConnectionLogs(w.deps);
+
+    expect(w.calls.flat().filter((name) => name[0] === "v")).toEqual([]);
+    expect(w.kept).toHaveLength(1);
+    expect(w.kept[0]!.scope).toBe(logScope("alpha", NS));
+    expect([...w.kept[0]!.names].sort()).toEqual([...pieces].sort());
+    // Nothing had been deleted when the names were written.
+    expect(w.kept[0]!.callsBefore).toBe(0);
+  });
+
+  it("deletes nothing when the piece names cannot be written down, and finishes once they can", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    w.failKeep();
+
+    const first = await eraseDeletedConnectionLogs(w.deps);
+
+    expect(first.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "error",
+    });
+    expect(w.calls).toEqual([]);
+    expect(w.objects("alpha", NS)).toHaveLength(9);
+
+    w.failKeep(false);
+    const second = await eraseDeletedConnectionLogs(w.deps);
+    expect(second.pending).toBe(false);
+    expect(w.erasable("alpha", NS)).toEqual([]);
   });
 
   it("waits for the control tombstone to be final, and deletes nothing before", async () => {
@@ -329,7 +386,7 @@ describe("eraseDeletedConnectionLogs", () => {
     w.setFinality("2");
     const done = await eraseDeletedConnectionLogs(w.deps);
     expect(done.pending).toBe(false);
-    expect(w.objects("alpha", NS)).toEqual([]);
+    expect(w.erasable("alpha", NS)).toEqual([]);
   });
 
   it("erases nothing of a tombstone the gateway rolled back", async () => {
@@ -404,16 +461,14 @@ describe("eraseDeletedConnectionLogs", () => {
       expect(w.objects("alpha", NS)).toHaveLength(10);
     });
 
-    it("keeps the piece it shares with the erased lifetime when it lands between two batches", async () => {
+    it("stops when it lands between two batches, and the piece it shares with the erased lifetime is untouched", async () => {
       const w = world();
-      // 20 pieces on one segment: two batches of pieces (15, then 5).
-      const pieces = Array.from({ length: 20 }, (_, i) => i + 1);
-      await w.segment("alpha", NS, { position: 1, pieces });
+      await w.compactedLog("alpha", NS);
       w.setControl("alpha", NS, 2, true);
-      // The new lifetime re-collects the record of piece 20 (second batch),
-      // right after the first batch is deleted.
+      // The new lifetime re-collects the record of piece 1, right after the
+      // first batch (the snapshot part) is deleted.
       w.hooks.afterDelete = async (batchNo) => {
-        if (batchNo === 0) await reAdd(w, 20);
+        if (batchNo === 0) await reAdd(w, 1);
       };
 
       const report = await eraseDeletedConnectionLogs(w.deps);
@@ -422,10 +477,29 @@ describe("eraseDeletedConnectionLogs", () => {
         kind: "stopped",
         why: "re-added",
       });
-      expect(w.objects("alpha", NS)).toContain(`v-${hex64(20)}`);
-      // Only the first batch (pieces 1-15) was sent.
+      expect(w.objects("alpha", NS)).toContain(`v-${hex64(1)}`);
+      // Only the first batch was sent.
       expect(w.calls).toHaveLength(1);
-      expect(w.calls[0]).toHaveLength(15);
+    });
+
+    it("never loses a piece it shares, wherever in the pass it lands", async () => {
+      // Pieces are named by content, so the new lifetime's piece and an old
+      // one are the same object: no batch of any pass may name it.
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      let batches = 0;
+      w.hooks.afterDelete = async () => {
+        if (++batches === 1) await reAdd(w, 1);
+      };
+
+      await eraseDeletedConnectionLogs(w.deps);
+      await eraseDeletedConnectionLogs(w.deps);
+
+      expect(w.calls.flat().some((name) => name === `v-${hex64(1)}`)).toBe(
+        false,
+      );
+      expect(w.objects("alpha", NS)).toContain(`v-${hex64(1)}`);
     });
   });
 
@@ -446,8 +520,10 @@ describe("eraseDeletedConnectionLogs", () => {
         kind: "pending",
         why: "storage",
       });
-      // Pieces are gone; the part failed; every segment is still there.
-      expect(w.objects("alpha", NS).filter((n) => n[0] === "v")).toEqual([]);
+      // The part failed: it and every segment are still there.
+      expect(w.objects("alpha", NS).filter((n) => n[0] === "q")).toHaveLength(
+        1,
+      );
       expect(w.objects("alpha", NS).filter((n) => n[0] === "s")).toHaveLength(
         4,
       );
@@ -455,7 +531,7 @@ describe("eraseDeletedConnectionLogs", () => {
       w.failing.clear();
       const second = await eraseDeletedConnectionLogs(w.deps);
       expect(second.pending).toBe(false);
-      expect(w.objects("alpha", NS)).toEqual([]);
+      expect(w.erasable("alpha", NS)).toEqual([]);
     });
 
     it("a failed segment delete never reaches the newest segment, and a repeat finds every object again", async () => {
@@ -475,7 +551,7 @@ describe("eraseDeletedConnectionLogs", () => {
       // A new pass with nothing remembered: a restart.
       const report = await eraseDeletedConnectionLogs({ ...w.deps });
       expect(report.pending).toBe(false);
-      expect(w.objects("alpha", NS)).toEqual([]);
+      expect(w.erasable("alpha", NS)).toEqual([]);
     });
 
     it("a delete that throws is a failed batch, not a failed pass", async () => {
@@ -502,14 +578,14 @@ describe("eraseDeletedConnectionLogs", () => {
       const w = world();
       await w.compactedLog("alpha", NS);
       w.setControl("alpha", NS, 2, true);
-      // The pieces went in an earlier pass that stopped.
+      // The part went in an earlier pass that stopped.
       for (const name of w.objects("alpha", NS))
-        if (name[0] === "v") w.store.delete(`${logScope("alpha", NS)}/${name}`);
+        if (name[0] === "q") w.store.delete(`${logScope("alpha", NS)}/${name}`);
 
       const report = await eraseDeletedConnectionLogs(w.deps);
 
       expect(report.pending).toBe(false);
-      expect(w.objects("alpha", NS)).toEqual([]);
+      expect(w.erasable("alpha", NS)).toEqual([]);
     });
 
     it("a verified complete pass remains erased without further deletes", async () => {
@@ -519,7 +595,8 @@ describe("eraseDeletedConnectionLogs", () => {
       const first = await eraseDeletedConnectionLogs(w.deps);
       expect(first.connections[0]!.outcome).toEqual({
         kind: "erased",
-        deleted: 9,
+        deleted: 5,
+        retained: 4,
         unenumerated: 0,
       });
       w.calls.length = 0;
@@ -539,6 +616,7 @@ describe("eraseDeletedConnectionLogs", () => {
       expect(again.connections[0]!.outcome).toEqual({
         kind: "erased",
         deleted: 0,
+        retained: 0,
         unenumerated: 0,
       });
       expect(w.calls).toEqual([]);
@@ -594,7 +672,8 @@ describe("eraseDeletedConnectionLogs", () => {
     const readable = await eraseDeletedConnectionLogs(w.deps);
     expect(readable.connections[0]!.outcome).toEqual({
       kind: "erased",
-      deleted: before.length,
+      deleted: before.filter((n) => n[0] !== "v").length,
+      retained: before.filter((n) => n[0] === "v").length,
       unenumerated: 0,
     });
   });
@@ -626,14 +705,18 @@ describe("eraseDeletedConnectionLogs", () => {
     const w = world();
     await w.compactedLog("alpha", NS);
     w.setControl("alpha", NS, 2, true);
-    const before = w.objects("alpha", NS);
     const batches: string[][] = [];
     const partial = await eraseDeletedConnectionLogs({
       ...w.deps,
       objects: {
         deleteBlobVersions: async (scope, names) => {
           batches.push([...names]);
-          return w.deps.objects.deleteBlobVersions(scope, names.slice(0, -1));
+          // The part batch is answered in full; the older segments' batch
+          // leaves its last name unanswered.
+          return w.deps.objects.deleteBlobVersions(
+            scope,
+            batches.length === 1 ? names : names.slice(0, -1),
+          );
         },
       },
     });
@@ -641,11 +724,13 @@ describe("eraseDeletedConnectionLogs", () => {
       kind: "pending",
       why: "storage",
     });
-    expect(batches).toHaveLength(1);
-    expect(batches[0]!.every((name) => name.startsWith("v-"))).toBe(true);
-    expect(
-      w.objects("alpha", NS).filter((name) => !name.startsWith("v-")),
-    ).toEqual(before.filter((name) => !name.startsWith("v-")));
+    expect(batches).toHaveLength(2);
+    expect(batches[0]!.every((name) => name.startsWith("q-"))).toBe(true);
+    expect(batches[1]!.every((name) => name.startsWith("s-"))).toBe(true);
+    // The newest segment was not reached.
+    const head = (w.reads.get(logScope("alpha", NS)) as { dataHash: string })
+      .dataHash;
+    expect(w.objects("alpha", NS)).toContain(`s-${head.slice(2)}`);
   });
 
   it("does not delete a log whose newest segment is not under this key", async () => {
@@ -741,7 +826,7 @@ describe("what the erasure refuses to act on", () => {
         expect(report.connections[0]!.outcome).toMatchObject({
           kind: "erased",
         });
-        expect(w.objects("alpha", NS)).toEqual([]);
+        expect(w.erasable("alpha", NS)).toEqual([]);
       },
     );
   });
@@ -966,7 +1051,59 @@ describe("inventoryVersionLister", () => {
         { expectedVersion: "2", dataHash: `0x${hex64(2)}`, isTombstone: true },
       ],
     });
-    expect(seen).toEqual(["scope", signal]);
+    // Read twice, under the caller's signal both times.
+    expect(seen).toEqual(["scope", signal, "scope", signal]);
+  });
+
+  it("is complete only when a second traversal reads the same inventory", async () => {
+    // A segment that compaction dropped from the head's refs can still be in
+    // the registry's inventory; one traversal that misses it is not proof.
+    const reads = [
+      { head: null, versions: [row("1"), row("2")] },
+      { head: null, versions: [row("2")] },
+    ];
+    const lister = inventoryVersionLister({
+      list: async () => reads.shift() ?? { head: null, versions: [] },
+    });
+    const listed = await lister.list("scope");
+    expect(listed.complete).toBe(false);
+  });
+
+  it("does not delete the head after a traversal that a second one contradicts", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const scope = logScope("alpha", NS);
+    const listed = w.deps.versions.list;
+    let traversals = 0;
+    const report = await eraseDeletedConnectionLogs({
+      ...w.deps,
+      versions: inventoryVersionLister({
+        list: async () => {
+          traversals += 1;
+          const all = (await listed(scope)).versions as {
+            expectedVersion: string;
+            dataHash: string;
+            isTombstone: boolean;
+          }[];
+          // The first traversal omits a historical segment.
+          return {
+            head: null,
+            versions: (traversals === 1 ? all.slice(1) : all).map((v) => ({
+              ...v,
+              metadataHash: `0x${hex64(0)}`,
+              status: "finalized",
+              addedAt: "2026-01-01T00:00:00.000Z",
+            })),
+          };
+        },
+      }),
+    });
+    expect(report.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "inventory",
+    });
+    expect(w.calls).toEqual([]);
   });
 
   it("lets a traversal that could not finish throw, so a pass reports it pending", async () => {

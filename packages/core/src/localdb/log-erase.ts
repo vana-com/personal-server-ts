@@ -30,31 +30,37 @@
 //    the pass stops and deletes nothing more.
 // 3. Segment and part names cannot be shared with a later lifetime: they are
 //    the Keccak-256 of clear bytes that hold the generation and the position,
-//    and a position is used once per log row. Body pieces are named by their
-//    clear bytes alone, so a re-add that collects the same large record names
-//    the same piece. Pieces therefore go first, each batch under the control
-//    check above, and are never deleted after a re-add is seen. What remains
-//    is the window between that check and the DELETE reaching storage: a
-//    re-add whose upload of the piece is answered by the old copy (storage
-//    keeps the first bytes of a name) and whose commit lands inside that
-//    window references a piece that is gone. Closing it needs a fence in the
-//    storage or the gateway, as `write-once-publication.md` says; a read here
-//    cannot. Cutting a lifetime's pieces at other offsets does not close it
-//    either: runs of identical bytes make equal pieces whatever the cut, and a
-//    name that carries a salt changes what a reader checks (`keccak(piece) =
-//    name`), so it is a format change every device must understand first.
+//    and a position is used once per log row. Body pieces CAN: they are named
+//    by the Keccak-256 of their clear bytes alone, so a re-add that collects
+//    the same large record names the same piece, and storage keeps the first
+//    bytes of a name, so its upload is answered by the old copy. A re-add that
+//    commits between the control check of 2 and the DELETE reaching storage
+//    would then name a piece the DELETE removes, and its log would not read
+//    ("apply: missing a piece of an out-of-line body"). No read here can close
+//    that window (`write-once-publication.md`: no read-then-delete reclaim),
+//    and cutting pieces at other offsets does not either. Salting the name per
+//    connection lifetime would, but it changes what a reader checks
+//    (`keccak(piece) = name`): a LOG_FORMAT change every device must understand
+//    first, and a follow-up. UNTIL THEN THE ERASER NEVER DELETES A BODY PIECE.
+//    It still finds them, to write their names down (`RetainedPieces`) before
+//    it deletes the parts and segments that name them: afterwards nothing
+//    names them, so the record is the only way the salting change can sweep
+//    them. A name in the record is a candidate, not proof it is unused: a live
+//    log can name the same piece, and the sweep must check that first.
 //
 // RETRY WITHOUT A JOURNAL
 //
 // Objects are deleted in an order that keeps the log readable until what it
-// names is gone: pieces, then parts, then segments, the newest segment (the
-// one the registry's log row names) last. Each phase finishes before the next
-// starts, and a failed batch stops the pass. So a pass that stops anywhere,
-// or a restart, leaves every segment that names a remaining part or piece in
-// place, and the next pass enumerates the same objects again. The newest
-// segment is removed only after a complete inventory and acknowledged deletes.
-// Its absence is checked against the full version inventory before a repeat
-// reports completion. A delete that answers 404 counts as done, so every step repeats.
+// names is gone: parts, then segments, the newest segment (the one the
+// registry's log row names) last. Each phase finishes before the next starts,
+// and a failed batch stops the pass. So a pass that stops anywhere, or a
+// restart, leaves every segment that names a remaining part in place, and the
+// next pass enumerates the same objects again. The piece names are recorded
+// before the first delete, so no restart loses them. The newest segment is
+// removed only after a complete inventory and acknowledged deletes. Its
+// absence is checked against the full version inventory before a repeat
+// reports completion. A delete that answers 404 counts as done, so every step
+// repeats.
 
 import {
   bodyPieceBlobName,
@@ -76,6 +82,7 @@ import {
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { VersionInventoryClient } from "../additions/version-inventory.js";
+import type { SqlDriver } from "./driver.js";
 import { keccakOf, type StreamCryptoPort } from "../stream-sync/crypto-port.js";
 import type {
   StreamSyncBlobs,
@@ -133,6 +140,37 @@ export interface LogObjectEraser {
   }>;
 }
 
+/**
+ * Where the pass writes down the body pieces it leaves in storage (see 3
+ * above), durably, before it deletes the objects that name them. Writing a
+ * name twice is fine. A failure fails the pass before any delete.
+ */
+export interface RetainedPieces {
+  keep(scope: string, names: readonly string[]): Promise<void>;
+}
+
+/** Rows per batch: a large body can name many pieces. */
+const KEEP_BATCH = 500;
+
+/**
+ * `RetainedPieces` in the local database (`retained_log_pieces`). The table is
+ * keyed by scope and name and survives a connection's purge: it is the
+ * record of what a delete left in storage, which nothing else names.
+ */
+export function retainedPiecesIn(db: Pick<SqlDriver, "batch">): RetainedPieces {
+  return {
+    async keep(scope, names) {
+      for (let at = 0; at < names.length; at += KEEP_BATCH)
+        await db.batch(
+          names.slice(at, at + KEEP_BATCH).map((name) => ({
+            sql: "INSERT OR IGNORE INTO retained_log_pieces(scope, name, recorded_at) VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+            params: [scope, name],
+          })),
+        );
+    },
+  };
+}
+
 export interface LogErasureDeps {
   readonly registry: Pick<StreamSyncRegistry, "read" | "listControlRows">;
   readonly versions: LogVersionLister;
@@ -141,6 +179,7 @@ export interface LogErasureDeps {
   readonly keys: Pick<StreamSyncKeyPorts, "namespaceHmac" | "decrypt">;
   readonly streamCrypto?: StreamCryptoPort;
   readonly objects: LogObjectEraser;
+  readonly retained: RetainedPieces;
   readonly logger: {
     info(obj: Record<string, unknown>, msg?: string): void;
     warn(obj: Record<string, unknown>, msg?: string): void;
@@ -154,21 +193,25 @@ export type LogErasurePorts = Pick<
 >;
 
 /**
- * The version inventory as a `LogVersionLister`. A traversal that finishes
- * read every page, so it is complete; one that cannot (a changed head, an
- * exceeded page budget, a failed read) throws, which a pass reports as pending.
+ * The version inventory as a `LogVersionLister`. One traversal is "not a
+ * completeness certificate" (`VersionInventoryClient.list`): a segment the
+ * registry still lists can be missed. The inventory is read again and the two
+ * reads compared, as every other certifying reader does
+ * (`additions/durable.ts`); it is complete only when they match. A traversal
+ * that cannot finish (a changed head, an exceeded page budget, a failed read)
+ * throws, which a pass reports as pending.
  */
 export function inventoryVersionLister(
   inventory: Pick<VersionInventoryClient, "list">,
 ): LogVersionLister {
   return {
     async list(scope, options) {
-      const { versions } = await inventory.list(scope, {
-        signal: options?.signal,
-      });
+      const read = () => inventory.list(scope, { signal: options?.signal });
+      const first = await read();
+      const second = await read();
       return {
-        complete: true,
-        versions: versions.map((v) => ({
+        complete: JSON.stringify(first) === JSON.stringify(second),
+        versions: second.versions.map((v) => ({
           expectedVersion: v.expectedVersion,
           dataHash: v.dataHash,
           isTombstone: v.isTombstone,
@@ -181,11 +224,14 @@ export function inventoryVersionLister(
 export type ErasureOutcome =
   /**
    * Every object discovered from the complete version inventory was acknowledged
-   * deleted or missing. A successful outcome always has zero unenumerated objects.
+   * deleted or missing, except the body pieces, which are not deleted and are
+   * recorded (`retained`, see 3 above). A successful outcome always has zero
+   * unenumerated objects.
    */
   | {
       readonly kind: "erased";
       readonly deleted: number;
+      readonly retained: number;
       readonly unenumerated: number;
     }
   /** Not finished; the same call again continues. */
@@ -271,8 +317,13 @@ export async function eraseDeletedConnectionLogs(
 function report(deps: LogErasureDeps, connector: string, o: ErasureOutcome) {
   if (o.kind === "erased")
     deps.logger.info(
-      { connector, deleted: o.deleted, unenumerated: o.unenumerated },
-      "stream sync: erased a deleted connection's log objects",
+      {
+        connector,
+        deleted: o.deleted,
+        retained: o.retained,
+        unenumerated: o.unenumerated,
+      },
+      "stream sync: erased a deleted connection's log objects, not its body pieces",
     );
   else
     deps.logger.warn(
@@ -353,7 +404,7 @@ async function eraseOne(
             detail: "log head is missing with listed segments still present",
           };
       }
-      return { kind: "erased", deleted: 0, unenumerated: 0 };
+      return { kind: "erased", deleted: 0, retained: 0, unenumerated: 0 };
     }
     if (opened === "unreadable")
       return { kind: "stopped", why: "head-unreadable" };
@@ -408,9 +459,12 @@ async function eraseOne(
         detail: `${unenumerated} log objects could not be enumerated`,
       };
 
+    // Written down before anything that names them is deleted (see 3 above).
+    if (pieces.size > 0) await deps.retained.keep(scope, [...pieces]);
+
     const rest = [...segments.keys()].filter((name) => name !== headName);
     let deleted = 0;
-    for (const phase of [[...pieces], [...parts.keys()], rest, [headName]]) {
+    for (const phase of [[...parts.keys()], rest, [headName]]) {
       for (let at = 0; at < phase.length; at += DELETE_BATCH) {
         signal?.throwIfAborted();
         await stillTombstoned(deps, target, signal);
@@ -448,7 +502,7 @@ async function eraseOne(
           };
       }
     }
-    return { kind: "erased", deleted, unenumerated };
+    return { kind: "erased", deleted, retained: pieces.size, unenumerated };
   } catch (error) {
     if (error instanceof Moved) return { kind: "stopped", why: "re-added" };
     return {

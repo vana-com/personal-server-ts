@@ -691,4 +691,15 @@ END`,
     // scan of all of them at every begin.
     `CREATE INDEX log_tombstones_by_stamp ON log_tombstones(connection_id, stamp_o, stamp_r)`,
   ],
+  [
+    // The body pieces a deleted connection's erasure left in storage
+    // (`log-erase.ts`, 3). Pieces are named by their content alone, so a
+    // connection added again can name the same ones; they are not deleted, and
+    // once the segments that name them are gone this is the only record of
+    // them. A name here is a candidate for a later sweep, not proof that no
+    // live log names it. Device-local, never published, and kept across a purge.
+    `CREATE TABLE retained_log_pieces (
+  scope TEXT NOT NULL, name TEXT NOT NULL, recorded_at INTEGER NOT NULL,
+  PRIMARY KEY (scope, name)) WITHOUT ROWID`,
+  ],
 ];

@@ -194,18 +194,21 @@ export async function purgeConnection(
       },
       "purge connection",
     );
-    const [row] = await deps.db.query<{ connector: string }>(
-      "SELECT connector FROM connections WHERE connection_id = ?",
-      [connectionId],
-    );
-    // Fire and forget: a listener that throws never fails the purge.
-    if (row)
+    // Best effort, after the commit: the lookup and the listener are the
+    // erasure's wake, and neither may fail a purge that has committed. A host
+    // with no listener has nothing to wake and asks nothing.
+    const listener = purgeListeners.get(deps.db);
+    if (listener)
       try {
-        purgeListeners.get(deps.db)?.(row.connector);
+        const [row] = await deps.db.query<{ connector: string }>(
+          "SELECT connector FROM connections WHERE connection_id = ?",
+          [connectionId],
+        );
+        if (row) listener(row.connector);
       } catch (error) {
         deps.logger.warn(
           { connectionId, error: String(error) },
-          "stream sync: the connection-purged listener threw",
+          "stream sync: the connection-purged listener failed",
         );
       }
   });

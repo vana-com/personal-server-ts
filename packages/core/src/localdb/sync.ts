@@ -38,6 +38,7 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import {
   eraseDeletedConnectionLogs,
+  retainedPiecesIn,
   type LogErasurePorts,
 } from "./log-erase.js";
 import { readerOf } from "./driver.js";
@@ -273,6 +274,7 @@ export function createLocalSync(
                   keys: deps.keys,
                   streamCrypto: deps.streamCrypto,
                   logger: deps.logger,
+                  retained: retainedPiecesIn(deps.db),
                   ...ports,
                 },
                 { connector, signal },

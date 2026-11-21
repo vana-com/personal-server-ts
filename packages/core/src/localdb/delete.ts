@@ -622,19 +622,19 @@ export function createConnectionDeleter(
     );
     return !live;
   }
-  async function eraseSettled(connector: string): Promise<void> {
+  /**
+   * One erasure pass for `connector`; answers whether it is unfinished. The
+   * caller has consumed the connector's queue entry: what is queued after
+   * that is news from while the pass runs, and this does not touch it.
+   */
+  async function eraseSettled(connector: string): Promise<boolean> {
     try {
-      if (stop.signal.aborted || !(await deleteSettled(connector))) {
-        erasing.delete(connector);
-        return;
-      }
-      const report = await options.eraseLogs!(connector, stop.signal);
-      if (report.pending) erasing.add(connector);
-      else erasing.delete(connector);
+      if (stop.signal.aborted || !(await deleteSettled(connector)))
+        return false;
+      return (await options.eraseLogs!(connector, stop.signal)).pending;
     } catch (error) {
       // The eraser reports a failure as pending; this is its own bug or a
       // database that went away. Try again later, never fail the delete.
-      erasing.add(connector);
       deps.logger.warn(
         {
           connector,
@@ -642,14 +642,32 @@ export function createConnectionDeleter(
         },
         "stream sync: connection log erasure failed",
       );
+      return true;
     }
   }
-  /** One erasure at a time per connector; a caller joins the running one. */
+  /**
+   * One erasure at a time per connector. A caller while one runs queues the
+   * connector again, since what it knows (a delete settled) may be newer than
+   * what the running pass read. A pass takes its queue entry when it starts,
+   * so an entry present when it ends arrived during it: it runs again. An
+   * entry the pass itself leaves (`pending`) waits for the retry loop.
+   */
   function eraseLogsOf(connector: string): Promise<void> {
     if (!options.eraseLogs) return Promise.resolve();
     const held = erasures.get(connector);
-    if (held) return held;
-    const run = eraseSettled(connector).finally(() => {
+    if (held) {
+      erasing.add(connector);
+      return held;
+    }
+    const run = (async () => {
+      let again: boolean;
+      do {
+        erasing.delete(connector);
+        const unfinished = await eraseSettled(connector);
+        again = erasing.has(connector) && !stop.signal.aborted;
+        if (unfinished) erasing.add(connector);
+      } while (again);
+    })().finally(() => {
       if (erasures.get(connector) === run) erasures.delete(connector);
     });
     erasures.set(connector, run);
@@ -828,13 +846,22 @@ export function createConnectionDeleter(
     async resumeErasures(): Promise<boolean> {
       if (!options.eraseLogs || stop.signal.aborted) return false;
       if (sweepOwed) {
-        sweepOwed = false;
         const rows = await deps.db.query<{ connector: string }>(
           "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
         );
         for (const { connector } of rows) erasing.add(connector);
+        // Only once the rows are queued: a query that failed leaves it owed.
+        sweepOwed = false;
       }
-      await Promise.all([...erasing].map(eraseLogsOf));
+      // A run in progress is waited for, not queued again: what it leaves
+      // unfinished is in `erasing` when it ends, and so is what arrived
+      // while it ran. Without this wait the loop would find the queue empty
+      // (a running pass has taken its entry) and stop with that work owed.
+      await Promise.all(
+        [...new Set([...erasing, ...erasures.keys()])].map(
+          (connector) => erasures.get(connector) ?? eraseLogsOf(connector),
+        ),
+      );
       return erasing.size > 0;
     },
     async close() {
