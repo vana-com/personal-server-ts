@@ -369,6 +369,7 @@ export function createLocalSync(
     ...deps,
     aliasScopes: options.aliasScopes,
     aliasTargets: options.aliasTargets,
+    aliasSpool: options.aliasSpool,
   };
   // Completion belongs to this owner/network database runtime, not a UI read.
   // A local listing (including an empty one) says nothing about remote data.

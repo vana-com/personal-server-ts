@@ -17,7 +17,11 @@ import {
 import { readerOf, type SqlDriver } from "./driver.js";
 import { PartialViewMoved } from "./partial-read.js";
 import type { StreamSyncFiles } from "../stream-sync/ports.js";
-import type { AliasRecordQuery } from "./query.js";
+import {
+  isAliasRecordQuery,
+  type AliasRecordQuery,
+  type RecordQuery,
+} from "./query.js";
 import { invalidAliasBinding, type Candidate } from "./read-selection.js";
 import type {
   AliasDiagnostic,
@@ -49,7 +53,9 @@ export interface AliasEnv {
   /**
    * Where a windowed read writes its body before serving it (`projectAlias`).
    * The directory holds nothing else; `sweepAliasSpool` empties it at startup.
-   * Absent: a body is built in memory, and one above `ARRAY_BUDGET` is refused.
+   * Absent, or with a query that is not an `AliasRecordQuery`: a body is built
+   * in memory, and one above `ARRAY_BUDGET` is refused. A listing's check
+   * (`checkAlias`) takes the same `env`, so it decides as the read does.
    */
   readonly spool?: StreamSyncFiles;
 }
@@ -134,36 +140,59 @@ type Outcome = Refusal | { readonly kind: "ok"; readonly built: Built };
 export async function projectAlias(
   binding: LocalAliasTarget,
   candidate: Candidate,
-  query: AliasRecordQuery,
+  query: RecordQuery,
   now: string,
   env: AliasEnv,
 ): Promise<AliasProjection> {
-  const outcome = await inView(binding, candidate, now, env, (view) =>
-    binding.window && env.spool
-      ? paged(binding, binding.window, view, query, now, env, env.spool)
-      : whole(binding, view, query, now, env),
-  );
+  const outcome = await build(binding, candidate, query, now, env, true);
   return outcome.kind === "ok" ? bodyOf(outcome.built) : outcome;
 }
 
 /**
  * Whether a body can be built from the installed records, and nothing kept:
- * for a listing, which only reads. A windowed binding is checked a window at a
- * time whatever its size, since nothing is held after the check.
+ * for a listing, which only reads. It decides as `projectAlias` does, on the
+ * same `env`: a host with a spool checks a windowed binding a window at a
+ * time, and a host without one builds it whole, so it refuses what a read
+ * would refuse.
  */
 export async function checkAlias(
   binding: LocalAliasTarget,
   candidate: Candidate,
-  query: AliasRecordQuery,
+  query: RecordQuery,
   now: string,
   env: AliasEnv,
 ): Promise<AliasCheck> {
-  const outcome = await inView(binding, candidate, now, env, (view) =>
-    binding.window
-      ? paged(binding, binding.window, view, query, now, env, undefined)
+  const outcome = await build(binding, candidate, query, now, env, false);
+  return outcome.kind === "ok" ? { kind: "ok" } : outcome;
+}
+
+/**
+ * The one rule for how a body is built, shared by a read and a listing's
+ * check: a windowed binding is paged where the host has a spool and the query
+ * can size its rows; every other read is built whole. `keep`: write the
+ * elements to the spool (a read), or only check them (a listing).
+ */
+function build(
+  binding: LocalAliasTarget,
+  candidate: Candidate,
+  query: RecordQuery,
+  now: string,
+  env: AliasEnv,
+  keep: boolean,
+): Promise<Outcome> {
+  return inView(binding, candidate, now, env, (view) =>
+    binding.window && env.spool && isAliasRecordQuery(query)
+      ? paged(
+          binding,
+          binding.window,
+          view,
+          query,
+          now,
+          env,
+          keep ? env.spool : undefined,
+        )
       : whole(binding, view, query, now, env),
   );
-  return outcome.kind === "ok" ? { kind: "ok" } : outcome;
 }
 
 /** Remove every file of a spool: the leftovers of a server that stopped mid-read. */
@@ -240,17 +269,50 @@ function bodyOf(built: Built): AliasProjection {
 }
 
 /**
- * Every row projected in one call. The memory of the rows and of their
- * projection is held from the governor while they are read and projected and
- * the text is built; the text is then the only copy, and is not held from the
- * governor.
+ * Every row projected in one call. Over a query that sizes its rows, the
+ * memory of the rows and of their projection is held from the governor while
+ * they are read and projected and the text is built; the text is then the
+ * only copy, and is not held from the governor. Over a plain `RecordQuery`,
+ * which cannot size them, the rows are streamed and counted, as main does.
  */
 async function whole(
   binding: LocalAliasTarget,
   view: View,
-  query: AliasRecordQuery,
+  query: RecordQuery,
   now: string,
   env: AliasEnv,
+): Promise<Outcome> {
+  const { fetched, current } = view;
+  const project = async (records: LocalAliasRecord[]): Promise<Outcome> => {
+    // Checked after the rows are read, so every one of them is a pinned row.
+    await assertViewCurrent(current);
+    const projected = binding.project(records, now, fetched);
+    if (!projected.ok && projected.error.kind === "invalid_binding")
+      return { kind: "invalid_binding" };
+    if (!projected.ok) return { kind: "no_data" };
+    // A payload that leaves rows out is not the data: refuse it, as the
+    // flag-off path does (`canonical_view_incomplete`), never serve it short.
+    const incomplete = incompleteDiagnostics(projected.diagnostics);
+    return incomplete.length > 0
+      ? { kind: "incomplete", diagnostics: incomplete }
+      : {
+          kind: "ok",
+          built: { head: JSON.stringify(projected.payload), tail: "" },
+        };
+  };
+  return isAliasRecordQuery(query)
+    ? wholeSized(view, query, env, project)
+    : wholeStreamed(view, query, project);
+}
+
+type Project = (records: LocalAliasRecord[]) => Promise<Outcome>;
+
+/** Sized first, held from the governor, then read: refused above `ARRAY_BUDGET`. */
+async function wholeSized(
+  view: View,
+  query: AliasRecordQuery,
+  env: AliasEnv,
+  project: Project,
 ): Promise<Outcome> {
   const { connectionId, fetched, current } = view;
   const sizes = new Map<string, StreamLimits>();
@@ -286,24 +348,31 @@ async function whole(
         }
       }
     }
-    // Checked after the rows are read, so every one of them is a pinned row.
-    await assertViewCurrent(current);
-    const projected = binding.project(records, now, fetched);
-    if (!projected.ok && projected.error.kind === "invalid_binding")
-      return { kind: "invalid_binding" };
-    if (!projected.ok) return { kind: "no_data" };
-    // A payload that leaves rows out is not the data: refuse it, as the
-    // flag-off path does (`canonical_view_incomplete`), never serve it short.
-    const incomplete = incompleteDiagnostics(projected.diagnostics);
-    return incomplete.length > 0
-      ? { kind: "incomplete", diagnostics: incomplete }
-      : {
-          kind: "ok",
-          built: { head: JSON.stringify(projected.payload), tail: "" },
-        };
+    return await project(records);
   } finally {
     release();
   }
+}
+
+/** Streamed and counted as it is read, with no governor: main's read of a plain `RecordQuery`. */
+async function wholeStreamed(
+  view: View,
+  query: RecordQuery,
+  project: Project,
+): Promise<Outcome> {
+  const records: LocalAliasRecord[] = [];
+  let bytes = 0;
+  for (const stream of view.fetched) {
+    for await (const record of query.streamRecords(view.connectionId, stream)) {
+      bytes += encoder.encode(record.body).byteLength;
+      if (bytes > ARRAY_BUDGET) return { kind: "too_large", bytes };
+      records.push({
+        stream,
+        data: JSON.parse(record.body) as Record<string, unknown>,
+      });
+    }
+  }
+  return project(records);
 }
 
 /**

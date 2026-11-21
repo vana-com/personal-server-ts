@@ -86,24 +86,27 @@ describe("the exported RecordQuery contract", () => {
     expect(messages.join("\n")).toMatch(/streamStats/);
   }, 60_000);
 
-  it("refuses alias configuration without an alias query", () => {
-    // The old call shape, with alias scopes, used to compile and then serve no
-    // alias. It no longer compiles, and an untyped caller is refused at
-    // construction.
+  it("accepts alias configuration with a plain RecordQuery, and refuses a spool with one", () => {
+    // Main's call shape: a plain RecordQuery with alias scopes and targets.
+    // It is served on the in-memory path; only a query that can size its rows
+    // takes a spool.
     expect(
       diagnosticsOf(
         `import type { RecordQuery, AliasRecordQuery } from "${QUERY}";
+         import type { StreamSyncFiles } from "../../../core/src/stream-sync/ports.js";
          import type { LocalSyncDeps } from "${DEPS}";
          import { createLocalResolver } from "${RESOLVE}";
          declare const deps: LocalSyncDeps;
          declare const query: RecordQuery;
          declare const aliasQuery: AliasRecordQuery;
-         // @ts-expect-error alias scopes need the query that reads them
-         export const scopes = createLocalResolver(deps, { query, aliasScopes: () => [] });
-         // @ts-expect-error alias targets need the query that reads them
-         export const targets = createLocalResolver(deps, { query, aliasTargets: () => [] });
-         export const both = createLocalResolver(deps, {
-           query, aliasQuery, aliasScopes: () => [], aliasTargets: () => [],
+         declare const aliasSpool: StreamSyncFiles;
+         export const plain = createLocalResolver(deps, {
+           query, aliasScopes: () => [], aliasTargets: () => [],
+         });
+         // @ts-expect-error a plain RecordQuery has no spool
+         export const wrong = createLocalResolver(deps, { query, aliasScopes: () => [], aliasSpool });
+         export const spooled = createLocalResolver(deps, {
+           query, aliasQuery, aliasScopes: () => [], aliasTargets: () => [], aliasSpool,
          });`,
       ),
     ).toEqual([]);
@@ -112,8 +115,7 @@ describe("the exported RecordQuery contract", () => {
   it("accepts main's call shape: a query that already has the alias methods", () => {
     // On main a caller passes `{ query: createRecordQuery(db), aliasScopes }`
     // and that query implements the alias methods. It stays a valid call, with
-    // no `aliasQuery` beside it; a plain RecordQuery with alias configuration
-    // is still refused (the test above).
+    // no `aliasQuery` beside it (and may take a spool).
     expect(
       diagnosticsOf(
         `import type { AliasRecordQuery } from "${QUERY}";
@@ -128,16 +130,15 @@ describe("the exported RecordQuery contract", () => {
     ).toEqual([]);
   }, 60_000);
 
-  it("throws at construction when alias configuration comes without an alias query", () => {
+  it("does not throw at construction when alias configuration comes with a plain query", () => {
     const deps = {} as never;
     const query = {} as never;
     expect(() =>
-      createLocalResolver(deps, { query, aliasScopes: () => [] } as never),
-    ).toThrow(/aliasQuery/);
+      createLocalResolver(deps, { query, aliasScopes: () => [] }),
+    ).not.toThrow();
     expect(() =>
-      createLocalResolver(deps, { query, aliasTargets: () => [] } as never),
-    ).toThrow(/aliasQuery/);
-    expect(() => createLocalResolver(deps, { query })).not.toThrow();
+      createLocalResolver(deps, { query, aliasTargets: () => [] }),
+    ).not.toThrow();
   });
 
   it("leaves the alias read's extra methods to AliasRecordQuery", () => {

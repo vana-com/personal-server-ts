@@ -122,6 +122,22 @@ export interface AliasRecordQuery extends RecordQuery {
   ): Promise<StoredRecord[]>;
 }
 
+/**
+ * Whether `query` answers sizes and records by key hash. A caller may pass a
+ * plain `RecordQuery` (the shape the resolver took before alias paging); an
+ * alias read over one is built in memory and refused above `ARRAY_BUDGET`.
+ */
+export const isAliasRecordQuery = (
+  query: RecordQuery,
+): query is AliasRecordQuery => {
+  const candidate = query as Partial<AliasRecordQuery>;
+  return (
+    typeof candidate.streamStats === "function" &&
+    typeof candidate.recordSizes === "function" &&
+    typeof candidate.recordsByHash === "function"
+  );
+};
+
 /** A record as it was sized: its key hash, its body's hash and its body's bytes. */
 export interface SizedRecord {
   readonly pkHash: string;

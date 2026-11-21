@@ -11,6 +11,7 @@
 
 import { createReadStream } from "node:fs";
 import {
+  chmod,
   mkdir,
   open,
   readFile,
@@ -46,8 +47,41 @@ async function fsyncDir(dir: string): Promise<void> {
 
 const IDLE_CLOSE_MS = 200;
 
-export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
+/** Modes of a private tree: its owner alone may enter its directories and read its files. */
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+export interface FsStreamSyncFilesOptions {
+  /**
+   * Create directories 0700 and files 0600, whatever the umask, and tighten
+   * the root if it exists with wider modes before the first write. For files
+   * that hold the owner's data in plain text. Absent: the process defaults.
+   */
+  readonly private?: boolean;
+}
+
+export function createFsStreamSyncFiles(
+  root: string,
+  options: FsStreamSyncFilesOptions = {},
+): StreamSyncFiles {
   const base = resolve(root);
+  const dirMode = options.private ? PRIVATE_DIR_MODE : undefined;
+  const fileMode = options.private ? PRIVATE_FILE_MODE : undefined;
+  // Made 0700 once, before the first file is created in it.
+  let privateRoot: Promise<void> | undefined;
+  const ensureRoot = async (): Promise<void> => {
+    if (!options.private) return;
+    privateRoot ??= (async () => {
+      await mkdir(base, { recursive: true, mode: PRIVATE_DIR_MODE });
+      await chmod(base, PRIVATE_DIR_MODE);
+    })();
+    try {
+      await privateRoot;
+    } catch (error) {
+      privateRoot = undefined;
+      throw error;
+    }
+  };
   let tmpCounter = 0;
   const abs = (path: string): string => {
     const full = resolve(base, path);
@@ -78,15 +112,16 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       handles.delete(oldest);
       await handle.close();
     }
+    await ensureRoot();
     // The directory exists after the first append of a run; create it only
     // when `open` says it does not.
     let handle: FileHandle;
     try {
-      handle = await open(full, "a");
+      handle = await open(full, "a", fileMode);
     } catch (error) {
       if (!missing(error)) throw error;
-      await mkdir(dirname(full), { recursive: true });
-      handle = await open(full, "a");
+      await mkdir(dirname(full), { recursive: true, mode: dirMode });
+      handle = await open(full, "a", fileMode);
     }
     handles.set(full, handle);
     return handle;
@@ -162,10 +197,11 @@ export function createFsStreamSyncFiles(root: string): StreamSyncFiles {
       const full = abs(path);
       // The rename replaces the inode; an append handle would write to the old one.
       await release(full);
-      await mkdir(dirname(full), { recursive: true });
+      await ensureRoot();
+      await mkdir(dirname(full), { recursive: true, mode: dirMode });
       tmpCounter += 1;
       const tmp = `${full}.tmp-${process.pid}-${tmpCounter}`;
-      const handle = await open(tmp, "w");
+      const handle = await open(tmp, "w", fileMode);
       try {
         await handle.writeFile(bytes);
         await handle.sync();

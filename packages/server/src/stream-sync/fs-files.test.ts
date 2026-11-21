@@ -1,4 +1,12 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -127,5 +135,50 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     await files.appendMany([{ path: "idle/0", bytes: enc.encode("c") }]);
     await files.sync("idle");
     expect(dec.decode((await files.read("idle/0"))!)).toBe("ac");
+  });
+});
+
+describe("createFsStreamSyncFiles with private modes", () => {
+  let parent: string;
+  let root: string;
+  let previousMask: number;
+  beforeEach(async () => {
+    parent = await mkdtemp(join(tmpdir(), "stream-sync-fs-private-"));
+    root = join(parent, "files");
+    // A common default: group and others may read what is created.
+    previousMask = process.umask(0o022);
+  });
+  afterEach(async () => {
+    process.umask(previousMask);
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  const modeOf = async (path: string) => (await stat(path)).mode & 0o777;
+
+  it("creates its directories 0700 and its files 0600, whatever the umask", async () => {
+    const files = createFsStreamSyncFiles(root, { private: true });
+    await files.appendMany([{ path: "a/b/leaf", bytes: enc.encode("x") }]);
+    await files.write("a/written", enc.encode("y"));
+    await files.sync("");
+    expect(await modeOf(root)).toBe(0o700);
+    expect(await modeOf(join(root, "a"))).toBe(0o700);
+    expect(await modeOf(join(root, "a", "b"))).toBe(0o700);
+    expect(await modeOf(join(root, "a", "b", "leaf"))).toBe(0o600);
+    expect(await modeOf(join(root, "a", "written"))).toBe(0o600);
+  });
+
+  it("tightens a root that exists with wider modes before it writes", async () => {
+    await mkdir(root, { mode: 0o755 });
+    await chmod(root, 0o755);
+    const files = createFsStreamSyncFiles(root, { private: true });
+    await files.appendMany([{ path: "leaf", bytes: enc.encode("x") }]);
+    expect(await modeOf(root)).toBe(0o700);
+  });
+
+  it("keeps the default modes when it is not asked to be private", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.appendMany([{ path: "leaf", bytes: enc.encode("x") }]);
+    await files.sync("");
+    expect(await modeOf(join(root, "leaf"))).toBe(0o644);
   });
 });

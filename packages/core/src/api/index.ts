@@ -3487,16 +3487,25 @@ export async function handlePersonalServerDataRequest(
               paymentResponseHeader = paid.paymentResponseHeader;
             }
           }
-          const checked = await validateStreamBody(decision, inProcess);
-          await settle(decision.served);
-          return serveStreamSyncView(deps, request, {
-            scope: scopeResult.scope,
-            grantId,
-            authResult,
-            decision: checked,
-            paymentResponseHeader,
-            inProcess,
-          });
+          // The body may be a file already written (a spooled alias). Any
+          // failure before it is served cancels it, which removes the file.
+          let checked = decision;
+          try {
+            checked = await validateStreamBody(decision, inProcess);
+            await settle(decision.served);
+            return await serveStreamSyncView(deps, request, {
+              scope: scopeResult.scope,
+              grantId,
+              authResult,
+              decision: checked,
+              paymentResponseHeader,
+              inProcess,
+            });
+          } catch (error) {
+            // A body already read or locked rejects the cancel: it has ended.
+            await checked.body.cancel().catch(() => undefined);
+            throw error;
+          }
         }
         return errorResponse(
           404,

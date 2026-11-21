@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   handlePersonalServerDataRequest,
@@ -12,11 +15,13 @@ import type {
   LocalAliasTarget,
 } from "../../../core/src/localdb/resolve.js";
 import { createLocalSync } from "../../../core/src/localdb/sync.js";
+import type { StreamSyncFiles } from "../../../core/src/stream-sync/ports.js";
 import {
   createStorageAccess,
   DEFAULT_STORAGE_ACCESS_POLICY,
 } from "../../../core/src/stream-sync/storage-retry.js";
 import { createMemoryDataStorage } from "../../../core/src/test-utils/memory-storage.js";
+import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 
 // The resolver applies registry heads before it reads; the rows below are
@@ -64,9 +69,20 @@ const ALL_NAMES = [
 ];
 
 const drivers: SqlDriver[] = [];
+const spoolDirs: string[] = [];
 afterEach(async () => {
   for (const driver of drivers.splice(0)) await driver.close();
+  for (const dir of spoolDirs.splice(0)) {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
+
+/** A spool on a directory of its own, as the server keeps one. */
+async function newSpool(): Promise<StreamSyncFiles> {
+  const dir = await mkdtemp(join(tmpdir(), "listed-scope-spool-"));
+  spoolDirs.push(dir);
+  return createFsStreamSyncFiles(dir);
+}
 
 const get = (deps: PersonalServerDataApiDeps, path: string) =>
   handlePersonalServerDataRequest(
@@ -90,6 +106,11 @@ const baseDeps = {
 
 async function switchedFixture(
   aliases: Record<string, readonly LocalAliasTarget[]> = ALIASES,
+  host: {
+    /** The host's alias spool: the server has one, Lite has none. */
+    readonly spool?: StreamSyncFiles;
+    readonly authorizeBuilderRead?: typeof baseDeps.auth.authorizeBuilderRead;
+  } = {},
 ) {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner: "0xabc",
@@ -122,11 +143,18 @@ async function switchedFixture(
     {
       aliasScopes: () => Object.keys(aliases),
       aliasTargets: (scope) => aliases[scope] ?? [],
+      aliasSpool: host.spool,
       resolveArtifact: () => null,
     },
   );
   const deps = {
     ...baseDeps,
+    auth: {
+      ...baseDeps.auth,
+      ...(host.authorizeBuilderRead
+        ? { authorizeBuilderRead: host.authorizeBuilderRead }
+        : {}),
+    },
     history: sync.history,
     streamSyncRead: {
       resolve: sync.resolver.resolve,
@@ -436,4 +464,121 @@ describe("a switched alias read above 64 MiB, on a host with no spool", () => {
     };
     expect(body.error).toMatchObject({ code: 503, errorCode: "TOO_LARGE" });
   }, 60_000);
+});
+
+/**
+ * A windowed alias: parents with one child each, and a profile beside the
+ * array. Its output is small, whatever the children weigh.
+ */
+const windowedTree: LocalAliasTarget = {
+  connector: "tree",
+  streams: ["parents", "kids"],
+  window: {
+    parentStream: "parents",
+    parentKey: "id",
+    childStream: "kids",
+    childKey: "parent",
+    arrayKey: "items",
+    sumKeys: ["kids"],
+    parentOrder: (a, b) => String(a.id).localeCompare(String(b.id)),
+  },
+  project: (records) => {
+    const parents = records.filter((r) => r.stream === "parents");
+    return {
+      ok: true as const,
+      payload: {
+        profile: { name: "tree" },
+        items: parents.map((p) => p.data),
+        kids: records.length - parents.length,
+      },
+    };
+  },
+};
+
+/** The tree's rows: `parents` parents, each with one child of `kidBytes` of text. */
+async function seedTree(
+  fixture: Awaited<ReturnType<typeof switchedFixture>>,
+  parents: number,
+  kidBytes: number,
+) {
+  await fixture.seed("tree", "c1", { parents: [1], kids: [1] });
+  const db = drivers[0]!;
+  await db.batch([{ sql: "DELETE FROM records" }]);
+  const rows = (stream: string, body: (i: number) => unknown) =>
+    Array.from({ length: parents }, (_, i) => ({
+      sql: "INSERT INTO records(connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256) VALUES ('c1', ?, ?, ?, 1000, 'run', ?, 'body-hash')",
+      params: [
+        stream,
+        `${stream}-${String(i).padStart(4, "0")}`,
+        `${stream}${i}`,
+        JSON.stringify(body(i)),
+      ],
+    }));
+  await db.batch(
+    rows("parents", (i) => ({ id: `p${String(i).padStart(4, "0")}` })),
+  );
+  await db.batch(
+    rows("kids", (i) => ({
+      id: `k${i}`,
+      parent: `p${String(i).padStart(4, "0")}`,
+      pad: "y".repeat(kidBytes),
+    })),
+  );
+}
+
+/**
+ * The listing and the read decide on one predicate: whether a body can be
+ * built here. A host with no spool (Lite) builds a windowed alias in memory
+ * and refuses one above 64 MiB; a host with a spool pages it into a file.
+ */
+describe("the listing and the read agree on a windowed alias above 64 MiB", () => {
+  const aliases = { "tree.items": [windowedTree] };
+  const MiB = 1024 * 1024;
+
+  for (const host of [
+    { name: "Lite (no spool)", spool: false, served: false },
+    { name: "the server (spool)", spool: true, served: true },
+  ]) {
+    it(`${host.name}: lists it exactly when it serves it`, async () => {
+      const fixture = await switchedFixture(aliases, {
+        spool: host.spool ? await newSpool() : undefined,
+      });
+      await seedTree(fixture, 65, MiB);
+      const names = await listed(fixture.deps);
+      const response = await get(fixture.deps, "/tree.items");
+      const served = response.status === 200;
+      await response.body?.cancel();
+      expect(names.includes("tree.items")).toBe(served);
+      expect(served).toBe(host.served);
+      if (!host.served) expect(response.status).toBe(503);
+    }, 120_000);
+  }
+});
+
+/**
+ * The body is written to the spool before settlement runs. A settlement that
+ * fails must not leave that file behind.
+ */
+describe("a read whose settlement fails leaves nothing in the spool", () => {
+  it("removes the file of the body it will not serve", async () => {
+    const spool = await newSpool();
+    const fixture = await switchedFixture(
+      { "tree.items": [windowedTree] },
+      {
+        spool,
+        // The check before the read passes; the settlement after it throws.
+        authorizeBuilderRead: vi.fn(
+          async (input: { metadataOnly?: boolean }) => {
+            if (!input.metadataOnly) throw new Error("settlement failed");
+            return { grantId: "owner" };
+          },
+        ) as typeof baseDeps.auth.authorizeBuilderRead,
+      },
+    );
+    await seedTree(fixture, 3, 1000);
+    const response = await get(fixture.deps, "/tree.items").catch(() => null);
+    expect(response?.status).not.toBe(200);
+    await response?.body?.cancel();
+    expect(await spool.list("")).toEqual([]);
+  });
 });

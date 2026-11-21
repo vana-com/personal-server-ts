@@ -24,7 +24,10 @@ import { HEAP_PER_STORED_BYTE } from "../../../core/src/localdb/alias-window.js"
 import type { SqlDriver, SqlValue } from "../../../core/src/localdb/driver.js";
 import { createLocalListing } from "../../../core/src/localdb/listing.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
-import { createRecordQuery } from "../../../core/src/localdb/query.js";
+import {
+  createRecordQuery,
+  type RecordQuery,
+} from "../../../core/src/localdb/query.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import {
   createLocalResolver,
@@ -1657,6 +1660,61 @@ describe("a host without a spool refuses a large alias read, as main does", () =
     expect(f.inUse()).toBe(0);
     await reader.cancel();
   }, 60_000);
+
+  /**
+   * What main's resolver took: a `RecordQuery` with none of the alias
+   * methods. It is served on the capped in-memory path, as a host with no
+   * spool is.
+   */
+  const plainQuery = (f: Awaited<ReturnType<typeof fixture>>): RecordQuery => {
+    const full = createRecordQuery(f.db);
+    return {
+      listRecords: (input) => full.listRecords(input),
+      getRecord: (input) => full.getRecord(input),
+      changesSince: (input) => full.changesSince(input),
+      streamRecords: (connectionId, stream) =>
+        full.streamRecords(connectionId, stream),
+    };
+  };
+  const resolverOver = (
+    f: Awaited<ReturnType<typeof fixture>>,
+    target: LocalAliasTarget,
+    scope: string,
+  ) =>
+    createLocalResolver(f.deps, {
+      query: plainQuery(f),
+      aliasScopes: () => [scope],
+      aliasTargets: () => [target],
+    });
+
+  it("keeps a plain RecordQuery working: the body is the whole projection", async () => {
+    const scope = "instagram.posts";
+    const target = legacyAliasScopes(scope)[0] as LocalAliasTarget;
+    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const records = WINDOW_FIXTURES[scope]!(binding);
+    const whole = target.project(records, NOW, binding.pdppStreams);
+    if (!whole.ok) throw new Error("whole projection failed");
+    const f = await fixture(24 * 1024 * 1024);
+    await f.seed(target, records);
+    const decision = await read(resolverOver(f, target, scope), scope);
+    expect(decision.kind).toBe("view");
+    if (decision.kind !== "view") return;
+    expect(await new Response(decision.body).text()).toBe(
+      envelopeOf(scope, whole.payload),
+    );
+    // No spool was asked for: nothing was written.
+    expect(await f.spool!.list("")).toEqual([]);
+  });
+
+  it("refuses a plain RecordQuery's read above the budget, as main does", async () => {
+    const f = await fixture(24 * 1024 * 1024);
+    await f.seed(tree, sized(65 * 1024 * 1024));
+    const decision = await read(
+      resolverOver(f, tree, "tree.items"),
+      "tree.items",
+    );
+    expect(decision.kind).toBe("too_large");
+  }, 120_000);
 });
 
 /** The engine's collector, switched on at run time when the process has none. */

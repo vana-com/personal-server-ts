@@ -1,6 +1,7 @@
 import { sha256 } from "@noble/hashes/sha2";
 import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
 import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
+import type { StreamSyncFiles } from "../stream-sync/ports.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
 import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
@@ -134,6 +135,11 @@ export function createLocalListing(
   deps: LocalSyncDeps & {
     readonly aliasScopes?: AliasScopes;
     readonly aliasTargets?: AliasTargets;
+    /**
+     * The host's alias spool, as the resolver has it: the check of a body
+     * decides as its read does (see `checkAlias`).
+     */
+    readonly aliasSpool?: StreamSyncFiles;
   },
 ): LocalListing {
   // Listing and status only read: they take the read connection, so they do
@@ -327,6 +333,7 @@ export function createLocalListing(
         {
           db: deps.db,
           memory: deps.blobs,
+          spool: deps.aliasSpool,
           // Listing only reads: a pin that cleared the marks would write, and
           // wait for the writer behind a long batch.
           epochs: await readAliasEpochs(

@@ -248,9 +248,9 @@ interface PinnedAlias {
  * What a resolver is made of. Legacy aliases are read through a query that
  * also answers sizes and records by key hash (`AliasRecordQuery`): `aliasQuery`,
  * or `query` itself when it is one, as `createRecordQuery` makes it (the shape
- * callers had before alias paging). `aliasScopes` and `aliasTargets` come only
- * with such a query: a caller that names aliases and a plain `RecordQuery`
- * would serve none.
+ * callers had before alias paging). A plain `RecordQuery` still serves aliases,
+ * as before: on the in-memory path, with the same refusal above `ARRAY_BUDGET`,
+ * and no spool.
  *
  * `aliasSpool` is a host's file space for the bodies of windowed aliases (see
  * `projectAlias`). A host without one (a phone or a browser) builds alias
@@ -260,8 +260,8 @@ export type LocalResolverParts =
   | {
       readonly query: RecordQuery;
       readonly aliasQuery?: undefined;
-      readonly aliasScopes?: undefined;
-      readonly aliasTargets?: undefined;
+      readonly aliasScopes?: AliasScopes;
+      readonly aliasTargets?: AliasTargets;
       readonly aliasSpool?: undefined;
     }
   | {
@@ -279,28 +279,11 @@ export type LocalResolverParts =
       readonly aliasSpool?: StreamSyncFiles;
     };
 
-const isAliasRecordQuery = (query: RecordQuery): query is AliasRecordQuery => {
-  const candidate = query as Partial<AliasRecordQuery>;
-  return (
-    typeof candidate.streamStats === "function" &&
-    typeof candidate.recordSizes === "function" &&
-    typeof candidate.recordsByHash === "function"
-  );
-};
-
 export function createLocalResolver(
   deps: LocalSyncDeps,
   parts: LocalResolverParts,
 ): LocalResolver {
-  const aliasQuery =
-    parts.aliasQuery ??
-    (isAliasRecordQuery(parts.query) ? parts.query : undefined);
-  if (!aliasQuery && (parts.aliasScopes || parts.aliasTargets)) {
-    // Not reachable from typed code (see `LocalResolverParts`).
-    throw new Error(
-      "createLocalResolver: aliasScopes and aliasTargets need an aliasQuery to read their records",
-    );
-  }
+  const aliasQuery: RecordQuery = parts.aliasQuery ?? parts.query;
   const streams = (connectionId: string): Promise<Stream[]> =>
     loadStreams(deps, connectionId);
 
@@ -563,7 +546,6 @@ export function createLocalResolver(
         ),
       );
     }
-    if (!aliasQuery) throw new Error("an alias target without an aliasQuery");
     return {
       finish: async () => {
         // Ends the waits of this read's alias body: the request's own signal,
