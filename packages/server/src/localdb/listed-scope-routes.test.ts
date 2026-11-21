@@ -158,6 +158,7 @@ async function switchedFixture(
     history: sync.history,
     streamSyncRead: {
       resolve: sync.resolver.resolve,
+      resolveStreaming: sync.resolver.resolveStreaming,
       listScopes: sync.listing.listScopes,
     },
     accountMode: { read: () => "switched" as const },
@@ -581,4 +582,40 @@ describe("a read whose settlement fails leaves nothing in the spool", () => {
     await response?.body?.cancel();
     expect(await spool.list("")).toEqual([]);
   });
+});
+
+/**
+ * The spooled body is for the consumer that streams it to a client. An
+ * in-process read (MCP) reads the body whole to check or parse it, so it takes
+ * main's capped path: a request that was small cannot exhaust the heap on an
+ * alias main refused.
+ */
+describe("an in-process read of a windowed alias above 64 MiB", () => {
+  const aliases = { "tree.items": [windowedTree] };
+
+  it("answers 503 TOO_LARGE, as main does, and never reads the body whole", async () => {
+    const spool = await newSpool();
+    const fixture = await switchedFixture(aliases, { spool });
+    await seedTree(fixture, 65, 1024 * 1024);
+    const validateBody = vi.fn(async () => undefined);
+    const response = await handlePersonalServerDataRequest(
+      new Request("https://server.example/v1/data/tree.items"),
+      fixture.deps,
+      {
+        basePath: "/v1/data",
+        inProcess: { onServed: vi.fn(), validateBody },
+      },
+    );
+    expect(response.status).toBe(503);
+    expect(
+      ((await response.json()) as { error: { errorCode: string } }).error
+        .errorCode,
+    ).toBe("TOO_LARGE");
+    expect(validateBody).not.toHaveBeenCalled();
+    expect(await spool.list("")).toEqual([]);
+    // The same alias, streamed to a client, is served from the spool.
+    const streamed = await get(fixture.deps, "/tree.items");
+    expect(streamed.status).toBe(200);
+    await streamed.body?.cancel();
+  }, 120_000);
 });

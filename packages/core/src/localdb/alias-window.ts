@@ -25,9 +25,11 @@ import { holdMemory } from "./transfer-memory.js";
  * hashes of its children) and one window's rows, parsed. Both are charged to
  * the store's byte budget (`StorageAccessPolicy.maxBytesInFlight`) in one
  * reservation, taken while the read holds nothing: under pressure the read
- * waits for its turn, and no size makes it fail. The window is a chunk of that
- * reservation, never a limit: a parent whose own rows are larger than a chunk
- * is a window of its own, and takes the larger reservation it needs.
+ * waits for its turn. The window is a chunk of that reservation: a parent whose
+ * own rows are larger than a chunk is a window of its own, and takes the
+ * larger reservation it needs, up to the governor's limit. Past the limit the
+ * read is refused (`AliasTooLarge`) before it loads the group: a parent and its
+ * children are one window, and a read never asks for more than the limit.
  *
  * Nothing is held before it is reserved. The children are indexed a batch of
  * bodies at a time (their join key is read from the body: shared SQL has no
@@ -71,9 +73,38 @@ const INDEX_BYTES_PER_CHILD = 256;
  * The share of the budget one windowed read takes for its working set. The
  * rest stays free for uploads, which draw on the same budget, so a long read
  * does not stop a publish. It sizes the chunk only: a read that needs more
- * than its share (a parent with more rows than a chunk) takes what it needs.
+ * than its share (a parent with more rows than a chunk) takes what it needs,
+ * up to the governor's limit.
  */
 const READ_SHARE = 0.5;
+
+/**
+ * The most a windowed read asks the governor for is its limit, whatever the
+ * data: the governor grants a request above its limit when it is idle, and an
+ * alias read must never be that request. A read that would need more (an index
+ * larger than the limit, or one parent whose rows with their children are) is
+ * refused before it loads them: `bytes` are the stored bytes it would hold, and
+ * the host answers `too_large`, as it does for a body above `ARRAY_BUDGET`.
+ */
+export class AliasTooLarge extends Error {
+  constructor(readonly bytes: number) {
+    super(`alias window: a read of ${bytes} stored bytes exceeds the budget`);
+    this.name = "AliasTooLarge";
+  }
+}
+
+/**
+ * What an in-memory read of `bytes` stored bytes is charged: its heap, up to
+ * its share of the budget. A read that builds the whole body holds what main
+ * held (a body is at most `ARRAY_BUDGET`); the charge keeps the governor's line
+ * moving for uploads, and is never a request the governor would grant above its
+ * limit.
+ */
+export const wholeReadCharge = (memory: AliasMemory, bytes: number): number =>
+  Math.min(
+    bytes * HEAP_PER_STORED_BYTE,
+    Math.floor(memory.governor.limitBytes * READ_SHARE),
+  );
 
 export type WindowOutcome =
   | {
@@ -169,6 +200,11 @@ export async function openWindowed(
   // more than a chunk, or one body if that is larger.
   const scan = Math.max(chunk, childStats.maxBytes);
   let held = fixed + scan * HEAP_PER_STORED_BYTE;
+  const limit = input.memory.governor.limitBytes;
+  // Decided on the sizes alone, before a row is read or a byte reserved: the
+  // index and one batch of bodies do not fit the budget.
+  if (held > limit)
+    throw new AliasTooLarge(Math.ceil(held / HEAP_PER_STORED_BYTE));
   let reservation: Reservation | undefined = await holdMemory(
     input.memory,
     held,
@@ -218,8 +254,13 @@ export async function openWindowed(
       // The largest window needs more than is held. The index was dropped
       // with the attempt: hold nothing while the larger reservation waits,
       // then build the index again under it. On a view that has not moved the
-      // same rows give the same plan, so the second attempt fits.
+      // same rows give the same plan, so the second attempt fits. A window
+      // that needs more than the budget is refused: the plan is known now, and
+      // a parent with its children is one window that cannot be split.
       await assertViewCurrent(input.current);
+      if (attempt.need > limit) {
+        throw new AliasTooLarge(Math.ceil(attempt.need / HEAP_PER_STORED_BYTE));
+      }
       release();
       held = attempt.need;
       reservation = await holdMemory(input.memory, held, 0, input.signal);
@@ -293,6 +334,7 @@ async function indexInput(
       limits.get(stream)!,
       WHOLE_STREAM_BATCH_BYTES,
       input.current,
+      input.signal,
     );
   for await (const batch of bodies(window.parentStream)) {
     for (const { record } of batch) {
@@ -348,6 +390,7 @@ async function indexChildren(
     childLimits,
     scan,
     input.current,
+    input.signal,
   )) {
     for (const { record, sized } of batch) {
       const data: unknown = JSON.parse(record.body);
@@ -400,6 +443,7 @@ async function* runWindows(
 ): AsyncGenerator<WindowOutcome, void> {
   const { query, connectionId, window, binding, now, fetched } = input;
   for (const { from, to } of plan) {
+    input.signal?.throwIfAborted();
     const inWindow = parents.slice(from, to);
     const sized = inWindow.flatMap((p) => children.get(p.key)!.sized);
     const rows =

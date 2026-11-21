@@ -5,6 +5,8 @@ import {
 import {
   type ReadDecision,
   type ResolveInput,
+  type SpooledView,
+  type StreamedReadDecision,
 } from "../stream-sync-read/service.js";
 import { streamReadScope } from "../stream-sync-read/routing.js";
 import {
@@ -50,7 +52,18 @@ import {
  * This current-read fallback is independent of optional historical reads.
  */
 export interface LocalResolver {
+  /**
+   * A decision whose body is memory: safe for a consumer that reads it whole
+   * (a block check, `.text()`). An alias above `ARRAY_BUDGET` is refused, as
+   * it was before alias paging, and no spool is touched.
+   */
   resolve(input: ResolveInput): Promise<ReadDecision>;
+  /**
+   * As `resolve`, for a consumer that streams the body to a client: a
+   * windowed alias is built into the host's spool, and the view says so
+   * (`SpooledView`). A host with no spool answers as `resolve` does.
+   */
+  resolveStreaming(input: ResolveInput): Promise<StreamedReadDecision>;
 }
 
 /** The host alone knows legacy aliases and how to project their records. */
@@ -241,7 +254,7 @@ async function* envelope(
  * and runs after the queue is released.
  */
 interface PinnedAlias {
-  readonly finish: () => Promise<ReadDecision>;
+  readonly finish: () => Promise<StreamedReadDecision>;
 }
 
 /**
@@ -444,6 +457,7 @@ export function createLocalResolver(
   async function build(
     input: ResolveInput,
     candidate: Candidate,
+    spool: StreamSyncFiles | undefined,
   ): Promise<ReadDecision | PinnedAlias> {
     // A body of the database is pinned before the head is read: see
     // `pinStream`. An alias is projected after the queue is released (a paged
@@ -507,7 +521,7 @@ export function createLocalResolver(
     const view = (
       payload: AsyncIterable<string | Uint8Array>,
       onCancel?: () => void | Promise<void>,
-    ): ReadDecision => ({
+    ): Extract<ReadDecision, { kind: "view" }> => ({
       kind: "view",
       connector: connection.connector,
       ns: connection.ns,
@@ -566,7 +580,7 @@ export function createLocalResolver(
               memory: deps.blobs,
               epochs,
               signal,
-              spool: parts.aliasSpool,
+              spool,
             },
           );
         } catch (error) {
@@ -586,200 +600,213 @@ export function createLocalResolver(
           return { kind: "too_large", bytes: projected.bytes };
         }
         if (projected.kind === "no_data") return noData();
-        return view(projected.body(), () => {
+        const served = view(projected.body(), () => {
           stop.abort();
           return projected.discard();
         });
+        // Asked for with a spool, the body may wait in a file: say so in the
+        // type, so only a consumer that streams it can be handed it.
+        return spool
+          ? ({ ...served, spooled: true } satisfies SpooledView)
+          : served;
       },
     };
   }
 
-  return {
-    async resolve(input) {
-      if (
-        input.connection !== null &&
-        !/^(?:[0-9a-f]{16})?$/.test(input.connection)
-      ) {
-        return { kind: "invalid_connection" };
-      }
-      if (input.cursor !== null && !validCursor(input.cursor))
-        return { kind: "invalid_cursor" };
-      const scope = streamReadScope(input.scope) ?? input.scope;
-      const targets = targetsForScope(
-        scope,
-        new Set(parts.aliasScopes?.() ?? []),
-        parts.aliasTargets,
-      );
-      if (
-        targets.some(
-          (target) => target.alias && invalidAliasBinding(target.alias),
-        )
+  function read(input: ResolveInput, spool: undefined): Promise<ReadDecision>;
+  function read(
+    input: ResolveInput,
+    spool: StreamSyncFiles | undefined,
+  ): Promise<StreamedReadDecision>;
+  async function read(
+    input: ResolveInput,
+    spool: StreamSyncFiles | undefined,
+  ): Promise<StreamedReadDecision> {
+    if (
+      input.connection !== null &&
+      !/^(?:[0-9a-f]{16})?$/.test(input.connection)
+    ) {
+      return { kind: "invalid_connection" };
+    }
+    if (input.cursor !== null && !validCursor(input.cursor))
+      return { kind: "invalid_cursor" };
+    const scope = streamReadScope(input.scope) ?? input.scope;
+    const targets = targetsForScope(
+      scope,
+      new Set(parts.aliasScopes?.() ?? []),
+      parts.aliasTargets,
+    );
+    if (
+      targets.some(
+        (target) => target.alias && invalidAliasBinding(target.alias),
       )
-        return { kind: "invalid_binding" };
-      // A stream that is still loading is served to its owner alone.
-      const progressive = progressiveFirstLoad && input.isOwnerView;
-      const candidates: Candidate[] = [];
-      let sawDeleted = false;
-      let sawTombstoned = false;
-      let sawForeign = false;
-      let sawConnection = false;
-      let sawActive = false;
-      let applyUnavailable = false;
-      const initial: Candidate[] = [];
-      for (const target of targets) {
-        // Apply sees the persisted state so it can mark pending deletes before
-        // selection hides them. Selection below still uses effective control.
-        const beforeApply = await deps.db.query<
-          Connection & { pending_delete: number }
-        >(
-          `SELECT c.connection_id, c.connector, c.ns, c.generation, c.control_state, c.deleted_at,
+    )
+      return { kind: "invalid_binding" };
+    // A stream that is still loading is served to its owner alone.
+    const progressive = progressiveFirstLoad && input.isOwnerView;
+    const candidates: Candidate[] = [];
+    let sawDeleted = false;
+    let sawTombstoned = false;
+    let sawForeign = false;
+    let sawConnection = false;
+    let sawActive = false;
+    let applyUnavailable = false;
+    const initial: Candidate[] = [];
+    for (const target of targets) {
+      // Apply sees the persisted state so it can mark pending deletes before
+      // selection hides them. Selection below still uses effective control.
+      const beforeApply = await deps.db.query<
+        Connection & { pending_delete: number }
+      >(
+        `SELECT c.connection_id, c.connector, c.ns, c.generation, c.control_state, c.deleted_at,
                   EXISTS (SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS pending_delete
            FROM connections c WHERE c.connector = ? ORDER BY c.ns`,
-          [target.connector],
-        );
-        const refused = new Set<string>();
-        // applyConnection is the single-flight boundary and verifies keys before
-        // installing rows. No rejected/foreign head is eligible for a DB read.
-        for (const c of beforeApply) {
-          if (
-            c.control_state === "active" &&
-            c.deleted_at === null &&
-            (input.connection === null || input.connection === c.ns)
-          ) {
-            try {
-              if (c.pending_delete)
-                await applyConnection(deps, c.connection_id);
-              else await applyFor(c, target, progressive);
-            } catch (error) {
-              if (!(error instanceof RegistryUnavailableBeforeWriteError))
-                throw error;
-              refused.add(c.connection_id);
-            }
-          }
-        }
-        let rows = await connections(target.connector);
-        if (input.connection !== null)
-          rows = rows.filter((c) => c.ns === input.connection);
-        sawConnection ||= rows.length > 0;
-        sawDeleted ||= rows.some(
-          (c) => c.control_state === "deleted" || c.deleted_at !== null,
-        );
-        sawForeign ||= rows.some((c) => c.control_state === "foreign");
-        sawActive ||= rows.some(
-          (c) => c.control_state === "active" && c.deleted_at === null,
-        );
-        const loaded: { connection: Connection; streams: Stream[] }[] = [];
-        for (const connection of rows) {
-          if (
-            connection.deleted_at !== null ||
-            (connection.control_state !== "active" &&
-              !(
-                input.requireRegistered && connection.control_state === "absent"
-              ))
-          )
-            continue;
-          const available = await streams(connection.connection_id);
-          if (connection.control_state === "active")
-            loaded.push({ connection, streams: available });
-          if (input.requireRegistered) {
-            const pending = servedStreams(
-              target,
-              available.filter((s) => target.streams.includes(s.stream)),
-              connection,
-            );
-            if (!pending.missingRequired && pending.streams.length > 0)
-              initial.push({
-                target,
-                connection,
-                streams: pending.streams,
-                registered: -Infinity,
-              });
-          }
-        }
-        const picked = selectForTarget(target, loaded, { progressive });
-        if (picked.kind === "invalid_binding") return picked;
-        if (picked.tombstoned) sawTombstoned = true;
-        // A winner's tombstone says nothing about another connection whose
-        // pending apply could change the selection.
+        [target.connector],
+      );
+      const refused = new Set<string>();
+      // applyConnection is the single-flight boundary and verifies keys before
+      // installing rows. No rejected/foreign head is eligible for a DB read.
+      for (const c of beforeApply) {
         if (
-          loaded.some(
-            ({ connection, streams }) =>
-              refused.has(connection.connection_id) &&
-              !tombstonedForTarget(target, connection, streams, progressive),
-          )
-        )
-          applyUnavailable = true;
-        if (picked.candidate) candidates.push(picked.candidate);
-      }
-      const ranked = chooseCandidate(candidates);
-      // First publication has no readable head to rank yet. Bootstrap only
-      // an unambiguous connection after ordinary selection found no body.
-      // A readable winner always keeps its existing rank and identity.
-      const chosen =
-        ranked ??
-        (!sawTombstoned && !applyUnavailable && initial.length === 1
-          ? initial[0]
-          : undefined);
-      if (!chosen) {
-        if (applyUnavailable)
-          return input.requireRegistered
-            ? { kind: "read_not_registered" }
-            : { kind: "busy", retryAfterSeconds: 5 };
-        if (sawTombstoned) return deleted();
-        if (sawDeleted) return deleted();
-        if (sawForeign && !sawActive) return { kind: "key_mismatch" };
-        if (input.cursor !== null) return { kind: "cursor_stale" };
-        if (input.connection !== null && !sawConnection) {
-          return { kind: "unavailable", reason: "connection_not_found" };
+          c.control_state === "active" &&
+          c.deleted_at === null &&
+          (input.connection === null || input.connection === c.ns)
+        ) {
+          try {
+            if (c.pending_delete) await applyConnection(deps, c.connection_id);
+            else await applyFor(c, target, progressive);
+          } catch (error) {
+            if (!(error instanceof RegistryUnavailableBeforeWriteError))
+              throw error;
+            refused.add(c.connection_id);
+          }
         }
-        return noData();
       }
+      let rows = await connections(target.connector);
+      if (input.connection !== null)
+        rows = rows.filter((c) => c.ns === input.connection);
+      sawConnection ||= rows.length > 0;
+      sawDeleted ||= rows.some(
+        (c) => c.control_state === "deleted" || c.deleted_at !== null,
+      );
+      sawForeign ||= rows.some((c) => c.control_state === "foreign");
+      sawActive ||= rows.some(
+        (c) => c.control_state === "active" && c.deleted_at === null,
+      );
+      const loaded: { connection: Connection; streams: Stream[] }[] = [];
+      for (const connection of rows) {
+        if (
+          connection.deleted_at !== null ||
+          (connection.control_state !== "active" &&
+            !(input.requireRegistered && connection.control_state === "absent"))
+        )
+          continue;
+        const available = await streams(connection.connection_id);
+        if (connection.control_state === "active")
+          loaded.push({ connection, streams: available });
+        if (input.requireRegistered) {
+          const pending = servedStreams(
+            target,
+            available.filter((s) => target.streams.includes(s.stream)),
+            connection,
+          );
+          if (!pending.missingRequired && pending.streams.length > 0)
+            initial.push({
+              target,
+              connection,
+              streams: pending.streams,
+              registered: -Infinity,
+            });
+        }
+      }
+      const picked = selectForTarget(target, loaded, { progressive });
+      if (picked.kind === "invalid_binding") return picked;
+      if (picked.tombstoned) sawTombstoned = true;
+      // A winner's tombstone says nothing about another connection whose
+      // pending apply could change the selection.
       if (
-        input.requireRegistered &&
-        !(await ensureRegisteredRead(
-          deps,
-          chosen.connection.connection_id,
-          chosen.streams.map((s) => s.stream),
-          input.signal,
-        ))
+        loaded.some(
+          ({ connection, streams }) =>
+            refused.has(connection.connection_id) &&
+            !tombstonedForTarget(target, connection, streams, progressive),
+        )
       )
-        return {
-          kind: input.signal?.aborted ? "read_aborted" : "read_not_registered",
-        };
-      if (chosen.partialStreams?.length) {
-        const partial = await buildPartial({ ...input, scope }, chosen);
-        if (partial) return partial;
+        applyUnavailable = true;
+      if (picked.candidate) candidates.push(picked.candidate);
+    }
+    const ranked = chooseCandidate(candidates);
+    // First publication has no readable head to rank yet. Bootstrap only
+    // an unambiguous connection after ordinary selection found no body.
+    // A readable winner always keeps its existing rank and identity.
+    const chosen =
+      ranked ??
+      (!sawTombstoned && !applyUnavailable && initial.length === 1
+        ? initial[0]
+        : undefined);
+    if (!chosen) {
+      if (applyUnavailable)
+        return input.requireRegistered
+          ? { kind: "read_not_registered" }
+          : { kind: "busy", retryAfterSeconds: 5 };
+      if (sawTombstoned) return deleted();
+      if (sawDeleted) return deleted();
+      if (sawForeign && !sawActive) return { kind: "key_mismatch" };
+      if (input.cursor !== null) return { kind: "cursor_stale" };
+      if (input.connection !== null && !sawConnection) {
+        return { kind: "unavailable", reason: "connection_not_found" };
       }
-      // The queue is held to decide the headers and no longer: a body held it
-      // until its reader finished or cancelled, which a reader that stopped
-      // pulling never did, and every apply and read of the connection waited.
-      // The body checks its head itself, on every page.
-      const decide = async (): Promise<ReadDecision> => {
-        const built = await deps.queue.run(
-          chosen.connection.connection_id,
-          "end",
-          () => build({ ...input, scope }, chosen),
-        );
-        // An alias is projected outside the queue: its check may wait for
-        // memory that a paused client holds, and the queue must not wait with
-        // it. Its statements carry the pinned view, so a write that lands
-        // after the queue is released ends the read as `busy`.
-        return "finish" in built ? built.finish() : built;
+      return noData();
+    }
+    if (
+      input.requireRegistered &&
+      !(await ensureRegisteredRead(
+        deps,
+        chosen.connection.connection_id,
+        chosen.streams.map((s) => s.stream),
+        input.signal,
+      ))
+    )
+      return {
+        kind: input.signal?.aborted ? "read_aborted" : "read_not_registered",
       };
-      const decision = await decide();
-      // A collector can commit between the early coverage check and build.
-      // Publish outside the queue and reselect the body once in that case.
-      if (decision.kind === "read_not_registered" && input.requireRegistered) {
-        const registered = await ensureRegisteredRead(
-          deps,
-          chosen.connection.connection_id,
-          chosen.target.streams,
-          input.signal,
-        );
-        if (input.signal?.aborted) return { kind: "read_aborted" };
-        if (registered) return decide();
-      }
-      return decision;
-    },
+    if (chosen.partialStreams?.length) {
+      const partial = await buildPartial({ ...input, scope }, chosen);
+      if (partial) return partial;
+    }
+    // The queue is held to decide the headers and no longer: a body held it
+    // until its reader finished or cancelled, which a reader that stopped
+    // pulling never did, and every apply and read of the connection waited.
+    // The body checks its head itself, on every page.
+    const decide = async (): Promise<StreamedReadDecision> => {
+      const built = await deps.queue.run(
+        chosen.connection.connection_id,
+        "end",
+        () => build({ ...input, scope }, chosen, spool),
+      );
+      // An alias is projected outside the queue: its check may wait for
+      // memory that a paused client holds, and the queue must not wait with
+      // it. Its statements carry the pinned view, so a write that lands
+      // after the queue is released ends the read as `busy`.
+      return "finish" in built ? built.finish() : built;
+    };
+    const decision = await decide();
+    // A collector can commit between the early coverage check and build.
+    // Publish outside the queue and reselect the body once in that case.
+    if (decision.kind === "read_not_registered" && input.requireRegistered) {
+      const registered = await ensureRegisteredRead(
+        deps,
+        chosen.connection.connection_id,
+        chosen.target.streams,
+        input.signal,
+      );
+      if (input.signal?.aborted) return { kind: "read_aborted" };
+      if (registered) return decide();
+    }
+    return decision;
+  }
+
+  return {
+    resolve: (input) => read(input, undefined),
+    resolveStreaming: (input) => read(input, parts.aliasSpool),
   };
 }

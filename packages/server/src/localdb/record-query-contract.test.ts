@@ -150,4 +150,26 @@ describe("the exported RecordQuery contract", () => {
       /streamStats.*recordSizes.*recordsByHash/s,
     );
   }, 60_000);
+
+  it("keeps a spooled body out of every consumer that reads a body whole", () => {
+    // `resolve` is what a materializing consumer calls: it returns a
+    // `ReadDecision`, and a spooled view is not one. A consumer that streams
+    // takes a `StreamedReadDecision` from `resolveStreaming`.
+    const SERVICE = "../../../core/src/stream-sync-read/service.js";
+    expect(
+      diagnosticsOf(
+        `import type { ReadDecision, SpooledView, StreamedReadDecision } from "${SERVICE}";
+         import type { LocalResolver } from "${RESOLVE}";
+         declare const resolver: LocalResolver;
+         declare const spooled: SpooledView;
+         export const whole: Promise<ReadDecision> = resolver.resolve(null as never);
+         export const streamed: Promise<StreamedReadDecision> = resolver.resolveStreaming(null as never);
+         export const fits: StreamedReadDecision = spooled;
+         // @ts-expect-error a spooled view is not a ReadDecision
+         export const leaked: ReadDecision = spooled;
+         // @ts-expect-error resolve does not promise a StreamedReadDecision's spool to a whole-body consumer
+         export const also: Promise<ReadDecision> = resolver.resolveStreaming(null as never);`,
+      ),
+    ).toEqual([]);
+  }, 60_000);
 });

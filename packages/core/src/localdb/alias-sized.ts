@@ -33,7 +33,9 @@ export interface SizedBody {
  * A record that is missing, changed or grown, or a stream that is larger than
  * `limits`, means the rows are not those the read reserved memory for:
  * `PartialViewMoved`, the read to be asked again. Nothing in it depends on the
- * change marks, so it holds whatever the marks say.
+ * change marks, so it holds whatever the marks say. `signal` ends the read:
+ * it is checked before each row and each batch, so a scan nobody waits for
+ * stops where it is.
  */
 export async function* sizedBodies(
   query: AliasRecordQuery,
@@ -42,12 +44,14 @@ export async function* sizedBodies(
   limits: StreamLimits,
   batchBytes: number,
   current: AliasViewCheck,
+  signal?: AbortSignal,
 ): AsyncGenerator<SizedBody[]> {
   let batch: SizedRecord[] = [];
   let batchSize = 0;
   let rows = 0;
   let bytes = 0;
   const flush = async (): Promise<SizedBody[]> => {
+    signal?.throwIfAborted();
     const records = await query.recordsByHash(
       connectionId,
       stream,
@@ -64,6 +68,8 @@ export async function* sizedBodies(
     }));
   };
   for await (const size of query.recordSizes(connectionId, stream)) {
+    // A read nobody waits for stops here, not at the end of its scan.
+    signal?.throwIfAborted();
     rows += 1;
     bytes += size.bytes;
     if (

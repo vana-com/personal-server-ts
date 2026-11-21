@@ -434,6 +434,8 @@ export function createApp(deps: AppDeps): Hono {
   const streamSyncRead: StreamSyncReadPort | undefined = localSync
     ? {
         resolve: async (input) => (await localSync()).resolver.resolve(input),
+        resolveStreaming: async (input) =>
+          (await localSync()).resolver.resolveStreaming(input),
         listScopes: async (input) =>
           (await localSync()).listing.listScopes(input),
       }

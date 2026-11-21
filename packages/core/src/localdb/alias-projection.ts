@@ -10,9 +10,11 @@ import {
   type AliasViewCheck,
 } from "./alias-view.js";
 import {
-  HEAP_PER_STORED_BYTE,
+  AliasTooLarge,
   openWindowed,
+  wholeReadCharge,
   type AliasMemory,
+  type WindowedRead,
 } from "./alias-window.js";
 import { readerOf, type SqlDriver } from "./driver.js";
 import { PartialViewMoved } from "./partial-read.js";
@@ -302,7 +304,7 @@ async function whole(
   };
   return isAliasRecordQuery(query)
     ? wholeSized(view, query, env, project)
-    : wholeStreamed(view, query, project);
+    : wholeStreamed(view, query, project, env.signal);
 }
 
 type Project = (records: LocalAliasRecord[]) => Promise<Outcome>;
@@ -325,7 +327,7 @@ async function wholeSized(
   if (bytes > ARRAY_BUDGET) return { kind: "too_large", bytes };
   const release = await holdMemory(
     env.memory,
-    bytes * HEAP_PER_STORED_BYTE,
+    wholeReadCharge(env.memory, bytes),
     0,
     env.signal,
   );
@@ -339,6 +341,7 @@ async function wholeSized(
         sizes.get(stream)!,
         WHOLE_STREAM_BATCH_BYTES,
         current,
+        env.signal,
       )) {
         for (const { record } of batch) {
           records.push({
@@ -359,11 +362,13 @@ async function wholeStreamed(
   view: View,
   query: RecordQuery,
   project: Project,
+  signal: AbortSignal | undefined,
 ): Promise<Outcome> {
   const records: LocalAliasRecord[] = [];
   let bytes = 0;
   for (const stream of view.fetched) {
     for await (const record of query.streamRecords(view.connectionId, stream)) {
+      signal?.throwIfAborted();
       bytes += encoder.encode(record.body).byteLength;
       if (bytes > ARRAY_BUDGET) return { kind: "too_large", bytes };
       records.push({
@@ -412,17 +417,26 @@ async function paged(
   spool: StreamSyncFiles | undefined,
 ): Promise<Outcome> {
   const { connectionId, fetched, current } = view;
-  const session = await openWindowed({
-    query,
-    connectionId,
-    binding,
-    window,
-    fetched,
-    now,
-    memory: env.memory,
-    current,
-    signal: env.signal,
-  });
+  let session: WindowedRead | null;
+  try {
+    session = await openWindowed({
+      query,
+      connectionId,
+      binding,
+      window,
+      fetched,
+      now,
+      memory: env.memory,
+      current,
+      signal: env.signal,
+    });
+  } catch (error) {
+    // Refused on its sizes, as a body above `ARRAY_BUDGET` is: nothing loaded.
+    if (error instanceof AliasTooLarge) {
+      return { kind: "too_large", bytes: error.bytes };
+    }
+    throw error;
+  }
   // A child names no parent, or a row has no key to join on: not windowable.
   if (session === null) return whole(binding, view, query, now, env);
   const file = spool && {

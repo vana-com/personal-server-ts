@@ -33,7 +33,10 @@ import {
   createLocalResolver,
   type LocalAliasTarget,
 } from "../../../core/src/localdb/resolve.js";
-import type { ReadDecision } from "../../../core/src/stream-sync-read/service.js";
+import type {
+  ReadDecision,
+  StreamedReadDecision,
+} from "../../../core/src/stream-sync-read/service.js";
 import {
   createStorageAccess,
   DEFAULT_STORAGE_ACCESS_POLICY,
@@ -53,6 +56,13 @@ vi.mock("../../../core/src/localdb/apply.js", () => ({
  * takes the memory it holds from the storage governor. Its output is the
  * output of the whole projection, byte for byte; no size refuses it.
  */
+/**
+ * A governor small enough to cut each fixture into windows of one parent, and
+ * large enough to hold the biggest of them: a read that needs more than the
+ * governor's limit is refused, so the limit cannot be smaller than a window.
+ */
+const TIGHT = 8 * 1024;
+
 const NOW_MS = 5000;
 const NOW = new Date(NOW_MS).toISOString();
 const OBSERVED_MS = 1000;
@@ -243,7 +253,9 @@ async function fixture(limit: number, spoolOption?: StreamSyncFiles | false) {
         if (bytes > 0) {
           readsOfBodies++;
           largest = Math.max(largest, bytes);
-          if (bytes * HEAP_PER_STORED_BYTE > inUse()) {
+          // A read built whole is charged its heap up to its share of the
+          // budget (`wholeReadCharge`); a window, its heap in full.
+          if (Math.min(bytes * HEAP_PER_STORED_BYTE, limit / 2) > inUse()) {
             unheld.push(
               `${bytes} stored bytes of bodies read while ${inUse()} bytes were held`,
             );
@@ -267,19 +279,29 @@ async function fixture(limit: number, spoolOption?: StreamSyncFiles | false) {
   return { db, deps, governor, inUse, kept, seed, resolverFor, audited, spool };
 }
 
+const readInput = (scope: string, signal?: AbortSignal) => ({
+  scope,
+  connection: null,
+  cursor: null,
+  legacyFile: false,
+  isOwnerView: true,
+  ...(signal ? { signal } : {}),
+});
+
+/** A read as the one consumer that streams the body to a client makes it. */
 const read = (
   resolver: ReturnType<typeof createLocalResolver>,
   scope: string,
   signal?: AbortSignal,
-): Promise<ReadDecision> =>
-  resolver.resolve({
-    scope,
-    connection: null,
-    cursor: null,
-    legacyFile: false,
-    isOwnerView: true,
-    ...(signal ? { signal } : {}),
-  });
+): Promise<StreamedReadDecision> =>
+  resolver.resolveStreaming(readInput(scope, signal));
+
+/** A read as a consumer that reads the body whole makes it (an MCP block read). */
+const readWhole = (
+  resolver: ReturnType<typeof createLocalResolver>,
+  scope: string,
+  signal?: AbortSignal,
+): Promise<ReadDecision> => resolver.resolve(readInput(scope, signal));
 
 /** The envelope a read writes around `payload`. */
 const envelopeOf = (scope: string, payload: unknown) =>
@@ -322,6 +344,26 @@ const completeRows = (records: PdppRecord[]): PdppRecord[] =>
       : r,
   );
 
+/**
+ * The smallest governor (a power of two from 4 KiB) that holds the largest
+ * window of `records`: below it a read is refused as too large, and the fixture
+ * is cut into the smallest windows the limit allows.
+ */
+async function tightBudget(
+  target: LocalAliasTarget,
+  scope: string,
+  records: PdppRecord[],
+): Promise<number> {
+  for (let limit = 4 * 1024; limit <= 64 * 1024 * 1024; limit *= 2) {
+    const f = await fixture(limit);
+    await f.seed(target, records);
+    const decision = await read(f.resolverFor(target, scope), scope);
+    if (decision.kind === "view") await decision.body.cancel();
+    if (decision.kind !== "too_large") return limit;
+  }
+  throw new Error("no budget holds the fixture");
+}
+
 /** The target, counting every projection it is asked for. */
 function counting(target: LocalAliasTarget) {
   const calls: number[] = [];
@@ -358,7 +400,7 @@ describe("a paged alias read equals the whole projection, byte for byte", () => 
         ),
       ).toEqual([]);
       // A governor of 2 KiB forces a window of one parent.
-      const f = await fixture(2 * 1024);
+      const f = await fixture(await tightBudget(target, scope, records));
       const { wrapped, calls } = counting(target);
       await f.seed(target, records);
       const decision = await read(f.resolverFor(wrapped, scope), scope);
@@ -516,7 +558,7 @@ describe("an alias body written to the spool", () => {
 
   async function failingRead() {
     const { real, failing } = await failingSpool();
-    const f = await fixture(2 * 1024, failing);
+    const f = await fixture(TIGHT, failing);
     await f.seed(target, records);
     const decision = await read(f.resolverFor(target, scope), scope);
     expect(decision.kind).toBe("view");
@@ -558,7 +600,7 @@ describe("an alias body written to the spool", () => {
 
   it("fails the read, and leaves no file and no memory held, when its projection fails", async () => {
     const real = await newSpool();
-    const f = await fixture(2 * 1024, real);
+    const f = await fixture(TIGHT, real);
     await f.seed(target, records);
     // The projection fails in its third window, after a file has been begun.
     let calls = 0;
@@ -577,7 +619,7 @@ describe("an alias body written to the spool", () => {
   });
 
   it("does not leave the governor's memory held", async () => {
-    const f = await fixture(2 * 1024);
+    const f = await fixture(TIGHT);
     await f.seed(target, records);
     const window = f.governor.window();
     const decision = await read(f.resolverFor(target, scope), scope);
@@ -593,7 +635,7 @@ describe("an alias body written to the spool", () => {
 
   describe("removes its file when the body ends", () => {
     const opened = async () => {
-      const f = await fixture(2 * 1024);
+      const f = await fixture(TIGHT);
       await f.seed(target, records);
       const decision = await read(f.resolverFor(target, scope), scope);
       if (decision.kind !== "view") throw new Error("not a view");
@@ -625,7 +667,7 @@ describe("an alias body written to the spool", () => {
     });
 
     it("when its projection is refused as incomplete", async () => {
-      const f = await fixture(2 * 1024);
+      const f = await fixture(TIGHT);
       const refusing: LocalAliasTarget = {
         ...target,
         project: (rs, now, fetched) => {
@@ -674,7 +716,7 @@ describe("an alias read's diagnostics, over windows", () => {
       (d) => d.kind === "records_dropped",
     );
     expect(dropped?.count).toBe(3);
-    const f = await fixture(2 * 1024);
+    const f = await fixture(await tightBudget(target, scope, all));
     await f.seed(target, all);
     const decision = await read(f.resolverFor(target, scope), scope);
     expect(decision).toEqual({
@@ -693,8 +735,9 @@ describe("an alias read's diagnostics, over windows", () => {
     const { scope, binding, target } = windowedTargets().find(
       (c) => c.label === "claude.conversations (anthropic)",
     )!;
-    const f = await fixture(2 * 1024);
-    await f.seed(target, WINDOW_FIXTURES[scope]!(binding));
+    const records = WINDOW_FIXTURES[scope]!(binding);
+    const f = await fixture(await tightBudget(target, scope, records));
+    await f.seed(target, records);
     expect(await read(f.resolverFor(target, scope), scope)).toEqual({
       kind: "incomplete",
       diagnostics: [
@@ -721,7 +764,7 @@ describe("an alias read's diagnostics, over windows", () => {
         liker_ordinal: 1,
       },
     };
-    const f = await fixture(2 * 1024);
+    const f = await fixture(TIGHT);
     await f.seed(target, [...records, orphan]);
     const decision = await read(f.resolverFor(target, scope), scope);
     // The orphan is a dropped row: the read is refused as incomplete, as the
@@ -743,7 +786,7 @@ describe("a read that is not windowed", () => {
         payload: { count: records.length },
       }),
     };
-    const f = await fixture(4 * 1024);
+    const f = await fixture(TIGHT);
     // 40 KiB of rows under a 4 KiB governor: the read waits to run alone.
     await f.seed(
       target,
@@ -813,16 +856,17 @@ describe("a windowed read holds nothing the governor does not count", () => {
   }, 60_000);
 
   it("holds no index while it waits for a larger reservation", async () => {
-    // One conversation of three 300 KiB messages is a window of its own, and
-    // needs more than the whole 2 MiB budget: its read must wait to run alone.
-    // Another holder keeps the budget busy, so the wait is real.
+    // One conversation of three 500 KiB messages is a window of its own, and
+    // needs more than the 4 MiB the read first holds (but fits the 8 MiB
+    // budget): its read asks again for what it needs. Another holder keeps
+    // the budget busy, so the wait is real.
     const records = [
-      ...chatgptConversation(0, 3, 300 * 1024),
+      ...chatgptConversation(0, 3, 500 * 1024),
       ...chatgptConversation(1, 1, 100),
       ...chatgptConversation(2, 1, 100),
     ];
     const real = chatgpt();
-    const f = await fixture(2 * 1024 * 1024);
+    const f = await fixture(8 * 1024 * 1024);
     await f.seed(real, records);
     const gc = collector();
     const seen: WeakRef<object>[] = [];
@@ -839,7 +883,7 @@ describe("a windowed read holds nothing the governor does not count", () => {
           if (phase === undefined) {
             phase = "first";
             queueMicrotask(() => (phase = "later"));
-            void f.governor.reserve(1024).then((release) => {
+            void f.governor.reserve(3 * 1024 * 1024).then((release) => {
               blocker = release;
             });
           }
@@ -857,7 +901,7 @@ describe("a windowed read holds nothing the governor does not count", () => {
     expect(seen.length).toBeGreaterThan(0);
     // While it waits it holds no reservation of its own, so it must hold none
     // of the rows the reservation was for.
-    expect(f.inUse()).toBe(1024);
+    expect(f.inUse()).toBe(3 * 1024 * 1024);
     gc();
     await sleep(10);
     gc();
@@ -1317,7 +1361,7 @@ describe("the envelope of a paged body is built from its fields", () => {
       })),
     ]).flat();
     // A governor of 2 KiB forces a window of one parent.
-    const f = await fixture(2 * 1024);
+    const f = await fixture(TIGHT);
     await f.seed(tree, rows);
     const decision = await read(
       f.resolverFor(tree, "tree.items"),
@@ -1715,6 +1759,184 @@ describe("a host without a spool refuses a large alias read, as main does", () =
     );
     expect(decision.kind).toBe("too_large");
   }, 120_000);
+});
+
+const MiB = 1024 * 1024;
+
+/**
+ * Rule 1: no read holds more than a fixed ceiling, whatever the data. A parent
+ * and its children are one window, so a conversation larger than the governor
+ * allows is refused before it is built, the way a body above `ARRAY_BUDGET` is.
+ */
+describe("a windowed read never asks the governor for more than its limit", () => {
+  const scope = "chatgpt.conversations";
+  const chatgpt = () =>
+    legacyAliasScopes(scope).find(
+      (t) => t.connector === "chatgpt",
+    ) as LocalAliasTarget;
+  const limit = 24 * MiB;
+
+  for (const c of [
+    { label: "one 74 MB conversation", messages: 740 },
+    { label: "one 20 MB conversation (main served it)", messages: 200 },
+  ]) {
+    it(`${c.label}: refused as too_large, within the ceiling, with an upload served`, async () => {
+      const f = await fixture(limit);
+      await f.seed(chatgpt(), chatgptConversation(0, c.messages, 100 * 1024));
+      const window = f.governor.window();
+      const audit = f.audited();
+      const decision = await read(
+        f.resolverFor(chatgpt(), scope, audit.query),
+        scope,
+      );
+      expect(decision.kind).toBe("too_large");
+      // The governor never saw a request above its limit, so it never
+      // granted one: nothing else was kept from an upload while it built.
+      expect(window.end().peakBytesInFlight).toBeLessThanOrEqual(limit);
+      expect(audit.unheld).toEqual([]);
+      expect(f.inUse()).toBe(0);
+      expect(await f.spool!.list("")).toEqual([]);
+      const upload = await f.governor.reserve(16 * MiB);
+      upload();
+    }, 120_000);
+  }
+
+  it("refuses from the sizes alone, before a body is read, when one child cannot fit", async () => {
+    const tree = treeTarget("p");
+    const f = await fixture(limit);
+    // One 8 MiB child: its scan batch alone is 32 MiB of heap, above 24 MiB.
+    await f.seed(tree, [
+      { stream: "parents", data: { id: "p0" } },
+      {
+        stream: "kids",
+        data: { id: "k0", parent: "p0", pad: "y".repeat(8 * MiB) },
+      },
+    ]);
+    const audit = f.audited();
+    const decision = await read(
+      f.resolverFor(tree, "tree.items", audit.query),
+      "tree.items",
+    );
+    expect(decision.kind).toBe("too_large");
+    expect(audit.reads().readsOfBodies).toBe(0);
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+
+  it("still serves a group that fits, byte for byte what the in-memory read serves", async () => {
+    const f = await fixture(limit);
+    await f.seed(chatgpt(), chatgptConversation(0, 30, 100 * 1024));
+    const resolver = f.resolverFor(chatgpt(), scope);
+    const streamed = await read(resolver, scope);
+    const whole = await readWhole(resolver, scope);
+    expect(streamed.kind).toBe("view");
+    expect(whole.kind).toBe("view");
+    if (streamed.kind !== "view" || whole.kind !== "view") return;
+    expect(await new Response(streamed.body).text()).toBe(
+      await new Response(whole.body).text(),
+    );
+    expect(f.inUse()).toBe(0);
+  }, 60_000);
+});
+
+/**
+ * Rule 2: only a consumer that streams the body to a client gets the spooled,
+ * unbounded path. `resolve` is what every consumer that materializes a body
+ * calls (an MCP block read, a block check): it takes main's capped path.
+ */
+describe("a consumer that reads the body whole is never given the spool", () => {
+  const tree = treeTarget("p");
+  /** 65 parents, each with one child of 1 MiB: 65 MiB, above `ARRAY_BUDGET`. */
+  const account = () =>
+    Array.from({ length: 65 }, (_, i) => [
+      { stream: "parents", data: { id: `p${String(i).padStart(3, "0")}` } },
+      {
+        stream: "kids",
+        data: {
+          id: `k${i}`,
+          parent: `p${String(i).padStart(3, "0")}`,
+          pad: "y".repeat(MiB),
+        },
+      },
+    ]).flat();
+
+  it("resolve answers too_large above the budget, as main does, and writes no file", async () => {
+    const f = await fixture(24 * MiB);
+    await f.seed(tree, account());
+    const resolver = f.resolverFor(tree, "tree.items");
+    const decision = await readWhole(resolver, "tree.items");
+    expect(decision.kind).toBe("too_large");
+    expect(await f.spool!.list("")).toEqual([]);
+    expect(f.inUse()).toBe(0);
+    // The same read, asked for by a consumer that streams it, is served.
+    const streamed = await read(resolver, "tree.items");
+    expect(streamed.kind).toBe("view");
+    if (streamed.kind === "view") {
+      expect(streamed.spooled).toBe(true);
+      await streamed.body.cancel();
+    }
+  }, 120_000);
+
+  it("answers a read of a small alias in memory, with no spool brand", async () => {
+    const f = await fixture(24 * MiB);
+    await f.seed(tree, [
+      { stream: "parents", data: { id: "p0" } },
+      { stream: "kids", data: { id: "k0", parent: "p0", pad: "y" } },
+    ]);
+    const resolver = f.resolverFor(tree, "tree.items");
+    const whole = await readWhole(resolver, "tree.items");
+    expect(whole.kind).toBe("view");
+    if (whole.kind === "view") {
+      expect(whole.spooled).toBeUndefined();
+      await whole.body.cancel();
+    }
+  });
+});
+
+/** A read nobody waits for stops its scan, not only its wait for memory. */
+describe("a read that is cancelled while it indexes stops", () => {
+  it("stops reading rows, and holds nothing", async () => {
+    const tree = treeTarget("p");
+    const f = await fixture(24 * MiB);
+    await f.seed(
+      tree,
+      Array.from({ length: 200 }, (_, i) => [
+        { stream: "parents", data: { id: `p${String(i).padStart(3, "0")}` } },
+        {
+          stream: "kids",
+          data: {
+            id: `k${i}`,
+            parent: `p${String(i).padStart(3, "0")}`,
+            pad: "y".repeat(100),
+          },
+        },
+      ]).flat(),
+    );
+    const real = createRecordQuery(f.db);
+    const stop = new AbortController();
+    let kidsSized = 0;
+    const query: ReturnType<typeof createRecordQuery> = {
+      ...real,
+      async *recordSizes(connectionId, stream) {
+        for await (const size of real.recordSizes(connectionId, stream)) {
+          if (stream === "kids") {
+            kidsSized += 1;
+            if (kidsSized === 3) stop.abort();
+          }
+          yield size;
+        }
+      },
+    };
+    const decision = await read(
+      f.resolverFor(tree, "tree.items", query),
+      "tree.items",
+      stop.signal,
+    );
+    expect(decision).toEqual({ kind: "read_aborted" });
+    // The scan stopped at the next row: it did not read the other 197.
+    expect(kidsSized).toBe(3);
+    expect(f.inUse()).toBe(0);
+    expect(await f.spool!.list("")).toEqual([]);
+  }, 60_000);
 });
 
 /** The engine's collector, switched on at run time when the process has none. */

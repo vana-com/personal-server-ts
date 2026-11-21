@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -43,5 +51,20 @@ describe("the server's alias spool", () => {
       { path: "alias-two", bytes: new TextEncoder().encode("body") },
     ]);
     expect(await modeOf(dir)).toBe(0o700);
+  });
+
+  it("refuses a root that is a symbolic link, and leaves the files of its target alone", async () => {
+    const target = join(storageRoot, "somewhere-else");
+    await mkdir(target, { mode: 0o755 });
+    await writeFile(join(target, "precious"), "not the spool's");
+    await symlink(target, join(storageRoot, "alias-spool"));
+    await expect(openAliasSpool(storageRoot)).rejects.toThrow(
+      /not a directory/,
+    );
+    // Neither the sweep nor the tighten followed the link.
+    expect(await readFile(join(target, "precious"), "utf8")).toBe(
+      "not the spool's",
+    );
+    expect(await modeOf(target)).toBe(0o755);
   });
 });

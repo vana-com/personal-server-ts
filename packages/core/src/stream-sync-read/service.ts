@@ -214,8 +214,30 @@ export type ReadDecision =
        * the rows applied so far. Absent: the view is complete.
        */
       readonly partial?: PartialView;
+      /**
+       * Absent here, always: this decision's body is memory, so a consumer
+       * may read it whole. A body that waits in a file is a `SpooledView`,
+       * which no consumer typed `ReadDecision` can receive.
+       */
+      readonly spooled?: undefined;
       readonly body: ReadableStream<Uint8Array>;
     };
+
+/**
+ * A stream view whose body waits in a file, as large as the data. Only a
+ * consumer that streams it to a client may hold one: a consumer that reads a
+ * body whole (`.text()`, a parse, a block check) takes a `ReadDecision` from
+ * `resolve`, never this. `resolveStreaming` is the one source of it.
+ */
+export type SpooledView = Omit<
+  Extract<ReadDecision, { kind: "view" }>,
+  "spooled"
+> & {
+  readonly spooled: true;
+};
+
+/** What a consumer that streams the body to a client may receive. */
+export type StreamedReadDecision = ReadDecision | SpooledView;
 
 export interface StreamSyncConnectionStatus {
   readonly connector: string;

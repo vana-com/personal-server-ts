@@ -12,6 +12,7 @@
 import { createReadStream } from "node:fs";
 import {
   chmod,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -55,7 +56,10 @@ export interface FsStreamSyncFilesOptions {
   /**
    * Create directories 0700 and files 0600, whatever the umask, and tighten
    * the root if it exists with wider modes before the first write. For files
-   * that hold the owner's data in plain text. Absent: the process defaults.
+   * that hold the owner's data in plain text. A root that is a symbolic link
+   * (or any file that is not a directory) is refused by every operation: a
+   * tighten, a sweep or a removal must not reach the files of its target.
+   * Absent: the process defaults.
    */
   readonly private?: boolean;
 }
@@ -67,10 +71,28 @@ export function createFsStreamSyncFiles(
   const base = resolve(root);
   const dirMode = options.private ? PRIVATE_DIR_MODE : undefined;
   const fileMode = options.private ? PRIVATE_FILE_MODE : undefined;
+  // A private root is the directory itself, never a link to one: checked on
+  // every operation, since a link can be put in its place at any time.
+  const guardRoot = async (): Promise<void> => {
+    if (!options.private) return;
+    let found;
+    try {
+      found = await lstat(base);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (!found.isDirectory()) {
+      throw new Error(
+        `private stream-sync root ${base} is not a directory (a symbolic link is refused)`,
+      );
+    }
+  };
   // Made 0700 once, before the first file is created in it.
   let privateRoot: Promise<void> | undefined;
   const ensureRoot = async (): Promise<void> => {
     if (!options.private) return;
+    await guardRoot();
     privateRoot ??= (async () => {
       await mkdir(base, { recursive: true, mode: PRIVATE_DIR_MODE });
       await chmod(base, PRIVATE_DIR_MODE);
@@ -194,6 +216,7 @@ export function createFsStreamSyncFiles(
 
   return {
     async write(path, bytes) {
+      await guardRoot();
       const full = abs(path);
       // The rename replaces the inode; an append handle would write to the old one.
       await release(full);
@@ -212,6 +235,7 @@ export function createFsStreamSyncFiles(
       await fsyncDir(dirname(full));
     },
     async read(path) {
+      await guardRoot();
       try {
         return new Uint8Array(await readFile(abs(path)));
       } catch (error) {
@@ -220,6 +244,7 @@ export function createFsStreamSyncFiles(
       }
     },
     async appendMany(entries) {
+      await guardRoot();
       appending += 1;
       try {
         for (const { path, bytes } of entries) {
@@ -243,6 +268,7 @@ export function createFsStreamSyncFiles(
       }
     },
     async *readChunks(path) {
+      await guardRoot();
       const full = abs(path);
       try {
         await stat(full);
@@ -256,6 +282,7 @@ export function createFsStreamSyncFiles(
       }
     },
     async size(path) {
+      await guardRoot();
       try {
         return (await stat(abs(path))).size;
       } catch (error) {
@@ -264,6 +291,7 @@ export function createFsStreamSyncFiles(
       }
     },
     async list(prefix) {
+      await guardRoot();
       const dir = abs(prefix);
       try {
         const entries = await readdir(dir, {
@@ -282,6 +310,7 @@ export function createFsStreamSyncFiles(
       }
     },
     async remove(prefix) {
+      await guardRoot();
       await release(abs(prefix));
       await rm(abs(prefix), { recursive: true, force: true });
     },
