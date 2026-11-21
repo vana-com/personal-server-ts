@@ -25,6 +25,7 @@ import {
   REPLICATION_MIGRATION,
   REPLICA_BINDING_HISTORY_MIGRATION,
   REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
+  REPLICA_PENDING_BUDGET_MIGRATION,
   type ReplicationExport,
 } from "./pdpp-replication-sqlite.js";
 import {
@@ -101,6 +102,7 @@ BEGIN SELECT RAISE(ABORT, 'local write log is append-only'); END;
   // Capture pins that reference canonical chunks instead of copying them.
   // See `pinReferenceKeepsBytes`.
   `CREATE TABLE IF NOT EXISTS pdpp_replica_blob_pins (blob_id TEXT PRIMARY KEY);`,
+  REPLICA_PENDING_BUDGET_MIGRATION,
 ];
 
 /**
