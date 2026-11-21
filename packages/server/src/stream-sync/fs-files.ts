@@ -104,6 +104,26 @@ export function createFsStreamSyncFiles(
       throw error;
     }
   };
+  /**
+   * Open `path`, and give a file this call created `fileMode` through its own
+   * handle: `open` applies the umask to the mode it creates with, so under a
+   * restrictive umask a file could be created 0000 and no longer be reopened.
+   */
+  const openFile = async (
+    path: string,
+    flags: "a" | "w",
+  ): Promise<FileHandle> => {
+    const handle = await open(path, flags, fileMode);
+    if (fileMode !== undefined) {
+      try {
+        await handle.chmod(fileMode);
+      } catch (error) {
+        await handle.close();
+        throw error;
+      }
+    }
+    return handle;
+  };
   let tmpCounter = 0;
   const abs = (path: string): string => {
     const full = resolve(base, path);
@@ -139,11 +159,11 @@ export function createFsStreamSyncFiles(
     // when `open` says it does not.
     let handle: FileHandle;
     try {
-      handle = await open(full, "a", fileMode);
+      handle = await openFile(full, "a");
     } catch (error) {
       if (!missing(error)) throw error;
       await mkdir(dirname(full), { recursive: true, mode: dirMode });
-      handle = await open(full, "a", fileMode);
+      handle = await openFile(full, "a");
     }
     handles.set(full, handle);
     return handle;
@@ -224,7 +244,7 @@ export function createFsStreamSyncFiles(
       await mkdir(dirname(full), { recursive: true, mode: dirMode });
       tmpCounter += 1;
       const tmp = `${full}.tmp-${process.pid}-${tmpCounter}`;
-      const handle = await open(tmp, "w", fileMode);
+      const handle = await openFile(tmp, "w");
       try {
         await handle.writeFile(bytes);
         await handle.sync();

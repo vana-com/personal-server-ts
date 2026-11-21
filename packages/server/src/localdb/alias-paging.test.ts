@@ -621,6 +621,69 @@ describe("an alias body written to the spool", () => {
     expect(f.inUse()).toBe(0);
   });
 
+  it("ends busy, with no file left, when a write commits during the last append", async () => {
+    const real = await newSpool();
+    let landed = false;
+    const later: { f?: Awaited<ReturnType<typeof fixture>> } = {};
+    // The fixture is small: its one append is the last. A write commits
+    // while that append is in flight.
+    const delaying: StreamSyncFiles = {
+      ...real,
+      async appendMany(entries) {
+        if (!landed) {
+          landed = true;
+          await later.f!.db.batch([
+            {
+              sql: "UPDATE records SET stamp_o = 9 WHERE connection_id = 'c1' AND pk_hash = (SELECT MIN(pk_hash) FROM records WHERE connection_id = 'c1')",
+            },
+          ]);
+        }
+        return real.appendMany(entries);
+      },
+    };
+    const f = await fixture(TIGHT, delaying);
+    later.f = f;
+    await f.seed(target, records);
+    const decision = await read(f.resolverFor(target, scope), scope);
+    expect(landed).toBe(true);
+    expect(decision).toMatchObject({ kind: "busy" });
+    expect(await real.list("")).toEqual([]);
+    expect(f.inUse()).toBe(0);
+  });
+
+  it("ends its body in an error when its file is gone, never a complete body with no elements", async () => {
+    const real = await newSpool();
+    const f = await fixture(TIGHT, real);
+    await f.seed(target, records);
+    const decision = await read(f.resolverFor(target, scope), scope);
+    if (decision.kind !== "view") throw new Error("not a view");
+    const reader = decision.body.getReader();
+    // The head is out; the file has not been opened yet. It disappears.
+    const head = new TextDecoder().decode((await reader.read()).value);
+    const [file] = await real.list("");
+    expect(file).toBeDefined();
+    await real.remove(file!);
+    let failure: unknown;
+    let rest = "";
+    for (;;) {
+      try {
+        const next = await reader.read();
+        if (next.done) break;
+        rest += new TextDecoder().decode(next.value);
+      } catch (error) {
+        failure = error;
+        break;
+      }
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(
+      /spool file holds 0 of \d+ bytes/,
+    );
+    // The tail was never sent: what went out is not a whole document.
+    expect(() => JSON.parse(head + rest)).toThrow();
+    expect(await real.list("")).toEqual([]);
+  });
+
   it("does not leave the governor's memory held", async () => {
     const f = await fixture(TIGHT);
     await f.seed(target, records);

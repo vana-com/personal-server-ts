@@ -116,7 +116,12 @@ interface View {
 /** A body built: its text before the elements of a spooled array, the file of those elements, the text after. */
 interface Built {
   readonly head: string;
-  readonly file?: { readonly files: StreamSyncFiles; readonly path: string };
+  readonly file?: {
+    readonly files: StreamSyncFiles;
+    readonly path: string;
+    /** The bytes appended to it: the body is not served unless it reads back as many. */
+    readonly bytes: number;
+  };
   readonly tail: string;
 }
 
@@ -261,7 +266,23 @@ function bodyOf(built: Built): AliasProjection {
         yield built.head.slice(at, end);
         at = end;
       }
-      if (built.file) yield* built.file.files.readChunks(built.file.path);
+      if (built.file) {
+        // A file that is gone reads as empty, and one cut short reads short:
+        // either is a body that is not what was projected, and must not end
+        // as a complete one.
+        let got = 0;
+        for await (const chunk of built.file.files.readChunks(
+          built.file.path,
+        )) {
+          got += chunk.byteLength;
+          yield chunk;
+        }
+        if (got !== built.file.bytes) {
+          throw new Error(
+            `alias spool file holds ${got} of ${built.file.bytes} bytes`,
+          );
+        }
+      }
       if (built.tail !== "") yield built.tail;
     } finally {
       await discard();
@@ -446,6 +467,8 @@ async function paged(
     files: spool,
     path: `alias-${globalThis.crypto.randomUUID()}`,
   };
+  /** Bytes appended to the file so far. */
+  let written = 0;
   const sums = new Map(window.sumKeys.map((key) => [key, 0]));
   const tallies = new Map<string, Tally>();
   let template: Record<string, unknown> | undefined;
@@ -453,9 +476,9 @@ async function paged(
   let piece = "";
   let first = true;
   const write = async () => {
-    await file!.files.appendMany([
-      { path: file!.path, bytes: encoder.encode(piece) },
-    ]);
+    const bytes = encoder.encode(piece);
+    await file!.files.appendMany([{ path: file!.path, bytes }]);
+    written += bytes.byteLength;
     piece = "";
   };
   let result: Outcome | undefined;
@@ -503,9 +526,19 @@ async function paged(
     // empty body for it: it is projected whole.
     if (result === undefined && template !== undefined) {
       if (file && piece !== "") await write();
+      // A write can commit while the last append is in flight: the file is
+      // kept only if the view it was projected from is still the view.
+      await assertViewCurrent(current);
       for (const key of window.sumKeys) template[key] = sums.get(key);
       const [head, tail] = envelopeAround(template, window.arrayKey, keyOrder);
-      result = { kind: "ok", built: { head, file, tail } };
+      result = {
+        kind: "ok",
+        built: {
+          head,
+          file: file && { ...file, bytes: written },
+          tail,
+        },
+      };
     }
   } finally {
     session.release();
