@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   createImportLedger,
+  importFingerprint,
   createLocalSeed,
   createLocalSync,
   createSeedIntake,
@@ -264,6 +265,76 @@ it("an explicit delete that was published and compacted keeps a later seed out a
   expect((await reopened.seed("install-2", ["A", "Z"])).kind).toBe("imported");
   // Z was never in the stream and fills; A was deleted and stays out.
   expect(await reopened.keys()).toEqual(["B", "Z"]);
+});
+
+/**
+ * What a device holds after an upgrade from the build before this one: that
+ * build wrote a tombstone only for what it applied from the log, never for a
+ * delete or omission it published itself.
+ */
+async function asBuiltBefore(device: Awaited<ReturnType<typeof openDevice>>) {
+  await device.db.batch([{ sql: "DELETE FROM log_tombstones" }]);
+}
+
+it("a delete the earlier build published and compacted keeps a late seed out after the upgrade", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("delete", ["A"], { remove: true });
+  await a.publish();
+  await a.publish();
+  await asBuiltBefore(a);
+  expect(
+    await a.db.query(
+      "SELECT count(*) AS n FROM record_changes WHERE record_key = 'A' AND stream = 'items'",
+    ),
+  ).toEqual([{ n: 0 }]);
+  expect((await a.seed("install-2", ["A", "Z"])).kind).toBe("imported");
+  expect(await a.keys()).toEqual(["B", "Z"]);
+  // The record stays gone for another device too.
+  await a.publish();
+  const b = await w.device("b");
+  await b.sync.cycle();
+  expect(await b.keys()).toEqual(["B", "Z"]);
+});
+
+it("an omission the earlier build published keeps a late seed out after the upgrade", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("refresh", ["B"]);
+  await a.publish();
+  await a.publish();
+  expect(await a.keys()).toEqual(["B"]);
+  await asBuiltBefore(a);
+  await a.seed("install-2", ["A", "Z"]);
+  expect(await a.keys()).toEqual(["B", "Z"]);
+});
+
+it("a delete that a log compaction folded into a snapshot keeps a late seed out after the upgrade", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("delete", ["A"], { remove: true });
+  await a.publish();
+  // The compaction rule (`shouldCompact`) reads the segments' real sizes, so
+  // grow the log until a head carries a snapshot.
+  let snapshot: string | null = null;
+  for (let i = 0; snapshot === null && i < 400; i++) {
+    await a.run(`more-${i}`, [`K${i}`]);
+    await a.publish();
+    [{ snapshot }] = await a.db.query<{ snapshot: string | null }>(
+      "SELECT snapshot FROM log_state",
+    );
+  }
+  expect(snapshot).not.toBeNull();
+  await asBuiltBefore(a);
+  await a.seed("install-2", ["A", "Z"]);
+  expect(await a.keys()).not.toContain("A");
+  expect(await a.keys()).toContain("Z");
 });
 
 it("an explicit delete that has not published yet keeps a seed out", async () => {
@@ -626,6 +697,57 @@ it("an excluded receipt an older build wrote does not stop the stream's seed", a
       "SELECT state, reason FROM import_ledger WHERE stream = 'items'",
     ),
   ).toEqual([{ state: "imported", reason: null }]);
+});
+
+it("an upload still staged after an upgrade is retried under its revision, though the earlier build's receipt names no rows", async () => {
+  const w = await world();
+  const dir = mkdtempSync(join(process.cwd(), ".late-seed-test-"));
+  dirs.push(dir);
+  const a = await w.device("a", join(dir, "db.sqlite"));
+  await a.run("refresh", ["B"]);
+  await a.publish();
+  const intake = seedHost(a, join(dir, "staging"));
+  await intake.put("fixture", "items", upload(["A", "B"]));
+  // What the earlier build left for this very upload: it read a stream a real
+  // write owned, kept the upload staged, and wrote the fingerprint of no rows
+  // under the upload's own revision.
+  const empty = await importFingerprint((async function* () {})());
+  await a.db.batch([
+    // The earlier build never merged A: no row, and no change to prune.
+    { sql: "DELETE FROM records WHERE record_key = 'A'" },
+    { sql: "DELETE FROM record_changes WHERE record_key = 'A'" },
+    {
+      sql: "UPDATE import_ledger SET state = 'excluded', reason = 'seed_window_closed', rows = ?, fingerprint = ?, highest_seq = 0 WHERE stream = 'items'",
+      params: [empty.rows, empty.fingerprint],
+    },
+  ]);
+  expect(await a.keys()).toEqual(["B"]);
+  expect(await intake.status("fixture")).toEqual({
+    targetKnown: true,
+    streams: { items: { state: "merged" } },
+  });
+  expect(await a.keys()).toEqual(["A", "B"]);
+  expect(
+    await a.db.query(
+      "SELECT state, reason, rows FROM import_ledger WHERE stream = 'items'",
+    ),
+  ).toEqual([{ state: "imported", reason: null, rows: 2 }]);
+});
+
+it("the audit lists a final exclusion and leaves out the earlier build's retryable one", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const receipt = (stream: string, reason: string) => ({
+    sql: `INSERT INTO import_ledger (source, connection_id, stream, state, rows, fingerprint, reason, at, revision, generation, highest_seq) VALUES ('s', ?, ?, 'excluded', 0, 'e', ?, 1, 'r', 1, 0)`,
+    params: [connectionId, stream, reason],
+  });
+  await a.db.batch([
+    receipt("retry", "seed_window_closed"),
+    receipt("final", "seed_skipped"),
+  ]);
+  expect(
+    (await a.sync.listing.status({ audit: true })).importExclusions,
+  ).toEqual([{ reason: "seed_skipped", streams: 1 }]);
 });
 
 it("a fresh device that only applied a remote head fills a seed for that stream", async () => {

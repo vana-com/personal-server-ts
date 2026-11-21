@@ -3,6 +3,7 @@ import type { StreamSyncReadStatus } from "../stream-sync-read/service.js";
 import { logicalStreamScopeParts } from "../stream-sync-read/routing.js";
 import type { LocalSyncDeps } from "./deps.js";
 import { readerOf } from "./driver.js";
+import { WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { SEEN_O } from "./merge.js";
 import { streamDigest } from "./stream-digest.js";
 import { createRecordQuery } from "./query.js";
@@ -540,7 +541,8 @@ export function createLocalListing(
           ? {
               importExclusions: (
                 await reads.db.query<{ reason: string; streams: number }>(
-                  "SELECT COALESCE(reason, 'unknown') AS reason, COUNT(*) AS streams FROM import_ledger WHERE state = 'excluded' GROUP BY 1 ORDER BY 1",
+                  "SELECT COALESCE(reason, 'unknown') AS reason, COUNT(*) AS streams FROM import_ledger WHERE state = 'excluded' AND reason IS NOT ? GROUP BY 1 ORDER BY 1",
+                  [WINDOW_CLOSED_REASON],
                 )
               ).map(({ reason, streams }) => ({ reason, streams })),
             }

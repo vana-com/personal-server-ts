@@ -3,6 +3,7 @@ import {
   IDENTITYLESS_NS,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { syncBeforeBegin } from "./bootstrap.js";
+import { recoverLogTombstones } from "./log-tombstone-recovery.js";
 import { TEMP_TABLES, mergeIncoming, withOrigin } from "./merge.js";
 import {
   stageImportSnapshot,
@@ -81,7 +82,9 @@ export type LegacyImportResult =
  * earn a receipt. Replays/crash retries add no rows or changes.
  * A seed only fills (`fillOnly`): it never changes a key the stream holds,
  * and never brings back a key a delete, an omission or a pending removal
- * covers, so it can land after any real write.
+ * covers, so it can land after any real write. Before it fills, the log's own
+ * deletions become tombstones (`recoverLogTombstones`), for a database an
+ * earlier build wrote.
  * Receipt and last merge commit atomically; highestSeq includes earlier crash
  * batches (conservatively use the stream change high-water mark). Empty
  * snapshots receive a zero-row receipt; invalid, changed or excluded sources
@@ -133,13 +136,20 @@ async function importSource(
     if (refreshed) return { kind: "refused", reason: refreshed };
     if (source.exclusions.length > 0)
       return { kind: "refused", reason: "invalid_record" };
+    // A fill needs every deletion this device has made. The build before
+    // `late-seed` kept none of its own published ones; the log still has them.
+    await recoverLogTombstones(deps, connectionId);
     const op = deps.newOp();
     await deps.db.batch(TEMP_TABLES.map((sql) => ({ sql })));
     try {
       const fingerprint = await stageImportSnapshot(deps.db, source, op);
       const prior = await ledger.get(source.source, connectionId, stream);
+      // An excluded receipt (the earlier build's `seed_window_closed`) holds
+      // the fingerprint of no rows, whatever the upload held: it proves nothing
+      // about the source, so a retry of the same staged upload is not a change.
       if (
         prior?.revision === source.revision &&
+        prior.state !== "excluded" &&
         (prior.rows !== fingerprint.rows ||
           prior.fingerprint !== fingerprint.fingerprint)
       )

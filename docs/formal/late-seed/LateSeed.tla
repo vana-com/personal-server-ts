@@ -26,6 +26,16 @@
 \* delete or omission also writes the device's own tombstone. It is local state,
 \* not a wire fact.
 \*
+\* The upgrade. The build before this one wrote no own tombstone, so a device that
+\* published a delete or omission then holds no trace of it once compaction prunes
+\* the pending change. The log still holds every deletion. `bld[d]` is the build
+\* of device d: "old" (publishes write no own tombstone), "new" (they do) and
+\* "rec" (new, and `Recover` has written a tombstone for every deletion in the
+\* log d holds, `recoverLogTombstones` in log-tombstone-recovery.ts). Modes
+\* "upgraded" and "upgradedNoRecover" start every device "old"; `Upgrade` and
+\* `Recover` are enabled only there, so the other configs keep their states.
+\* In "upgraded" a seed waits for "rec"; the mutant lets it run once "new".
+\*
 \* Mutants: each `Mode` breaks one rule; TLC must reject it.
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -51,8 +61,11 @@ VARIABLES log,         \* the connection log: a sequence of segments (sets of op
           knows,       \* knows[d]: d has learned of the wipe
           gdel,        \* ghost: deletions and omissions d authored or applied
           clobbered,   \* ghost: a seed step changed a row a live write made
-          nev          \* real events so far
-vars == <<log, rec, tomb, pend, pos, done, wiped, knows, gdel, clobbered, nev>>
+          nev,         \* real events so far
+          bld          \* bld[d]: "old", "new" or "rec" (see the upgrade above)
+vars == <<log, rec, tomb, pend, pos, done, wiped, knows, gdel, clobbered, nev, bld>>
+
+Upgrading == Mode \in {"upgraded", "upgradedNoRecover"}
 
 Stamps == 0..MaxO
 NoRow == [on |-> FALSE, stamp |-> 0, src |-> "none"]
@@ -93,11 +106,19 @@ SeedOK(d, k) ==
   /\ (Mode = "seedIgnoresPend" \/ PendDel(d, k) = {})
   /\ (Mode # "windowClosed" \/ nev = 0)
 
+\* A seed pass of device d may begin: after the upgrade, only once the device
+\* has recovered its tombstones (the import recovers before it fills, so the
+\* pass, its skips and its receipt all follow it).
+Pass(d) ==
+  /\ (Mode # "upgraded" \/ bld[d] = "rec")
+  /\ (Mode # "upgradedNoRecover" \/ bld[d] # "old")
+
 SeedStamp == IF Mode = "seedStampLive" THEN MaxO + 1 ELSE 0
 
 Receipt(d) == Mode # "noReceipt" /\ done[d] = Keys
 
 Seed(d, k) ==
+  /\ Pass(d)
   /\ ~Receipt(d)
   /\ SeedOK(d, k)
   /\ rec' = [rec EXCEPT ![d][k] = [on |-> TRUE, stamp |-> SeedStamp, src |-> "seed"]]
@@ -105,16 +126,17 @@ Seed(d, k) ==
              ELSE [pend EXCEPT ![d] = @ \cup {[key |-> k, kind |-> "up", stamp |-> SeedStamp]}]
   /\ done' = [done EXCEPT ![d] = @ \cup {k}]
   /\ clobbered' = (clobbered \/ (rec[d][k].on /\ rec[d][k].src = "live"))
-  /\ UNCHANGED <<log, tomb, pos, wiped, knows, gdel, nev>>
+  /\ UNCHANGED <<bld, log, tomb, pos, wiped, knows, gdel, nev>>
 
 \* A seed pass finds nothing to fill for a key it must leave (the guard says no):
 \* the key is handled, and the pass can end.
 SeedSkip(d, k) ==
+  /\ Pass(d)
   /\ ~Receipt(d)
   /\ ~SeedOK(d, k)
   /\ k \notin done[d]
   /\ done' = [done EXCEPT ![d] = @ \cup {k}]
-  /\ UNCHANGED <<log, rec, tomb, pend, pos, wiped, knows, gdel, clobbered, nev>>
+  /\ UNCHANGED <<bld, log, rec, tomb, pend, pos, wiped, knows, gdel, clobbered, nev>>
 
 \* ---- real writes ---------------------------------------------------------
 LiveUp(d, k, o) ==
@@ -122,7 +144,7 @@ LiveUp(d, k, o) ==
   /\ rec' = [rec EXCEPT ![d][k] = [on |-> TRUE, stamp |-> o, src |-> "live"]]
   /\ pend' = [pend EXCEPT ![d] = @ \cup {[key |-> k, kind |-> "up", stamp |-> o]}]
   /\ nev' = nev + 1
-  /\ UNCHANGED <<log, tomb, pos, done, wiped, knows, gdel, clobbered>>
+  /\ UNCHANGED <<bld, log, tomb, pos, done, wiped, knows, gdel, clobbered>>
 
 LiveRemove(d, k, o, kind) ==
   /\ nev < MaxEv /\ ~knows[d] /\ o \in 1..MaxO /\ o > Known(d, k)
@@ -131,7 +153,7 @@ LiveRemove(d, k, o, kind) ==
   /\ pend' = [pend EXCEPT ![d] = @ \cup {[key |-> k, kind |-> kind, stamp |-> o]}]
   /\ gdel' = [gdel EXCEPT ![d] = @ \cup {[key |-> k, kind |-> kind, stamp |-> o]}]
   /\ nev' = nev + 1
-  /\ UNCHANGED <<log, tomb, pos, done, wiped, knows, clobbered>>
+  /\ UNCHANGED <<bld, log, tomb, pos, done, wiped, knows, clobbered>>
 
 \* ---- publish and apply ---------------------------------------------------
 \* The ops a device publishes from its pending changes: an upsert goes as what the
@@ -155,21 +177,21 @@ Publish(d) ==
   /\ log' = Append(log, OpsOfPend(d))
   /\ pos' = [pos EXCEPT ![d] = Len(log) + 1]
   /\ pend' = [pend EXCEPT ![d] = {}]
-  /\ tomb' = IF Mode = "ownTombOff" THEN tomb
+  /\ tomb' = IF Mode = "ownTombOff" \/ bld[d] = "old" THEN tomb
              ELSE [tomb EXCEPT ![d] = [k \in Keys |->
                     LET dels == {op \in OpsOfPend(d) : op.key = k /\ op.kind # "up"}
                     IN IF dels = {} THEN @[k]
                        ELSE MergeTomb(@[k],
                               (CHOOSE op \in dels : \A o2 \in dels : o2.stamp <= op.stamp).stamp,
                               Rank((CHOOSE op \in dels : \A o2 \in dels : o2.stamp <= op.stamp).kind))]]
-  /\ UNCHANGED <<rec, done, wiped, knows, gdel, clobbered, nev>>
+  /\ UNCHANGED <<bld, rec, done, wiped, knows, gdel, clobbered, nev>>
 
 \* Nothing to send: the pending upserts are for keys the device no longer holds.
 \* Publish drops them (`commitIdle` in log-publish.ts).
 Drop(d) ==
   /\ pend[d] # {} /\ OpsOfPend(d) = {}
   /\ pend' = [pend EXCEPT ![d] = {}]
-  /\ UNCHANGED <<log, rec, tomb, pos, done, wiped, knows, gdel, clobbered, nev>>
+  /\ UNCHANGED <<bld, log, rec, tomb, pos, done, wiped, knows, gdel, clobbered, nev>>
 
 \* An applied operation of segment i on device d.
 ApplyOp(d, op, t, r) ==
@@ -208,7 +230,30 @@ Apply(d) ==
               {[key |-> op.key, kind |-> op.kind, stamp |-> op.stamp] :
                  op \in {x \in seg : x.kind # "up"}}]
   /\ pos' = [pos EXCEPT ![d] = @ + 1]
-  /\ UNCHANGED <<log, pend, done, wiped, knows, clobbered, nev>>
+  /\ UNCHANGED <<bld, log, pend, done, wiped, knows, clobbered, nev>>
+
+\* ---- the upgrade ---------------------------------------------------------
+Upgrade(d) ==
+  /\ Upgrading /\ bld[d] = "old"
+  /\ bld' = [bld EXCEPT ![d] = "new"]
+  /\ UNCHANGED <<log, rec, tomb, pend, pos, done, wiped, knows, gdel, clobbered, nev>>
+
+\* Write the tombstone of every deletion and omission in the log d holds
+\* (positions 1..pos[d]): the greatest (stamp, rank) per key, merged into what d
+\* already has.
+LogDels(d, k) ==
+  {op \in UNION {log[i] : i \in 1..pos[d]} : op.key = k /\ op.kind # "up"}
+
+Recover(d) ==
+  /\ Upgrading /\ bld[d] = "new"
+  /\ tomb' = [tomb EXCEPT ![d] = [k \in Keys |->
+        IF LogDels(d, k) = {} THEN @[k]
+        ELSE LET best == CHOOSE op \in LogDels(d, k) :
+                           \A o2 \in LogDels(d, k) :
+                             ~After(o2.stamp, Rank(o2.kind), op.stamp, Rank(op.kind))
+             IN MergeTomb(@[k], best.stamp, Rank(best.kind))]]
+  /\ bld' = [bld EXCEPT ![d] = "rec"]
+  /\ UNCHANGED <<log, rec, pend, pos, done, wiped, knows, gdel, clobbered, nev>>
 
 \* ---- the person deletes the connection -----------------------------------
 Wipe(d) ==
@@ -218,14 +263,14 @@ Wipe(d) ==
   /\ rec' = [rec EXCEPT ![d] = [k \in Keys |-> NoRow]]
   /\ pend' = [pend EXCEPT ![d] = {}]
   /\ nev' = nev + 1
-  /\ UNCHANGED <<log, tomb, pos, done, gdel, clobbered>>
+  /\ UNCHANGED <<bld, log, tomb, pos, done, gdel, clobbered>>
 
 LearnWipe(d) ==
   /\ wiped /\ ~knows[d]
   /\ knows' = [knows EXCEPT ![d] = TRUE]
   /\ rec' = [rec EXCEPT ![d] = [k \in Keys |-> NoRow]]
   /\ pend' = [pend EXCEPT ![d] = {}]
-  /\ UNCHANGED <<log, tomb, pos, done, wiped, gdel, clobbered, nev>>
+  /\ UNCHANGED <<bld, log, tomb, pos, done, wiped, gdel, clobbered, nev>>
 
 Init ==
   /\ log = <<>>
@@ -239,6 +284,7 @@ Init ==
   /\ gdel = [d \in Devs |-> {}]
   /\ clobbered = FALSE
   /\ nev = 0
+  /\ bld = [d \in Devs |-> IF Upgrading THEN "old" ELSE "new"]
 
 Next ==
   \E d \in Devs :
@@ -246,6 +292,7 @@ Next ==
     \/ \E k \in Keys, o \in 1..MaxO : LiveUp(d, k, o)
     \/ \E k \in Keys, o \in 1..MaxO : LiveRemove(d, k, o, "del") \/ LiveRemove(d, k, o, "omit")
     \/ Publish(d) \/ Drop(d) \/ Apply(d) \/ Wipe(d) \/ LearnWipe(d)
+    \/ Upgrade(d) \/ Recover(d)
 
 Spec == Init /\ [][Next]_vars
 
@@ -253,6 +300,7 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
   /\ \A d \in Devs, k \in Keys : rec[d][k].stamp \in 0..(MaxO + 1)
   /\ \A d \in Devs : pos[d] \in 0..Len(log)
+  /\ \A d \in Devs : bld[d] \in {"old", "new", "rec"}
 
 \* A record a device deleted or saw deleted never comes back on that device: a
 \* row it holds for the key is newer than the deletion.

@@ -14,6 +14,15 @@ export interface ImportLedger {
   statements(receipt: ImportReceipt): readonly SqlStatement[];
 }
 
+/**
+ * The reason the build before `late-seed` wrote on the `excluded` receipt of a
+ * stream a real write already owned. It is not final: a seed only fills now, so
+ * the stream's upload is merged again. Every other `excluded` receipt
+ * (`seed_skipped`, the seeds purged with a reset stream) stays final. The seed
+ * and the audit both read this one rule.
+ */
+export const WINDOW_CLOSED_REASON = "seed_window_closed";
+
 const nonempty = (value: unknown): value is string =>
   typeof value === "string" && value.trim().length > 0;
 const nonnegativeInteger = (value: unknown): value is number =>

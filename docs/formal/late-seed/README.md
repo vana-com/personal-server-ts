@@ -51,30 +51,55 @@ the device's own `log_tombstones` row (`tombstoneStatements` in `log-batch.ts`,
 called by `candidateAcknowledgements` in `log-publish.ts`). It writes nothing to
 the wire.
 
+## Upgrade
+
+The repair above covers a delete published after it ships. A device on the build
+before it may already have published a delete, compacted its pending change and
+kept no tombstone. The seed cannot tell that key from one the stream never held,
+and the owner's deleted record comes back (`MutUpgradedNoRecover`, depth 6):
+
+1. `LiveUp` k, `LiveRemove` k (explicit delete), `Publish` on the old build:
+   no own tombstone, and the pending change is pruned.
+2. `Upgrade`: the device runs the new build.
+3. `Seed` k: the record is live under the seed stamp.
+
+The log still holds every deletion (a snapshot keeps every tombstone), so the
+repair is local too. Before an import fills a connection, `recoverLogTombstones`
+(`log-tombstone-recovery.ts`) writes the tombstone of every deletion and
+omission in the log the device holds. The model has `bld[d]` ("old", "new",
+"rec"), `Upgrade` and `Recover`, enabled only in the two upgrade modes; a seed
+pass (its fills, skips and receipt) begins only at "rec". In the mutant it
+begins at "new".
+
 ## Results
 
-Run with `TLA2TOOLS=<tla2tools.jar> ./run.sh <Config>` (one job, 4 workers,
-`nice -n 19 ionice -c3`). Constants: two keys, two devices, `MaxO = 2`,
+Run with `TLA2TOOLS=<tla2tools.jar> [WORKERS=2] ./run.sh <Config>` (one job, 4
+workers unless `WORKERS` says otherwise, `nice -n 19 ionice -c3`). Constants: two keys, two devices, `MaxO = 2`,
 `MaxEv = 3`, `MaxLog = 5`. Logs are in `traces/`.
 
 | Config                                   | Result                                                                                                                                      |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Good`                                   | No error. 23,516,317 states generated, 8,227,927 distinct, depth 19.                                                                        |
+| `Good`                                   | No error. 30,351,465 states generated, 8,227,927 distinct, depth 19.                                                                        |
 | `MutOwnTombOff-NoResurrection`           | `NoResurrection` violated, depth 5.                                                                                                         |
 | `MutOwnTombOff-RetryAddsNothing`         | `RetryAddsNothing` violated, depth 5.                                                                                                       |
 | `MutSeedIgnoresTomb-NoResurrection`      | `NoResurrection` violated, depth 5.                                                                                                         |
 | `MutSeedIgnoresPend-NoResurrection`      | `NoResurrection` violated, depth 4.                                                                                                         |
-| `MutSeedOverwrite-SeedNeverClobbersLive` | `SeedNeverClobbersLive` violated, depth 3.                                                                                                  |
-| `MutSeedStampLive-LiveWins`              | `LiveWins` violated, depth 7.                                                                                                               |
+| `MutSeedOverwrite-SeedNeverClobbersLive` | `SeedNeverClobbersLive` violated, depth 4.                                                                                                  |
+| `MutSeedStampLive-LiveWins`              | `LiveWins` violated, depth 6.                                                                                                               |
 | `MutSeedNotPublished-Convergence`        | `Convergence` violated, depth 2.                                                                                                            |
-| `MutSeedIgnoresWipe-WipeStays`           | `WipeStays` violated, depth 3.                                                                                                              |
+| `MutSeedIgnoresWipe-WipeStays`           | `WipeStays` violated, depth 4.                                                                                                              |
 | `MutWindowClosed-Fills`                  | `Fills` violated, depth 8: the old window leaves keys unfilled.                                                                             |
+| `Upgraded`                               | No error, all invariants of `Good`. 31,740,157 states generated, 8,638,953 distinct, depth 21 (`MaxLog = 4`).                               |
+| `MutUpgradedNoRecover-NoResurrection`    | `NoResurrection` violated, depth 6: the seed runs on the new build before it recovers.                                                      |
 | `MutNoReceipt-all`                       | Same state count as `Good`, no error: the model's retry safety comes from the fill rule, so the receipt is a cost bound, not a safety rule. |
 
 This is bounded model evidence. It is not a refinement proof of the SQL.
 Tests in `packages/server/src/localdb/late-seed.test.ts` run each invariant
 against the real code, and two mutations of that code (no own tombstones; no
-`fillOnly`) turn four and eight of them red.
+`fillOnly`) turn four and eight of them red. Three upgrade tests drop the
+tombstones a device holds, as the earlier build left them (a published delete, a
+published omission, a delete folded into a snapshot), and turn red without
+`recoverLogTombstones`.
 
 ## Known limits
 

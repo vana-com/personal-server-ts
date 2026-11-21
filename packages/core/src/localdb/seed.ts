@@ -3,7 +3,7 @@ import {
   IDENTITYLESS_NS,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { withScopeLock } from "../additions/scope-lock.js";
-import { createImportLedger } from "./import-ledger.js";
+import { createImportLedger, WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { importLegacySource } from "./legacy-import.js";
 import { syncBeforeBegin } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
@@ -104,14 +104,6 @@ export function createSeedIntake(seed: LocalSeedCapability): SeedIntake {
   };
 }
 
-/**
- * The reason an earlier build wrote on the `excluded` receipt of a stream a real
- * write already owned. Such a receipt is not final: a seed only fills now
- * (`importLegacySource`), so the stream's upload is merged again. Every other
- * `excluded` receipt (`seed_skipped`, the seeds purged with a reset stream)
- * stays final.
- */
-const WINDOW_CLOSED_REASON = "seed_window_closed";
 const isFinalReceipt = (receipt: ImportReceipt) =>
   ["imported", "verified", "retired"].includes(receipt.state) ||
   (receipt.state === "excluded" && receipt.reason !== WINDOW_CLOSED_REASON);
