@@ -64,39 +64,64 @@ export interface RunIntakeStore {
 /**
  * What `begin` reads as a connector's START state, without a run: the
  * connection's checkpoint entry per stream, with the connector version that
- * wrote it. The applied cursors are folded first, as before every read of the
- * checkpoint, so a cursor another device published is included. A stream
- * flagged `needs_full` is left out, as `begin` would read it in full. A
- * deleted connection, or one with no checkpoint, has none.
+ * wrote it. It takes the same basis `begin` does: the registry is read and
+ * applied first (`syncBeforeBegin`, a foreign control row reported, not
+ * saved), so a connection deleted or reconnected on another device is not
+ * read from a stale local view, and the applied cursors are folded, as before
+ * every read of the checkpoint. A connection whose control row is not this
+ * owner's, is deleted, or cannot be read from the registry has none; so does
+ * one with a stream flagged `needs_full`, as `begin` would read the whole
+ * connection in full.
+ *
+ * `cursorVersion` is the version of the connector that wrote the stream's
+ * entry as this device knows it (`stream_state.cursor_version`); a fold stamps
+ * it with the published cursor's version, so it can be newer than the entry a
+ * reader holds in between. A reader that compares it with its own connector
+ * version therefore errs on the side of a full read.
  */
 async function readConnectionCheckpoint(
-  db: LocalSyncDeps["db"],
+  deps: LocalSyncDeps,
   connector: string,
 ): Promise<ConnectionCheckpoint | null> {
+  const { db } = deps;
   const id = controlScope(connector, "");
+  const synced = await syncBeforeBegin(deps, connector, { foreign: "report" });
+  if (
+    synced.unreachable ||
+    !synced.connection ||
+    synced.connection.controlState === "deleted" ||
+    synced.connection.controlState === "foreign" ||
+    synced.control?.kind === "foreign" ||
+    synced.control?.kind === "deleted"
+  )
+    return null;
   await foldAppliedCursors(db, id);
   const [row] = await db.query<{
     checkpoint: string | null;
     control_state: string;
+    needs_full: number;
   }>(
-    "SELECT checkpoint, control_state FROM connections WHERE connection_id=?",
+    `SELECT c.checkpoint, c.control_state,
+      EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id=c.connection_id AND s.needs_full=1) AS needs_full
+      FROM connections c WHERE c.connection_id=?`,
     [id],
   );
-  if (!row || row.checkpoint === null || row.control_state === "deleted")
+  if (
+    !row ||
+    row.checkpoint === null ||
+    row.control_state === "deleted" ||
+    row.needs_full === 1
+  )
     return null;
   const stored: unknown = JSON.parse(row.checkpoint);
   if (!isPlainObject(stored)) return null;
   const versions = new Map(
     (
-      await db.query<{
-        stream: string;
-        cursor_version: string | null;
-        needs_full: number;
-      }>(
-        "SELECT stream, cursor_version, needs_full FROM stream_state WHERE connection_id=?",
+      await db.query<{ stream: string; cursor_version: string | null }>(
+        "SELECT stream, cursor_version FROM stream_state WHERE connection_id=?",
         [id],
       )
-    ).map((entry) => [entry.stream, entry]),
+    ).map((entry) => [entry.stream, entry.cursor_version]),
   );
   const streams: Record<
     string,
@@ -105,11 +130,8 @@ async function readConnectionCheckpoint(
   for (const [stream, state] of Object.entries(
     stored as Record<string, JsonValue>,
   )) {
-    if (state === undefined || versions.get(stream)?.needs_full === 1) continue;
-    streams[stream] = {
-      state,
-      cursorVersion: versions.get(stream)?.cursor_version ?? null,
-    };
+    if (state === undefined) continue;
+    streams[stream] = { state, cursorVersion: versions.get(stream) ?? null };
   }
   return Object.keys(streams).length ? { connectionId: id, streams } : null;
 }
@@ -245,7 +267,7 @@ export function createRunIntakeStore(
     return run;
   }
   return {
-    checkpoint: (connector) => readConnectionCheckpoint(deps.db, connector),
+    checkpoint: (connector) => readConnectionCheckpoint(deps, connector),
     begin: (runId, req, declarations) =>
       serial(runId, async () => {
         if (

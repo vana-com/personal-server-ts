@@ -342,8 +342,11 @@ export interface ConnectionCheckpoint {
   /**
    * Per stream with a saved cursor: the connector's STATE for it and the
    * version of the connector that wrote it (here or on another device), or
-   * null when no run has stamped one yet. A stream marked to be read in full
-   * next is left out: its cursor would not be handed to a run either.
+   * null when no run has stamped one yet. `cursorVersion` may be newer than
+   * the state beside it (a fold stamps the published cursor's version), so a
+   * reader comparing it with its own connector version errs towards a full
+   * read. A connection with a stream marked to be read in full next has no
+   * cursors at all: `begin` reads the whole connection in full then.
    */
   readonly streams: Readonly<
     Record<
@@ -360,9 +363,11 @@ export interface RunIntake {
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
   /**
    * The connection's saved cursors for `connector`, or null when it has none
-   * (no connection, no checkpoint, or a deleted connection). A read: it opens
-   * no run and needs no artifact. Optional: a host over an older writer has
-   * none, and reads in full.
+   * (no connection, no checkpoint, a deleted or foreign connection, a
+   * registry that cannot be read, or a stream that must be read in full). It
+   * reads the registry first, as `begin` does, so another device's delete or
+   * reconnect is seen. A read: it opens no run and needs no artifact.
+   * Optional: a host over an older writer has none, and reads in full.
    */
   checkpoint?(connector: string): Promise<ConnectionCheckpoint | null>;
   /**

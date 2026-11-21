@@ -64,7 +64,13 @@ describe("connection checkpoint read", () => {
     }
   });
 
-  async function open(version = "1") {
+  async function open(
+    version = "1",
+    shared: {
+      registry?: ReturnType<typeof createMemoryStreamSyncRegistry>;
+      blobs?: ReturnType<typeof createMemoryStreamSyncBlobs>;
+    } = {},
+  ) {
     const root = mkdtempSync(join(homedir(), ".tmp", "connection-checkpoint-"));
     roots.push(root);
     const db = await openLocalDb(driver(join(root, "data.db")), {
@@ -96,8 +102,8 @@ describe("connection checkpoint read", () => {
         db,
         queue: connectionQueue(),
         ownerAddress: owner,
-        registry: createMemoryStreamSyncRegistry(),
-        blobs: createMemoryStreamSyncBlobs(),
+        registry: shared.registry ?? createMemoryStreamSyncRegistry(),
+        blobs: shared.blobs ?? createMemoryStreamSyncBlobs(),
         keys: {
           namespaceHmac: async () => new Uint8Array(32),
           encrypt: async (_s, b) => b,
@@ -120,6 +126,43 @@ describe("connection checkpoint read", () => {
     owner: { address: owner, leaseId: null },
     connect: true as const,
   };
+
+  it("sees a connection another device deleted, through the registry, instead of its own stale checkpoint", async () => {
+    const registry = createMemoryStreamSyncRegistry();
+    const blobs = createMemoryStreamSyncBlobs();
+    const here = await open("1", { registry, blobs });
+    const elsewhere = await open("1", { registry, blobs });
+    try {
+      await here.sync.intake.begin("run-1", request);
+      await here.sync.intake.batch("run-1", {
+        batch: 0,
+        records: [
+          { stream: "items", data: { id: "one" } },
+          { stream: "notes", data: { id: "n1" } },
+        ],
+      });
+      await here.sync.intake.end("run-1", {
+        finish: "completed",
+        streams: { items: observed(true), notes: observed(true) },
+        checkpoints: { items: { cursor: "a" }, notes: { cursor: "b" } },
+        lastBatch: 0,
+      });
+      await here.sync.publish();
+      expect(await here.sync.intake.checkpoint?.("fixture")).not.toBeNull();
+      // The other device joins the connection and deletes it.
+      await elsewhere.sync.cycle();
+      await elsewhere.sync.deleter.requestConnectionDelete("fixture");
+      await elsewhere.sync.cycle();
+      // The local row still holds yesterday's checkpoint until the registry is read.
+      expect(await here.db.query("SELECT checkpoint FROM connections")).toEqual(
+        [{ checkpoint: expect.any(String) }],
+      );
+      expect(await here.sync.intake.checkpoint?.("fixture")).toBeNull();
+    } finally {
+      await here.sync.close();
+      await elsewhere.sync.close();
+    }
+  });
 
   it("is null before any run, and for a connector with no connection", async () => {
     const { sync } = await open();
@@ -185,7 +228,7 @@ describe("connection checkpoint read", () => {
     }
   });
 
-  it("leaves out a stream that must be read in full next, and is null once the checkpoint is cleared", async () => {
+  it("has no cursors while any stream must be read in full next (begin reads the whole connection then), and none once the checkpoint is cleared", async () => {
     const { db, sync } = await open();
     try {
       await sync.intake.begin("run-1", request);
@@ -214,10 +257,15 @@ describe("connection checkpoint read", () => {
           params: [],
         },
       ]);
-      const partial = await sync.intake.checkpoint?.("fixture");
-      expect(partial?.streams).toEqual({
-        notes: { state: { cursor: "b" }, cursorVersion: "1" },
-      });
+      expect(await sync.intake.checkpoint?.("fixture")).toBeNull();
+      await db.batch([
+        { sql: "UPDATE stream_state SET needs_full = 0", params: [] },
+      ]);
+      expect(
+        Object.keys(
+          (await sync.intake.checkpoint?.("fixture"))?.streams ?? {},
+        ).sort(),
+      ).toEqual(["items", "notes"]);
       await db.batch([
         { sql: "UPDATE connections SET checkpoint = NULL", params: [] },
       ]);
