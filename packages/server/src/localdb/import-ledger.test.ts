@@ -93,11 +93,14 @@ describe("import ledger", () => {
       },
     ]);
 
-    // A replay must use its prior committed sequence, not its zero change count.
-    expect(() => ledger.statements({ ...updated, highestSeq: 0 })).toThrow(
-      "Invalid import receipt",
-    );
+    // A replay keeps its prior committed sequence, not its zero change count.
+    // Zero with rows is a valid receipt: a seed only fills, and when every key
+    // was already held or covered by a tombstone it logs no change.
+    await db.batch(ledger.statements({ ...updated, highestSeq: 0 }));
     expect(await lookup(db)).toEqual(updated);
+    const filled = receipt({ source: "all-held-source", highestSeq: 0 });
+    await db.batch(ledger.statements(filled));
+    expect(await lookup(db, filled)).toEqual(filled);
 
     for (const other of [
       receipt({ source: "other-source" }),
@@ -199,7 +202,6 @@ describe("import ledger", () => {
       ["highest_seq", null],
       ["highest_seq", "unknown"],
       ["highest_seq", -1],
-      ["highest_seq", 0],
       ["highest_seq", 1.5],
       ["highest_seq", Number.MAX_SAFE_INTEGER + 1],
       ["rows", -1],

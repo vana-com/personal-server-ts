@@ -172,7 +172,7 @@ it("imports a phone snapshot through the real Lite runtime and reopens its recei
   });
 });
 
-it("skips a late seed once a real collection owns the stream", async () => {
+it("fills a late seed into a stream a real collection owns, without overwriting it", async () => {
   const f = await fixture();
   const context = await f.boot();
   const intake = context.streamSyncIntake!;
@@ -198,28 +198,34 @@ it("skips a late seed once a real collection owns the stream", async () => {
       { id: "b", value: "seed-only" },
     ]),
   );
-  // Old data is a one-time seed: the real full refresh won, so neither the
-  // stale "a" nor the seed-only "b" comes back, and the skip is a final receipt.
+  // The seed fills what the stream lacks: the real "a" stays, the old "b" is
+  // added under the seed stamp, and the stream's own receipt says so.
+  expect(
+    await f
+      .driver()
+      .query(
+        "SELECT record_key, stamp_r FROM records WHERE stream = 'items' ORDER BY record_key",
+      ),
+  ).toMatchObject([
+    {
+      record_key: expect.stringContaining("a"),
+      stamp_r: expect.not.stringMatching(/^seed$/),
+    },
+    { record_key: expect.stringContaining("b"), stamp_r: "seed" },
+  ]);
   expect(await read(context)).toMatchObject({
-    data: { records: [{ id: "a", value: "new" }] },
+    data: {
+      records: [
+        { id: "a", value: "new" },
+        { id: "b", value: "seed-only" },
+      ],
+    },
   });
   expect(
     await f
       .driver()
-      .query("SELECT record_key FROM records WHERE stamp_r = 'seed'"),
-  ).toEqual([]);
-  expect(
-    await f
-      .driver()
       .query("SELECT stream, state, reason, rows FROM import_ledger"),
-  ).toEqual([
-    {
-      stream: "items",
-      state: "excluded",
-      reason: "seed_window_closed",
-      rows: 0,
-    },
-  ]);
+  ).toEqual([{ stream: "items", state: "imported", reason: null, rows: 2 }]);
   expect(
     await context.runtime.streamSyncSeed!.status("fixture-source"),
   ).toEqual({ targetKnown: true, streams: { items: { state: "merged" } } });

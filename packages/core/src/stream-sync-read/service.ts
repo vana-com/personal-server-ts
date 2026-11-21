@@ -251,8 +251,9 @@ export interface StreamSyncReadStatus {
   /**
    * Present only when the status was asked for with `audit`. The seed imports
    * this database refused for good, from its import ledger: one entry per
-   * reason, counting the streams (`seed_window_closed`: a real write already
-   * owned the stream, so the old data was skipped). Durable across restarts.
+   * reason, counting the streams (`seed_skipped`: the seeds of a reset stream were
+   * purged). An exclusion that a retry still merges (`WINDOW_CLOSED_REASON`) is
+   * not listed. Durable across restarts.
    */
   readonly importExclusions?: readonly {
     readonly reason: string;

@@ -3,12 +3,11 @@ import {
   IDENTITYLESS_NS,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { withScopeLock } from "../additions/scope-lock.js";
-import { createImportLedger } from "./import-ledger.js";
+import { createImportLedger, WINDOW_CLOSED_REASON } from "./import-ledger.js";
 import { importLegacySource } from "./legacy-import.js";
-import { importFingerprint } from "./import-fingerprint.js";
 import { syncBeforeBegin } from "./bootstrap.js";
 import type { LocalSyncDeps } from "./deps.js";
-import type { ImportSource } from "./legacy-import-types.js";
+import type { ImportReceipt, ImportSource } from "./legacy-import-types.js";
 import { manifestArtifact } from "../stream-sync/artifacts.js";
 import { ProtocolError } from "../errors/catalog.js";
 import {
@@ -104,6 +103,10 @@ export function createSeedIntake(seed: LocalSeedCapability): SeedIntake {
       ),
   };
 }
+
+const isFinalReceipt = (receipt: ImportReceipt) =>
+  ["imported", "verified", "retired"].includes(receipt.state) ||
+  (receipt.state === "excluded" && receipt.reason !== WINDOW_CLOSED_REASON);
 
 /** Host staging feeds the same SQL seed importer as native
  * legacy access. The host supplies its one open database and verified artifacts.
@@ -202,10 +205,7 @@ export function createLocalSeed(options: {
           connectionId,
           stream,
         );
-        if (
-          prior &&
-          ["imported", "verified", "retired", "excluded"].includes(prior.state)
-        ) {
+        if (prior && isFinalReceipt(prior)) {
           receipts[stream] = "merged";
           continue;
         }
@@ -232,29 +232,6 @@ export function createLocalSeed(options: {
           records: () => source.records(connector, stream),
         };
         const result = await importLegacySource(locked, ledger, imported);
-        if (
-          result.kind === "refused" &&
-          result.reason === "seed_window_closed"
-        ) {
-          // A real write already owns this stream. The old data is skipped
-          // for good: an excluded receipt is final and is never re-imported.
-          await deps.db.batch([
-            ...ledger.statements({
-              ...(await importFingerprint((async function* () {})())),
-              source: imported.source,
-              revision: imported.revision,
-              connectionId,
-              stream,
-              generation: 1,
-              highestSeq: 0,
-              state: "excluded",
-              reason: "seed_window_closed",
-              at: deps.now(),
-            }),
-          ]);
-          receipts[stream] = "merged";
-          continue;
-        }
         if (result.kind === "refused") {
           if (result.reason === "connection_deleted")
             throw new ProtocolError(
@@ -267,10 +244,12 @@ export function createLocalSeed(options: {
         receipts[stream] = "merged";
       }
       // Finished imports and authoritative exclusions remain receipts after
-      // staging cleanup and restart. An excluded seed must never be re-imported.
+      // staging cleanup and restart.
       const stored = await deps.db.query<{ stream: string }>(
-        "SELECT stream FROM import_ledger WHERE source = ? AND connection_id = ? AND state IN ('imported','verified','retired','excluded')",
-        [sourceName(install, connector), connectionId],
+        `SELECT stream FROM import_ledger WHERE source = ? AND connection_id = ?
+           AND (state IN ('imported','verified','retired')
+                OR (state = 'excluded' AND reason IS NOT ?))`,
+        [sourceName(install, connector), connectionId, WINDOW_CLOSED_REASON],
       );
       for (const row of stored) receipts[row.stream] = "merged";
       return { targetKnown, receipts };

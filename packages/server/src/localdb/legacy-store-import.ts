@@ -36,7 +36,7 @@ import { importProjection } from "./sync.js";
  *   and older copies of a connection; `undeclared_source`, `undeclared_stream`,
  *   `unbound_store`, ... are stores with no verified declaration).
  * - `refused`: sources the database turned down, by its reason
- *   (`seed_window_closed`: a real write already owns the stream).
+ *   (`generation_not_one`, `connection_deleted`, `source_changed`, ...).
  * - `files`: old data files seen at retirement, and those with no importable
  *   source (file-only scopes). `null` when the retirement pass failed.
  *

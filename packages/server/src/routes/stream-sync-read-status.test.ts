@@ -196,7 +196,7 @@ describe("stream-sync read status route", () => {
           },
         ],
         ...(options?.audit
-          ? { importExclusions: [{ reason: "seed_window_closed", streams: 2 }] }
+          ? { importExclusions: [{ reason: "seed_skipped", streams: 2 }] }
           : {}),
       }));
       const route = streamSyncReadStatusRoutes({
@@ -238,7 +238,7 @@ describe("stream-sync read status route", () => {
           },
         ],
         seedExclusions: {
-          ledger: [{ reason: "seed_window_closed", streams: 2 }],
+          ledger: [{ reason: "seed_skipped", streams: 2 }],
           legacyStore: report,
         },
       });

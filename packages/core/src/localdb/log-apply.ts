@@ -630,13 +630,18 @@ function snapshotItems(
   }));
 }
 
-/** One segment, fetched, decrypted and verified against the hash and position. */
+/**
+ * One segment, fetched, decrypted and verified against the hash and position.
+ * With `deletionsOnly` the upserts are dropped before their out-of-line bodies
+ * are fetched: a reader that wants only what the log removed pays for no body.
+ */
 export async function fetchSegment(
   deps: LocalSyncDeps,
   scope: string,
   context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
   dataHash: string,
   position: number,
+  deletionsOnly = false,
 ): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
   const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
   if (cipher === null)
@@ -663,18 +668,28 @@ export async function fetchSegment(
     );
   const segment: Segment = {
     ...verified.segment,
-    operations: await resolveBodies(deps, scope, verified.segment.operations),
+    operations: await resolveBodies(
+      deps,
+      scope,
+      deletionsOnly
+        ? verified.segment.operations.filter((op) => !isUpsert(op))
+        : verified.segment.operations,
+    ),
   };
   return { segment, bytes: verified.bytes, cipherBytes: cipher.length };
 }
 
-/** One snapshot part, fetched, decrypted and verified. */
+const isUpsert = (op: { readonly kind: string }) =>
+  op.kind === "upsert" || op.kind === "upsert-ref";
+
+/** One snapshot part, fetched, decrypted and verified (`deletionsOnly`: see `fetchSegment`). */
 export async function fetchSnapshotPart(
   deps: LocalSyncDeps,
   scope: string,
   context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
   dataHash: string,
   position: number,
+  deletionsOnly = false,
 ): Promise<SnapshotPart> {
   const cipher = await deps.blobs.get(
     `${scope}/${snapshotPartBlobName(dataHash)}`,
@@ -700,7 +715,13 @@ export async function fetchSnapshotPart(
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
   return {
     ...verified.part,
-    entries: await resolveBodies(deps, scope, verified.part.entries),
+    entries: await resolveBodies(
+      deps,
+      scope,
+      deletionsOnly
+        ? verified.part.entries.filter((entry) => !isUpsert(entry))
+        : verified.part.entries,
+    ),
   };
 }
 
