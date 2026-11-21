@@ -5,12 +5,24 @@
  * sampler misses.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { run } from "./memory-oracle.js";
+import { createTempRoot, run } from "./memory-oracle.js";
 
 const WORKLOADS = fileURLToPath(
   new URL("./memory-oracle.calibration.ts", import.meta.url),
@@ -88,4 +100,123 @@ describe("memory-oracle calibration", () => {
     });
     expect(r.peakBytes).toBeGreaterThanOrEqual(0.9 * HELD_MiB * MiB);
   }, 60_000);
+});
+
+describe("memory-oracle temp roots", () => {
+  function withTempParent(run: (parent: string) => void): void {
+    const parent = mkdtempSync(join(tmpdir(), "memory-oracle-roots-"));
+    try {
+      run(parent);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  }
+
+  it("disposes a root and can safely dispose it again", () => {
+    withTempParent((parent) => {
+      const { root, dispose } = createTempRoot("oracle-", parent);
+      expect(existsSync(root)).toBe(true);
+      dispose();
+      expect(existsSync(root)).toBe(false);
+      expect(dispose).not.toThrow();
+    });
+  });
+
+  it("keeps a live owner's root when a second root is created", () => {
+    withTempParent((parent) => {
+      const first = createTempRoot("oracle-", parent);
+      try {
+        const second = createTempRoot("oracle-", parent);
+        try {
+          expect(existsSync(first.root)).toBe(true);
+          expect(second.root).not.toBe(first.root);
+        } finally {
+          second.dispose();
+        }
+      } finally {
+        first.dispose();
+      }
+    });
+  });
+
+  it("disposes a root even when setup throws", () => {
+    withTempParent((parent) => {
+      const { root, dispose } = createTempRoot("oracle-", parent);
+      expect(() => {
+        try {
+          throw new Error("synthetic setup failure");
+        } finally {
+          dispose();
+        }
+      }).toThrow("synthetic setup failure");
+      expect(existsSync(root)).toBe(false);
+    });
+  });
+
+  it("reaps only old markerless roots and never follows a sibling symlink", () => {
+    withTempParent((parent) => {
+      const old = mkdtempSync(join(parent, "oracle-"));
+      const fresh = mkdtempSync(join(parent, "oracle-"));
+      const other = mkdtempSync(join(parent, "other-"));
+      const link = join(parent, "oracle-abcdef");
+      const yesterday = new Date(Date.now() - 25 * 60 * 60 * 1_000);
+      utimesSync(old, yesterday, yesterday);
+      utimesSync(other, yesterday, yesterday);
+      symlinkSync(other, link, "dir");
+      const next = createTempRoot("oracle-", parent);
+      try {
+        expect(existsSync(old)).toBe(false);
+        expect(existsSync(fresh)).toBe(true);
+        expect(existsSync(other)).toBe(true);
+        expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      } finally {
+        next.dispose();
+      }
+    });
+  });
+
+  it("sweeps the root of a worker killed before it could dispose", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "memory-oracle-roots-"));
+    const moduleUrl = new URL("./memory-oracle.ts", import.meta.url).href;
+    const child = spawn(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `import { createTempRoot } from ${JSON.stringify(moduleUrl)};
+          console.log(createTempRoot("oracle-", process.argv[1]).root);
+          setInterval(() => {}, 1e6);`,
+        parent,
+      ],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    const childExit = once(child, "close");
+    try {
+      const output = createInterface({ input: child.stdout });
+      const orphan = await Promise.race([
+        once(output, "line").then(([line]) => String(line)),
+        childExit.then(() => {
+          throw new Error("worker exited before creating its root");
+        }),
+      ]);
+      output.close();
+      expect(existsSync(orphan)).toBe(true);
+      expect(child.kill("SIGKILL")).toBe(true);
+      expect(await childExit).toEqual([null, "SIGKILL"]);
+      expect(existsSync(orphan)).toBe(true);
+
+      const next = createTempRoot("oracle-", parent);
+      try {
+        expect(existsSync(orphan)).toBe(false);
+      } finally {
+        next.dispose();
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await childExit.catch(() => {});
+      rmSync(parent, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
