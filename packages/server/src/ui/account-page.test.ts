@@ -34,6 +34,28 @@ describe("renderAccountPage", () => {
     expect(html).toContain("<script>void 0;</script>");
   });
 
+  it("includes a visible keyboard focus outline for the account action", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html).toMatch(
+      /\.unity-button:focus-visible\s*\{[^}]*outline:\s*2px solid/,
+    );
+  });
+
+  it("suppresses account-action transitions when reduced motion is requested", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html).toMatch(
+      /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.unity-button\s*\{\s*transition:\s*none/,
+    );
+  });
+
   it("follows the system colour scheme like Vana Account", () => {
     const html = renderAccountPage({
       title: "t",
