@@ -37,3 +37,16 @@ describe("resolveRootPath", () => {
     );
   });
 });
+
+describe("config path boundary handling", () => {
+  it("leaves a named tilde segment literal instead of looking up another home", () => {
+    expect(expandHomePath("~fixture/state")).toBe("~fixture/state");
+    expect(resolveRootPath("~fixture/state")).toBe(resolve("~fixture/state"));
+  });
+
+  it("normalizes redundant segments after expanding the current home shortcut", () => {
+    expect(resolveRootPath("~/fixture/./staging/../config")).toBe(
+      resolve(homedir(), "fixture/config"),
+    );
+  });
+});
