@@ -60,4 +60,27 @@ describe("Oura earliest required collection day", () => {
       deriveOuraCollectionRequirements([{ scope: "oura.activity", data }]),
     ).toMatchObject({ ok: false });
   });
+
+  it("accepts a leap-day sleep period when the optional daily scores are absent", () => {
+    expect(
+      deriveOuraCollectionRequirements([
+        {
+          scope: "oura.sleep",
+          data: { sleepPeriods: [{ day: "2024-02-29" }] },
+        },
+      ]),
+    ).toEqual({ ok: true, since: "2024-02-29" });
+  });
+
+  it("does not mistake an empty history for a lower collection bound", () => {
+    const histories = [
+      { scope: "oura.activity", data: { records: [] } },
+      { scope: "oura.readiness", data: { days: [{ day: "2024-03-02" }] } },
+    ];
+    const expected = { ok: true, since: "2024-03-02" };
+    expect(deriveOuraCollectionRequirements(histories)).toEqual(expected);
+    expect(deriveOuraCollectionRequirements([...histories].reverse())).toEqual(
+      expected,
+    );
+  });
 });
