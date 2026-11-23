@@ -152,3 +152,50 @@ describe("stream-sync read names", () => {
     });
   });
 });
+
+describe("live stream status projection", () => {
+  it("distinguishes a live empty stream from a non-live head's cached count", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      listed: true,
+      issues: [],
+      connections: [
+        {
+          connector: "fixture",
+          ns: "",
+          streams: {
+            empty: { live: true, version: 1, records: 0 },
+            pending: { live: false, version: 2, records: 8 },
+          },
+        },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+
+    expect(liveStreamCounts(status)).toEqual([
+      { connector: "fixture", ns: "", stream: "empty", records: 0 },
+      { connector: "fixture", ns: "", stream: "pending", records: null },
+    ]);
+  });
+
+  it("preserves the distinction between unaudited and audited unavailable digests", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      listed: true,
+      issues: [],
+      connections: [
+        {
+          connector: "fixture",
+          ns: "",
+          streams: {
+            unaudited: { live: true, version: 1, records: 1 },
+            audited: { live: false, version: 2, records: null, digest: null },
+          },
+        },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+
+    const rows = liveStreamCounts(status);
+    expect(rows[0]).not.toHaveProperty("digest");
+    expect(rows[1]).toHaveProperty("digest", null);
+  });
+});
