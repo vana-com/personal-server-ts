@@ -66,19 +66,23 @@ describe("hash port output formatting", () => {
   it("forwards a sliced byte view to SHA-256 and emits lowercase text without a prefix", async () => {
     const bytes = Uint8Array.of(99, 1, 2, 88).subarray(1, 3);
     const result = await sha256Hex(async (seen) => {
-      expect(seen).toEqual(Uint8Array.of(1, 2));
+      expect(seen).toBe(bytes);
       return Uint8Array.from({ length: 32 }, () => 0xab);
     }, bytes);
 
     expect(result).toBe("ab".repeat(32));
   });
 
-  it("formats the Keccak port result as a prefixed registry hash", async () => {
+  it("formats only the returned Keccak digest view as a prefixed registry hash", async () => {
+    const backing = Uint8Array.of(
+      0xfe,
+      0,
+      ...Uint8Array.from({ length: 31 }, () => 0xcd),
+      0xff,
+    );
     const result = await keccakHex(async (seen) => {
       expect(seen).toEqual(new Uint8Array());
-      return Uint8Array.from({ length: 32 }, (_, index) =>
-        index === 0 ? 0 : 0xcd,
-      );
+      return backing.subarray(1, 33);
     }, new Uint8Array());
 
     expect(result).toBe("0x00" + "cd".repeat(31));
