@@ -201,6 +201,22 @@ describe("owner key derivation has one owner", () => {
       expect(violationsIn(other, source)).toEqual(["MASTER_KEY_MESSAGE (SDK)"]);
     });
 
+    it("reports each named use once when the same primitive appears repeatedly", () => {
+      const source =
+        "deriveMasterKey(input); deriveMasterKey(input); recoverServerOwner(input);";
+      expect(violationsIn(other, source)).toEqual([
+        "deriveMasterKey",
+        "recoverServerOwner",
+      ]);
+    });
+
+    it("reports a master-key message embedded in a no-substitution template literal", () => {
+      const source = "export const label = `prefix:" + MESSAGE + ":suffix`;";
+      expect(violationsIn(other, source)).toEqual([
+        `string containing "${MESSAGE}"`,
+      ]);
+    });
+
     it("reads a .mts file", () => {
       const source = `export const k = recoverServerOwner(sig);\n`;
       expect(violationsIn("packages/server/src/example.mts", source)).toEqual([
