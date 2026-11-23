@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { InvalidArgumentError } from "./errors.js";
-import { canonicalBytes32, toHex, utf8, utf8Length } from "./bytes.js";
+import {
+  canonicalBytes32,
+  keccakHex,
+  sha256Hex,
+  toHex,
+  utf8,
+  utf8Length,
+} from "./bytes.js";
 
 const digits = "0123456789abcdefABCDEF".repeat(3).slice(0, 64);
 const lower = `0x${digits.toLowerCase()}`;
@@ -52,5 +59,28 @@ describe("toHex", () => {
     const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
     expect(toHex(bytes)).toBe(Buffer.from(bytes).toString("hex"));
     expect(toHex(new Uint8Array())).toBe("");
+  });
+});
+
+describe("hash port output formatting", () => {
+  it("forwards a sliced byte view to SHA-256 and emits lowercase text without a prefix", async () => {
+    const bytes = Uint8Array.of(99, 1, 2, 88).subarray(1, 3);
+    const result = await sha256Hex(async (seen) => {
+      expect(seen).toEqual(Uint8Array.of(1, 2));
+      return Uint8Array.from({ length: 32 }, () => 0xab);
+    }, bytes);
+
+    expect(result).toBe("ab".repeat(32));
+  });
+
+  it("formats the Keccak port result as a prefixed registry hash", async () => {
+    const result = await keccakHex(async (seen) => {
+      expect(seen).toEqual(new Uint8Array());
+      return Uint8Array.from({ length: 32 }, (_, index) =>
+        index === 0 ? 0 : 0xcd,
+      );
+    }, new Uint8Array());
+
+    expect(result).toBe("0x00" + "cd".repeat(31));
   });
 });
