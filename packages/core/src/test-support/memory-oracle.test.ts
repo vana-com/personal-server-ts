@@ -112,6 +112,20 @@ describe("memory-oracle temp roots", () => {
     }
   }
 
+  it("requires a nonempty prefix before resolving the parent", () => {
+    expect(() => createTempRoot("", "/fixture/unused-parent")).toThrow(
+      "Invalid temp-root prefix",
+    );
+  });
+
+  it("rejects both platform separators and NUL before resolving the parent", () => {
+    for (const prefix of ["fixture/path", "fixture\\path", "fixture\0root"]) {
+      expect(() => createTempRoot(prefix, "/fixture/unused-parent")).toThrow(
+        "Invalid temp-root prefix",
+      );
+    }
+  });
+
   it("disposes a root and can safely dispose it again", () => {
     withTempParent((parent) => {
       const { root, dispose } = createTempRoot("oracle-", parent);
