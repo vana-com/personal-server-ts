@@ -359,4 +359,26 @@ describe("access reporter payload", () => {
     expect(record).not.toHaveProperty("denyReason");
     expect(record.outcome).toBe("served");
   });
+
+  it("keeps enqueue order when a flush and shutdown overlap", async () => {
+    const send = okFetch();
+    const { instance } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    const flushing = instance.flush();
+    await instance.report(event(2));
+    await Promise.all([flushing, instance.stop()]);
+
+    expect(send.mock.calls.flatMap(logIdsOf)).toEqual(["log-1", "log-2"]);
+  });
+
+  it("does not resend an already drained queue on repeated shutdown", async () => {
+    const send = okFetch();
+    const { instance } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+
+    await instance.stop();
+    await instance.stop();
+
+    expect(send.mock.calls.flatMap(logIdsOf)).toEqual(["log-1"]);
+  });
 });
