@@ -96,18 +96,15 @@ async function readConnectionCheckpoint(
   )
     return null;
   await foldAppliedCursors(db, id);
-  // No cursors while any stream must be read in full next: one flagged
-  // `needs_full`, or one whose head is incomplete. Only a full read completes
-  // an incomplete head (a run resumed from this cursor publishes `complete`
-  // from its base, which an incomplete or reset base cannot give), so handing
-  // the cursor out again would resume from the same place forever.
+  // No cursors at all while a stream is flagged `needs_full`: `begin` reads
+  // the whole connection in full then.
   const [row] = await db.query<{
     checkpoint: string | null;
     control_state: string;
-    full_next: number;
+    needs_full: number;
   }>(
     `SELECT c.checkpoint, c.control_state,
-      EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id=c.connection_id AND (s.needs_full=1 OR s.complete=0)) AS full_next
+      EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id=c.connection_id AND s.needs_full=1) AS needs_full
       FROM connections c WHERE c.connection_id=?`,
     [id],
   );
@@ -115,18 +112,22 @@ async function readConnectionCheckpoint(
     !row ||
     row.checkpoint === null ||
     row.control_state === "deleted" ||
-    row.full_next === 1
+    row.needs_full === 1
   )
     return null;
   const stored: unknown = JSON.parse(row.checkpoint);
   if (!isPlainObject(stored)) return null;
-  const versions = new Map(
+  const heads = new Map(
     (
-      await db.query<{ stream: string; cursor_version: string | null }>(
-        "SELECT stream, cursor_version FROM stream_state WHERE connection_id=?",
+      await db.query<{
+        stream: string;
+        cursor_version: string | null;
+        complete: number;
+      }>(
+        "SELECT stream, cursor_version, complete FROM stream_state WHERE connection_id=?",
         [id],
       )
-    ).map((entry) => [entry.stream, entry.cursor_version]),
+    ).map((entry) => [entry.stream, entry]),
   );
   const streams: Record<
     string,
@@ -136,7 +137,15 @@ async function readConnectionCheckpoint(
     stored as Record<string, JsonValue>,
   )) {
     if (state === undefined) continue;
-    streams[stream] = { state, cursorVersion: versions.get(stream) ?? null };
+    const head = heads.get(stream);
+    // A cursor is not handed out while its stream's head is incomplete. Only
+    // a full read completes such a head (a run resumed from the cursor takes
+    // `complete` from its base, which an incomplete or reset base cannot
+    // give), so the reader reads that stream in full instead of resuming
+    // from the same place forever. Other streams' cursors still go out; a
+    // stream this connection never wrote has no cursor to withhold.
+    if (head !== undefined && head.complete !== 1) continue;
+    streams[stream] = { state, cursorVersion: head?.cursor_version ?? null };
   }
   return Object.keys(streams).length ? { connectionId: id, streams } : null;
 }

@@ -274,4 +274,142 @@ describe("connection checkpoint read", () => {
       await sync.close();
     }
   });
+
+  /**
+   * The end a host sends for a run that selected the streams it writes (the
+   * raw dialect `selectedStreams` requires): one stream, its records in the
+   * batch, its cursor, nothing else claimed.
+   */
+  const selectedEnd = (stream: string, cursor: Record<string, unknown>) => ({
+    wireDialect: "connector-end-evidence/1" as const,
+    lastBatch: 0,
+    selectedStreams: [stream],
+    covered: [stream],
+    done: { status: "succeeded" as const },
+    errors: [],
+    checkpoints: { [stream]: cursor },
+    preflightExcludedStreams: [],
+    detailCoverage: {},
+    invalidDetailCoverageStreams: [],
+    wholeStreamEvidence: [],
+  });
+
+  it("saves and reads the cursor of a stream a run selected and wrote, whatever the connector declares besides; later keys' runs add theirs", async () => {
+    const { db, sync } = await open("1.2.0");
+    try {
+      // The host writes one key per run, selecting its stream: the connector
+      // also declares `notes`, which this grant does not cover.
+      await sync.intake.begin("run-items", {
+        ...request,
+        selectedStreams: ["items"],
+      });
+      await sync.intake.batch("run-items", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "one" } }],
+      });
+      const ended = await sync.intake.end(
+        "run-items",
+        selectedEnd("items", { cursor: "a" }),
+      );
+      expect(ended.outcome).toBe("succeeded");
+      await sync.publish();
+      expect((await sync.intake.checkpoint?.("fixture"))?.streams).toEqual({
+        items: { state: { cursor: "a" }, cursorVersion: "1.2.0" },
+      });
+      // The unselected stream has no state of its own.
+      expect(
+        await db.query("SELECT stream FROM stream_state ORDER BY stream"),
+      ).toEqual([{ stream: "items" }]);
+      // A later key's run, on the same connection, adds its stream's cursor.
+      await sync.intake.begin("run-notes", {
+        ...request,
+        selectedStreams: ["notes"],
+      });
+      await sync.intake.batch("run-notes", {
+        batch: 0,
+        records: [{ stream: "notes", data: { id: "n1" } }],
+      });
+      await sync.intake.end("run-notes", selectedEnd("notes", { cursor: "b" }));
+      await sync.publish();
+      expect((await sync.intake.checkpoint?.("fixture"))?.streams).toEqual({
+        items: { state: { cursor: "a" }, cursorVersion: "1.2.0" },
+        notes: { state: { cursor: "b" }, cursorVersion: "1.2.0" },
+      });
+      // A resumed run of the first key advances its cursor and keeps the other.
+      await sync.intake.begin("run-items-2", {
+        ...request,
+        selectedStreams: ["items"],
+        streams: [{ name: "items", resumed: true }],
+      });
+      await sync.intake.batch("run-items-2", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "two" } }],
+      });
+      await sync.intake.end(
+        "run-items-2",
+        selectedEnd("items", { cursor: "c" }),
+      );
+      await sync.publish();
+      expect((await sync.intake.checkpoint?.("fixture"))?.streams).toEqual({
+        items: { state: { cursor: "c" }, cursorVersion: "1.2.0" },
+        notes: { state: { cursor: "b" }, cursorVersion: "1.2.0" },
+      });
+      expect(
+        (
+          await db.query<{ record_key: string }>(
+            "SELECT record_key FROM records WHERE stream='items' ORDER BY record_key",
+          )
+        ).map((r) => r.record_key),
+      ).toEqual(["one", "two"]);
+    } finally {
+      await sync.close();
+    }
+  });
+
+  it("reads the cursor a selecting run saved although an earlier run that selected nothing left the unwritten stream an empty, incomplete head", async () => {
+    const { db, sync } = await open("1.2.0");
+    try {
+      // The earlier host wrote one stream without selecting it: the run also
+      // covered `notes` with nothing, publishing an empty incomplete head for
+      // it, and saved no cursor (the run was not complete as a whole).
+      await sync.intake.begin("run-legacy", request);
+      await sync.intake.batch("run-legacy", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "one" } }],
+      });
+      await sync.intake.end("run-legacy", {
+        finish: "completed",
+        streams: { items: observed(true) },
+        checkpoints: { items: { cursor: "a" } },
+        lastBatch: 0,
+      });
+      await sync.publish();
+      expect(await sync.intake.checkpoint?.("fixture")).toBeNull();
+      expect(
+        await db.query(
+          "SELECT stream, complete FROM stream_state ORDER BY stream",
+        ),
+      ).toEqual([
+        { stream: "items", complete: 1 },
+        { stream: "notes", complete: 0 },
+      ]);
+      // A run that selects the stream it writes saves its cursor, and the
+      // read hands it out: the never-written stream has none to withhold.
+      await sync.intake.begin("run-items", {
+        ...request,
+        selectedStreams: ["items"],
+      });
+      await sync.intake.batch("run-items", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "two" } }],
+      });
+      await sync.intake.end("run-items", selectedEnd("items", { cursor: "c" }));
+      await sync.publish();
+      expect((await sync.intake.checkpoint?.("fixture"))?.streams).toEqual({
+        items: { state: { cursor: "c" }, cursorVersion: "1.2.0" },
+      });
+    } finally {
+      await sync.close();
+    }
+  });
 });

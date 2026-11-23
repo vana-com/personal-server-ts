@@ -435,4 +435,41 @@ describe("a run resumed from a cursor read before it began", () => {
       await here.sync.close();
     }
   });
+
+  it("with the stream selected, as the host writes it, the same reconnect still saves no cursor and keeps the rows", async () => {
+    const { here, elsewhere } = await deletedMeanwhile();
+    try {
+      await here.sync.intake.begin("run-2", {
+        ...connect,
+        selectedStreams: ["items"],
+        streams: [{ name: "items", resumed: true }],
+      });
+      await here.sync.intake.batch("run-2", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "two" } }],
+      });
+      const ended = await here.sync.intake.end("run-2", {
+        wireDialect: "connector-end-evidence/1",
+        lastBatch: 0,
+        selectedStreams: ["items"],
+        covered: ["items"],
+        done: { status: "succeeded" },
+        errors: [],
+        checkpoints: { items: { cursor: "c" } },
+        preflightExcludedStreams: [],
+        detailCoverage: {},
+        invalidDetailCoverageStreams: [],
+        wholeStreamEvidence: [],
+      });
+      expect(ended.outcome).toBe("succeeded");
+      await here.sync.publish();
+      expect(await itemKeys(here)).toEqual(["two"]);
+      expect(await itemsState(here)).toEqual([{ complete: 0, needs_full: 0 }]);
+      expect(await storedCheckpoint(here)).toBeNull();
+      expect(await here.sync.intake.checkpoint?.("fixture")).toBeNull();
+    } finally {
+      await here.sync.close();
+      await elsewhere.sync.close();
+    }
+  });
 });

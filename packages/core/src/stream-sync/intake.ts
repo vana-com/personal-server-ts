@@ -357,12 +357,14 @@ export interface ConnectionCheckpoint {
    * null when no run has stamped one yet. `cursorVersion` may be newer than
    * the state beside it (a fold stamps the published cursor's version), so a
    * reader comparing it with its own connector version errs towards a full
-   * read. A connection with a stream to be read in full next has no cursors
-   * at all: one flagged for a full read (`begin` reads the whole connection
-   * in full then), or one whose published head is incomplete, which only a
-   * full read completes (a run resumed from the cursor takes `complete` from
-   * its base, so over a reset base, such as a changed primary key, it would
-   * be handed the same cursor forever).
+   * read. A connection with a stream flagged for a full read has no cursors
+   * at all (`begin` reads the whole connection in full then). A stream whose
+   * published head is incomplete has no entry here, whatever is stored for
+   * it: only a full read completes such a head (a run resumed from the
+   * cursor takes `complete` from its base, so over a reset base, such as a
+   * changed primary key, it would be handed the same cursor forever). A
+   * stream the connection never wrote (a run that selected the streams it
+   * writes leaves the others alone) simply has no entry.
    */
   readonly streams: Readonly<
     Record<
@@ -380,8 +382,8 @@ export interface RunIntake {
   /**
    * The connection's saved cursors for `connector`, or null when it has none
    * (no connection, no checkpoint, a deleted or foreign connection, a
-   * registry that cannot be read, or a stream that must be read in full:
-   * flagged so, or with an incomplete head). It
+   * registry that cannot be read, a stream flagged for a full read, or no
+   * stream with both a cursor and a complete head). It
    * reads the registry first, as `begin` does, so another device's delete or
    * reconnect is seen. A read: it opens no run and needs no artifact.
    * Optional: a host over an older writer has none, and reads in full.
