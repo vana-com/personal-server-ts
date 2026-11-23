@@ -20,6 +20,7 @@ import type { ReplicaBackoff, ReplicaWorkState } from "./schedule.js";
 import {
   defaultReplicaBackoff,
   initialReplicaWorkState,
+  replicaEligibleAt,
   settleReplicaWork,
 } from "./schedule.js";
 
@@ -476,6 +477,36 @@ describe("outcome.ts", () => {
 // ---------------------------------------------------------------------------
 // Pure algebra: schedule.ts
 // ---------------------------------------------------------------------------
+
+describe("schedule.ts replicaEligibleAt synthetic timing", () => {
+  it("keeps the durable time when parking lacks verified timing evidence", () => {
+    const due = 130;
+    const item = {
+      finalityWait: true,
+      nextEligible: due,
+      waitSince: 10,
+      checkedBlock: "42",
+    };
+    const hint = { now: 100, head: 42n, hintRefreshAt: 300 };
+
+    expect(replicaEligibleAt({ ...item, checkedBlock: null }, hint)).toBe(due);
+    expect(replicaEligibleAt({ ...item, waitSince: null }, hint)).toBe(due);
+    expect(replicaEligibleAt(item, { ...hint, head: undefined })).toBe(due);
+  });
+
+  it("does not park beyond a supplied refresh or before the durable time", () => {
+    const item = {
+      finalityWait: true,
+      nextEligible: 180,
+      waitSince: 10,
+      checkedBlock: "42",
+    };
+    const hint = { now: 100, head: 42n, hintRefreshAt: 150 };
+
+    expect(replicaEligibleAt(item, hint)).toBe(180);
+    expect(replicaEligibleAt(item, { ...hint, hintRefreshAt: 240 })).toBe(240);
+  });
+});
 
 describe("schedule.ts settleReplicaWork", () => {
   it("05 initial state is fresh and due at any real time", () => {
