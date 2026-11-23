@@ -123,7 +123,7 @@ describe("a run resumed from a cursor read before it began", () => {
       },
       { resolveArtifact },
     );
-    return { db, sync, names };
+    return { db, sync, names, resolveArtifact };
   }
 
   type Opened = Awaited<ReturnType<typeof open>>;
@@ -166,6 +166,7 @@ describe("a run resumed from a cursor read before it began", () => {
     { sync }: Opened,
     runId: string,
     options: { resumed: boolean; publish?: false },
+    record: Record<string, unknown> = { id: "two" },
   ) {
     const begun = await sync.intake.begin(runId, {
       ...connect,
@@ -175,7 +176,7 @@ describe("a run resumed from a cursor read before it began", () => {
     });
     await sync.intake.batch(runId, {
       batch: 0,
-      records: [{ stream: "items", data: { id: "two" } }],
+      records: [{ stream: "items", data: record }],
     });
     const ended = await sync.intake.end(runId, {
       finish: "completed",
@@ -392,6 +393,41 @@ describe("a run resumed from a cursor read before it began", () => {
       await writeBack(here, "run-2", { resumed: false });
       expect(await itemsState(here)).toEqual([{ complete: 1, needs_full: 0 }]);
       expect(await storedCheckpoint(here)).toEqual({ items: { cursor: "c" } });
+      expect(
+        (await here.sync.intake.checkpoint?.("fixture"))?.streams.items?.state,
+      ).toEqual({ cursor: "c" });
+    } finally {
+      await here.sync.close();
+    }
+  });
+
+  it("hands out no cursor while a stream's head is incomplete: a resumed run over a reset base is followed by a full read, not by the same cursor forever", async () => {
+    const here = await open({ streams: ["items"] });
+    try {
+      await seeded(here);
+      // A newer connector changes the stream's primary key. The published head
+      // is no base for it (`empty_base`), so a run that is not a full read
+      // publishes an incomplete head and saves no cursor.
+      here.resolveArtifact.mockImplementation(() => ({
+        connector: "fixture",
+        version: "1.3.0",
+        streams: [
+          {
+            name: "items",
+            semantics: "mutable_state" as const,
+            primaryKey: ["id", "v"],
+            coverageStrategy: "checkpoint_window" as const,
+          },
+        ],
+      }));
+      await writeBack(here, "run-2", { resumed: true }, { id: "two", v: 1 });
+      expect(await itemsState(here)).toEqual([{ complete: 0, needs_full: 0 }]);
+      expect((await storedCheckpoint(here))?.items).toEqual({ cursor: "a" });
+      // The stored cursor is not handed out: a second resumed run would come
+      // out incomplete again, and so on. The next remote run reads in full.
+      expect(await here.sync.intake.checkpoint?.("fixture")).toBeNull();
+      await writeBack(here, "run-3", { resumed: false }, { id: "three", v: 1 });
+      expect(await itemsState(here)).toEqual([{ complete: 1, needs_full: 0 }]);
       expect(
         (await here.sync.intake.checkpoint?.("fixture"))?.streams.items?.state,
       ).toEqual({ cursor: "c" });

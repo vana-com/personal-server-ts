@@ -96,13 +96,18 @@ async function readConnectionCheckpoint(
   )
     return null;
   await foldAppliedCursors(db, id);
+  // No cursors while any stream must be read in full next: one flagged
+  // `needs_full`, or one whose head is incomplete. Only a full read completes
+  // an incomplete head (a run resumed from this cursor publishes `complete`
+  // from its base, which an incomplete or reset base cannot give), so handing
+  // the cursor out again would resume from the same place forever.
   const [row] = await db.query<{
     checkpoint: string | null;
     control_state: string;
-    needs_full: number;
+    full_next: number;
   }>(
     `SELECT c.checkpoint, c.control_state,
-      EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id=c.connection_id AND s.needs_full=1) AS needs_full
+      EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id=c.connection_id AND (s.needs_full=1 OR s.complete=0)) AS full_next
       FROM connections c WHERE c.connection_id=?`,
     [id],
   );
@@ -110,7 +115,7 @@ async function readConnectionCheckpoint(
     !row ||
     row.checkpoint === null ||
     row.control_state === "deleted" ||
-    row.needs_full === 1
+    row.full_next === 1
   )
     return null;
   const stored: unknown = JSON.parse(row.checkpoint);
