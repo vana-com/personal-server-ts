@@ -29,4 +29,25 @@ describe("PdppError", () => {
     const body = err.toJSON("req_1");
     expect(body.error).not.toHaveProperty("param");
   });
+
+  it("keeps current reads and history failures distinguishable at the same status", () => {
+    const read = new PdppError("STREAM_READ_UNAVAILABLE", "Read unavailable");
+    const history = new PdppError(
+      "STREAM_HISTORY_UNAVAILABLE",
+      "History unavailable",
+    );
+    expect([read.status, history.status]).toEqual([503, 503]);
+    expect([
+      read.toJSON("read-test").error.code,
+      history.toJSON("history-test").error.code,
+    ]).toEqual(["STREAM_READ_UNAVAILABLE", "STREAM_HISTORY_UNAVAILABLE"]);
+  });
+
+  it("uses the supplied request ID on each serialization", () => {
+    const error = new PdppError("not_found", "Not found");
+    const first = error.toJSON("first-test");
+    const second = error.toJSON("second-test");
+    expect(first.error.request_id).toBe("first-test");
+    expect(second.error.request_id).toBe("second-test");
+  });
 });
