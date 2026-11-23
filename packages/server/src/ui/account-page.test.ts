@@ -83,6 +83,29 @@ describe("renderAccountPage", () => {
     expect(slim).toContain('class="unity-panel unity-panel--slim"');
     expect(full).not.toContain('class="unity-panel unity-panel--slim"');
   });
+
+  it("keeps the section label linked to its visible heading", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html.match(/<section[^>]+aria-labelledby="([^"]+)"/)?.[1]).toBe(
+      "page-heading",
+    );
+    expect(html.match(/<h1[^>]+id="([^"]+)"/)?.[1]).toBe("page-heading");
+  });
+
+  it("omits empty optional content instead of emitting empty landmarks", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html).not.toContain('id="page-description"');
+    expect(html).not.toContain('<div class="unity-content">');
+    expect(html).not.toContain("<script>");
+  });
 });
 
 describe("escapeHtml", () => {
