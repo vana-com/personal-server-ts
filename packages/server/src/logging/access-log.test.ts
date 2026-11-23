@@ -98,6 +98,45 @@ describe("AccessLogWriter", () => {
     expect(JSON.parse(lines[1]).logId).toBe("log-2");
   });
 
+  it("uses the UTC day for a timestamp with a local offset", async () => {
+    const writer = createAccessLogWriter(tempDir);
+    await writer.write(
+      makeEntry({ logId: "offset", timestamp: "2026-01-28T23:30:00-02:00" }),
+    );
+    await writer.write(
+      makeEntry({ logId: "utc", timestamp: "2026-01-29T01:30:00Z" }),
+    );
+
+    expect(await readdir(tempDir)).toEqual(["access-2026-01-29.log"]);
+    const content = await readFile(
+      join(tempDir, "access-2026-01-29.log"),
+      "utf-8",
+    );
+    expect(
+      content
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line).logId),
+    ).toEqual(["offset", "utc"]);
+  });
+
+  it("keeps an embedded newline inside a single JSONL record", async () => {
+    const writer = createAccessLogWriter(tempDir);
+    const userAgent = "Synthetic client\nsecond line";
+    await writer.write(makeEntry({ userAgent }));
+    await writer.write(makeEntry({ logId: "next-entry" }));
+
+    const content = await readFile(
+      join(tempDir, "access-2026-01-28.log"),
+      "utf-8",
+    );
+    const lines = content.split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toBe("");
+    expect(JSON.parse(lines[0]).userAgent).toBe(userAgent);
+    expect(JSON.parse(lines[1]).logId).toBe("next-entry");
+  });
+
   it("writes to different days produce separate files", async () => {
     const logsDir = join(tempDir, "logs");
     const writer = createAccessLogWriter(logsDir);
