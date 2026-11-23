@@ -36,6 +36,18 @@ describe("resolveRootPath", () => {
       resolve("relative/personal-server"),
     );
   });
+
+  it("normalizes dot segments in an explicit current-home root", () => {
+    expect(resolveRootPath("~/synthetic/../server")).toBe(
+      resolve(homedir(), "server"),
+    );
+  });
+
+  it("does not treat a named-user tilde prefix as the current home", () => {
+    expect(resolveRootPath("~synthetic/server")).toBe(
+      resolve("~synthetic/server"),
+    );
+  });
 });
 
 describe("config path boundary handling", () => {
