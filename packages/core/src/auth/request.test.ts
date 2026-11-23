@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { authenticateRequest } from "./request.js";
+import {
+  authenticateRequest,
+  isWeb3SignedLifetimeError,
+  TokenLifetimeError,
+} from "./request.js";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -96,5 +100,22 @@ describe("authenticateRequest Web3Signed lifetime", () => {
     await expect(authenticate(header, now)).rejects.toMatchObject({
       errorCode: "EXPIRED_TOKEN",
     });
+  });
+});
+
+describe("lifetime error diagnostics", () => {
+  it("classifies the dedicated lifetime error and exposes the rejected duration", () => {
+    const error = new TokenLifetimeError(901);
+    expect(isWeb3SignedLifetimeError(error)).toBe(true);
+    expect(error.details).toMatchObject({
+      lifetimeSeconds: 901,
+      maxLifetimeSeconds: 900,
+    });
+  });
+
+  it("does not classify unrelated errors with the same human-readable message", () => {
+    const error = new TokenLifetimeError(901);
+    expect(isWeb3SignedLifetimeError(new Error(error.message))).toBe(false);
+    expect(isWeb3SignedLifetimeError(undefined)).toBe(false);
   });
 });
