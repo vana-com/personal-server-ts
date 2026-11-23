@@ -192,6 +192,30 @@ describe("parsePaymentHeader", () => {
     expect(parsePaymentHeader(btoa('{"hello":"world"}'))).toBeNull();
   });
 
+  it("does not coerce version metadata or accept another payment scheme", () => {
+    expect(
+      parsePaymentHeader(
+        btoa('{"x402Version":"1","scheme":"vana-escrow-grant"}'),
+      ),
+    ).toBeNull();
+    expect(
+      parsePaymentHeader(btoa('{"x402Version":1,"scheme":"fixture-other"}')),
+    ).toBeNull();
+  });
+
+  it("keeps an explicit null payload distinct from a structured payment", () => {
+    const header = {
+      x402Version: 1,
+      scheme: "vana-escrow-grant",
+      network: "fixture",
+    };
+    for (const payload of [null, 0, ""]) {
+      expect(
+        parsePaymentHeader(btoa(JSON.stringify({ ...header, payload }))),
+      ).toBeNull();
+    }
+  });
+
   it("round-trips a well-formed X402Payment via encodePaymentHeader", () => {
     const payment: X402Payment = {
       x402Version: 1,
