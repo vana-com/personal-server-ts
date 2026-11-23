@@ -714,3 +714,39 @@ describe("PdppGrantBindingStore", () => {
     expect(store.getBindingsForPermission(PERMISSION)).toEqual([first, second]);
   });
 });
+
+describe("in-memory grant list presentation", () => {
+  const bindingRow = (pdppGrantId: string, boundAt: string) => ({
+    pdppGrantId,
+    boundAt,
+    permission: PERMISSION,
+    ownerAddress: OWNER,
+    granteeAddress: GRANTEE,
+    pdppClientId: "fixture-client",
+    granteeId: "fixture-builder",
+    grantVersion: "1",
+  });
+
+  it("lists rows chronologically and breaks equal timestamps by grant id", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    const early = bindingRow("entry-z", "2026-01-01T00:00:00.000Z");
+    const laterB = bindingRow("entry-b", "2026-01-02T00:00:00.000Z");
+    const laterA = bindingRow("entry-a", laterB.boundAt);
+    for (const row of [laterB, laterA, early]) store.putBinding(row);
+
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([
+      early,
+      laterA,
+      laterB,
+    ]);
+  });
+
+  it("returns a list container that callers can change without changing the stored list", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    const row = bindingRow("entry-a", "2026-01-01T00:00:00.000Z");
+    store.putBinding(row);
+    store.getBindingsForPermission(PERMISSION).pop();
+
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([row]);
+  });
+});
