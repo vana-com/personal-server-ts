@@ -76,6 +76,19 @@ describe("the lifetime token", () => {
     ).toThrow(InvalidConnectionLifetime);
   });
 
+  it("rejects a generation that cannot be represented exactly", () => {
+    expect(() => parseLifetime(C, `v2:${C}:@9007199254740992`)).toThrow(
+      "lifetime is not one this server names",
+    );
+  });
+
+  it("rejects accidental trailing whitespace instead of silently normalizing it", () => {
+    const token = formatLifetime(C, new Map([["", 2]]));
+    expect(() => parseLifetime(C, token + "\n")).toThrow(
+      InvalidConnectionLifetime,
+    );
+  });
+
   it("round-trips a connector id with separators in it", () => {
     const id = "a:b,c/d@e%f";
     const token = formatLifetime(id, new Map([["", 2]]));
