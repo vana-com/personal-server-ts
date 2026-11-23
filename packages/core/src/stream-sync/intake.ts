@@ -142,14 +142,26 @@ export interface BeginRequest {
   readonly expectedControlVersion?: number;
   readonly observedAt?: number;
   /**
-   * The scope the producer will put in START, per stream. Used only to
-   * refuse `fields` and `resources` (R17).
+   * The scope the producer will put in START, per stream. Used to refuse
+   * `fields` and `resources` (R17), and to tell a read that is not a full one.
    */
   readonly streams?: readonly {
     readonly name: string;
     readonly fields?: unknown;
     readonly resources?: unknown;
     readonly time_range?: unknown;
+    /**
+     * True when the producer resumes this stream from a cursor it was handed
+     * outside this run (the connection's checkpoint read by `checkpoint()`
+     * before a remote run). Its rows are then only those after that cursor,
+     * whatever the run's mode asks for: the stream is not read in full, even
+     * when `connect` or `wantFull` makes the run a full collection. The
+     * publication treats it as an incremental read: over a changed or reset
+     * connection, or a stream flagged for a full read since the cursor was
+     * read, the head stays incomplete and the run's checkpoint is not saved;
+     * over the unchanged connection it publishes and saves as usual.
+     */
+    readonly resumed?: boolean;
   }[];
 }
 

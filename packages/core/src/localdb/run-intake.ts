@@ -342,6 +342,8 @@ export function createRunIntakeStore(
             throw invalid("stream is not declared");
           if (entry.fields != null || entry.resources != null)
             throw new RunIntakeError("restricted_scope_unsupported");
+          if (entry.resumed !== undefined && typeof entry.resumed !== "boolean")
+            throw invalid("invalid run flag");
         }
         if (
           req.selectedStreams !== undefined &&
@@ -640,9 +642,14 @@ export function createRunIntakeStore(
                   : (synced.connection?.generation ?? null),
                 JSON.stringify(d.primaryKey),
                 declarations.version,
+                // A full read is what the stream's rows prove, not what the
+                // run's mode asked for: a windowed read, or one resumed from
+                // a cursor handed out before the run, is not one.
                 modes.get(d.name) === "full_refresh" &&
                 !(req.streams ?? []).some(
-                  (s) => s.name === d.name && s.time_range != null,
+                  (s) =>
+                    s.name === d.name &&
+                    (s.time_range != null || s.resumed === true),
                 )
                   ? 1
                   : 0,
