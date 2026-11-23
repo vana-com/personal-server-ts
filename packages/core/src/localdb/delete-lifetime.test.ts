@@ -28,6 +28,23 @@ describe("the lifetime token", () => {
     expect(parseLifetime(C, `v2:${C}:`)).toEqual(new Map());
   });
 
+  it("orders encoded entries without changing the caller's map", () => {
+    const input = new Map([
+      [WORK, 3],
+      ["", 1],
+    ]);
+    const before = [...input];
+    expect(formatLifetime(C, input)).toBe(`v2:${C}:@1,${WORK}@3`);
+    expect([...input]).toEqual(before);
+  });
+
+  it("returns an independent map on each parse", () => {
+    const token = formatLifetime(C, new Map([["", 1]]));
+    const first = parseLifetime(C, token) as Map<string, number>;
+    first.clear();
+    expect(parseLifetime(C, token)).toEqual(new Map([["", 1]]));
+  });
+
   it("refuses what the server did not write", () => {
     for (const token of [
       "",
