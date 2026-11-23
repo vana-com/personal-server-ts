@@ -83,4 +83,27 @@ describe("hash port output formatting", () => {
 
     expect(result).toBe("0x00" + "cd".repeat(31));
   });
+
+  it("preserves the exact rejection from the SHA-256 callback", async () => {
+    const failure = new Error("synthetic digest unavailable");
+    await expect(
+      sha256Hex(() => Promise.reject(failure), new Uint8Array()),
+    ).rejects.toBe(failure);
+  });
+
+  it("allows a fresh Keccak callback attempt after a rejected one", async () => {
+    let attempts = 0;
+    const failure = new Error("synthetic retry");
+    const adapter = async () => {
+      if (++attempts === 1) throw failure;
+      return new Uint8Array(32);
+    };
+    const bytes = Uint8Array.of(42);
+
+    await expect(keccakHex(adapter, bytes)).rejects.toBe(failure);
+    await expect(keccakHex(adapter, bytes)).resolves.toBe(
+      `0x${"00".repeat(32)}`,
+    );
+    expect(attempts).toBe(2);
+  });
 });
