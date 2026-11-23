@@ -29,6 +29,30 @@ describe("Oura earliest required collection day", () => {
       ]),
     ).toEqual({ ok: true, since: null });
   });
+  it("uses the retained records view without mixing in accompanying legacy projections", () => {
+    const result = deriveOuraCollectionRequirements([
+      {
+        scope: "oura.sleep",
+        data: {
+          records: [{ day: "2020-02-03" }],
+          dailyScores: [{ day: "2020-01-01" }],
+          sleepPeriods: [{ day: "2020-01-02" }],
+        },
+      },
+    ]);
+    expect(result).toEqual({ ok: true, since: "2020-02-03" });
+  });
+
+  it("uses the oldest session day when legacy sleep has no daily scores", () => {
+    const result = deriveOuraCollectionRequirements([
+      {
+        scope: "oura.sleep",
+        data: { sleepPeriods: [{ day: "2020-02-04" }, { day: "2020-02-02" }] },
+      },
+    ]);
+    expect(result).toEqual({ ok: true, since: "2020-02-02" });
+  });
+
   it.each([
     undefined,
     null,
