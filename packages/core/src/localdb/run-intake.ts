@@ -138,14 +138,17 @@ async function readConnectionCheckpoint(
   )) {
     if (state === undefined) continue;
     const head = heads.get(stream);
-    // A cursor is not handed out while its stream's head is incomplete. Only
-    // a full read completes such a head (a run resumed from the cursor takes
-    // `complete` from its base, which an incomplete or reset base cannot
-    // give), so the reader reads that stream in full instead of resuming
-    // from the same place forever. Other streams' cursors still go out; a
-    // stream this connection never wrote has no cursor to withhold.
-    if (head !== undefined && head.complete !== 1) continue;
-    streams[stream] = { state, cursorVersion: head?.cursor_version ?? null };
+    // A cursor is handed out only with a complete head here to resume onto.
+    // An incomplete head only a full read completes (a run resumed from the
+    // cursor takes `complete` from its base, which an incomplete or reset
+    // base cannot give), and a remote reader cannot choose one later, so it
+    // reads that stream in full now instead of resuming from the same place
+    // forever; a cursor for a stream this device holds no head of is read in
+    // full the same way. Other streams' cursors still go out. (`begin` keeps
+    // resuming such a stream: a retrying device run's progress cursor sits
+    // on a head not yet complete.)
+    if (head === undefined || head.complete !== 1) continue;
+    streams[stream] = { state, cursorVersion: head.cursor_version };
   }
   return Object.keys(streams).length ? { connectionId: id, streams } : null;
 }
@@ -522,10 +525,30 @@ export function createRunIntakeStore(
             cached?.checkpoint == null ||
             cached.needs_full === 1);
         const collection = full ? "full_refresh" : "incremental";
+        const stored: unknown = cached?.checkpoint
+          ? JSON.parse(cached.checkpoint)
+          : null;
+        // A stream resumes only from a cursor of its own, on a stream this
+        // connection has state for. Any other declared stream is read whole,
+        // whatever the run's mode: a stream the connection holds no cursor
+        // for (a host that writes one stream per run left the others alone)
+        // would otherwise be read from nothing but labelled incremental, and
+        // its head would never complete. A stream with a cursor keeps its
+        // mode whatever its head: a retrying or not yet published run's
+        // progress cursor is resumed as before.
+        const resumable = new Set<string>();
+        if (!full && isPlainObject(stored)) {
+          const known = await db.query<{ stream: string }>(
+            "SELECT stream FROM stream_state WHERE connection_id=?",
+            [id],
+          );
+          for (const { stream } of known)
+            if (Object.hasOwn(stored, stream)) resumable.add(stream);
+        }
         const modes = new Map(
           declarations.streams.map((d) => [
             d.name,
-            full || d.incremental === false
+            full || d.incremental === false || !resumable.has(d.name)
               ? ("full_refresh" as const)
               : ("incremental" as const),
           ]),
@@ -557,9 +580,7 @@ export function createRunIntakeStore(
             if (order === null) modes.set(stream, "full_refresh");
           }
         }
-        let state: JsonValue | null = cached?.checkpoint
-          ? JSON.parse(cached.checkpoint)
-          : null;
+        let state: JsonValue | null = stored as JsonValue | null;
         if (isPlainObject(state)) {
           state = Object.fromEntries(
             Object.entries(state).filter(

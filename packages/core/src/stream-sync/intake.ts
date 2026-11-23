@@ -144,6 +144,8 @@ export interface BeginRequest {
   /**
    * The scope the producer will put in START, per stream. Used to refuse
    * `fields` and `resources` (R17), and to tell a read that is not a full one.
+   * (Per stream, `begin` resumes only a stream with a saved cursor of its
+   * own; any other declared stream is read whole, whatever the run's mode.)
    */
   readonly streams?: readonly {
     readonly name: string;
@@ -358,13 +360,16 @@ export interface ConnectionCheckpoint {
    * the state beside it (a fold stamps the published cursor's version), so a
    * reader comparing it with its own connector version errs towards a full
    * read. A connection with a stream flagged for a full read has no cursors
-   * at all (`begin` reads the whole connection in full then). A stream whose
-   * published head is incomplete has no entry here, whatever is stored for
-   * it: only a full read completes such a head (a run resumed from the
-   * cursor takes `complete` from its base, so over a reset base, such as a
-   * changed primary key, it would be handed the same cursor forever). A
-   * stream the connection never wrote (a run that selected the streams it
-   * writes leaves the others alone) simply has no entry.
+   * at all (`begin` reads the whole connection in full then). A stream has
+   * an entry only with a complete head here to resume onto: one whose head
+   * is incomplete, or that has no head here, is left out whatever is stored
+   * for it. A remote reader cannot complete a head except by choosing a full
+   * read up front, and a run resumed from the cursor takes `complete` from
+   * its base, so over a reset base (a changed primary key) or an unpublished
+   * one it would be handed the same cursor forever; `begin` itself keeps
+   * resuming such a stream, as a retrying device run must. A stream the
+   * connection never wrote (a run that selected the streams it writes leaves
+   * the others alone) simply has no entry.
    */
   readonly streams: Readonly<
     Record<

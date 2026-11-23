@@ -412,4 +412,122 @@ describe("connection checkpoint read", () => {
       await sync.close();
     }
   });
+
+  it("after a selecting run, a plain begin resumes the written stream from its cursor and reads the unwritten one whole", async () => {
+    const { db, sync } = await open("1.2.0");
+    try {
+      await sync.intake.begin("run-items", {
+        ...request,
+        selectedStreams: ["items"],
+      });
+      await sync.intake.batch("run-items", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "one" } }],
+      });
+      await sync.intake.end("run-items", selectedEnd("items", { cursor: "a" }));
+      await sync.publish();
+      // A device's ordinary run: the connection has a checkpoint, so the run
+      // is incremental, but only `items` has a cursor and a complete head.
+      const begun = await sync.intake.begin("run-device", {
+        ...request,
+        connect: false,
+      });
+      expect(begun.start).toEqual({
+        collection_mode: "incremental",
+        state: { items: { cursor: "a" } },
+      });
+      expect(begun.streams.map((stream) => [stream.name, stream.mode])).toEqual(
+        [
+          ["items", "incremental"],
+          ["notes", "full_refresh"],
+        ],
+      );
+      expect(
+        await db.query(
+          "SELECT stream, full_read FROM run_streams WHERE run_id='run-device' ORDER BY stream",
+        ),
+      ).toEqual([
+        { stream: "items", full_read: 0 },
+        { stream: "notes", full_read: 1 },
+      ]);
+      // The whole read completes the stream; the connection then resumes both.
+      await sync.intake.batch("run-device", {
+        batch: 0,
+        records: [
+          { stream: "items", data: { id: "two" } },
+          { stream: "notes", data: { id: "n1" } },
+        ],
+      });
+      await sync.intake.end("run-device", {
+        finish: "completed",
+        streams: { items: observed(true), notes: observed(true) },
+        checkpoints: { items: { cursor: "c" }, notes: { cursor: "b" } },
+        lastBatch: 0,
+      });
+      await sync.publish();
+      expect(
+        await db.query(
+          "SELECT stream, complete FROM stream_state ORDER BY stream",
+        ),
+      ).toEqual([
+        { stream: "items", complete: 1 },
+        { stream: "notes", complete: 1 },
+      ]);
+      expect((await sync.intake.checkpoint?.("fixture"))?.streams).toEqual({
+        items: { state: { cursor: "c" }, cursorVersion: "1.2.0" },
+        notes: { state: { cursor: "b" }, cursorVersion: "1.2.0" },
+      });
+      const next = await sync.intake.begin("run-device-2", {
+        ...request,
+        connect: false,
+      });
+      expect(next.streams.map((stream) => stream.mode)).toEqual([
+        "incremental",
+        "incremental",
+      ]);
+    } finally {
+      await sync.close();
+    }
+  });
+
+  it("withholds a stored cursor whose stream has no head here, as begin reads such a stream whole", async () => {
+    const { db, sync } = await open("1.2.0");
+    try {
+      await sync.intake.begin("run-items", {
+        ...request,
+        selectedStreams: ["items"],
+      });
+      await sync.intake.batch("run-items", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "one" } }],
+      });
+      await sync.intake.end("run-items", selectedEnd("items", { cursor: "a" }));
+      await sync.publish();
+      // A cursor for a stream no run here ever declared or published.
+      await db.batch([
+        {
+          sql: "UPDATE connections SET checkpoint = ?",
+          params: [
+            JSON.stringify({ items: { cursor: "a" }, notes: { cursor: "x" } }),
+          ],
+        },
+      ]);
+      expect((await sync.intake.checkpoint?.("fixture"))?.streams).toEqual({
+        items: { state: { cursor: "a" }, cursorVersion: "1.2.0" },
+      });
+      const begun = await sync.intake.begin("run-device", {
+        ...request,
+        connect: false,
+      });
+      expect(begun.start.state).toEqual({ items: { cursor: "a" } });
+      expect(begun.streams.map((stream) => [stream.name, stream.mode])).toEqual(
+        [
+          ["items", "incremental"],
+          ["notes", "full_refresh"],
+        ],
+      );
+    } finally {
+      await sync.close();
+    }
+  });
 });
