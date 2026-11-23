@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -71,6 +71,8 @@ describe("connection checkpoint read", () => {
       blobs?: ReturnType<typeof createMemoryStreamSyncBlobs>;
     } = {},
   ) {
+    // The runner has no `~/.tmp` of its own: make it before the first run.
+    mkdirSync(join(homedir(), ".tmp"), { recursive: true });
     const root = mkdtempSync(join(homedir(), ".tmp", "connection-checkpoint-"));
     roots.push(root);
     const db = await openLocalDb(driver(join(root, "data.db")), {

@@ -9,7 +9,7 @@
 // read in between, the head stays incomplete and the cursor is not saved, so
 // the rows the resumed read skipped are read in full by the next run.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -84,6 +84,8 @@ describe("a run resumed from a cursor read before it began", () => {
       streams?: readonly ("items" | "notes")[];
     } = {},
   ) {
+    // The runner has no `~/.tmp` of its own: make it before the first run.
+    mkdirSync(join(homedir(), ".tmp"), { recursive: true });
     const root = mkdtempSync(join(homedir(), ".tmp", "resumed-run-"));
     roots.push(root);
     const db = await openLocalDb(driver(join(root, "data.db")), {
