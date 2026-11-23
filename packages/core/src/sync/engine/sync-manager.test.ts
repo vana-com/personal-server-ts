@@ -535,6 +535,56 @@ describe("SyncManager", () => {
     expect(downloadAll).not.toHaveBeenCalled();
   });
 
+  it("baselines a subscriber without an event and stops notifying after unsubscribe", async () => {
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+    );
+    const listener = vi.fn();
+    const unsubscribe = manager.subscribeStatus(listener);
+    try {
+      expect(listener).not.toHaveBeenCalled();
+      manager.start();
+      expect(listener).toHaveBeenCalledWith(
+        expect.objectContaining({ running: true }),
+      );
+      unsubscribe();
+      listener.mockClear();
+      await vi.advanceTimersByTimeAsync(0);
+      await manager.stop();
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+      await manager.stop();
+    }
+  });
+
+  it("continues delivering status and starts the cycle after a listener throws", async () => {
+    const upload = makeMockUploadDeps();
+    const manager = createSyncManager(upload, makeMockDownloadDeps());
+    const stopBad = manager.subscribeStatus(() => {
+      throw new Error("synthetic status listener failure");
+    });
+    const listener = vi.fn();
+    const stopGood = manager.subscribeStatus(listener);
+    try {
+      expect(() => manager.start()).not.toThrow();
+      expect(listener).toHaveBeenCalledWith(
+        expect.objectContaining({ running: true }),
+      );
+      expect(upload.logger.warn).toHaveBeenCalledWith(
+        { error: "synthetic status listener failure" },
+        "a sync status listener threw",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(downloadAll).toHaveBeenCalled();
+    } finally {
+      stopBad();
+      stopGood();
+      await manager.stop();
+    }
+  });
+
   it("getStatus() returns correct pending count", () => {
     const uploadDeps = makeMockUploadDeps();
     const downloadDeps = makeMockDownloadDeps();
