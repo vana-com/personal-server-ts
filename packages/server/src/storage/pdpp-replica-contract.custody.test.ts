@@ -33,6 +33,7 @@ import {
   replicaScope,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
+import { createReplicationJournal } from "./pdpp-replication-sqlite.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import {
@@ -1724,6 +1725,51 @@ describe("section C: fences, outcomes and claims", () => {
       await running.catch(() => undefined);
       net.port.put = realPut;
       secondStore.close();
+    }
+  });
+});
+
+describe("baseline checkpoint receipt", () => {
+  function journal(checkpoint: number) {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE pdpp_replica_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      config_json TEXT NOT NULL,
+      watermark INTEGER NOT NULL,
+      checkpoint INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.prepare("INSERT INTO pdpp_replica_settings VALUES (1, '{}', 4, ?)").run(
+      checkpoint,
+    );
+    return {
+      db,
+      exporter: createReplicationJournal(db, () => "synthetic-writer").exporter,
+    };
+  }
+
+  it("acknowledges a repeated receipt without moving the checkpoint twice", () => {
+    const { db, exporter } = journal(1);
+    try {
+      exporter.acknowledgeBaselinePage(1, 2);
+      exporter.acknowledgeBaselinePage(1, 2);
+      expect(exporter.getBaselineCheckpoint()).toBe(2);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps the last accepted checkpoint on conflict or invalid range", () => {
+    const { db, exporter } = journal(2);
+    try {
+      expect(() => exporter.acknowledgeBaselinePage(1, 3)).toThrow(
+        "baseline checkpoint conflict",
+      );
+      expect(() => exporter.acknowledgeBaselinePage(2, 5)).toThrow(
+        "invalid baseline checkpoint",
+      );
+      expect(exporter.getBaselineCheckpoint()).toBe(2);
+    } finally {
+      db.close();
     }
   });
 });
