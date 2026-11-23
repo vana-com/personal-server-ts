@@ -12,6 +12,8 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -124,6 +126,28 @@ describe("memory-oracle temp roots", () => {
         "Invalid temp-root prefix",
       );
     }
+  });
+
+  it("reports a missing temp-root parent without creating it", () => {
+    withTempParent((parent) => {
+      const missing = join(parent, "missing");
+      const exitListeners = process.listenerCount("exit");
+      expect(() => createTempRoot("oracle-", missing)).toThrow(/ENOENT/);
+      expect(readdirSync(parent)).toEqual([]);
+      expect(process.listenerCount("exit")).toBe(exitListeners);
+    });
+  });
+
+  it("rejects a file as the temp-root parent without changing it", () => {
+    withTempParent((parent) => {
+      const file = join(parent, "not-a-directory");
+      writeFileSync(file, "synthetic sentinel");
+      const exitListeners = process.listenerCount("exit");
+      expect(() => createTempRoot("oracle-", file)).toThrow(/ENOTDIR/);
+      expect(readdirSync(parent)).toEqual(["not-a-directory"]);
+      expect(readFileSync(file, "utf8")).toBe("synthetic sentinel");
+      expect(process.listenerCount("exit")).toBe(exitListeners);
+    });
   });
 
   it("disposes a root and can safely dispose it again", () => {
