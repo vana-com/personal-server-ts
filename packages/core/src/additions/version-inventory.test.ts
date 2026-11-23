@@ -1,8 +1,35 @@
 import { describe, expect, it, vi } from "vitest";
+import { AdditionsBudget, AdditionsBudgetExceeded } from "./budget.js";
 import { createVersionInventoryClient } from "./version-inventory.js";
 
 const owner = "0x1111111111111111111111111111111111111111";
 const id = "0xc4514b17500f374e6ba098810bfeb0855719335bc2de26fa3038d0a0e5ffc2ce";
+
+describe("version inventory byte allowance receipts", () => {
+  it("records actual cost and closes the budget after an oversized receipt", () => {
+    const budget = new AdditionsBudget(10);
+    const reservation = budget.reserve(3);
+
+    expect(() => reservation.settle(4)).toThrow(AdditionsBudgetExceeded);
+    expect(budget.remaining).toBe(6);
+    expect(() => budget.charge(1)).toThrow(AdditionsBudgetExceeded);
+  });
+
+  it("keeps the reservation when a malformed receipt can be corrected", () => {
+    const budget = new AdditionsBudget(10);
+    const reservation = budget.reserve(5);
+
+    for (const invalid of [-1, 1.5, Number.NaN]) {
+      expect(() => reservation.settle(invalid)).toThrow(
+        AdditionsBudgetExceeded,
+      );
+      expect(budget.remaining).toBe(5);
+    }
+
+    reservation.settle(2);
+    expect(budget.remaining).toBe(8);
+  });
+});
 
 describe("owner version inventory", () => {
   it("signs the canonical owner URI with defaults, preserving scope whitespace", async () => {
