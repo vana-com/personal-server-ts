@@ -29,7 +29,10 @@ import {
 } from "../grants/pdpp-binding.js";
 import { createInMemoryPdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
 
-import { verifyDataReadPolicy } from "./data-read.js";
+import {
+  parseGrantExpiresAtSeconds,
+  verifyDataReadPolicy,
+} from "./data-read.js";
 
 const OWNER = "0x00000000000000000000000000000000000000AA" as const;
 const OTHER_OWNER = "0x00000000000000000000000000000000000000BB" as const;
@@ -434,5 +437,20 @@ describe("verifyDataReadPolicy — PDPP §6 grant binding", () => {
         "GRANT_REVOKED",
       );
     }
+  });
+});
+
+describe("grant expiry metadata parsing", () => {
+  it("returns an unknown expiry for an unreadable date string", () => {
+    expect(parseGrantExpiresAtSeconds("not-a-date")).toBeNull();
+    expect(parseGrantExpiresAtSeconds("2026-06-01T00:00:00.001Z")).toBe(
+      1780272000,
+    );
+  });
+
+  it("returns an unknown expiry for non-finite numeric metadata", () => {
+    expect(parseGrantExpiresAtSeconds(Number.NaN)).toBeNull();
+    expect(parseGrantExpiresAtSeconds(Number.POSITIVE_INFINITY)).toBeNull();
+    expect(parseGrantExpiresAtSeconds(1780272000)).toBe(1780272000);
   });
 });
