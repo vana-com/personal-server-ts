@@ -1,0 +1,139 @@
+import { describe, expect, it } from "vitest";
+import {
+  seedLegacyStore,
+  type LegacySeedStream,
+} from "./legacy-seed-producer.js";
+import type { FoldLayer } from "./legacy-fold.js";
+import type { SeedIntake } from "./seed.js";
+
+// The producer reads a host's legacy store twice: once to count the rows the
+// upload will carry, once to write them. It must stop on abort in either pass,
+// close every reader it opened, and keep each upload chunk within its bound.
+
+const CHUNK_BYTES = 256 * 1024;
+
+/** An intake that drains the body as the real one does, and keeps what it saw. */
+function intake() {
+  const chunks: Uint8Array[] = [];
+  const puts: string[] = [];
+  const port: SeedIntake = {
+    async status() {
+      return { targetKnown: true, streams: {} };
+    },
+    async put(_connector, stream, body) {
+      for await (const chunk of body) chunks.push(chunk);
+      puts.push(stream);
+      return { state: "staged", records: 0, invalid: 0 };
+    },
+  };
+  return { port, chunks, puts };
+}
+
+const stream = (layers: FoldLayer[]): LegacySeedStream => ({
+  connector: "fixture",
+  stream: "items",
+  primaryKey: ["id"],
+  version: "1",
+  layers,
+});
+const store = (...streams: LegacySeedStream[]) => ({
+  async *streams() {
+    yield* streams;
+  },
+});
+
+/** A layer that notes each open and close of its reader. */
+function watched(rows: () => AsyncIterable<unknown>, log: string[]): FoldLayer {
+  return {
+    async *records() {
+      log.push("open");
+      try {
+        yield* rows();
+      } finally {
+        log.push("close");
+      }
+    },
+  };
+}
+
+describe("seedLegacyStore abort", () => {
+  it("closes the reader when the counting pass is aborted", async () => {
+    const abort = new AbortController();
+    const log: string[] = [];
+    const layer = watched(async function* () {
+      for (let i = 0; i < 10; i++) {
+        if (i === 3) abort.abort();
+        yield { id: `k${i}` };
+      }
+    }, log);
+    const { port, puts } = intake();
+    await expect(
+      seedLegacyStore(port, store(stream([layer])), { signal: abort.signal }),
+    ).rejects.toThrow();
+    expect(log).toEqual(["open", "close"]);
+    expect(puts).toEqual([]);
+  });
+
+  it("stops the upload pass, rows the fold skips included, and imports nothing", async () => {
+    const abort = new AbortController();
+    const log: string[] = [];
+    let pass = 0;
+    const layer = watched(async function* () {
+      pass++;
+      yield { id: "a" };
+      // Rows the fold leaves out (no key): the second pass reaches the abort
+      // only here, after the last row it would write.
+      for (let i = 0; i < 5; i++) {
+        if (pass === 2 && i === 2) abort.abort();
+        yield { nope: i };
+      }
+    }, log);
+    const { port, puts } = intake();
+    await expect(
+      seedLegacyStore(port, store(stream([layer])), { signal: abort.signal }),
+    ).rejects.toThrow();
+    expect(pass).toBe(2);
+    expect(log).toEqual(["open", "close", "open", "close"]);
+    expect(puts).toEqual([]);
+  });
+});
+
+describe("seedLegacyStore chunks", () => {
+  it("bounds each chunk by UTF-8 bytes, not UTF-16 code units", async () => {
+    // Each row is about 90 KB as UTF-8 and 30 KB as UTF-16 code units.
+    const wide = "日".repeat(30_000);
+    const layer: FoldLayer = {
+      async *records() {
+        for (let i = 0; i < 12; i++) yield { id: `k${i}`, wide };
+      },
+    };
+    const { port, chunks } = intake();
+    await seedLegacyStore(port, store(stream([layer])));
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks)
+      expect(chunk.byteLength).toBeLessThanOrEqual(CHUNK_BYTES);
+    // Nothing is lost to the flush rule: the lines add back up to every row.
+    const text = chunks.map((c) => new TextDecoder().decode(c)).join("");
+    expect(text.trimEnd().split("\n")).toHaveLength(1 + 12);
+  });
+
+  it("sends a line larger than the bound alone", async () => {
+    const layer: FoldLayer = {
+      async *records() {
+        yield { id: "small" };
+        yield { id: "huge", wide: "日".repeat(100_000) };
+        yield { id: "small-2" };
+      },
+    };
+    const { port, chunks } = intake();
+    await seedLegacyStore(port, store(stream([layer])));
+    const lines = chunks.map(
+      (c) => new TextDecoder().decode(c).trimEnd().split("\n").length,
+    );
+    expect(lines.reduce((a, b) => a + b, 0)).toBe(1 + 3);
+    expect(chunks.some((c) => c.byteLength > CHUNK_BYTES)).toBe(true);
+    expect(chunks.filter((c) => c.byteLength > CHUNK_BYTES)).toHaveLength(1);
+    const big = chunks.find((c) => c.byteLength > CHUNK_BYTES)!;
+    expect(new TextDecoder().decode(big).trimEnd().split("\n")).toHaveLength(1);
+  });
+});

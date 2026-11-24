@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from "vitest";
 import { foldLayers, type FoldLayer } from "../../../core/src/localdb/index.js";
-import { drivers, world } from "./late-seed-harness.js";
+import { drivers, world } from "./late-seed-harness.test-utils.js";
 
 // Layers are stored versions of one stream, newest first: the `{records}`
 // files a source left, one after another. The fold lets the newest version of
@@ -248,4 +248,150 @@ it("fold-replay-adds-nothing", async () => {
     changes: await a.db.query("SELECT * FROM record_changes"),
     tombstones: await a.db.query("SELECT * FROM log_tombstones"),
   }).toEqual(before);
+});
+
+it("fold-an-unreadable-newer-row-leaves-the-older-copy-standing", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const cyclic: Record<string, unknown> = { id: "b", v: "new" };
+  cyclic["self"] = cyclic;
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, [
+      layer([{ id: "a", v: 1n }, cyclic, { id: "c", v: "new-c" }]),
+      layer([
+        { id: "a", v: "old-a" },
+        { id: "b", v: "old-b" },
+        { id: "c", v: "old-c" },
+      ]),
+    ]),
+  );
+  // The newer copies of a and b have no JSON form. They claim nothing, so the
+  // older copies stand; c is readable in the newer layer and wins there.
+  expect(result).toMatchObject({
+    kind: "imported",
+    quarantine: { unserializable_body: 2, superseded: 1 },
+  });
+  expect(await bodies(a)).toEqual({
+    a: '{"id":"a","v":"old-a"}',
+    b: '{"id":"b","v":"old-b"}',
+    c: '{"id":"c","v":"new-c"}',
+  });
+});
+
+// A v1-full row names its operation in `$pdpp.record`. A delete holds the
+// key (`record.key`) and its payload still carries the key fields.
+const deleteEnvelope = (
+  id: string,
+  extra: { sourceId?: string; claim?: unknown; op?: string } = {},
+) => ({
+  id,
+  $pdpp: {
+    version: 1,
+    sourceId: extra.sourceId ?? SOURCE,
+    record: {
+      key: "claim" in extra ? extra.claim : { id },
+      op: extra.op ?? "delete",
+    },
+  },
+});
+
+it("fold-a-v1-full-delete-envelope-hides-older-rows-and-writes-a-seed-tombstone", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const result = await a.importSource("files", (base) =>
+    foldLayers(
+      base,
+      [
+        layer([tagged("n", "new"), deleteEnvelope("b")]),
+        layer([tagged("a", "mid"), tagged("b", "mid-b")]),
+        layer([tagged("b", "old-b"), tagged("c", "old-c")]),
+      ],
+      { sourceId: SOURCE },
+    ),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    tombstoned: 1,
+    quarantine: { deleted_in_newer_layer: 2 },
+  });
+  expect(await a.keys()).toEqual(["a", "c", "n"]);
+  expect(
+    await a.db.query("SELECT record_key, stamp_o, stamp_r FROM log_tombstones"),
+  ).toEqual([{ record_key: "b", stamp_o: 0, stamp_r: "seed" }]);
+  // Another copy's seed cannot bring it back.
+  await a.seed("another-install", ["b"]);
+  expect(await a.keys()).toEqual(["a", "c", "n"]);
+});
+
+it("fold-a-v1-full-upsert-envelope-is-a-row-and-an-unknown-op-is-counted", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const result = await a.importSource("files", (base) =>
+    foldLayers(
+      base,
+      [
+        layer([
+          deleteEnvelope("u", { op: "upsert" }),
+          deleteEnvelope("p", { op: "patch" }),
+        ]),
+      ],
+      { sourceId: SOURCE },
+    ),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    tombstoned: 0,
+    quarantine: { unknown_op: 1 },
+  });
+  expect(await a.keys()).toEqual(["u"]);
+});
+
+it("fold-a-delete-envelope-of-another-source-or-with-a-wrong-key-claim-deletes-nothing", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const result = await a.importSource("files", (base) =>
+    foldLayers(
+      base,
+      [
+        layer([
+          deleteEnvelope("x", { sourceId: "urn:other" }),
+          deleteEnvelope("y", { claim: { id: "not-y" } }),
+          deleteEnvelope("z", { claim: "z" }),
+        ]),
+        layer([tagged("x", "kept"), tagged("y", "kept"), tagged("z", "kept")]),
+      ],
+      { sourceId: SOURCE },
+    ),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    tombstoned: 0,
+    quarantine: {
+      source_mismatch: 1,
+      deletion_record_key_mismatch: 1,
+      deletion_not_an_object: 1,
+    },
+  });
+  expect(await a.keys()).toEqual(["x", "y", "z"]);
+});
+
+it("fold-a-live-row-in-the-same-or-a-newer-layer-outranks-a-v1-full-delete", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const result = await a.importSource("files", (base) =>
+    foldLayers(
+      base,
+      [
+        layer([tagged("k", "revived")]),
+        layer([deleteEnvelope("k"), tagged("m", "same-layer-live")]),
+        layer([deleteEnvelope("m"), tagged("k", "old")]),
+      ],
+      { sourceId: SOURCE },
+    ),
+  );
+  expect(result).toMatchObject({ kind: "imported", tombstoned: 0 });
+  expect(await bodies(a)).toEqual({
+    k: '{"id":"k","v":"revived"}',
+    m: '{"id":"m","v":"same-layer-live"}',
+  });
 });

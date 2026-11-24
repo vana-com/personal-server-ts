@@ -7,7 +7,12 @@ import {
   createCanonicalImportSource,
   type CanonicalImportPageReader,
 } from "./canonical-import-source.js";
-import { connectionId, drivers, owner, world } from "./late-seed-harness.js";
+import {
+  connectionId,
+  drivers,
+  owner,
+  world,
+} from "./late-seed-harness.test-utils.js";
 
 // Two live instances of one source hold overlapping keys with different
 // bodies. The newest instance's body wins on every device, whatever order the
@@ -260,4 +265,15 @@ it("olderInstances exclude keeps today's behaviour: the newest instance only", a
     "source",
     "older_instance",
   ]);
+});
+
+it("a merged source whose reader cannot count older instances carries no row count", async () => {
+  const counted = store({ old: OLD, new: NEW }, { old: 10, new: 20 });
+  const { rows: _unused, ...uncounted } = counted;
+  const all = await entries(uncounted);
+  // The newest instance's two rows are not the whole stream: the count is
+  // unknown, and an unknown count is absent, never a smaller number.
+  expect(sources(all)).toHaveLength(1);
+  expect(sources(all)[0]!.rows).toBeUndefined();
+  expect("rows" in sources(all)[0]!).toBe(false);
 });

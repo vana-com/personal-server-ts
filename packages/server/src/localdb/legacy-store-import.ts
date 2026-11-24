@@ -47,9 +47,12 @@ import { importProjection } from "./sync.js";
  *
  * - `rows`: for the sources the runner offered to the database (the newest
  *   live instance of each declared source): rows the old store held, rows now
- *   imported, and rows left out for want of a full identity, by reason. Every
- *   old row is in one of the three, or its stream is in `refused`. The
- *   receipt keeps the same reasons, so the count outlives the old files.
+ *   imported, rows left out for want of a full identity (by reason), and rows
+ *   of streams the database refused. Every old row is in exactly one of the
+ *   last three: `legacy = imported + sum(quarantined) + refused`. `legacy` is
+ *   null once any source carried no count; `refused` is null once a refused
+ *   source carried none. The receipt keeps the quarantine reasons, so the
+ *   count outlives the old files.
  *
  * A source with no rows is not counted: the inventory lists every declared
  * stream of each connection, and an empty one loses nothing.
@@ -70,6 +73,9 @@ export interface LegacyStoreImportReport {
     readonly legacy: number | null;
     readonly imported: number;
     readonly quarantined: QuarantineCounts;
+    /** Rows of refused streams (`refused` has them by reason); null once a
+     * refused source did not carry a count. */
+    readonly refused: number | null;
   };
   readonly files: {
     readonly total: number;
@@ -284,6 +290,7 @@ async function importSources(
   const quarantined = quarantineTally();
   let legacyRows: number | null = 0;
   let importedRows = 0;
+  let refusedRows: number | null = 0;
   for await (const entry of access.sources()) {
     if (signal.aborted) break;
     if ("kind" in entry) {
@@ -331,8 +338,13 @@ async function importSources(
     }
     const result = await importLegacySource(deps, ledger, source);
     count(result.kind === "refused" ? `refused:${result.reason}` : result.kind);
-    if (result.kind === "refused") refused.add(result.reason, source.rows);
-    else {
+    if (result.kind === "refused") {
+      refused.add(result.reason, source.rows);
+      refusedRows =
+        refusedRows === null || source.rows === undefined
+          ? null
+          : refusedRows + source.rows;
+    } else {
       importedRows += result.receipt.rows;
       for (const [reason, rows] of Object.entries(result.quarantine))
         quarantined.add(reason, rows);
@@ -355,6 +367,7 @@ async function importSources(
         legacy: legacyRows,
         imported: importedRows,
         quarantined: quarantined.counts(),
+        refused: refusedRows,
       },
       files: null,
     }),

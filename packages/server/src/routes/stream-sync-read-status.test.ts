@@ -172,7 +172,7 @@ describe("stream-sync read status route", () => {
       alreadyImported: 0,
       excluded: [{ reason: "older_instance", streams: 1, rows: 4 }],
       refused: [],
-      rows: { legacy: 7, imported: 7, quarantined: {} },
+      rows: { legacy: 7, imported: 7, quarantined: {}, refused: 0 },
       files: { total: 2, unimported: 1 },
     };
     function audited(legacyStoreImport?: () => typeof report | null) {

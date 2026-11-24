@@ -137,6 +137,38 @@ describe("legacy store import report", () => {
     expect(second.files).toEqual(first.files);
   }, 120_000);
 
+  it("accounts for the rows of a refused stream: every old row is imported, left out, or refused", async () => {
+    const base = await scratch("legacy-report-");
+    directories.push(base);
+    const root = join(base, "root");
+    writeLegacyStore(root);
+    addOtherInstances(root);
+    const h = await direct(base, root);
+    closers.push(h.close);
+    await h.run();
+    // The stream's declaration changed under the receipt: the next run
+    // refuses it whole, and its rows are neither imported nor quarantined.
+    await h.local.batch([
+      {
+        sql: "UPDATE stream_state SET primary_key = '[\"other\"]' WHERE connection_id = 'pdpp.github~' AND stream = 'repositories'",
+      },
+      { sql: "DELETE FROM import_ledger WHERE stream = 'repositories'" },
+    ]);
+    await h.run();
+    const report = h.runner.report()!;
+    expect(report.refused).toEqual([
+      { reason: "invalid_record", streams: 1, rows: 5 },
+    ]);
+    const left = Object.values(report.rows.quarantined).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(report.rows.refused).toBe(5);
+    expect(report.rows.legacy).toBe(
+      report.rows.imported + left + report.rows.refused!,
+    );
+  }, 120_000);
+
   it("publishes one report per run, after retirement: files are never null beside a finished report", async () => {
     const base = await scratch("legacy-report-");
     directories.push(base);

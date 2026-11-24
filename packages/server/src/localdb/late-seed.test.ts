@@ -10,14 +10,14 @@ import {
 import { createSeedStaging } from "../../../core/src/stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import type { openDevice } from "./late-seed-harness.js";
+import type { openDevice } from "./late-seed-harness.test-utils.js";
 import {
   connectionId,
   drivers,
   owner,
   state,
   world,
-} from "./late-seed-harness.js";
+} from "./late-seed-harness.test-utils.js";
 
 // A seed after a stream's first real write is fill-only: it adds a record the
 // stream never saw, and leaves a record the stream holds, or ever deleted or

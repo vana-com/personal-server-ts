@@ -200,6 +200,10 @@ export async function* createCanonicalImportSource(options: {
       continue;
     }
     // Several live instances: one source, named for the merge, over their layers.
+    // Its row count is the sum over instances. A reader that cannot count the
+    // older ones leaves the count unknown: the newest instance's count alone
+    // would be a smaller number, not a diagnostic.
+    const { rows: _newestOnly, ...withoutRows } = base;
     let rows: number | undefined = entry.rows;
     if (reader.rows)
       for (const instance of instances.slice(1))
@@ -207,7 +211,7 @@ export async function* createCanonicalImportSource(options: {
     else rows = undefined;
     yield foldLayers(
       {
-        ...base,
+        ...withoutRows,
         source: JSON.stringify(["merged", entry.sourceId, revision]),
         ...(rows === undefined ? {} : { rows }),
       },

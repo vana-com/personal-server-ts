@@ -61,13 +61,16 @@ export interface LegacySeedReport {
   readonly quarantine: QuarantineCounts;
 }
 
-/** About one write batch of the staging; a line larger than this travels alone. */
+/** About one write batch of the staging, in UTF-8 bytes; a line larger than
+ * this travels alone. */
 const CHUNK_BYTES = 256 * 1024;
 
 const encoder = new TextEncoder();
 
-/** The importable rows of a stream, and what was left out, in one traversal. */
-function importable(stream: LegacySeedStream) {
+/** The importable rows of a stream, and what was left out, in one traversal.
+ * The signal is checked at every stored record, the ones the fold leaves out
+ * included, so a long skip cannot outlast an abort. */
+function importable(stream: LegacySeedStream, signal?: AbortSignal) {
   const source = foldLayers(
     {
       source: "producer",
@@ -89,6 +92,7 @@ function importable(stream: LegacySeedStream) {
   );
   return async function* (quarantine: ReturnType<typeof quarantineTally>) {
     for await (const record of source.records()) {
+      signal?.throwIfAborted();
       const classified = await classifyImportRow(record, stream.primaryKey);
       if ("quarantine" in classified) quarantine.add(classified.quarantine);
       else yield record as Record<string, unknown>;
@@ -129,16 +133,13 @@ export async function seedLegacyStore(
       continue;
     }
     const quarantine = quarantineTally();
-    const read = importable(stream);
+    const read = importable(stream, options.signal);
     // The descriptor leads the upload and states the line count, so one pass
     // counts. The second pass writes the lines. A store that changes between
     // the two fails the upload's count check, and nothing is imported.
     let count = 0;
-    const pass = read(quarantine)[Symbol.asyncIterator]();
-    while (!(await pass.next()).done) {
-      options.signal?.throwIfAborted();
-      count++;
-    }
+    // `for await` closes the readers when the pass ends early, by abort or fault.
+    for await (const _row of read(quarantine)) count++;
     if (count === 0) {
       reports.push({
         connector,
@@ -158,20 +159,30 @@ export async function seedLegacyStore(
       records: count,
     });
     async function* body(): AsyncIterable<Uint8Array> {
-      let pending: string[] = [descriptor];
-      let bytes = descriptor.length;
-      for await (const row of read(quarantineTally())) {
-        const line = JSON.stringify(row);
-        pending.push(line);
-        bytes += line.length + 1;
-        if (bytes >= CHUNK_BYTES) {
-          yield encoder.encode(pending.join("\n") + "\n");
-          pending = [];
-          bytes = 0;
+      let pending: Uint8Array[] = [encoder.encode(descriptor + "\n")];
+      let bytes = pending[0]!.byteLength;
+      const flush = () => {
+        const chunk = new Uint8Array(bytes);
+        let at = 0;
+        for (const part of pending) {
+          chunk.set(part, at);
+          at += part.byteLength;
         }
+        pending = [];
+        bytes = 0;
+        return chunk;
+      };
+      for await (const row of read(quarantineTally())) {
+        const line = encoder.encode(JSON.stringify(row) + "\n");
+        // Flush before the line that would pass the bound, so a chunk holds
+        // whole lines within it; a line over the bound alone travels alone.
+        if (bytes > 0 && bytes + line.byteLength > CHUNK_BYTES) yield flush();
+        pending.push(line);
+        bytes += line.byteLength;
       }
-      if (pending.length > 0) yield encoder.encode(pending.join("\n") + "\n");
+      if (bytes > 0) yield flush();
     }
+    options.signal?.throwIfAborted();
     const put = await intake.put(connector, name, body());
     statusOf.delete(connector);
     reports.push({
