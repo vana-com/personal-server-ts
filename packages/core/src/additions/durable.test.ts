@@ -1556,3 +1556,53 @@ it("returns freshly verified history without crossing a deleted portable-summary
   expect(cold.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
   expect((await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE]).toEqual(before);
 });
+
+describe("in-process scope scheduling", () => {
+  it("lets queued work continue in order after the first task rejects", async () => {
+    const { withScopeLock } = await import("./scope-lock.js");
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const failure = new Error("synthetic first task failed");
+    const first = withScopeLock("fixture.lock-order", async () => {
+      order.push("first");
+      await gate;
+      throw failure;
+    }).catch((error: unknown) => error);
+    const second = withScopeLock("fixture.lock-order", async () => {
+      order.push("second");
+      return "next";
+    });
+    try {
+      await Promise.resolve();
+      expect(order).toEqual(["first"]);
+    } finally {
+      release();
+    }
+    await expect(first).resolves.toBe(failure);
+    await expect(second).resolves.toBe("next");
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("does not delay an independent scope behind a waiting task", async () => {
+    const { withScopeLock } = await import("./scope-lock.js");
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = withScopeLock("fixture.lock-a", async () => {
+      await gate;
+      order.push("first finished");
+    });
+    const other = withScopeLock("fixture.lock-b", async () => {
+      order.push("other started");
+    });
+    try {
+      await Promise.resolve();
+      expect(order).toEqual(["other started"]);
+    } finally {
+      release();
+    }
+    await Promise.all([first, other]);
+    expect(order).toEqual(["other started", "first finished"]);
+  });
+});
