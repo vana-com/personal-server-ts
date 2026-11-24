@@ -92,6 +92,13 @@ export function createRegistryChangePush(
     subscribe(handlers) {
       const lifetime = new AbortController();
       let cursor: string | undefined;
+      // The gateway database's epoch, held beside the cursor: the generation
+      // the cursor's number belongs to. It is sent with every request. An
+      // answer under another epoch means the database was replaced (a dev
+      // reset, a restore), so the cursor and the `since` built on it say
+      // nothing: that answer is a reset, whatever its `changed` says. A gateway
+      // that sends none leaves the push as it was, and one seen earlier stays.
+      let epoch: string | undefined;
       let healthy = false;
       let afterFailure = false;
       let failures = 0;
@@ -144,21 +151,35 @@ export function createRegistryChangePush(
           lifetime.signal.addEventListener("abort", onStop, { once: true });
         });
         try {
+          const since = cursor === undefined ? undefined : handlers.since();
           const wait = waitForChange!(
             cursor,
             waitMs,
             request.signal,
-            cursor === undefined ? undefined : handlers.since(),
+            since,
+            epoch,
           );
           wait.catch(() => {}); // a late failure after the race is not ours
           const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
+          const epochMoved =
+            epoch !== undefined &&
+            answer.epoch !== undefined &&
+            answer.epoch !== epoch;
+          if (answer.epoch !== undefined) epoch = answer.epoch;
           cursor = answer.seq;
           failures = 0;
           setHealth(true);
           // The position first: the cycle a poke starts samples it.
           handlers.onPosition(answer.seq);
-          if (answer.changed || afterFailure) {
+          if (epochMoved) {
+            afterFailure = false;
+            handlers.onChange(
+              answer.delta?.reset
+                ? answer.delta
+                : { since: since ?? answer.seq, seq: answer.seq, reset: true },
+            );
+          } else if (answer.changed || afterFailure) {
             afterFailure = false;
             handlers.onChange(answer.changed ? answer.delta : undefined);
           }

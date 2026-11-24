@@ -651,13 +651,14 @@ export function createGatewayStreamSyncRegistry(
       return `${newest.changedAt}|${String(newest.id)}|${String(newest.expectedVersion)}`;
     },
 
-    async waitForChange(after, waitMs, signal, since) {
+    async waitForChange(after, waitMs, signal, since, epoch) {
       const params = new URLSearchParams({ user: options.ownerAddress });
       if (after !== undefined) {
         params.set("after", after);
         params.set("wait", String(Math.max(0, Math.round(waitMs / 1000))));
       }
       if (since !== undefined) params.set("since", since);
+      if (epoch !== undefined) params.set("epoch", epoch);
       const res = await fetchImpl(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
@@ -684,6 +685,7 @@ export function createGatewayStreamSyncRegistry(
         seq?: unknown;
         changed?: unknown;
         delta?: unknown;
+        epoch?: unknown;
       };
       if (
         typeof body.seq !== "string" ||
@@ -696,14 +698,20 @@ export function createGatewayStreamSyncRegistry(
       // (rows or reset). One that does not, or carries another request's, or
       // one this client cannot read, fails the request: the push then pokes a
       // full pull on its next answer.
+      // The epoch is read as the gateway sends it: a gateway that predates it
+      // sends none, and anything but a non-empty string is no epoch.
+      const answered =
+        typeof body.epoch === "string" && body.epoch !== ""
+          ? { epoch: body.epoch }
+          : {};
       if (!body.changed || since === undefined)
-        return { seq: body.seq, changed: body.changed };
+        return { seq: body.seq, changed: body.changed, ...answered };
       const delta = parseDelta(body.delta, since, body.seq);
       if (delta === undefined)
         throw new Error(
           `registry change answer has no readable delta for since=${since}`,
         );
-      return { seq: body.seq, changed: true, delta };
+      return { seq: body.seq, changed: true, delta, ...answered };
     },
 
     listOwnerRows: () => listRows(() => true),

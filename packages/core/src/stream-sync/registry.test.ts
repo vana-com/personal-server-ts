@@ -631,6 +631,56 @@ describe("waitForChange", () => {
     expect(signals[0]).toBe(controller.signal);
   });
 
+  it("sends the epoch it holds beside the cursor, and reads the epoch of the answer", async () => {
+    const epoch = "11111111-1111-4111-8111-111111111111";
+    const next = "22222222-2222-4222-8222-222222222222";
+    const { registry, urls } = waiting(
+      () =>
+        new Response(JSON.stringify({ seq: "12", epoch: next, changed: true })),
+    );
+    const answer = await registry.waitForChange!(
+      "9",
+      25_000,
+      new AbortController().signal,
+      undefined,
+      epoch,
+    );
+    expect(new URL(urls[0]!).searchParams.get("epoch")).toBe(epoch);
+    expect(answer).toMatchObject({ seq: "12", changed: true, epoch: next });
+  });
+
+  it("sends no epoch when it holds none, and an answer without one carries none (a gateway before the epoch)", async () => {
+    const { registry, urls } = waiting(
+      () => new Response(JSON.stringify({ seq: "12", changed: true })),
+    );
+    const answer = await registry.waitForChange!(
+      "9",
+      25_000,
+      new AbortController().signal,
+      undefined,
+      undefined,
+    );
+    expect(new URL(urls[0]!).searchParams.has("epoch")).toBe(false);
+    expect(answer).not.toHaveProperty("epoch");
+  });
+
+  it.each([[7], [null], [""]])(
+    "ignores an epoch that is not a non-empty string (%j)",
+    async (epoch) => {
+      const { registry } = waiting(
+        () => new Response(JSON.stringify({ seq: "12", epoch, changed: true })),
+      );
+      const answer = await registry.waitForChange!(
+        "9",
+        25_000,
+        new AbortController().signal,
+        undefined,
+        "11111111-1111-4111-8111-111111111111",
+      );
+      expect(answer).not.toHaveProperty("epoch");
+    },
+  );
+
   it("sends no cursor when it has none", async () => {
     const { registry, urls } = waiting(
       () => new Response(JSON.stringify({ seq: "0", changed: true })),

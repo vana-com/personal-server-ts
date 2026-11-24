@@ -15,21 +15,25 @@ import {
 } from "./change-push.js";
 
 type Wait = NonNullable<StreamSyncRegistry["waitForChange"]>;
-type Answer = { seq: string; changed: boolean };
+type Answer = { seq: string; changed: boolean; epoch?: string };
 
 /** A registry whose held request the test answers, fails or leaves hanging. */
 function scripted() {
   const calls: Array<{
     after: string | undefined;
+    since: string | undefined;
+    epoch: string | undefined;
     waitMs: number;
     signal: AbortSignal;
     answer: (a: Answer) => void;
     fail: (e: Error) => void;
   }> = [];
-  const waitForChange: Wait = (after, waitMs, signal) =>
+  const waitForChange: Wait = (after, waitMs, signal, since, epoch) =>
     new Promise<Answer>((resolve, reject) => {
       const call = {
         after,
+        since,
+        epoch,
         waitMs,
         signal,
         answer: resolve,
@@ -453,5 +457,129 @@ describe("the delta", () => {
     await flush();
     expect(deltas).toEqual([undefined, delta, undefined]);
     stop();
+  });
+});
+
+// The gateway's database has a generation (`epoch`). A device that held a
+// cursor across a dev reset or a restore must list again, not trust a counter
+// that happens to be in range.
+describe("the database epoch", () => {
+  const A = "11111111-1111-4111-8111-111111111111";
+  const B = "22222222-2222-4222-8222-222222222222";
+
+  function withEpochs(since: () => string | undefined = () => "4") {
+    const s = scripted();
+    const push = createRegistryChangePush(s.registry)!;
+    const changes: unknown[] = [];
+    const positions: string[] = [];
+    const stop = push.subscribe({
+      onChange: (d) => changes.push(d),
+      onHealth: () => {},
+      onPosition: (p) => positions.push(p),
+      since,
+    });
+    return { ...s, changes, positions, stop };
+  }
+
+  it("sends the epoch of the last answer beside the cursor, and none before one", async () => {
+    const s = withEpochs();
+    await flush();
+    s.calls[0].answer({ seq: "4", changed: true, epoch: A });
+    await flush();
+    s.calls[1].answer({ seq: "4", changed: false, epoch: A });
+    await flush();
+    expect(s.calls.map((c) => c.epoch)).toEqual([undefined, A, A]);
+    s.stop();
+  });
+
+  it("an answer under the same epoch is no extra poke: delta and quiet answers pass as before", async () => {
+    const s = withEpochs();
+    await flush();
+    s.calls[0].answer({ seq: "4", changed: true, epoch: A });
+    await flush();
+    s.calls[1].answer({ seq: "4", changed: false, epoch: A });
+    await flush();
+    expect(s.changes).toEqual([undefined]);
+    s.stop();
+  });
+
+  it("a new epoch is a reset even when the answer says nothing changed (mutation: epoch ignored)", async () => {
+    const s = withEpochs();
+    await flush();
+    s.calls[0].answer({ seq: "40", changed: true, epoch: A });
+    await flush();
+    // The database was replaced: its counter is 3, below the held cursor.
+    s.calls[1].answer({ seq: "3", changed: false, epoch: B });
+    await flush();
+    expect(s.changes).toEqual([
+      undefined,
+      { since: "4", seq: "3", reset: true },
+    ]);
+    // The position is still reported first, then the next request holds the new epoch.
+    expect(s.positions).toEqual(["40", "3"]);
+    expect(s.calls[2].epoch).toBe(B);
+    expect(s.calls[2].after).toBe("3");
+    s.stop();
+  });
+
+  it("the gateway's own reset for a new epoch is handed on once, not doubled", async () => {
+    const s = withEpochs();
+    await flush();
+    s.calls[0].answer({ seq: "40", changed: true, epoch: A });
+    await flush();
+    const delta = { since: "4", seq: "3", reset: true as const };
+    (s.calls[1].answer as (a: unknown) => void)({
+      seq: "3",
+      changed: true,
+      epoch: B,
+      delta,
+    });
+    await flush();
+    expect(s.changes).toEqual([undefined, delta]);
+    s.stop();
+  });
+
+  it("a reset with no since to name still reaches the manager", async () => {
+    const s = withEpochs(() => undefined);
+    await flush();
+    s.calls[0].answer({ seq: "40", changed: true, epoch: A });
+    await flush();
+    s.calls[1].answer({ seq: "3", changed: true, epoch: B });
+    await flush();
+    expect(s.changes[1]).toMatchObject({ seq: "3", reset: true });
+    s.stop();
+  });
+
+  it("a gateway without the epoch keeps today's behaviour, and does not lose the epoch it held", async () => {
+    const s = withEpochs();
+    await flush();
+    s.calls[0].answer({ seq: "4", changed: true });
+    await flush();
+    s.calls[1].answer({ seq: "5", changed: true });
+    await flush();
+    expect(s.calls.map((c) => c.epoch)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(s.changes).toEqual([undefined, undefined]);
+    // An epoch seen once is kept through an answer that has none.
+    s.calls[2].answer({ seq: "5", changed: false, epoch: A });
+    await flush();
+    s.calls[3].answer({ seq: "5", changed: false });
+    await flush();
+    expect(s.calls[4].epoch).toBe(A);
+    s.stop();
+  });
+
+  it("the poke after a failure still reads the epoch it held", async () => {
+    const s = withEpochs();
+    await flush();
+    s.calls[0].answer({ seq: "4", changed: true, epoch: A });
+    await flush();
+    s.calls[1].fail(new Error("down"));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(s.calls[2].epoch).toBe(A);
+    s.stop();
   });
 });
