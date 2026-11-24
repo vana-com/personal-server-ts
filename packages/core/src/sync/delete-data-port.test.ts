@@ -310,6 +310,89 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     });
   });
 
+  it("reads a 409 owner_stream_head_already_deleted like a 410: already deleted, at the version the answer or the feed names", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(409, {
+        success: false,
+        code: "owner_stream_head_already_deleted",
+        data: { expectedVersion: "9", deletedAt: "2026-08-25T10:00:00.000Z" },
+      }),
+    );
+    const { port } = makePort(
+      liveRecord({ expectedVersion: "4" }),
+      fetchImpl as unknown as typeof fetch,
+    );
+
+    expect(await port.tombstone(SCOPE)).toEqual({
+      status: "already-deleted",
+      dataPointId: computeDataPointId(OWNER, SCOPE),
+      version: "9",
+      deletedAt: "2026-08-25T10:00:00.000Z",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    // With no version in the answer, the deletion-aware feed names it.
+    const bare = vi.fn(async () =>
+      jsonResponse(409, { code: "owner_stream_head_already_deleted" }),
+    );
+    const second = makePort(
+      liveRecord({ expectedVersion: "4" }),
+      bare as unknown as typeof fetch,
+    );
+    (second.dataPointFeed.getDataPoint as ReturnType<typeof vi.fn>)
+      .mockReset()
+      .mockResolvedValueOnce(liveRecord({ expectedVersion: "4" }))
+      .mockResolvedValueOnce({
+        ...liveRecord({ expectedVersion: "7" }),
+        deletedAt: "2026-08-25T10:00:00.000Z",
+      });
+    expect(await second.port.tombstone(SCOPE)).toMatchObject({
+      status: "already-deleted",
+      version: "7",
+    });
+  });
+
+  it("reads a 409 owner_stream_head_already_deleted as already deleted when a fence is given too", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(409, { code: "owner_stream_head_already_deleted" }),
+    );
+    const { port } = makePort(
+      liveRecord({ expectedVersion: "4" }),
+      fetchImpl as unknown as typeof fetch,
+    );
+
+    expect(
+      await port.tombstone(SCOPE, {
+        head: {
+          expectedVersion: "4",
+          dataHash: liveRecord().dataHash,
+          metadataHash: liveRecord().metadataHash,
+        },
+      }),
+    ).toMatchObject({ status: "already-deleted" });
+  });
+
+  it("reads a 409 owner_stream_head_absent like a 404: nothing registered to tombstone, not a refusal and not a version conflict", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(409, {
+        success: false,
+        code: "owner_stream_head_absent",
+        scope: SCOPE,
+      }),
+    );
+    const { port } = makePort(
+      liveRecord({ expectedVersion: "4" }),
+      fetchImpl as unknown as typeof fetch,
+    );
+
+    expect(await port.tombstone(SCOPE)).toEqual({
+      status: "not-registered",
+      dataPointId: computeDataPointId(OWNER, SCOPE),
+    });
+    // No second, re-signed request: the answer is not a version conflict.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("throws on other gateway errors so the caller keeps the local copy", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(503, { error: "Service Unavailable" }),

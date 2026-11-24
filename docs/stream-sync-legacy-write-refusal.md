@@ -57,8 +57,15 @@ the write whether or not the header is present.
   with `409 USE_CONNECTOR_DELETE`: the connector delete erases. On an unknown
   mode it is a retryable `503`. On an unswitched account it deletes. The mode
   check and the delete are one `commit`.
-- The **gateway tombstone** in a scope delete is a new fact in the registry. It
-  is a legacy write: it runs inside `commit`, and a switched account sends none.
+- The **gateway tombstone** in a scope delete is a removal too: the exact
+  tombstone over a live head adds no readable data. It runs under `seal.remove`
+  (or inside a caller's `commit`), so a switched account can send it. Whether
+  the gateway admits it is the gateway's call: cutover policy v3 admits it from
+  the owner or a registered server, and policy v1 answers 409
+  `owner_stream_sync_required`, which the delete reports as terminal. Every
+  other legacy write stays closed (`seal.commit`). A switched account's
+  connection delete sends it for each legacy scope bound to the connector
+  (`localdb/legacy-delete.ts`).
 
 ### Sync workers
 
@@ -68,7 +75,7 @@ A worker step is classified by whether it writes anything new.
 | ------------------------------------ | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Download: store a fetched version    | Yes (file and row)                 | Refused at the storage seal. The pass stops at the first refusal and advances no cursor.                                          |
 | Upload: blob upload and registration | Yes (remote object, registry fact) | Each remote write is its own `commit` (`publication/publish.ts`). A blob already in flight finishes, the registration is refused. |
-| Delete: gateway tombstone            | Yes (registry fact)                | Refused. A re-submission after a failed tombstone is paused and spends no attempt.                                                |
+| Delete: gateway tombstone            | No (a removal)                     | Runs (`seal.remove`). A re-submission after a failed tombstone is a removal too, and runs.                                        |
 | Delete: local copy and blob cleanup  | No                                 | Runs in every mode.                                                                                                               |
 | Derivative compute: store the answer | Yes                                | Refused at the storage seal. The model is not asked when the account is already refused.                                          |
 | PDPP importer: canonical publish     | Yes                                | Refused inside `commit`.                                                                                                          |
@@ -107,18 +114,18 @@ Each row names the seal site and the test that proves it.
 
 ### Core callers
 
-| Sink                            | Seal site                                             | Test                                       |
-| ------------------------------- | ----------------------------------------------------- | ------------------------------------------ |
-| Client `DELETE /v1/data/:scope` | `core/src/api/index.ts`                               | `core/src/api/legacy-delete-route.test.ts` |
-| Gateway tombstone               | `core/src/sync/workers/delete.ts`                     | `delete-seal.test.ts`                      |
-| Tombstone re-submission         | same                                                  | `delete-finality.test.ts`                  |
-| Upload: blob and registration   | `core/src/publication/publish.ts`                     | `upload-seal.test.ts`                      |
-| Download                        | storage seal; early check in `workers/download.ts`    | `download-seal.test.ts`                    |
-| PDPP importer                   | `core/src/sync/pdpp-import.ts`                        | `pdpp-import.test.ts`                      |
-| Derivative answer               | storage seal; early check in `derivatives/compute.ts` | `compute-seal.test.ts`                     |
-| Ingest, index step              | `core/src/contracts/data.ts`                          | `data-seal.test.ts`                        |
-| The seal itself                 | `core/src/storage/legacy-write-seal.ts`               | `legacy-write-seal.test.ts`                |
-| `commitRemoval`                 | `core/src/sync/account-mode/authority.ts`             | `authority.test.ts`                        |
+| Sink                            | Seal site                                             | Test                                             |
+| ------------------------------- | ----------------------------------------------------- | ------------------------------------------------ |
+| Client `DELETE /v1/data/:scope` | `core/src/api/index.ts`                               | `core/src/api/legacy-delete-route.test.ts`       |
+| Gateway tombstone (removal)     | `core/src/sync/workers/delete.ts`                     | `delete-seal.test.ts`, `delete-switched.test.ts` |
+| Tombstone re-submission         | same                                                  | `delete-finality.test.ts`                        |
+| Upload: blob and registration   | `core/src/publication/publish.ts`                     | `upload-seal.test.ts`                            |
+| Download                        | storage seal; early check in `workers/download.ts`    | `download-seal.test.ts`                          |
+| PDPP importer                   | `core/src/sync/pdpp-import.ts`                        | `pdpp-import.test.ts`                            |
+| Derivative answer               | storage seal; early check in `derivatives/compute.ts` | `compute-seal.test.ts`                           |
+| Ingest, index step              | `core/src/contracts/data.ts`                          | `data-seal.test.ts`                              |
+| The seal itself                 | `core/src/storage/legacy-write-seal.ts`               | `legacy-write-seal.test.ts`                      |
+| `commitRemoval`                 | `core/src/sync/account-mode/authority.ts`             | `authority.test.ts`                              |
 
 ### Boot
 

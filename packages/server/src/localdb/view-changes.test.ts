@@ -86,6 +86,8 @@ const dropStampIndexSchema = [
 // A later migration's table of the body pieces an erasure left in storage.
 const dropRetainedPiecesSchema = [
   { sql: "DROP TABLE IF EXISTS retained_log_pieces" },
+  { sql: "DROP TABLE IF EXISTS enumerated_logs" },
+  { sql: "DROP TABLE IF EXISTS delete_tombstones" },
 ];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {

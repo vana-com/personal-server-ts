@@ -52,6 +52,7 @@ import {
   type AliasScopes,
   type AliasTargets,
 } from "./resolve.js";
+import type { LegacyDeletePorts } from "./legacy-delete.js";
 import { onConnectionPurged } from "./purge.js";
 import { ELIGIBLE_CHANGE, PENDING_RUN } from "./publication-work.js";
 import { createRunEndStore } from "./run-end.js";
@@ -128,6 +129,13 @@ export function createLocalSync(
      * that cannot delete from storage) erases nothing.
      */
     readonly erasure?: () => LogErasurePorts | undefined;
+    /**
+     * The host's ports for retiring a deleted connection's legacy copy at the
+     * gateway and in storage (`legacy-delete.ts`). Read when the stage runs,
+     * like `erasure`; `undefined` (a host that cannot) retires nothing and the
+     * delete status says another device must.
+     */
+    readonly legacyDelete?: () => LegacyDeletePorts | undefined;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
     readonly currentLease?: () => string | null;
     /** Waits between resumes of a delete that keeps failing (tests shorten). */
@@ -286,15 +294,27 @@ export function createLocalSync(
                 {
                   connector,
                   signal,
-                  ...(gate && { skipNamespaces: gate.skipNamespaces }),
+                  ...(gate && {
+                    skipNamespaces: gate.skipNamespaces,
+                    tombstones: gate.tombstones,
+                  }),
                 },
               )
-            : { connections: [], pending: false };
+            : {
+                connections: [],
+                pending: false,
+                skipped: [],
+                unavailable: true as const,
+              };
         },
       }),
+      ...(options.legacyDelete && { legacy: options.legacyDelete }),
       // A request waits for the fence no longer than the loop waits to look
       // at a delete that has not landed.
       fenceWaitMs: retryFirst,
+      // A connector's erasure that is unfinished arms the retry when its own
+      // pass ends: a sibling still waiting on storage does not delay it.
+      onUnfinished: () => armRetry(),
     });
   let deleteStore: ReturnType<typeof createConnectionDeleter> | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());
@@ -316,13 +336,20 @@ export function createLocalSync(
   // A connection purged here, by a delete made here or one adopted from
   // another device, may be erased from storage once its delete has settled;
   // the retry loop runs the erasure (and decides whether it is time).
-  const stopHearingPurges = options.erasure
-    ? onConnectionPurged(deps.db, (connector) => {
-        if (connector === null) deletes().noteSweepOwed();
-        else deletes().noteSettled(connector);
-        armRetry();
-      })
-    : () => {};
+  const stopHearingPurges =
+    options.erasure || options.legacyDelete
+      ? onConnectionPurged(deps.db, (purged) => {
+          if (purged === null) deletes().noteSweepOwed();
+          else
+            deletes().noteSettled(
+              purged.connector,
+              purged.confirmed
+                ? { ns: purged.ns, version: purged.controlVersion }
+                : undefined,
+            );
+          armRetry();
+        })
+      : () => {};
   const resumes = new Set<Promise<readonly PendingDelete[]>>();
   const resume = () => {
     const work = resumeOnce();
@@ -367,6 +394,16 @@ export function createLocalSync(
       return result;
     },
     resumeDeletes: resume,
+    deleteStatusSnapshot: (connector) =>
+      deletes().deleteStatusSnapshot(connector),
+    async deleteStatus(connector) {
+      const status = await deletes().deleteStatus(connector);
+      // A status that found a newer delete owes its erasure: the retry loop
+      // is what runs it, so it is armed by the read that found the work.
+      if (deletes().erasureOwed()) armRetry();
+      return status;
+    },
+    erasureOwed: () => deletes().erasureOwed(),
   };
   const listingDeps = {
     ...deps,

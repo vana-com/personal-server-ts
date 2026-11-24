@@ -72,6 +72,63 @@ describe("handleOwnerConnectorDelete (PS-2 W6 owner-delete)", () => {
     });
   });
 
+  it("carries the three-part delete status on the 202, so no app says deleted before all three parts are done", async () => {
+    const { deps } = makeDeps();
+    const deleteStatus = {
+      fence: { state: "done" },
+      legacy: { state: "blocked", reason: "owner_stream_sync_required" },
+      storage: { state: "pending" },
+    } as const;
+    const response = await handleOwnerConnectorDelete(
+      deleteRequest(),
+      "fixture",
+      {
+        ...deps,
+        connectionDelete: {
+          ...deps.connectionDelete!,
+          deleteStatusSnapshot: vi.fn(async () => deleteStatus),
+        },
+      },
+    );
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({
+      deleteId: "delete-1",
+      fenced: true,
+      deleteStatus,
+    });
+  });
+
+  it("answers a delete request from the status held here, never from a read that can wait on the network", async () => {
+    const { deps } = makeDeps();
+    const snapshot = {
+      fence: { state: "pending" },
+      legacy: { state: "pending" },
+      storage: { state: "pending" },
+    } as const;
+    const deleteStatus = vi.fn(() => new Promise<never>(() => {}));
+    const response = await handleOwnerConnectorDelete(
+      deleteRequest(),
+      "fixture",
+      {
+        ...deps,
+        connectionDelete: {
+          ...deps.connectionDelete!,
+          deleteStatus,
+          deleteStatusSnapshot: vi.fn(async () => snapshot),
+        },
+      },
+    );
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({
+      deleteId: "delete-1",
+      fenced: true,
+      deleteStatus: snapshot,
+    });
+    expect(deleteStatus).not.toHaveBeenCalled();
+  });
+
   it("tells a caller whose delete could not reach the registry that it is still pending", async () => {
     const { deps, requestConnectionDelete } = makeDeps();
     requestConnectionDelete.mockResolvedValueOnce({
@@ -211,6 +268,27 @@ describe("handleOwnerConnectorLifetime", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ lifetime: "v1:@3" });
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("answers the delete status beside the lifetime, for a caller that polls", async () => {
+    const { deps } = lifetimeDeps();
+    const deleteStatus = {
+      fence: { state: "done" },
+      legacy: { state: "done" },
+      storage: { state: "blocked", reason: "needs_another_device" },
+    } as const;
+    const response = await handleOwnerConnectorLifetime(
+      getRequest(),
+      "fixture",
+      {
+        ...deps,
+        connectionDelete: {
+          ...deps.connectionDelete!,
+          deleteStatus: vi.fn(async () => deleteStatus),
+        },
+      },
+    );
+    expect(await response.json()).toEqual({ lifetime: "v1:@3", deleteStatus });
   });
 
   it("refuses what the delete refuses: a bad id, an unswitched account, an unknown mode, no writer (mutant: LIFETIME_SKIPS_MODE)", async () => {

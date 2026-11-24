@@ -21,6 +21,10 @@ import { parseRetryAfterHeader } from "./storage-retry.js";
 import { NODE_MAX_TIMER_DELAY_MS } from "./timer.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import {
+  isGatewayAlreadyDeletedCode,
+  isGatewayHeadAbsentCode,
+} from "../sync/gateway-refusal.js";
+import {
   AmbiguousRegistryReplyError,
   RegistryUnavailableError,
   RegistryOverloadError,
@@ -179,6 +183,37 @@ function batchRowOf(raw: unknown, scope: string): RegistryBatchRow {
   throw new AmbiguousRegistryReplyError(
     `registry batch gave ${scope} the status ${status}`,
   );
+}
+
+/**
+ * A refused batch whose body names a head answer (a tombstone row over a head
+ * already deleted, or never registered) and the first row it refused, by
+ * `scope`. That row lost: its head is not the one the write expected. The
+ * gateway names no other row, and wrote none: they go again without it. A body
+ * that names no row of the request says nothing of which lost, and is read as
+ * a failed condition.
+ */
+function refusedByHeadAnswer(
+  request: SignedRegistryBatch,
+  body: unknown,
+): RegistryBatchResult | null {
+  const record = asRecord(body);
+  if (
+    !(
+      isGatewayAlreadyDeletedCode(record?.code) ||
+      isGatewayHeadAbsentCode(record?.code)
+    ) ||
+    !request.rows.some((row) => row.scope === record?.scope)
+  )
+    return null;
+  return {
+    kind: "refused",
+    rows: request.rows.map((row): RegistryBatchRow =>
+      row.scope === record?.scope
+        ? { kind: "conflict", latestVersion: null, latestDataHash: null }
+        : { kind: "not_written" },
+    ),
+  };
 }
 
 export function createGatewayStreamSyncRegistry(
@@ -541,6 +576,8 @@ export function createGatewayStreamSyncRegistry(
         if (asRecord(body)?.error === "conflict") {
           return refusedRowsOf(request, body);
         }
+        const headRefused = refusedByHeadAnswer(request, body);
+        if (headRefused) return headRefused;
         return {
           kind: "precondition_failed",
           failure: requirementFailure(body),
