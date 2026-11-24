@@ -59,6 +59,21 @@ export {
   type DeleteIntent,
   type PendingDelete,
 } from "./delete.js";
+export type {
+  ConnectionDeleteStatus,
+  DeleteBlockReason,
+  DeletePart,
+} from "./delete-status.js";
+export {
+  legacyHeadFrom,
+  modeFrom,
+  modeOfAccount,
+  pendingBlobsFrom,
+  retireLegacyOf,
+  type LegacyDeletePorts,
+  type LegacyHead,
+  type LegacyOutcome,
+} from "./legacy-delete.js";
 export {
   eraseDeletedConnectionLogs,
   inventoryVersionLister,

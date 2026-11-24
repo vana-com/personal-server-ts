@@ -24,6 +24,14 @@ import { RegistryRefusedError } from "../stream-sync/ports.js";
 import { commitFences } from "./delete-batch.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { ErasureReport } from "./log-erase.js";
+import {
+  blocked,
+  PART_DONE,
+  PART_PENDING,
+  type ConnectionDeleteStatus,
+  type DeletePart,
+} from "./delete-status.js";
+import { retireLegacyOf, type LegacyDeletePorts } from "./legacy-delete.js";
 import { purgeConnection } from "./purge.js";
 import {
   ConnectionLifetimeChanged,
@@ -35,6 +43,36 @@ export {
   ConnectionLifetimeChanged,
   InvalidConnectionLifetime,
 } from "./delete-lifetime.js";
+
+/**
+ * The storage part of a delete from one erasure report: `done` only when every
+ * deleted connection's objects are gone, bodies included.
+ */
+function storagePartOf(report: ErasureReport): DeletePart {
+  if (report.unavailable) return blocked("needs_another_device");
+  let part: DeletePart = PART_DONE;
+  for (const { outcome } of report.connections) {
+    const next: DeletePart =
+      outcome.kind === "pending"
+        ? PART_PENDING
+        : outcome.kind === "stopped"
+          ? outcome.why === "rolled-back"
+            ? blocked("tombstone_rolled_back")
+            : outcome.why === "head-unreadable"
+              ? blocked("log_unreadable")
+              : // Another lifetime of the connector: not this delete's.
+                PART_DONE
+          : outcome.retained > 0
+            ? blocked("body_pieces_retained")
+            : PART_DONE;
+    if (rankOf(next) > rankOf(part)) part = next;
+  }
+  return part;
+}
+const rankOf = (p: DeletePart) =>
+  p.state === "blocked" ? 2 : p.state === "pending" ? 1 : 0;
+const isRolledBack = (o: ErasureReport["connections"][number]["outcome"]) =>
+  o.kind === "stopped" && o.why === "rolled-back";
 
 export class ConnectionStoppedError extends Error {
   constructor(readonly connector: string) {
@@ -101,6 +139,12 @@ export interface ConnectionDeleter {
   /** The lifetime the connector's live control rows hold now (see `delete-lifetime.ts`). */
   readConnectionLifetime(connector: string): Promise<string>;
   resumeDeletes(): Promise<readonly PendingDelete[]>;
+  /**
+   * What is left of the connector's delete here, in three parts
+   * (`delete-status.ts`). A fact of this device's last pass, not a guess: a
+   * part no pass has judged yet is `pending`.
+   */
+  deleteStatus(connector: string): Promise<ConnectionDeleteStatus>;
 }
 /**
  * The erasure of deleted connections' log objects, as the deleter drives it
@@ -145,6 +189,12 @@ export function createConnectionDeleter(
      * and once at the first call after a start, for deletes settled before it.
      */
     readonly eraseLogs?: EraseLogs;
+    /**
+     * The legacy stage's ports (`legacy-delete.ts`), read when a pass runs. It
+     * runs in the same pass as `eraseLogs`, under the same settled-delete rule
+     * and the same retry loop.
+     */
+    readonly legacy?: () => LegacyDeletePorts | undefined;
     /**
      * How long a request waits for the fence before it answers
      * `fenced: false`. The landing keeps going in the background and the
@@ -216,7 +266,20 @@ export function createConnectionDeleter(
   /** Connectors whose erasure ended `pending`, until a later pass finishes it. */
   const erasing = new Set<string>();
   /** The start sweep (deletes settled before this process) is still owed. */
-  let sweepOwed = options.eraseLogs !== undefined;
+  const owesErasure = options.eraseLogs !== undefined || !!options.legacy;
+  let sweepOwed = owesErasure;
+  /**
+   * What the last pass here judged of each connector's delete. Dropped when a
+   * delete of the connector starts: the pass that follows judges it again.
+   */
+  const judged = new Map<
+    string,
+    {
+      legacy?: DeletePart;
+      storage?: DeletePart;
+      rolledBack?: true;
+    }
+  >();
   /**
    * The control rows the plan listed, by delete id, then by scope. Only a
    * delete this process just planned has one; the landing takes it. Each
@@ -640,9 +703,35 @@ export function createConnectionDeleter(
       if (stop.signal.aborted) return false;
       const skipNamespaces = await unsettledNamespaces(connector);
       if (skipNamespaces === null) return false;
-      return (
-        await options.eraseLogs!(connector, stop.signal, { skipNamespaces })
-      ).pending;
+      // The legacy copy first: it needs no log port, so a device that cannot
+      // erase storage still retires it.
+      let unfinished = false;
+      const legacy = options.legacy?.();
+      if (options.legacy) {
+        if (!legacy) {
+          judge(connector, { legacy: blocked("needs_another_device") });
+        } else {
+          const outcome = await retireLegacyOf(
+            deps,
+            legacy,
+            connector,
+            stop.signal,
+          );
+          judge(connector, {
+            legacy: outcome.part,
+            ...(outcome.rolledBack && { rolledBack: true as const }),
+          });
+          unfinished = outcome.pending;
+        }
+      }
+      if (!options.eraseLogs) return unfinished;
+      const report = await options.eraseLogs(connector, stop.signal, {
+        skipNamespaces,
+      });
+      judge(connector, { storage: storagePartOf(report) });
+      if (report.connections.some((c) => isRolledBack(c.outcome)))
+        judge(connector, { rolledBack: true });
+      return report.pending || unfinished;
     } catch (error) {
       // The eraser reports a failure as pending; this is its own bug or a
       // database that went away. Try again later, never fail the delete.
@@ -656,6 +745,16 @@ export function createConnectionDeleter(
       return true;
     }
   }
+  function judge(
+    connector: string,
+    part: {
+      legacy?: DeletePart;
+      storage?: DeletePart;
+      rolledBack?: true;
+    },
+  ) {
+    judged.set(connector, { ...judged.get(connector), ...part });
+  }
   /**
    * One erasure at a time per connector. A caller while one runs queues the
    * connector again, since what it knows (a delete settled) may be newer than
@@ -664,7 +763,7 @@ export function createConnectionDeleter(
    * entry the pass itself leaves (`pending`) waits for the retry loop.
    */
   function eraseLogsOf(connector: string): Promise<void> {
-    if (!options.eraseLogs) return Promise.resolve();
+    if (!owesErasure) return Promise.resolve();
     const held = erasures.get(connector);
     if (held) {
       erasing.add(connector);
@@ -684,6 +783,41 @@ export function createConnectionDeleter(
     erasures.set(connector, run);
     return run;
   }
+  /**
+   * The three parts of `connector`'s delete (`delete-status.ts`). While a
+   * delete is landing, or before a pass has judged a part, that part is
+   * `pending`: it is only `done` or `blocked` on a pass's word.
+   */
+  async function deleteStatus(
+    connector: string,
+  ): Promise<ConnectionDeleteStatus> {
+    const [open] = await deps.db.query(
+      "SELECT 1 FROM delete_intents WHERE connector=?",
+      [connector],
+    );
+    if (open)
+      return {
+        fence: PART_PENDING,
+        legacy: PART_PENDING,
+        storage: PART_PENDING,
+      };
+    const seen = judged.get(connector);
+    // A host with no stage cannot do it: another device of the account must.
+    const unjudged = (can: boolean) =>
+      !can
+        ? blocked("needs_another_device")
+        : sweepOwed ||
+            flights.has(connector) ||
+            erasing.has(connector) ||
+            erasures.has(connector)
+          ? PART_PENDING
+          : PART_DONE;
+    return {
+      fence: seen?.rolledBack ? blocked("tombstone_rolled_back") : PART_DONE,
+      legacy: seen?.legacy ?? unjudged(!!options.legacy),
+      storage: seen?.storage ?? unjudged(!!options.eraseLogs),
+    };
+  }
   function schedule(connector: string): Landing {
     const held = flights.get(connector);
     if (held) return held;
@@ -697,6 +831,9 @@ export function createConnectionDeleter(
       });
     const landing: Landing = { fenced, done };
     flights.set(connector, landing);
+    // Owed from the start, so a status read between the landing's end and
+    // the erasure's start does not call the connector settled.
+    if (owesErasure) erasing.add(connector);
     // A delete that settled is erased from storage, outside its own queue.
     void done.then(
       () => eraseLogsOf(connector),
@@ -731,6 +868,8 @@ export function createConnectionDeleter(
       `delete:${connector}`,
       "purge",
       async () => {
+        // A new delete: what an earlier pass judged says nothing of it.
+        judged.delete(connector);
         const decide = async (
           planned: Awaited<ReturnType<typeof plan>>,
           held: ReadonlySet<string>,
@@ -842,16 +981,17 @@ export function createConnectionDeleter(
       ).filter((p): p is PendingDelete => p !== null);
     },
     resumeDelete,
+    deleteStatus,
     /** A connection of the connector was purged here: its erasure may be owed. */
     noteSettled(connector: string) {
-      if (options.eraseLogs) erasing.add(connector);
+      if (owesErasure) erasing.add(connector);
     },
     /**
      * A connection was purged and its connector is unknown: the sweep of
      * every deleted connection is owed again.
      */
     noteSweepOwed() {
-      if (options.eraseLogs) sweepOwed = true;
+      if (owesErasure) sweepOwed = true;
     },
     /** Whether erasure work is owed: the start sweep, or an unfinished erasure. */
     erasureOwed: () => sweepOwed || erasing.size > 0,
@@ -862,7 +1002,7 @@ export function createConnectionDeleter(
      * Answers true while one is still unfinished, so the caller retries.
      */
     async resumeErasures(): Promise<boolean> {
-      if (!options.eraseLogs || stop.signal.aborted) return false;
+      if (!owesErasure || stop.signal.aborted) return false;
       if (sweepOwed) {
         const rows = await deps.db.query<{ connector: string }>(
           "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",

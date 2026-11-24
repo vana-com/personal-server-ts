@@ -19,6 +19,49 @@ export function isGatewayReservedScope(scope: string): boolean {
   return scope.startsWith("vana.system.");
 }
 
+/**
+ * The gateway answers a tombstone with a machine code when it refuses the
+ * signer or the owner's cutover receipt. None of these changes on a retry:
+ * the owner switched under a policy that admits no legacy delete, or the
+ * server key is revoked or was never registered.
+ */
+export type GatewayRefusalCode =
+  "owner_stream_sync_required" | "server_revoked" | "server_unregistered";
+
+const REFUSAL_CODES: ReadonlySet<string> = new Set<GatewayRefusalCode>([
+  "owner_stream_sync_required",
+  "server_revoked",
+  "server_unregistered",
+]);
+
+/** A tombstone the gateway refused with a terminal code (see `GatewayRefusalCode`). */
+export class GatewayRefusalError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: GatewayRefusalCode,
+    detail: string,
+  ) {
+    super(`Gateway error: ${status} ${detail}`);
+    this.name = "GatewayRefusalError";
+  }
+}
+
+/** The terminal refusal a response body names, or null. */
+function refusalOf(
+  status: number,
+  body: unknown,
+  fallback: string,
+): GatewayRefusalError | null {
+  if (typeof body !== "object" || body === null) return null;
+  const code = (body as Record<string, unknown>).code;
+  if (typeof code !== "string" || !REFUSAL_CODES.has(code)) return null;
+  return new GatewayRefusalError(
+    status,
+    code as GatewayRefusalCode,
+    `${code}: ${detailFromBody(body, fallback)}`,
+  );
+}
+
 export interface GatewayDeleteDataPortOptions {
   /** Gateway base URL, e.g. https://dp-rpc.vana.org */
   gatewayUrl: string;
@@ -171,8 +214,15 @@ export function createGatewayDeleteDataPort(
       };
       let version = BigInt(current.expectedVersion) + 1n;
       let res = await sendTombstone(scope, dataPointId, version);
+      // A 409 is either a version conflict or the owner's cutover refusal;
+      // the body says which. The refusal is terminal, so it is read first.
+      const conflictBody =
+        res.status === 409 ? await res.json().catch(() => null) : null;
+      if (res.status === 409) {
+        const refusal = refusalOf(409, conflictBody, res.statusText);
+        if (refusal) throw refusal;
+      }
       if (res.status === 409 && fence) {
-        await res.body?.cancel();
         throw new Error(
           `Scope head is not the one the fenced delete saw (v${fence.head.expectedVersion}): another writer moved it`,
         );
@@ -182,7 +232,7 @@ export function createGatewayDeleteDataPort(
         // write. The 409 body carries `currentExpectedVersion` (and the
         // legacy message phrasing names the next valid version); re-sign
         // once against it.
-        const body = await res.json().catch(() => null);
+        const body = conflictBody;
         const conflict = unwrap(body);
         // Gateway 409 body: `nextExpectedVersion` is the version to sign
         // next; `currentExpectedVersion` is the version the gateway holds,
@@ -249,8 +299,12 @@ export function createGatewayDeleteDataPort(
         };
       }
       if (!res.ok) {
-        throw new Error(
-          `Gateway error: ${res.status} ${await errorDetail(res)}`,
+        const body = await res.json().catch(() => null);
+        throw (
+          refusalOf(res.status, body, res.statusText) ??
+          new Error(
+            `Gateway error: ${res.status} ${detailFromBody(body, res.statusText)}`,
+          )
         );
       }
       const body = await res.json().catch(() => null);
@@ -310,11 +364,6 @@ export function createGatewayDeleteDataPort(
       return outcome;
     },
   };
-}
-
-async function errorDetail(res: Response): Promise<string> {
-  const body = await res.json().catch(() => null);
-  return detailFromBody(body, res.statusText);
 }
 
 function detailFromBody(body: unknown, fallback: string): string {

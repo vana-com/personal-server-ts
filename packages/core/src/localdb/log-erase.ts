@@ -253,6 +253,8 @@ export interface ErasureReport {
   readonly connections: readonly ConnectionErasure[];
   /** True when a later call can still make progress (a `pending` outcome). */
   readonly pending: boolean;
+  /** This device has no ports to delete from storage: nothing was tried. */
+  readonly unavailable?: true;
 }
 
 /** The legacy delete's batch: vana-storage rate-limits DELETE per owner. */

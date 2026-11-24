@@ -2,6 +2,7 @@ import { createPsLiteSeedStaging } from "./seed-staging.js";
 import {
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
+  legacyScopesOfConnector,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import type {
   OwnedAccountStorageMode,
@@ -14,7 +15,12 @@ import {
   createLocalSeed,
   createSeedIntake,
   createViewChanges,
+  inventoryVersionLister,
+  legacyHeadFrom,
+  modeOfAccount,
+  pendingBlobsFrom,
   type LocalSyncDeps,
+  type LogErasurePorts,
   type SeedIntake,
   type LocalSync,
   type SqlDriver,
@@ -543,19 +549,26 @@ export async function createPsLiteSyncManager(
   // Blob deletes wait for the covering tombstone to be finalized. The
   // inventory accepts the owner or a registered server of the owner: the
   // same account that signs storage requests.
-  const tombstoneFinality = createInventoryTombstoneFinality(
-    createVersionInventoryClient({
-      gatewayUrl: options.config.gateway.url,
-      ownerAddress: serverOwner,
-      ownerSigner: ownerRequestSigner ?? {
-        signRequest: (params) =>
-          buildWeb3SignedHeader({
-            ...params,
-            signMessage: (message: string) => syncAccount.signMessage(message),
-          }),
-      },
-    }),
-  );
+  const versionInventory = createVersionInventoryClient({
+    gatewayUrl: options.config.gateway.url,
+    ownerAddress: serverOwner,
+    ownerSigner: ownerRequestSigner ?? {
+      signRequest: (params) =>
+        buildWeb3SignedHeader({
+          ...params,
+          signMessage: (message: string) => syncAccount.signMessage(message),
+        }),
+    },
+  });
+  const tombstoneFinality = createInventoryTombstoneFinality(versionInventory);
+  // A deleted connection's log objects leave storage through the same signed
+  // delete port and finality as everything else this runtime deletes: a Web or
+  // phone delete erases them here, with no Desktop needed.
+  const logErasurePorts: LogErasurePorts = {
+    versions: inventoryVersionLister(versionInventory),
+    finality: tombstoneFinality,
+    objects: deleteData,
+  };
   const downloadDiagnostics = options.diagnostics
     ? buildDownloadDiagnosticsHook(options.diagnostics)
     : undefined;
@@ -647,6 +660,19 @@ export async function createPsLiteSyncManager(
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
+          erasure: () => logErasurePorts,
+          // The legacy copy of a deleted connection is retired at the gateway
+          // and in storage by this runtime's own scope delete: the manager is
+          // read when the stage runs, not when the database opens.
+          legacyDelete: () => ({
+            scopesOf: legacyScopesOfConnector,
+            mode: modeOfAccount(() => mode.read()),
+            head: legacyHeadFrom(dataPointFeed, serverOwner),
+            retire: (scope, head) =>
+              syncManager.deleteScope(scope, undefined, { fence: { head } }),
+            pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
+            finality: tombstoneFinality,
+          }),
         });
       }
       return localSync;

@@ -1,9 +1,13 @@
 import {
   createViewChanges,
   inventoryVersionLister,
+  legacyHeadFrom,
   localDatabaseName,
+  modeFrom,
   openLocalDb,
+  pendingBlobsFrom,
   connectionQueue,
+  type LegacyDeletePorts,
   type LocalSync,
   type LocalSyncDeps,
   type LogErasurePorts,
@@ -83,6 +87,7 @@ import {
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { McpScopeRequestApprovalUrlHook } from "@opendatalabs/personal-server-ts-core/mcp";
 import { mcpGrantDefaultExpiry } from "@opendatalabs/personal-server-ts-core/mcp";
+import { legacyScopesOfConnector } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   createGatewayClient,
@@ -934,6 +939,13 @@ async function bootstrapServer(
    * where sync is off, which then erase nothing.
    */
   let logErasurePorts: LogErasurePorts | undefined;
+  /**
+   * What retiring a deleted connection's legacy copy needs of the host
+   * (`localdb/legacy-delete.ts`): the gateway head, the sync manager's durable
+   * scope delete, its blob queue and tombstone finality. Set once the sync
+   * manager exists; absent where sync is off or the server cannot delete.
+   */
+  let legacyDeletePorts: LegacyDeletePorts | undefined;
   async function getLocalSync(): Promise<LocalSync> {
     requireStreamMode();
     if (localSync) return localSync;
@@ -1010,6 +1022,7 @@ async function bootstrapServer(
           // its delete settled. Only a server that deletes from storage can
           // (see `logErasurePorts`); the ports are read when an erasure runs.
           erasure: () => logErasurePorts,
+          legacyDelete: () => legacyDeletePorts,
         });
         localSyncDeps = deps;
         localDb = db;
@@ -1386,6 +1399,18 @@ async function bootstrapServer(
         }
       },
     });
+    if (deleteData && tombstoneFinality) {
+      const manager = syncManager;
+      legacyDeletePorts = {
+        scopesOf: legacyScopesOfConnector,
+        mode: modeFrom(legacyWriteSeal),
+        head: legacyHeadFrom(dataPointFeed, serverOwner),
+        retire: (scope, head) =>
+          manager.deleteScope(scope, undefined, { fence: { head } }),
+        pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
+        finality: tombstoneFinality,
+      };
+    }
     syncManager.start();
     logger.info("Sync engine started");
   } else if (config.sync.enabled) {
@@ -1844,6 +1869,8 @@ async function bootstrapServer(
             ),
           readConnectionLifetime: async (connector) =>
             (await localSyncSource()).deleter.readConnectionLifetime(connector),
+          deleteStatus: async (connector) =>
+            (await localSyncSource()).deleter.deleteStatus(connector),
         }
       : null,
     // Shutdown stops admission before the database closes.

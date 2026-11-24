@@ -110,3 +110,26 @@ test and a latency-ratio test).
   lane) for good, and `plan()` is not bounded: the request still waits there. The
   registry adapter has no timeout.
 - Unity Surfaces UI should show "pending" when `fenced:false`. Out of scope here.
+
+## After the fence: the legacy copy and the status
+
+On a switched account the fence is not the whole delete. The gateway still lists
+the connector's legacy data points, and storage still holds their blobs. Once a
+control tombstone of the connector is final, the deleter's settled pass retires
+every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
+
+- It is driven by state (a final control tombstone, a bound legacy scope with a
+  live gateway head), not by `delete_intents`. That row means "a delete is
+  landing" and blocks reconnects; a legacy retire can take hours behind
+  storage's rate limit. The start sweep resumes it after a restart.
+- It does nothing before the switch (the legacy copy is the live store then).
+  After it, no legacy scope accepts a write, so a connection added again writes
+  only to its own log scope, which the stage never names. Each tombstone is
+  fenced to the head the stage read.
+- The tombstone leaves through the seal's `remove`. A gateway refusal that a
+  retry cannot change (`owner_stream_sync_required`, `server_revoked`,
+  `server_unregistered`) ends the stage as `blocked`, with no retry loop.
+- `deleter.deleteStatus(connector)` answers `{ fence, legacy, storage }`, each
+  `done`, `pending` or `blocked(reason)` (`localdb/delete-status.ts`). The owner
+  connector routes carry it as `deleteStatus` (202 body and `GET`). An app says
+  "deleted" only when all three are `done`.

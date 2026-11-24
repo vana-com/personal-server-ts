@@ -12,7 +12,8 @@
  * storage-mode change owns it, after owner authorization.
  *
  * Answers:
- *   202 { deleteId, fenced }    the delete intent is durable; the landing runs
+ *   202 { deleteId, fenced, deleteStatus }
+ *                               the delete intent is durable; the landing runs
  *                               in the writer and retries until it lands. The
  *                               delete is the control tombstone (the fence),
  *                               and the request waits for it: `fenced: true`
@@ -47,8 +48,17 @@
  * is connected now.
  *
  *   GET /v1/owner/connectors/:connectorId
- *     200 { lifetime }          the lifetime the connector holds now; the same
+ *     200 { lifetime, deleteStatus }
+ *                               the lifetime the connector holds now; the same
  *                               refusals as the delete answer before it
+ *
+ * `deleteStatus` is what is left of the connector's delete on this server, in
+ * three parts (`ConnectionDeleteStatus`, `localdb/delete-status.ts`): `fence`
+ * (the control tombstone), `legacy` (the legacy copy at the gateway and in
+ * storage) and `storage` (the stream-sync objects). Each is `done`, `pending`
+ * (finishes on its own) or `blocked` with a reason (it does not). A caller
+ * says "deleted" only when all three are `done`, and polls the GET to watch
+ * them. Absent when the writer cannot report it.
  *
  * Every refusal has the one error shape of the API, the `ProtocolError`
  * envelope: `{ error: { code, errorCode, message } }`.
@@ -59,6 +69,7 @@ import {
   ConnectionLifetimeChanged,
   InvalidConnectionLifetime,
 } from "../localdb/delete-lifetime.js";
+import type { ConnectionDeleteStatus } from "../localdb/delete-status.js";
 
 /**
  * What the route needs of the account's storage mode: the read shape of
@@ -80,6 +91,8 @@ export interface ConnectionDeletePort {
   ): Promise<{ readonly deleteId: string; readonly fenced: boolean }>;
   /** The lifetime the connector's live control rows hold now. */
   readConnectionLifetime?(connector: string): Promise<string>;
+  /** What is left of the connector's delete here (`ConnectionDeleteStatus`). */
+  deleteStatus?(connector: string): Promise<ConnectionDeleteStatus>;
 }
 
 export interface OwnerConnectorDeleteDeps {
@@ -111,8 +124,12 @@ export function ownerConnectorRefusal(
   );
 }
 
-function accepted(deleteId: string, fenced: boolean): Response {
-  return new Response(JSON.stringify({ deleteId, fenced }), {
+function accepted(
+  deleteId: string,
+  fenced: boolean,
+  deleteStatus: ConnectionDeleteStatus | undefined,
+): Response {
+  return new Response(JSON.stringify({ deleteId, fenced, deleteStatus }), {
     status: 202,
     headers: {
       "content-type": "application/json",
@@ -195,7 +212,10 @@ export async function handleOwnerConnectorDelete(
         : await deps.connectionDelete.requestConnectionDelete(connectorId!, {
             lifetime,
           });
-    return accepted(started.deleteId, started.fenced);
+    const deleteStatus = await deps.connectionDelete.deleteStatus?.(
+      connectorId!,
+    );
+    return accepted(started.deleteId, started.fenced, deleteStatus);
   } catch (error) {
     if (error instanceof ConnectionLifetimeChanged) {
       return ownerConnectorRefusal(
@@ -230,7 +250,10 @@ export async function handleOwnerConnectorLifetime(
   const read = deps.connectionDelete?.readConnectionLifetime;
   if (!read) return unavailable();
   const lifetime = await read.call(deps.connectionDelete, connectorId!);
-  return new Response(JSON.stringify({ lifetime }), {
+  const deleteStatus = await deps.connectionDelete?.deleteStatus?.(
+    connectorId!,
+  );
+  return new Response(JSON.stringify({ lifetime, deleteStatus }), {
     status: 200,
     headers: {
       "content-type": "application/json",

@@ -118,6 +118,8 @@ export async function world(options: {
       streamCrypto?: StreamCryptoPort;
       /** The host's ports for erasing a deleted connection's log objects. */
       erasure?: () => LogErasurePorts | undefined;
+      /** The host's ports for retiring a deleted connection's legacy copy. */
+      legacyDelete?: () => LegacyDeletePorts | undefined;
       /** Waits between retries of a delete or erasure (shortened for tests). */
       deleteRetryMs?: { first: number; max: number };
     } = {},
@@ -228,6 +230,7 @@ export async function world(options: {
     };
     const sync = createLocalSync(deps, {
       ...(hooks.erasure ? { erasure: hooks.erasure } : {}),
+      ...(hooks.legacyDelete ? { legacyDelete: hooks.legacyDelete } : {}),
       ...(hooks.deleteRetryMs ? { deleteRetryMs: hooks.deleteRetryMs } : {}),
       // A digest `<connector>@<version>` names a connector version; a bare
       // connector name is version 1.
