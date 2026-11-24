@@ -413,13 +413,25 @@ describe("erasure wired into the connection delete", () => {
     const otherBefore = logKeys(w, OTHER_LOG);
     expect(otherBefore.length).toBeGreaterThan(0);
 
-    expect(
-      (await a.sync.deleter.requestConnectionDelete(CONNECTOR)).fenced,
-    ).toBe(true);
+    // The request answers `fenced: false` when the fence has not landed within
+    // the retry loop's first wait (5 ms here); the loop then lands it. The
+    // test waits on what the fence leaves behind, not on that answer.
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
 
-    await vi.waitFor(() => expect(erasable(w, LOG)).toEqual([]));
+    // The pass is over when the device judges the storage part: it deletes the
+    // head last, then records its verdict. Wait for that, not for the retry
+    // timer to have run a pass or for storage to look empty.
+    await vi.waitFor(
+      async () => {
+        expect(erasable(w, LOG)).toEqual([]);
+        expect(await intents(a)).toEqual([]);
+        expect(
+          (await a.sync.deleter.deleteStatusSnapshot(CONNECTOR)).storage,
+        ).toEqual({ state: "blocked", reason: "body_pieces_retained" });
+      },
+      { timeout: 10_000 },
+    );
     expect(logKeys(w, OTHER_LOG)).toEqual(otherBefore);
-    expect(await intents(a)).toEqual([]);
     // What storage still holds of the log is on record, in the device's database.
     const left = logKeys(w, LOG).map((key) => key.slice(LOG.length + 1));
     expect(left.length).toBeGreaterThan(0);
