@@ -2,11 +2,30 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { access, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { loadConfig } from "./loader.js";
+import { loadConfig, parseConfigJson } from "./loader.js";
 import {
   DEFAULTS,
+  ServerConfigSchema,
   SUPERSEDED_INFERENCE_MODELS,
 } from "@opendatalabs/personal-server-ts-core/schemas";
+
+describe("parseConfigJson", () => {
+  it("accepts one leading UTF-8 BOM without changing JSON strings", () => {
+    expect(parseConfigJson("\uFEFF{}")).toEqual({});
+    expect(parseConfigJson("{}")).toEqual({});
+    expect(parseConfigJson('\uFEFF{"note":"\uFEFFinside"}')).toEqual({
+      note: "\uFEFFinside",
+    });
+  });
+
+  it("still rejects malformed JSON and leaves schema validation intact", () => {
+    for (const raw of ["\uFEFF{", "\uFEFF\uFEFF{}", " \uFEFF{}"]) {
+      expect(() => parseConfigJson(raw)).toThrow(SyntaxError);
+    }
+    const parsed = parseConfigJson('\uFEFF{"server":{"port":-1}}');
+    expect(ServerConfigSchema.safeParse(parsed).success).toBe(false);
+  });
+});
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "config-test-"));
