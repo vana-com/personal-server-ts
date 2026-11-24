@@ -71,33 +71,70 @@ export function quarantineTally() {
   };
 }
 
-const PREFIX = "quarantined:";
+/** What an import receipt says about the rows that did not become records. */
+export interface ReceiptOutcomes {
+  /** Staged rows the fill-only rules kept out (a live row, a deletion, or a
+   * removal waiting to publish holds the key). They are in the receipt's
+   * `rows`; they are not imported. */
+  readonly blocked: number;
+  /** Rows left out of the staging, by reason. Not in the receipt's `rows`. */
+  readonly quarantined: QuarantineCounts;
+}
 
-/** The receipt's `reason`: null for a clean import, else the counts. */
-export function quarantineReceiptReason(
-  counts: QuarantineCounts,
-): string | null {
-  const names = Object.keys(counts).sort();
-  if (names.length === 0) return null;
+const PREFIX = "outcomes:";
+/** The first format: the quarantine counts alone. Still read. */
+const FIRST_PREFIX = "quarantined:";
+
+const positive = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+
+function countsOf(value: unknown): QuarantineCounts {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out: Record<string, number> = {};
+  for (const [name, rows] of Object.entries(value))
+    if (positive(rows)) out[name] = rows;
+  return out;
+}
+
+/** The receipt's `reason`: null for a clean import, else the outcomes. */
+export function receiptReason(outcomes: ReceiptOutcomes): string | null {
+  const names = Object.keys(outcomes.quarantined).sort();
+  if (names.length === 0 && outcomes.blocked === 0) return null;
   return (
     PREFIX +
-    JSON.stringify(Object.fromEntries(names.map((n) => [n, counts[n]])))
+    JSON.stringify({
+      ...(outcomes.blocked > 0 ? { blocked: outcomes.blocked } : {}),
+      ...(names.length > 0
+        ? {
+            quarantined: Object.fromEntries(
+              names.map((n) => [n, outcomes.quarantined[n]]),
+            ),
+          }
+        : {}),
+    })
   );
 }
 
-/** The counts an `imported` receipt carries; empty for any other reason. */
-export function quarantineFromReceipt(reason: string | null): QuarantineCounts {
-  if (reason === null || !reason.startsWith(PREFIX)) return {};
+/** The outcomes an `imported` receipt carries; none for any other reason. */
+export function receiptOutcomes(reason: string | null): ReceiptOutcomes {
+  const none = { blocked: 0, quarantined: {} };
+  if (reason === null) return none;
   try {
+    if (reason.startsWith(FIRST_PREFIX))
+      return {
+        blocked: 0,
+        quarantined: countsOf(JSON.parse(reason.slice(FIRST_PREFIX.length))),
+      };
+    if (!reason.startsWith(PREFIX)) return none;
     const parsed: unknown = JSON.parse(reason.slice(PREFIX.length));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-      return {};
-    const out: Record<string, number> = {};
-    for (const [name, rows] of Object.entries(parsed))
-      if (typeof rows === "number" && Number.isSafeInteger(rows) && rows > 0)
-        out[name] = rows;
-    return out;
+      return none;
+    const { blocked, quarantined } = parsed as Record<string, unknown>;
+    return {
+      blocked: positive(blocked) ? blocked : 0,
+      quarantined: countsOf(quarantined),
+    };
   } catch {
-    return {};
+    return none;
   }
 }

@@ -138,6 +138,7 @@ export async function stageImportSnapshot(
       sql: `CREATE TEMP TABLE IF NOT EXISTS import_snapshot (
     op TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
     body_sha256 TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
+    blocked INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (op, pk_hash), UNIQUE (op, record_key)) WITHOUT ROWID`,
     },
   ]);
@@ -158,6 +159,8 @@ export async function stageImportSnapshot(
       const held = chunk.get(row.record_key)!;
       if (row.pk_hash !== held.pk_hash || row.body_sha256 !== held.body_sha256)
         throw new Error("invalid_record");
+      // The same row again, from an earlier chunk: counted, as the fold does.
+      quarantine.add("duplicate_key");
     }
     await db.batch(
       [...chunk].map(([recordKey, held]) => ({
@@ -178,12 +181,15 @@ export async function stageImportSnapshot(
     }
     const row = classified.row;
     const inChunk = chunk.get(row.record_key);
-    if (
-      inChunk !== undefined &&
-      (inChunk.pk_hash !== row.pk_hash ||
-        inChunk.body_sha256 !== row.body_sha256)
-    )
-      throw new Error("invalid_record");
+    if (inChunk !== undefined) {
+      if (
+        inChunk.pk_hash !== row.pk_hash ||
+        inChunk.body_sha256 !== row.body_sha256
+      )
+        throw new Error("invalid_record");
+      quarantine.add("duplicate_key");
+      continue;
+    }
     chunk.set(row.record_key, {
       pk_hash: row.pk_hash,
       body_sha256: row.body_sha256,

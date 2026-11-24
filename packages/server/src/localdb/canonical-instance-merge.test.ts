@@ -308,3 +308,24 @@ it("an unresolved newest instance excludes the rows of every layer, not only its
     expect(new Set(excluded.map((e) => e.reason)).size).toBe(1);
   }
 });
+
+it("conflicting repeats of a key refuse the stream with one live instance and with two", async () => {
+  const conflicting = [
+    { id: "x", v: "one" },
+    { id: "x", v: "two" },
+  ];
+  const w = await world();
+  for (const rows of [
+    { new: conflicting },
+    { new: conflicting, old: OLD },
+  ] as Rows[]) {
+    const a = await w.device(`d${Object.keys(rows).length}`);
+    const reader = store(rows, { new: 20, old: 10 });
+    const [source] = sources(await entries(reader));
+    expect(await a.importEntry(source!)).toMatchObject({
+      kind: "refused",
+      reason: "invalid_record",
+    });
+    expect(await a.keys()).toEqual([]);
+  }
+});

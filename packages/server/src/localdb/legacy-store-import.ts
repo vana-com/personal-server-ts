@@ -20,7 +20,7 @@ import type {
   LocalSyncDeps,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
-  quarantineFromReceipt,
+  receiptOutcomes,
   quarantineTally,
   type QuarantineCounts,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -47,10 +47,11 @@ import { importProjection } from "./sync.js";
  *
  * - `rows`: for the sources the runner offered to the database (the newest
  *   live instance of each declared source): rows the old store held, rows now
- *   imported, rows left out (by reason: no full identity, an older copy, a
- *   valid delete envelope as `delete_envelope`), and rows of streams the
- *   database refused. Every stored record is in exactly one of the last
- *   three: `legacy = imported + sum(quarantined) + refused`. `legacy` is
+ *   imported, rows blocked (staged, but the stream already holds or deleted
+ *   the key: a live write wins), rows left out (by reason: no full identity,
+ *   an older copy, a valid delete envelope as `delete_envelope`), and rows of
+ *   streams the database refused. Every stored record is in exactly one of
+ *   them: `legacy = imported + blocked + sum(quarantined) + refused`. `legacy` is
  *   null once any source carried no count; `refused` is null once a refused
  *   source carried none. The receipt keeps the quarantine reasons, so the
  *   count outlives the old files.
@@ -73,6 +74,9 @@ export interface LegacyStoreImportReport {
     /** Inventory rows; null once a source did not carry a count. */
     readonly legacy: number | null;
     readonly imported: number;
+    /** Staged rows the fill-only rules kept out: the stream already holds, or
+     * deleted, the key with other content. */
+    readonly blocked: number;
     readonly quarantined: QuarantineCounts;
     /** Rows of refused streams (`refused` has them by reason); null once a
      * refused source did not carry a count. */
@@ -291,6 +295,7 @@ async function importSources(
   const quarantined = quarantineTally();
   let legacyRows: number | null = 0;
   let importedRows = 0;
+  let blockedRows = 0;
   let refusedRows: number | null = 0;
   for await (const entry of access.sources()) {
     if (signal.aborted) break;
@@ -321,10 +326,10 @@ async function importSources(
     );
     if (prior && prior.state !== "excluded") {
       count("already-imported");
-      importedRows += prior.rows;
-      for (const [reason, rows] of Object.entries(
-        quarantineFromReceipt(prior.reason),
-      ))
+      const outcomes = receiptOutcomes(prior.reason);
+      importedRows += prior.rows - outcomes.blocked;
+      blockedRows += outcomes.blocked;
+      for (const [reason, rows] of Object.entries(outcomes.quarantined))
         quarantined.add(reason, rows);
       continue;
     }
@@ -346,7 +351,8 @@ async function importSources(
           ? null
           : refusedRows + source.rows;
     } else {
-      importedRows += result.receipt.rows;
+      importedRows += result.receipt.rows - result.blocked;
+      blockedRows += result.blocked;
       for (const [reason, rows] of Object.entries(result.quarantine))
         quarantined.add(reason, rows);
     }
@@ -367,6 +373,7 @@ async function importSources(
       rows: {
         legacy: legacyRows,
         imported: importedRows,
+        blocked: blockedRows,
         quarantined: quarantined.counts(),
         refused: refusedRows,
       },

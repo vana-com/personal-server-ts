@@ -249,3 +249,33 @@ describe("seedLegacyStore deletes", () => {
     expect(puts).toEqual(["shadowed"]);
   });
 });
+
+describe("seedLegacyStore conflicts", () => {
+  it("refuses a stream whose layer repeats a key with different bodies, and carries on", async () => {
+    const { port, puts } = intake();
+    const repeat: FoldLayer = {
+      async *records() {
+        yield { id: "a", v: 1 };
+        yield { id: "a", v: 2 };
+      },
+    };
+    const fine: FoldLayer = {
+      async *records() {
+        yield { id: "b" };
+      },
+    };
+    const report = await seedLegacyStore(port, {
+      async *streams() {
+        yield stream([repeat]);
+        yield { ...stream([fine]), stream: "other" };
+      },
+    });
+    expect(report.streams[0]).toMatchObject({
+      outcome: "refused",
+      reason: "invalid_record",
+      rows: 0,
+    });
+    expect(report.streams[1]).toMatchObject({ outcome: "staged", rows: 1 });
+    expect(puts).toEqual(["other"]);
+  });
+});

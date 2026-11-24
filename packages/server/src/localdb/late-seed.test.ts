@@ -85,9 +85,31 @@ it("an explicit delete that was published and compacted keeps a later seed out a
   await first.db.close();
   drivers.splice(drivers.indexOf(first.db), 1);
   const reopened = await w.device("a", path);
-  expect((await reopened.seed("install-2", ["A", "Z"])).kind).toBe("imported");
-  // Z was never in the stream and fills; A was deleted and stays out.
+  const result = await reopened.seed("install-2", ["A", "Z"]);
+  expect(result.kind).toBe("imported");
+  // Z was never in the stream and fills; A was deleted and stays out. The
+  // receipt holds both staged rows; the audit says one of them was blocked.
   expect(await reopened.keys()).toEqual(["B", "Z"]);
+  expect(result).toMatchObject({ blocked: 1, receipt: { rows: 2 } });
+});
+
+it("a tombstone written before it kept a record key still keeps a seed out", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("delete", ["A"], { remove: true });
+  await a.publish();
+  // The tombstone of a device that upgraded from before the column.
+  await a.db.batch([{ sql: "UPDATE log_tombstones SET record_key = NULL" }]);
+  expect(
+    await a.db.query(
+      "SELECT count(*) AS n FROM log_tombstones WHERE record_key IS NULL",
+    ),
+  ).toEqual([{ n: 1 }]);
+  const result = await a.seed("install-2", ["A", "Z"]);
+  expect(await a.keys()).toEqual(["B", "Z"]);
+  expect(result).toMatchObject({ kind: "imported", blocked: 1 });
 });
 
 /**

@@ -90,7 +90,7 @@ it("fold-newest-file-wins-and-unfit-rows-are-counted-by-reason", async () => {
     {
       state: "imported",
       reason:
-        'quarantined:{"missing_key_field":1,"source_mismatch":1,"superseded":3,"untagged":1}',
+        'outcomes:{"quarantined":{"missing_key_field":1,"source_mismatch":1,"superseded":3,"untagged":1}}',
       rows: 4,
     },
   ]);
@@ -424,7 +424,7 @@ it("fold-layers-collide-by-legacy-record-key-not-by-typed-key", async () => {
   });
 });
 
-it("fold-a-repeat-of-a-record-key-in-another-type-is-a-duplicate-and-a-typed-delete-hides-it", async () => {
+it("fold-an-identical-repeat-of-a-record-key-is-a-duplicate-and-a-typed-delete-hides-an-older-row", async () => {
   const w = await world();
   const a = await w.device("a");
   const result = await a.importSource("files", (base) =>
@@ -432,7 +432,7 @@ it("fold-a-repeat-of-a-record-key-in-another-type-is-a-duplicate-and-a-typed-del
       layer(
         [
           { id: 5, v: "first" },
-          { id: "5", v: "repeat" },
+          { id: 5, v: "first" },
         ],
         [{ id: "6" }],
       ),
@@ -507,7 +507,9 @@ it("fold-a-live-row-in-another-type-fills-nothing-and-is-not-a-conflict", async 
 it("fold-every-stored-record-is-imported-or-counted-once: legacy = imported + counted", async () => {
   const w = await world();
   const a = await w.device("a");
+  await a.run("live", ["g"]); // the stream already holds `g`
   const newest = [
+    tagged("g", "old-g"), // blocked: a live row holds the key
     tagged("a", "live"), // imported
     deleteEnvelope("a"), // a delete a live row of its own layer shadows
     deleteEnvelope("b"), // a delete the older layer's row is hidden by
@@ -517,7 +519,7 @@ it("fold-every-stored-record-is-imported-or-counted-once: legacy = imported + co
     { v: "no key", $pdpp: { sourceId: SOURCE } }, // no identity
     { id: "x", v: "untagged" }, // no source
     tagged("f", "first"),
-    tagged("f", "repeat"), // a repeat key in one layer
+    tagged("f", "first"), // an identical repeat in one layer
   ];
   const older = [
     tagged("a", "old"), // superseded
@@ -531,6 +533,147 @@ it("fold-every-stored-record-is-imported-or-counted-once: legacy = imported + co
   if (result.kind !== "imported") throw new Error(result.kind);
   const counted = Object.values(result.quarantine).reduce((n, v) => n + v, 0);
   expect(result.quarantine).toMatchObject({ delete_envelope: 3 });
-  expect(stored).toBe(result.receipt.rows + counted);
-  expect(await a.keys()).toEqual(["a", "c", "f"]);
+  expect(result.blocked).toBe(1);
+  // legacy = imported + blocked + quarantined (no stream is refused here).
+  const imported = result.receipt.rows - result.blocked;
+  expect(imported).toBe(3); // a, c and f
+  expect(stored).toBe(imported + result.blocked + counted);
+  expect(await a.keys()).toEqual(["a", "c", "f", "g"]);
+});
+
+const compound = (base: Parameters<typeof foldLayers>[0]) => ({
+  ...base,
+  target: { ...base.target, primaryKey: ["tenant", "id"] },
+});
+const tenantRow = (tenant: string, id: number, v: string) => ({
+  tenant,
+  id,
+  v,
+  $pdpp: { sourceId: SOURCE },
+});
+
+it("fold-a-delete-whose-payload-disagrees-with-its-claim-on-any-key-field-deletes-nothing", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  // The payload names tenant B but claims A/1: a partial payload must not
+  // pass for a claim it contradicts.
+  const forged = {
+    tenant: "B",
+    $pdpp: {
+      sourceId: SOURCE,
+      record: { key: { tenant: "A", id: 1 }, op: "delete" },
+    },
+  };
+  const honest = {
+    tenant: "A",
+    $pdpp: {
+      sourceId: SOURCE,
+      record: { key: { tenant: "A", id: 2 }, op: "delete" },
+    },
+  };
+  const result = await a.importSource("files", (base) =>
+    foldLayers(
+      compound(base),
+      [
+        layer([forged, honest]),
+        layer([tenantRow("A", 1, "keep"), tenantRow("A", 2, "gone")]),
+      ],
+      { sourceId: SOURCE },
+    ),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    tombstoned: 1,
+    quarantine: {
+      deletion_record_key_mismatch: 1,
+      delete_envelope: 1,
+      deleted_in_newer_layer: 1,
+    },
+  });
+  expect(Object.keys(await bodies(a))).toEqual(['["A","1"]']);
+});
+
+it("fold-a-delete-yields-only-its-key-fields", async () => {
+  const fold = foldLayers(
+    {
+      source: "s",
+      owner: "o",
+      network: "test",
+      revision: "r",
+      target: {
+        connectionId: "c",
+        connector: "fixture",
+        stream: "items",
+        primaryKey: ["id"],
+        semantics: "mutable_state",
+        incremental: true,
+      },
+      exclusions: [],
+    },
+    [
+      layer([
+        {
+          id: "a",
+          big: "x".repeat(1000),
+          $pdpp: {
+            sourceId: SOURCE,
+            record: { key: { id: "a" }, op: "delete" },
+          },
+        },
+      ]),
+      layer([tagged("b", "older")], undefined),
+    ],
+    { sourceId: SOURCE },
+  );
+  const kept: unknown[] = [];
+  for await (const key of fold.deletions!()) kept.push(key);
+  expect(kept).toEqual([{ id: "a" }]);
+});
+
+it("fold-conflicting-repeats-of-a-key-in-one-layer-refuse-the-stream-as-the-direct-importer-does", async () => {
+  const w = await world();
+  const rows = [
+    { id: "r", v: "one", $pdpp: { sourceId: SOURCE } },
+    { id: "r", v: "two", $pdpp: { sourceId: SOURCE } },
+  ];
+  const direct = await (
+    await w.device("direct")
+  ).importSource("files", (base) => ({
+    ...base,
+    async *records() {
+      yield* rows.map(({ $pdpp: _p, ...row }) => row);
+    },
+  }));
+  expect(direct).toMatchObject({ kind: "refused", reason: "invalid_record" });
+  // A second live layer must not turn that into a first-row-wins import.
+  for (const [index, layers] of [
+    [layer(rows)],
+    [layer(rows), layer([tagged("older", "x")])],
+    // The conflict is among copies a newer layer already outranks: still a
+    // conflict in that layer's own file.
+    [layer([tagged("r", "new")]), layer(rows)],
+  ].entries()) {
+    const a = await w.device(`fold-${index}`);
+    const result = await a.importSource("files", (base) =>
+      foldLayers(base, layers, { sourceId: SOURCE }),
+    );
+    expect(result).toMatchObject({ kind: "refused", reason: "invalid_record" });
+    expect(await a.keys()).toEqual([]);
+  }
+});
+
+it("an identical repeat of a row is counted by the direct importer too", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const result = await a.importSource("files", (base) => ({
+    ...base,
+    async *records() {
+      yield { id: "r", v: "same" };
+      yield { id: "r", v: "same" };
+    },
+  }));
+  expect(result).toMatchObject({
+    kind: "imported",
+    quarantine: { duplicate_key: 1 },
+  });
 });

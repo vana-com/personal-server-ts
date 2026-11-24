@@ -45,8 +45,13 @@ export interface LegacySeedStreamReport {
   /** `merged`: a final receipt already held it (before the read, or by the time
    * the upload arrived); nothing was imported here.
    * `staged`: the rows went through the importer (`rows` of them).
-   * `empty`: the store had nothing importable, so no upload was made. */
-  readonly outcome: "merged" | "staged" | "empty";
+   * `empty`: the store had nothing importable, so no upload was made.
+   * `refused`: the stream holds a fault that makes it untrustworthy (a key
+   * repeated with different bodies, `reason`); nothing of it was uploaded and
+   * the next stream goes on, as the server's import refuses one stream only. */
+  readonly outcome: "merged" | "staged" | "empty" | "refused";
+  /** Why the stream was refused. */
+  readonly reason?: "invalid_record";
   /** Rows put to the intake. */
   readonly rows: number;
   /** Rows left out for want of a full identity, by reason. */
@@ -140,7 +145,24 @@ export async function seedLegacyStore(
     // the two fails the upload's count check, and nothing is imported.
     let count = 0;
     // `for await` closes the readers when the pass ends early, by abort or fault.
-    for await (const _row of read(quarantine)) count++;
+    try {
+      for await (const _row of read(quarantine)) count++;
+    } catch (error) {
+      // A conflict the fold found refuses this stream only. Anything else,
+      // an abort included, stops the seed.
+      if (!(error instanceof Error) || error.message !== "invalid_record")
+        throw error;
+      reports.push({
+        connector,
+        stream: name,
+        outcome: "refused",
+        reason: "invalid_record",
+        rows: 0,
+        quarantine: {},
+        invalid: 0,
+      });
+      continue;
+    }
     if (count === 0) {
       reports.push({
         connector,

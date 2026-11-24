@@ -175,7 +175,9 @@ it("oracle: every difference between the old store and the database is in the re
     (a, b) => a + b,
     0,
   );
-  expect(report.rows.imported + quarantined).toBe(live.length);
+  expect(report.rows.imported + report.rows.blocked + quarantined).toBe(
+    live.length,
+  );
   expect(report.rows.imported).toBe(expected.size);
   expect(report.rows.quarantined).toEqual({
     not_an_object: 1,

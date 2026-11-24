@@ -37,8 +37,10 @@ import {
  * - A row whose body has no JSON form (a cycle, a BigInt) is counted out
  *   before it claims its key, so an older readable copy still stands.
  * - A row with no full identity passes through for the import to count. A
- *   second row for a key within one layer is counted as `duplicate_key`; the
- *   first stands.
+ *   second row for a key within one layer is counted as `duplicate_key` when
+ *   its body is the same. With another body it is a conflict: the fold throws
+ *   `invalid_record`, and the import refuses the stream, as it does for a
+ *   direct source (`stageImportSnapshot`).
  *
  * Identity is the legacy record key (`computeRecordKeyFromData`), the key the
  * database keeps a row under, never the typed key hash: `{id: 42}` and
@@ -52,8 +54,10 @@ import {
  * apart from its records (`deletions`, `deletedRecordKeys`) are not stored
  * records; only a malformed `deletions()` key is counted.
  *
- * Memory: the record keys (and deleted record keys) of the layers read so far.
- * No body is kept; each traversal reads the layers again.
+ * Memory: the record keys (and deleted record keys) of the layers read so far,
+ * a body digest per key of the layer being read, and the key fields of
+ * the layer's delete envelopes. No body or payload is kept; each traversal
+ * reads the layers again.
  */
 export interface FoldLayer {
   records(): AsyncIterable<unknown>;
@@ -68,7 +72,8 @@ export interface FoldOptions {
   readonly sourceId?: string;
 }
 
-type Event = { readonly row: unknown } | { readonly deletion: unknown };
+type Event =
+  { readonly row: unknown } | { readonly deletion: Record<string, unknown> };
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
@@ -101,22 +106,52 @@ function decode(record: unknown, sourceId: string | undefined): Decoded {
   return { row: data };
 }
 
+const isKeyValue = (value: unknown): boolean =>
+  typeof value === "string" ||
+  typeof value === "boolean" ||
+  (typeof value === "number" && Number.isFinite(value));
+
+/** Only the primary-key fields of `source`, taken from the first of `sources`
+ * that holds each: all a tombstone needs, and all the fold keeps. */
+function keyFields(
+  primaryKey: readonly string[],
+  ...sources: readonly Record<string, unknown>[]
+): Record<string, unknown> {
+  const key: Record<string, unknown> = {};
+  for (const field of primaryKey)
+    key[field] = sources.find((s) => Object.hasOwn(s, field))?.[field];
+  return key;
+}
+
 /** The key a v1-full delete names, or why it names none. The claim must be a
- * full key; the payload's own key fields (typed, as a live row holds them)
- * stand in for it when present, and must agree with it. */
+ * full key. Every key field the payload holds must agree with the claim (by
+ * the record key's own rule, so `1` and `"1"` agree); a field it holds that
+ * disagrees makes the claim a forgery, however few fields the payload has.
+ * The payload's typed values stand in for the claim's where it holds them. */
 async function deletedKey(
   payload: unknown,
   claim: unknown,
   primaryKey: readonly string[],
-): Promise<{ readonly id: string; readonly record: unknown } | QuarantinedRow> {
+): Promise<
+  | { readonly id: string; readonly key: Record<string, unknown> }
+  | QuarantinedRow
+> {
   const claimed = await classifyImportKey(claim, primaryKey);
   if ("quarantine" in claimed) return new QuarantinedRow(claimed.quarantine);
-  const held = await classifyImportKey(payload, primaryKey);
-  if ("quarantine" in held)
-    return { id: claimed.key.record_key, record: claim };
-  return held.key.record_key === claimed.key.record_key
-    ? { id: held.key.record_key, record: payload }
-    : new QuarantinedRow("record_key_mismatch");
+  const held = isObject(payload) ? payload : {};
+  const claimedFields = claim as Record<string, unknown>;
+  for (const field of primaryKey) {
+    if (!Object.hasOwn(held, field)) continue;
+    if (
+      !isKeyValue(held[field]) ||
+      String(held[field]) !== String(claimedFields[field])
+    )
+      return new QuarantinedRow("record_key_mismatch");
+  }
+  return {
+    id: claimed.key.record_key,
+    key: keyFields(primaryKey, held, claimedFields),
+  };
 }
 
 export function foldLayers(
@@ -131,11 +166,15 @@ export function foldLayers(
     // Record keys a newer layer deleted that no row has named yet.
     const deletedByKey = new Set<string>();
     for (const layer of layers) {
+      // Every record key this layer holds, with the digest of its body: a
+      // repeat is checked against the first, whatever became of the first.
+      const seen = new Map<string, string>();
+      // The record keys this layer holds live.
       const own = new Set<string>();
       const deleted = new Set<string>();
       // Deletions the layer's own envelopes declare, by record key. They are
       // applied after its rows, so a live row of the layer outranks them.
-      const declared = new Map<string, unknown>();
+      const declared = new Map<string, Record<string, unknown>>();
       for await (const record of layer.records()) {
         const decoded = decode(record, options.sourceId);
         if ("deletion" in decoded) {
@@ -153,7 +192,7 @@ export function foldLayers(
             // it is counted here, whatever happens to its key below (a live
             // row of its layer, or a newer layer, may outrank it).
             yield { row: new QuarantinedRow(DELETE_ENVELOPE) };
-            if (!declared.has(named.id)) declared.set(named.id, named.record);
+            if (!declared.has(named.id)) declared.set(named.id, named.key);
           }
           continue;
         }
@@ -168,6 +207,18 @@ export function foldLayers(
         // The legacy record key is the identity the database keeps a row
         // under: `{id: 42}` and `{id: "42"}` are one key, not two.
         const id = classified.row.record_key;
+        // Within one layer a repeat of a key is the same row again (counted),
+        // or a conflict, and the stream is refused exactly as the direct
+        // importer refuses it (`stageImportSnapshot`). Two typed forms of one
+        // record key cannot share a body, so the body digest alone tells them.
+        const digest = classified.row.body_sha256;
+        const first = seen.get(id);
+        if (first !== undefined) {
+          if (first !== digest) throw new Error("invalid_record");
+          yield { row: new QuarantinedRow("duplicate_key") };
+          continue;
+        }
+        seen.set(id, digest);
         const decided = taken.get(id);
         if (decided !== undefined) {
           yield {
@@ -183,12 +234,9 @@ export function foldLayers(
           taken.set(id, false);
           deleted.add(id);
           yield { row: new QuarantinedRow("deleted_in_newer_layer") };
-          yield { deletion: row };
-          continue;
-        }
-        // One version per key per layer: the first stands, a repeat is counted.
-        if (own.has(id)) {
-          yield { row: new QuarantinedRow("duplicate_key") };
+          yield {
+            deletion: keyFields(primaryKey, row as Record<string, unknown>),
+          };
           continue;
         }
         own.add(id);
@@ -196,10 +244,10 @@ export function foldLayers(
       }
       // A layer that holds a key live, or a newer layer that decided it,
       // outranks this layer's deletion.
-      for (const [id, record] of declared) {
+      for (const [id, key] of declared) {
         if (own.has(id) || taken.has(id) || deleted.has(id)) continue;
         deleted.add(id);
-        yield { deletion: record };
+        yield { deletion: key };
       }
       if (layer.deletions)
         for await (const record of layer.deletions()) {
@@ -211,7 +259,9 @@ export function foldLayers(
           const id = key.key.record_key;
           if (own.has(id) || taken.has(id) || deleted.has(id)) continue;
           deleted.add(id);
-          yield { deletion: record };
+          yield {
+            deletion: keyFields(primaryKey, record as Record<string, unknown>),
+          };
         }
       if (layer.deletedRecordKeys)
         for await (const recordKey of layer.deletedRecordKeys())
