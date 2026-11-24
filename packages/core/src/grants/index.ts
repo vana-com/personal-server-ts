@@ -46,3 +46,14 @@ export {
   permissionKey,
   type PdppGrantBindingStore,
 } from "./pdpp-binding-store.js";
+// One salted fingerprint per PDPP grant, the entry it takes in the on-chain
+// permission slot. Nothing calls it yet.
+export {
+  GRANT_FINGERPRINT_DOMAIN,
+  GRANT_FINGERPRINT_PREFIX,
+  grantFingerprint,
+  grantMatchesFingerprint,
+  isGrantFingerprint,
+  isGrantSalt,
+  newGrantSalt,
+} from "./grant-fingerprint.js";
