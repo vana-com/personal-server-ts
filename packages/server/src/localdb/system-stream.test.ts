@@ -407,6 +407,48 @@ it("retention deletes old activity canonically and persists its deletion waterma
   expect(deleted!.tombstone_wm_o).toBeGreaterThan(f.deps.now());
 });
 
+it("rejects incomplete access activity attribution", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    action: "read",
+    scope: "synthetic.entries",
+    grantId: "synthetic-grant",
+    builder: "synthetic-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  for (const field of ["grantId", "builder"]) {
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, [field]: "" }),
+    ).toThrow("Invalid access activity field");
+  }
+});
+
+it("distinguishes unknown access activity phases from served-start", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    action: "read",
+    scope: "synthetic.entries",
+    grantId: "synthetic-grant",
+    builder: "synthetic-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, phase: "served-finish" }),
+  ).toThrow("Invalid access activity event");
+});
+
 it("owner history pages tied timestamps without skips, duplicate rows or recursive audit", async () => {
   const { createAccessActivity } =
     await import("../../../core/src/logging/activity-stream.js");
