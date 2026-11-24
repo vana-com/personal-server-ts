@@ -1,5 +1,9 @@
 import { afterEach, expect, it } from "vitest";
-import { foldLayers, type FoldLayer } from "../../../core/src/localdb/index.js";
+import {
+  foldLayers,
+  IMPORT_CHUNK_ROWS,
+  type FoldLayer,
+} from "../../../core/src/localdb/index.js";
 import { drivers, state, world } from "./late-seed-harness.test-utils.js";
 
 // Layers are stored versions of one stream, newest first: the `{records}`
@@ -484,6 +488,25 @@ it("fold-a-live-row-in-another-type-fills-nothing-and-is-not-a-conflict", async 
   }));
   expect(result).toMatchObject({ kind: "imported", tombstoned: 0 });
   expect(Object.keys(await bodies(a))).toEqual(["7", "8"]);
+  expect(await a.db.query("SELECT 1 FROM log_tombstones")).toEqual([]);
+});
+
+it("fold-a-refused-import-leaves-no-tombstones, even after a full batch of deletions", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  // The source hands over a full batch of deleted keys, then its final
+  // revision check fails. No batch may have reached `log_tombstones` by then.
+  const result = await a.importSource("files", (base) => ({
+    ...base,
+    async *records() {
+      yield { id: "kept", v: "row" };
+    },
+    async *deletions() {
+      for (let i = 0; i < IMPORT_CHUNK_ROWS; i++) yield { id: `gone-${i}` };
+      throw new Error("source_changed");
+    },
+  }));
+  expect(result).toEqual({ kind: "refused", reason: "source_changed" });
   expect(await a.db.query("SELECT 1 FROM log_tombstones")).toEqual([]);
 });
 

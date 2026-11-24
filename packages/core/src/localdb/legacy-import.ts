@@ -8,6 +8,8 @@ import { recoverLogTombstones } from "./log-tombstone-recovery.js";
 import { TEMP_TABLES, mergeIncoming, withOrigin } from "./merge.js";
 import {
   stageImportSnapshot,
+  stageImportDeletions,
+  commitImportDeletions,
   classifyImportKey,
   classifyImportRow,
   clearImportSnapshot,
@@ -319,42 +321,9 @@ async function importSource(
         faults.add(reason, rows);
       const tombstonesBefore = await countTombstones();
       if (source.deletions) {
+        // Staged, not written: the iterator's own revision check runs when it
+        // ends, and a refused import must leave no tombstone behind.
         let keys: { pk_hash: string; record_key: string }[] = [];
-        const writeKeys = async (): Promise<
-          Extract<LegacyImportResult, { kind: "refused" }>["reason"] | null
-        > => {
-          if (keys.length === 0) return null;
-          const batch = keys;
-          keys = [];
-          const fenced = await importFence(deps, source);
-          if (fenced) return fenced;
-          await deps.db.batch([
-            ...guard,
-            ...batch.map((key): SqlStatement => ({
-              sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
-                  SELECT ?, ?, ?, ?, 0, 'seed', ? WHERE NOT EXISTS (SELECT 1 FROM records r
-                    WHERE r.connection_id = ? AND r.stream = ? AND r.record_key = ?)
-                  AND NOT EXISTS (SELECT 1 FROM log_tombstones t
-                    WHERE t.connection_id = ? AND t.stream = ? AND t.record_key = ?)`,
-              // A tombstone with no record key (written before the column) has
-              // the same hash, so the primary key's `INSERT OR IGNORE` keeps it.
-              params: [
-                connectionId,
-                stream,
-                key.pk_hash,
-                key.record_key,
-                EXPLICIT_DELETE_RANK,
-                connectionId,
-                stream,
-                key.record_key,
-                connectionId,
-                stream,
-                key.record_key,
-              ],
-            })),
-          ]);
-          return null;
-        };
         for await (const record of source.deletions()) {
           const classified = await classifyImportKey(
             record,
@@ -366,12 +335,21 @@ async function importSource(
           }
           keys.push(classified.key);
           if (keys.length >= IMPORT_CHUNK_ROWS) {
-            const stopped = await writeKeys();
-            if (stopped) return { kind: "refused", reason: stopped };
+            await stageImportDeletions(deps.db, op, keys);
+            keys = [];
           }
         }
-        const stopped = await writeKeys();
-        if (stopped) return { kind: "refused", reason: stopped };
+        await stageImportDeletions(deps.db, op, keys);
+        const fenced = await importFence(deps, source);
+        if (fenced) return { kind: "refused", reason: fenced };
+        await deps.db.batch([
+          ...guard,
+          commitImportDeletions(
+            op,
+            { connectionId, stream },
+            EXPLICIT_DELETE_RANK,
+          ),
+        ]);
       }
       const tombstoned = (await countTombstones()) - tombstonesBefore;
       const fence = await importFence(deps, source);
