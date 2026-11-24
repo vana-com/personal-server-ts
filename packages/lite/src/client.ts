@@ -106,6 +106,8 @@ export type PersonalServerLiteConnectionPublication = {
   /** `update_required`: this build cannot read the connection's log. `degraded`: a load stopped on `failedStreams`. */
   readonly status?: "update_required" | "degraded";
   readonly failedStreams?: readonly FailedStream[];
+  /** A later pass of the cycle failed after this connection's publication settled; the receipt stands. */
+  readonly followUpError?: string;
   readonly publications: readonly PublicationReceipt[];
 };
 
@@ -807,6 +809,9 @@ function connectionPublication(
     ...(connection.status ? { status: connection.status } : {}),
     ...(connection.failedStreams
       ? { failedStreams: connection.failedStreams }
+      : {}),
+    ...(connection.followUpError
+      ? { followUpError: connection.followUpError }
       : {}),
     publications,
   };

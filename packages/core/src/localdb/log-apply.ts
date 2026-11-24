@@ -85,6 +85,7 @@ import { recommitApplied } from "./log-recommit.js";
 import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
+  noteMarkedFailed,
   failureCode,
   hideStoredRows,
   partialRowStatement,
@@ -779,7 +780,14 @@ async function listKeyedLoad(
       await deps.db
         .batch(identities.map((identity) => failedRowStatement(identity, code)))
         .then(
-          () => announceApplied(deps, connectionId),
+          () => {
+            noteMarkedFailed(
+              error,
+              identities.map((identity) => identity.stream),
+              code,
+            );
+            announceApplied(deps, connectionId);
+          },
           () => undefined,
         );
     },
@@ -996,7 +1004,14 @@ async function loadProgressively(
           ),
         )
         .then(
-          () => announceApplied(deps, connectionId),
+          () => {
+            noteMarkedFailed(
+              error,
+              stopped.map((identity) => identity.stream),
+              failureCode(error),
+            );
+            announceApplied(deps, connectionId);
+          },
           () => undefined,
         );
     throw error;
@@ -1253,7 +1268,14 @@ async function loadProgressively(
           ]),
         )
         .then(
-          () => announceApplied(deps, connectionId),
+          () => {
+            noteMarkedFailed(
+              error,
+              stopped.map((identity) => identity.stream),
+              code,
+            );
+            announceApplied(deps, connectionId);
+          },
           () => undefined,
         );
     throw error;

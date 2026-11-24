@@ -23,6 +23,7 @@ import {
 import {
   partialRowStatement,
   failedRowStatement,
+  noteMarkedFailed,
   hideStoredRows,
   type PartialIdentity,
 } from "./partial-load.js";
@@ -475,7 +476,16 @@ async function runBootstrap(input: {
     ]);
     if (statements.length)
       await deps.db.batch(statements).then(
-        () => announceApplied(deps, connectionId),
+        () => {
+          noteMarkedFailed(
+            error,
+            stopped.map((row) => row.stream),
+            error instanceof FalseRemovalFact
+              ? "invalid_segment"
+              : "apply_failed",
+          );
+          announceApplied(deps, connectionId);
+        },
         () => undefined,
       );
     throw error;

@@ -16,6 +16,7 @@ import {
 import {
   controlScope,
   logScope,
+  streamScope,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 import { createFakeGateway } from "../../server/src/localdb/fake-gateway.js";
@@ -298,6 +299,22 @@ describe("the save path of a Web write", () => {
       const receipt = await server.publish({ connections: [own] });
       expect(receipt.outcome).toBe("published");
       expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
+    });
+
+    it("keeps the caller's receipt when the fallback's apply of its connection also fails", async () => {
+      const { server, gateway } = await withFailingSibling();
+      // A later build reserved another `~` name beside the caller's log.
+      gateway.write(streamScope(CONNECTOR, "", "~future"), {
+        dataHash: `0x${"ab".repeat(32)}`,
+        metadataHash: `0x${"cd".repeat(32)}`,
+      });
+      const own = controlScope(CONNECTOR, "");
+      const receipt = await server.publish({ connections: [own] });
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
+      const mine = receipt.connections.find((c) => c.connectionId === own);
+      expect(mine?.outcome).toBe("published");
+      expect(mine?.followUpError).toMatch(/~future/);
     });
 
     it("still rejects for the sibling when the caller names it", async () => {

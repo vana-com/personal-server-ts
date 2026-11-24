@@ -5,7 +5,11 @@ import {
   knownActiveConnections,
   newConnectionsWithStreams,
 } from "../../../core/src/localdb/bootstrap.js";
-import { runCycle, syncConnection } from "../../../core/src/localdb/cycle.js";
+import {
+  runCycle,
+  runPublish,
+  syncConnection,
+} from "../../../core/src/localdb/cycle.js";
 import type {
   ConnectionRow,
   LocalSyncDeps,
@@ -62,6 +66,24 @@ beforeEach(() => {
 });
 
 describe("local database cycle", () => {
+  it("lets a bootstrap failure propagate when a sibling forced the fallback", async () => {
+    const deps = dependencies();
+    vi.mocked(knownActiveConnections).mockResolvedValue([
+      connection("own"),
+      connection("sibling"),
+    ]);
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
+      if (id === "sibling") throw new Error("commit failed");
+      return published(id);
+    });
+    vi.mocked(bootstrapConnections).mockRejectedValue(
+      new Error("controls write failed"),
+    );
+    await expect(runPublish(deps, ["own"])).rejects.toThrow(
+      /controls write failed/,
+    );
+  });
+
   it.each([[], ["missing"]])(
     "avoids registry calls when no scoped connection is held: %j",
     async (connections) => {

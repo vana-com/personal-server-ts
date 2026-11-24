@@ -110,3 +110,43 @@ describe("a publish that fails while a stream is already marked failed", () => {
     expect(connection.failedStreams).toBeUndefined();
   });
 });
+
+describe("a retry that fails before it reaches the failed streams", () => {
+  it("reports only what this attempt saw, not the earlier attempt's reasons", async () => {
+    const w = await world({ streams: 2 });
+    const peer = await w.device("peer");
+    await peer.run("run-1", records("a"));
+    await peer.cycle();
+    await peer.run("run-2", [{ stream: sName(0), id: "late" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await peer.cycle();
+    await peer.run("run-3", [{ stream: sName(1), id: "later" }], {
+      full: false,
+      covered: [sName(1)],
+    });
+    await peer.cycle();
+    const keys = await w.segmentKeys();
+    w.innerBlobs.delete(keys.get(Math.max(...keys.keys()) - 1)!);
+    let unreachable = false;
+    const here = await w.device("here", {
+      progressiveFirstLoad: true,
+      beforeGet: async () => {
+        if (unreachable) throw new Error("registry unreachable");
+      },
+    });
+    const first = (await here.sync.cycle()).connections.find(
+      (c) => c.connectionId === CONNECTION_ID,
+    )!;
+    expect(first.status).toBe("degraded");
+
+    unreachable = true;
+    const retry = (await here.sync.cycle()).connections.find(
+      (c) => c.connectionId === CONNECTION_ID,
+    )!;
+    expect(retry.error).toMatch(/registry unreachable/);
+    expect(retry.status).toBeUndefined();
+    expect(retry.failedStreams).toBeUndefined();
+  });
+});
