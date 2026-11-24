@@ -341,6 +341,42 @@ it("each served owner or delegated read durably appends one minimized served-sta
   expect(await f.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
 });
 
+it("rejects an unsupported access activity schema version", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      schemaVersion: 2,
+      eventId: "00000000-0000-4000-8000-000000000001",
+      instanceId: "00000000-0000-4000-8000-000000000002",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      action: "read",
+      scope: "synthetic.entries",
+      grantId: "synthetic-grant",
+      builder: "synthetic-builder",
+      phase: "served-start",
+    }),
+  ).toThrow("Invalid access activity event");
+});
+
+it("rejects an empty scope in an otherwise valid access activity event", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      schemaVersion: 1,
+      eventId: "00000000-0000-4000-8000-000000000001",
+      instanceId: "00000000-0000-4000-8000-000000000002",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      action: "read",
+      scope: "",
+      grantId: "synthetic-grant",
+      builder: "synthetic-builder",
+      phase: "served-start",
+    }),
+  ).toThrow("Invalid access activity field");
+});
+
 it("retention deletes old activity canonically and persists its deletion watermark", async () => {
   const { createAccessActivity } =
     await import("../../../core/src/logging/activity-stream.js");

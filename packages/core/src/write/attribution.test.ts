@@ -780,6 +780,21 @@ describe("stampWriterAttribution", () => {
     expect(stamped[WRITER_ATTRIBUTION_KEY]).toEqual(attribution);
   });
 
+  it("stamps a frozen payload without modifying the caller's record", () => {
+    const input = Object.freeze({ note: "synthetic", rating: 0 });
+    const result = stampWriterAttribution(input, attribution);
+    expect(result).not.toBe(input);
+    expect(Object.keys(input)).toEqual(["note", "rating"]);
+    expect(result.rating).toBe(0);
+  });
+
+  it("returns independent records when stamping the same input twice", () => {
+    const input = { note: "synthetic" };
+    const first = stampWriterAttribution(input, attribution);
+    first.note = "changed";
+    expect(stampWriterAttribution(input, attribution).note).toBe("synthetic");
+  });
+
   it("hasReservedWriterKey detects caller-supplied attribution", () => {
     expect(hasReservedWriterKey({ note: "x" })).toBe(false);
     expect(hasReservedWriterKey({ [WRITER_ATTRIBUTION_KEY]: {} })).toBe(true);

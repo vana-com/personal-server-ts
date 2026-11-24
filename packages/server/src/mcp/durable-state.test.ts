@@ -413,6 +413,37 @@ describe("MCP_STATE_REQUIRED", () => {
     expect((await reopened.getIdentity(userPsId(14800, OWNER)))?.epoch).toBe(1);
   });
 
+  it("refuses an unsupported envelope version even when a missing file would be allowed", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-version-"));
+    directories.push(directory);
+    const path = join(directory, "future.sealed");
+    const contents = JSON.stringify({ v: 999 });
+    await writeFile(path, contents);
+
+    await expect(
+      openMcpDurableState({ path, key: randomBytes(32) }),
+    ).rejects.toThrow("Unsupported MCP state version");
+    expect(await readFile(path, "utf8")).toBe(contents);
+  });
+
+  it("reports required-state failure while retaining the version rejection as the cause", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-version-"));
+    directories.push(directory);
+    const path = join(directory, "future.sealed");
+    await writeFile(path, JSON.stringify({ v: 999 }));
+
+    await expect(
+      openMcpDurableState({
+        path,
+        key: randomBytes(32),
+        requirement: McpStateRequirement.Required,
+      }),
+    ).rejects.toMatchObject({
+      name: "McpStateRequiredError",
+      cause: { message: "Unsupported MCP state version" },
+    });
+  });
+
   it("still starts fresh on a missing file when unset, unchanged from today", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mcp-state-required-"));
     directories.push(directory);

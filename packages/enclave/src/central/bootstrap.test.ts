@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { createFakeDstackClient } from "../dstack/fake.js";
-import { startFleetCentral } from "./bootstrap.js";
+import { closeFleetListeners, startFleetCentral } from "./bootstrap.js";
 import { MAINNET_CHAIN_ID, MAINNET_GATEWAY_ORIGIN } from "../chain-id.js";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { openMcpDurableState } from "@opendatalabs/personal-server-ts-server/mcp/tee";
@@ -23,6 +23,37 @@ import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
 import type { FleetOwner, FleetWorkerPort } from "../fleet/contracts.js";
 
 vi.mock("node:fs/promises", { spy: true });
+
+it("still closes fleet listeners when MCP cleanup fails, preserving the MCP error", async () => {
+  const calls: string[] = [];
+  const primary = new Error("synthetic MCP close error");
+  const secondary = new Error("synthetic listener close error");
+  await expect(
+    closeFleetListeners(
+      async () => {
+        calls.push("mcp");
+        throw primary;
+      },
+      async () => {
+        calls.push("listeners");
+        throw secondary;
+      },
+    ),
+  ).rejects.toBe(primary);
+  expect(calls).toEqual(["mcp", "listeners"]);
+});
+
+it("surfaces a listener close error when MCP cleanup succeeds", async () => {
+  const secondary = new Error("synthetic listener close error");
+  await expect(
+    closeFleetListeners(
+      async () => {},
+      async () => {
+        throw secondary;
+      },
+    ),
+  ).rejects.toBe(secondary);
+});
 
 it("rejects unsigned runtime configuration before reading any protected central state", async () => {
   const path = await mkdtemp(join(tmpdir(), "central-config-"));

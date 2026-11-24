@@ -3,7 +3,10 @@ import pino from "pino";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
-import { createPdppRecordsDeps } from "./records-bootstrap.js";
+import {
+  createPdppRecordsDeps,
+  legacyScopeRecords,
+} from "./records-bootstrap.js";
 
 const SERVER_OWNER = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 const OTHER_SUBJECT = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -262,5 +265,30 @@ describe("createPdppRecordsDeps: readBlobBytes", () => {
     const readBack = await deps!.readBlobBytes!(meta.blobId);
     expect(readBack).toBeDefined();
     expect(Array.from(readBack!)).toEqual(Array.from(bytes));
+  });
+});
+
+describe("legacyScopeRecords blob bytes", () => {
+  function readerFor(bytes: Uint8Array | undefined) {
+    const deps = {
+      bindingStore: {},
+      reads: () => ({ getBlobBytes: () => bytes }),
+    } as unknown as Parameters<typeof legacyScopeRecords>[0];
+    return legacyScopeRecords(deps);
+  }
+
+  it("does not turn an absent blob into a zero-length payload", () => {
+    expect(
+      readerFor(undefined).getBlobBytes("synthetic-missing"),
+    ).toBeUndefined();
+  });
+
+  it("returns an independently owned copy of shared-buffer data", () => {
+    const shared = new Uint8Array(new SharedArrayBuffer(3));
+    shared.set([1, 2, 3]);
+    const returned = readerFor(shared).getBlobBytes("synthetic-blob");
+    expect(returned?.buffer).toBeInstanceOf(ArrayBuffer);
+    shared[0] = 9;
+    expect(Array.from(returned ?? [])).toEqual([1, 2, 3]);
   });
 });

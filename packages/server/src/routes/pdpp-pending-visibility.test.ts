@@ -296,94 +296,108 @@ it("serves owner pending markers while the same grant sees nothing until promoti
   }
 });
 
-it("keeps the visible row's instance when rebinding a multi-connection page cursor", async () => {
-  const db = new Database(":memory:");
-  try {
-    const store = createReplicaRecordStore(db);
-    const ids = ["conn_a", "conn_b", "conn_c"];
-    for (const instance of ids)
-      store.registerConnection({
-        instance,
-        sourceId: identity.sourceId,
-        method: identity.methodId,
-        label: instance,
+it.each([1, 2])(
+  "pages multi-connection records at limit %i without losing their instance",
+  async (limit) => {
+    const db = new Database(":memory:");
+    try {
+      const store = createReplicaRecordStore(db);
+      const ids = ["conn_a", "conn_b", "conn_c"];
+      for (const instance of ids)
+        store.registerConnection({
+          instance,
+          sourceId: identity.sourceId,
+          method: identity.methodId,
+          label: instance,
+        });
+      store.replication.beginBaseline({
+        owner: identity.owner,
+        declarations: [{ sourceId: identity.sourceId, binding }],
       });
-    store.replication.beginBaseline({
-      owner: identity.owner,
-      declarations: [{ sourceId: identity.sourceId, binding }],
-    });
-    for (const instance of ids)
-      store.ingestBatch(
-        [
-          {
-            instance,
-            stream: binding.stream,
-            key: "same-key",
-            data: { id: "same-key", instance },
-            emitted_at: "2026-10-21T00:00:00.000Z",
-          },
+      for (const instance of ids)
+        store.ingestBatch(
+          [
+            {
+              instance,
+              stream: binding.stream,
+              key: "same-key",
+              data: { id: "same-key", instance },
+              emitted_at: "2026-10-21T00:00:00.000Z",
+            },
+          ],
+          () => binding.semantics,
+          () => ["id"],
+          { method: identity.methodId, generation: 1 },
+        );
+      const receiver = createReplicaReceiver({
+        db,
+        store,
+        owner: identity.owner,
+        enabled: true,
+        authenticate: () => identity.owner,
+        declarations: () => [
+          { sourceId: identity.sourceId, binding, validateData: () => true },
         ],
-        () => binding.semantics,
-        () => ["id"],
-        { method: identity.methodId, generation: 1 },
-      );
-    const receiver = createReplicaReceiver({
-      db,
-      store,
-      owner: identity.owner,
-      enabled: true,
-      authenticate: () => identity.owner,
-      declarations: () => [
-        { sourceId: identity.sourceId, binding, validateData: () => true },
-      ],
-    });
-    const auth = createFixtureAuthorizationService({
-      owner: {
-        active: true,
-        tokenKind: "owner",
-        subjectId: identity.owner,
-        instanceIds: ids,
-      },
-    });
-    const declarations = createStreamDeclarationRegistry([
-      {
-        name: binding.stream,
-        semantics: binding.semantics,
-        primaryKey: ["id"],
-        cursorField: "emitted_at",
-        requiredFields: ["id"],
-      },
-    ]);
-    const app = pdppRecordsRoutes({
-      accountStorageMode: explicitLegacyStorageMode("unswitched"),
-      store,
-      auth,
-      declarations,
-      bindingStore: store,
-      instancesForSubject: () => ids,
-      reads: (reader) => receiver.readStore({ reader }),
-    });
-    const seen: string[] = [];
-    let cursor: string | undefined;
-    do {
-      const response = await app.request(
-        `/streams/messages/records?limit=1&order=asc${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
-        { headers: { Authorization: "Bearer owner" } },
-      );
-      expect(response.status).toBe(200);
-      const page = await response.json();
-      seen.push(
-        ...page.data.map(
-          (row: { data: { instance: string } }) => row.data.instance,
-        ),
-      );
-      cursor = page.next_cursor;
-    } while (cursor);
-    expect(seen).toEqual(ids);
-  } finally {
-    db.close();
-  }
-});
+      });
+      const auth = createFixtureAuthorizationService({
+        owner: {
+          active: true,
+          tokenKind: "owner",
+          subjectId: identity.owner,
+          instanceIds: ids,
+        },
+      });
+      const declarations = createStreamDeclarationRegistry([
+        {
+          name: binding.stream,
+          semantics: binding.semantics,
+          primaryKey: ["id"],
+          cursorField: "emitted_at",
+          requiredFields: ["id"],
+        },
+      ]);
+      const app = pdppRecordsRoutes({
+        accountStorageMode: explicitLegacyStorageMode("unswitched"),
+        store,
+        auth,
+        declarations,
+        bindingStore: store,
+        instancesForSubject: () => ids,
+        reads: (reader) => receiver.readStore({ reader }),
+      });
+      const seen: string[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      for (let offset = 0; offset < ids.length; offset += limit) {
+        const response = await app.request(
+          `/streams/messages/records?limit=${limit}&order=asc${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { headers: { Authorization: "Bearer owner" } },
+        );
+        expect(response.status).toBe(200);
+        const page = await response.json();
+        expect(page.data).toHaveLength(Math.min(limit, ids.length - offset));
+        seen.push(
+          ...page.data.map(
+            (row: { data: { instance: string } }) => row.data.instance,
+          ),
+        );
+        cursor = page.next_cursor;
+        expect(page.has_more).toBe(offset + limit < ids.length);
+        if (page.has_more) {
+          expect(typeof cursor).toBe("string");
+          expect(cursor).toBeTruthy();
+          expect(cursors.has(cursor!)).toBe(false);
+          cursors.add(cursor!);
+        } else {
+          expect(cursor).toBeFalsy();
+        }
+      }
+      expect(seen).toEqual(ids);
+    } finally {
+      db.close();
+    }
+  },
+);
 
 it("uses local journal values for conflicted owners and hides the whole connection from apps", async () => {
   const db = new Database(":memory:");

@@ -258,10 +258,19 @@ export function createAccessReporter(
     detail: { reason: string; attempts?: number },
   ): void {
     dropped += records.length;
-    logger.warn(
-      { count: records.length, droppedTotal: dropped, ...detail },
-      ACCESS_RECORDS_DROPPED,
-    );
+    const payload = { count: records.length, droppedTotal: dropped, ...detail };
+    try {
+      logger.warn(payload, ACCESS_RECORDS_DROPPED);
+    } catch {
+      // An unavailable warning sink must not poison the delivery queue.
+      if (logger !== consoleAccessReporterLogger) {
+        try {
+          consoleAccessReporterLogger.warn(payload, ACCESS_RECORDS_DROPPED);
+        } catch {
+          // Count the drop even if neither sink can report it.
+        }
+      }
+    }
   }
 
   function delay(ms: number): Promise<void> {

@@ -40,6 +40,26 @@ describe("the file mode record store", () => {
     expect(bad.sort()).toEqual(["broken.json", "shape.json"]);
   });
 
+  it("propagates a non-directory storage root instead of treating it as empty", async () => {
+    const blocked = join(dir, "not-a-directory");
+    await writeFile(blocked, "fixture");
+    const store = createFileModeRecordStore(blocked);
+
+    await expect(store.load()).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  it("round-trips the maximum owner name without accepting one character more", async () => {
+    const owner = "a".repeat(100);
+    const tooLong = owner + "a";
+    const record = { answer: "off" as const, generation: 0, receivedAt: 1 };
+    const store = createFileModeRecordStore(dir);
+    await store.save(owner, record);
+
+    await expect(store.save(tooLong, record)).rejects.toThrow("safe file name");
+    const loaded = await createFileModeRecordStore(dir).load();
+    expect([...loaded]).toEqual([[owner, record]]);
+  });
+
   it("refuses an owner that is not a safe file name", async () => {
     const store = createFileModeRecordStore(dir);
     await expect(

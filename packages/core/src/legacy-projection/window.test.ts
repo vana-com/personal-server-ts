@@ -3,6 +3,7 @@ import {
   alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
   projectPdppRecordsToLegacyPayload,
+  requiredLegacyStreams,
 } from "./index.js";
 import type { LegacyScopeBinding, PdppRecord } from "./types.js";
 import { WINDOW_FIXTURES } from "./__fixtures__/window-records.js";
@@ -149,5 +150,35 @@ describe("legacy projection memory guard", () => {
       }
     }
     expect(failures).toEqual([]);
+  });
+});
+
+describe("required legacy stream planning", () => {
+  it("keeps required streams in binding order without changing the binding", () => {
+    const pdppStreams = [
+      "synthetic-parent",
+      "synthetic-extra",
+      "synthetic-child",
+    ];
+    const optionalStreams = ["synthetic-extra"];
+    expect(requiredLegacyStreams({ pdppStreams, optionalStreams })).toEqual([
+      "synthetic-parent",
+      "synthetic-child",
+    ]);
+    expect(pdppStreams).toEqual([
+      "synthetic-parent",
+      "synthetic-extra",
+      "synthetic-child",
+    ]);
+    expect(optionalStreams).toEqual(["synthetic-extra"]);
+  });
+
+  it("returns independent required lists when no optional streams are declared", () => {
+    const pdppStreams = ["synthetic-primary"];
+    const first = requiredLegacyStreams({ pdppStreams });
+    first.push("local-only");
+    expect(requiredLegacyStreams({ pdppStreams })).toEqual([
+      "synthetic-primary",
+    ]);
   });
 });

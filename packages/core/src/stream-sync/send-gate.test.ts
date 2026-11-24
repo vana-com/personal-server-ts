@@ -762,4 +762,41 @@ describe("createByteBudget", () => {
     part.shrink(1);
     expect(budget.inUse()).toBe(0);
   });
+
+  it("queues zero-byte reservations behind an earlier waiting part", async () => {
+    const budget = createByteBudget(10);
+    const full = await budget.reserve(10);
+    const order: string[] = [];
+    const part = budget.reserve(4).then((release) => {
+      order.push("part");
+      return release;
+    });
+    const empty = budget.reserve(0).then((release) => {
+      order.push("empty");
+      return release;
+    });
+    await Promise.resolve();
+    expect(order).toEqual([]);
+    full();
+    const [releasePart, releaseEmpty] = await Promise.all([part, empty]);
+    expect(order).toEqual(["part", "empty"]);
+    expect(budget.inUse()).toBe(4);
+    releaseEmpty();
+    expect(budget.inUse()).toBe(4);
+    releasePart();
+    expect(budget.inUse()).toBe(0);
+  });
+
+  it("keeps accounting local to each byte budget", async () => {
+    const first = createByteBudget(10);
+    const second = createByteBudget(10);
+    const releaseFirst = await first.reserve(10);
+    const releaseSecond = await second.reserve(3);
+    expect(first.inUse()).toBe(10);
+    expect(second.inUse()).toBe(3);
+    releaseFirst();
+    expect(first.inUse()).toBe(0);
+    expect(second.inUse()).toBe(3);
+    releaseSecond();
+  });
 });

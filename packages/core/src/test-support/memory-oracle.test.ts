@@ -12,6 +12,8 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -100,6 +102,30 @@ describe("memory-oracle calibration", () => {
     });
     expect(r.peakBytes).toBeGreaterThanOrEqual(0.9 * HELD_MiB * MiB);
   }, 60_000);
+
+  // "€" is three bytes in UTF-8, and a ~300 KiB report line arrives in
+  // several stdout chunks. 65536 is not a multiple of 3, so a chunk boundary
+  // falls inside a character; decoding each chunk on its own replaces the
+  // split bytes with U+FFFD while JSON.parse still succeeds.
+  it("returns multi-byte characters intact across stdout chunks", async () => {
+    const temporary = join(homedir(), ".tmp");
+    mkdirSync(temporary, { recursive: true });
+    const root = mkdtempSync(join(temporary, "memory-oracle-unicode-"));
+    try {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        `export function unicode() { return "€".repeat(100_000); }`,
+      );
+      const measured = await run<string>({
+        module,
+        exportName: "unicode",
+      });
+      expect(measured.result).toBe("€".repeat(100_000));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe("memory-oracle temp roots", () => {
@@ -111,6 +137,42 @@ describe("memory-oracle temp roots", () => {
       rmSync(parent, { recursive: true, force: true });
     }
   }
+
+  it("requires a nonempty prefix before resolving the parent", () => {
+    expect(() => createTempRoot("", "/fixture/unused-parent")).toThrow(
+      "Invalid temp-root prefix",
+    );
+  });
+
+  it("rejects both platform separators and NUL before resolving the parent", () => {
+    for (const prefix of ["fixture/path", "fixture\\path", "fixture\0root"]) {
+      expect(() => createTempRoot(prefix, "/fixture/unused-parent")).toThrow(
+        "Invalid temp-root prefix",
+      );
+    }
+  });
+
+  it("reports a missing temp-root parent without creating it", () => {
+    withTempParent((parent) => {
+      const missing = join(parent, "missing");
+      const exitListeners = process.listenerCount("exit");
+      expect(() => createTempRoot("oracle-", missing)).toThrow(/ENOENT/);
+      expect(readdirSync(parent)).toEqual([]);
+      expect(process.listenerCount("exit")).toBe(exitListeners);
+    });
+  });
+
+  it("rejects a file as the temp-root parent without changing it", () => {
+    withTempParent((parent) => {
+      const file = join(parent, "not-a-directory");
+      writeFileSync(file, "synthetic sentinel");
+      const exitListeners = process.listenerCount("exit");
+      expect(() => createTempRoot("oracle-", file)).toThrow(/ENOTDIR/);
+      expect(readdirSync(parent)).toEqual(["not-a-directory"]);
+      expect(readFileSync(file, "utf8")).toBe("synthetic sentinel");
+      expect(process.listenerCount("exit")).toBe(exitListeners);
+    });
+  });
 
   it("disposes a root and can safely dispose it again", () => {
     withTempParent((parent) => {

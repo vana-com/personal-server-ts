@@ -160,6 +160,59 @@ describe("ServerSigner", () => {
     });
   });
 
+  it("hands its capability a copy of the lineage source list", async () => {
+    const unavailable = new Error("inert capability");
+    const sourceList = Object.freeze(["0x01", "0x02"] as const);
+    let seen: unknown;
+    const account = {
+      address: "0x1111111111111111111111111111111111111111",
+      signTypedData: async ({
+        message,
+      }: {
+        message: Record<string, unknown>;
+      }) => {
+        seen = message.sources;
+        throw unavailable;
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    const signer = createServerSigner(account, TEST_GATEWAY_CONFIG);
+    const input = { sources: sourceList } as Parameters<
+      typeof signer.signLineageAttestation
+    >[0];
+    await expect(signer.signLineageAttestation(input)).rejects.toBe(
+      unavailable,
+    );
+    expect(seen).toEqual(sourceList);
+    expect(seen).not.toBe(sourceList);
+  });
+
+  it("uses independent source lists for repeated lineage projections", async () => {
+    const unavailable = new Error("inert capability");
+    const observed: unknown[] = [];
+    const account = {
+      address: "0x1111111111111111111111111111111111111111",
+      signTypedData: async ({
+        message,
+      }: {
+        message: Record<string, unknown>;
+      }) => {
+        observed.push(message.sources);
+        throw unavailable;
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    const signer = createServerSigner(account, TEST_GATEWAY_CONFIG);
+    const input = { sources: [] } as Parameters<
+      typeof signer.signLineageAttestation
+    >[0];
+    for (let i = 0; i < 2; i++) {
+      await expect(signer.signLineageAttestation(input)).rejects.toBe(
+        unavailable,
+      );
+    }
+    expect(observed).toEqual([[], []]);
+    expect(observed[0]).not.toBe(observed[1]);
+  });
+
   it("signing is deterministic", async () => {
     const { signer } = setup();
     const addDataMsg = {
@@ -174,5 +227,37 @@ describe("ServerSigner", () => {
     const sig1 = await signer.signAddData(addDataMsg);
     const sig2 = await signer.signAddData(addDataMsg);
     expect(sig1).toBe(sig2);
+  });
+});
+
+describe("ServerSigner with an inert signing capability", () => {
+  const address = "0x1111111111111111111111111111111111111111" as const;
+
+  it("exposes its account address without requesting a signature", () => {
+    const account = {
+      address,
+      signTypedData: async () => {
+        throw new Error("unexpected signing call");
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    expect(createServerSigner(account, TEST_GATEWAY_CONFIG).address).toBe(
+      address,
+    );
+  });
+
+  it("forwards a signing capability failure without reporting success", async () => {
+    const refused = new Error("synthetic signer unavailable");
+    let calls = 0;
+    const account = {
+      address,
+      signTypedData: async () => {
+        calls += 1;
+        throw refused;
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    const signer = createServerSigner(account, TEST_GATEWAY_CONFIG);
+    const input = {} as Parameters<typeof signer.signAddData>[0];
+    await expect(signer.signAddData(input)).rejects.toBe(refused);
+    expect(calls).toBe(1);
   });
 });

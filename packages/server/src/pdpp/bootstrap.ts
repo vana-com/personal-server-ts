@@ -353,6 +353,24 @@ export async function createPdppAuthDeps(
   };
 }
 
+/** Explain a rejection without treating an absent parse result as a key. */
+export function methodManifestRejectionDiagnostic(
+  parsedConnector: string | undefined,
+) {
+  if (parsedConnector === undefined) {
+    return {
+      reason: "manifest_invalid",
+      message:
+        "PDPP method manifest could not be parsed — its runs stay legacy-only",
+    };
+  }
+  return {
+    reason: "manifest_key_mismatch",
+    message:
+      "PDPP method manifest names a different connector key — its runs stay legacy-only",
+  };
+}
+
 /**
  * Read the connector manifest each configured method pins.
  *
@@ -401,11 +419,11 @@ export async function readMethodManifests(
       );
       continue;
     }
-    if (manifestArtifact(document)?.declarations.connector !== methodId) {
-      logger.warn(
-        { methodId, reason: "manifest_key_mismatch" },
-        "PDPP method manifest names a different connector key — its runs stay legacy-only",
-      );
+    const parsedConnector = manifestArtifact(document)?.declarations.connector;
+    if (parsedConnector !== methodId) {
+      const { reason, message } =
+        methodManifestRejectionDiagnostic(parsedConnector);
+      logger.warn({ methodId, reason }, message);
       continue;
     }
     out.push(document);

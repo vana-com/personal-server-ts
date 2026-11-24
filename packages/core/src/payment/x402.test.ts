@@ -72,6 +72,34 @@ function makeGrant(
   };
 }
 
+describe("gateway payment diagnostic classification", () => {
+  it("uses one bounded fallback for missing and non-string reason values", async () => {
+    const { gatewayPaymentReasonCode } = await import("./x402.js");
+    for (const body of [
+      null,
+      [],
+      {},
+      { reasonCode: 42 },
+      { reasonCode: ["AMOUNT_INVALID"] },
+    ]) {
+      expect(gatewayPaymentReasonCode(body)).toBe("GATEWAY_REJECTED");
+    }
+  });
+
+  it("retains exact known classifications without guessing from similar text", async () => {
+    const { gatewayPaymentReasonCode } = await import("./x402.js");
+    expect(gatewayPaymentReasonCode({ reasonCode: "AMOUNT_OVERFLOW" })).toBe(
+      "AMOUNT_OVERFLOW",
+    );
+    expect(gatewayPaymentReasonCode({ reasonCode: "amount_overflow" })).toBe(
+      "GATEWAY_REJECTED",
+    );
+    expect(gatewayPaymentReasonCode({ reasonCode: "AMOUNT_OVERFLOW " })).toBe(
+      "GATEWAY_REJECTED",
+    );
+  });
+});
+
 describe("nextPaymentNonce", () => {
   it("produces strictly-monotonic-across-ms values", async () => {
     const a = nextPaymentNonce();
@@ -190,6 +218,30 @@ describe("parsePaymentHeader", () => {
     expect(parsePaymentHeader(btoa("not json"))).toBeNull();
     // Valid base64+JSON but wrong shape
     expect(parsePaymentHeader(btoa('{"hello":"world"}'))).toBeNull();
+  });
+
+  it("does not coerce version metadata or accept another payment scheme", () => {
+    expect(
+      parsePaymentHeader(
+        btoa('{"x402Version":"1","scheme":"vana-escrow-grant"}'),
+      ),
+    ).toBeNull();
+    expect(
+      parsePaymentHeader(btoa('{"x402Version":1,"scheme":"fixture-other"}')),
+    ).toBeNull();
+  });
+
+  it("keeps an explicit null payload distinct from a structured payment", () => {
+    const header = {
+      x402Version: 1,
+      scheme: "vana-escrow-grant",
+      network: "fixture",
+    };
+    for (const payload of [null, 0, ""]) {
+      expect(
+        parsePaymentHeader(btoa(JSON.stringify({ ...header, payload }))),
+      ).toBeNull();
+    }
   });
 
   it("round-trips a well-formed X402Payment via encodePaymentHeader", () => {

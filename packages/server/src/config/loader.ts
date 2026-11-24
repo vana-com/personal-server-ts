@@ -52,6 +52,11 @@ function applyEnvOverrides(obj: Record<string, unknown>): void {
   }
 }
 
+/** Parse config file text after UTF-8 decoding, accepting one initial BOM. */
+export function parseConfigJson(raw: string) {
+  return JSON.parse(raw.startsWith("\uFEFF") ? raw.slice(1) : raw);
+}
+
 export interface LoadConfigOptions {
   configPath?: string;
   rootPath?: string;
@@ -79,7 +84,7 @@ export async function loadConfig(
     }
   }
 
-  const parsed = raw !== undefined ? JSON.parse(raw) : {};
+  const parsed = raw !== undefined ? parseConfigJson(raw) : {};
 
   // Allow env vars to override config-file values (useful for cloud / Docker deployments)
   applyEnvOverrides(parsed);

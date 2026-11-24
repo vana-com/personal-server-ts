@@ -7,6 +7,8 @@
  * Report items come from worker.step(budget); durable logical fields come from
  * workRecords(db) and from raw SQL on pdpp_transport_import_work.
  */
+import Database from "better-sqlite3";
+import { createReplicationJournal } from "./pdpp-replication-sqlite.js";
 import { afterEach, expect, it, vi } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
@@ -1874,4 +1876,47 @@ it("34b a device whose only work is terminal is idle: nextWake is undefined befo
   const reopened = await step(a, { units: 1 });
   expect(reopened, "step returned no report").toBeDefined();
   expect(reopened?.nextWake).toBeUndefined();
+});
+
+it("starts baseline and tail pages from their own implicit cursors", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE pdpp_replica_settings (id INTEGER, config_json TEXT, watermark INTEGER, checkpoint INTEGER);
+      INSERT INTO pdpp_replica_settings VALUES (1, '{}', 4, 1);
+      CREATE TABLE pdpp_replica_operations (sequence INTEGER, operation_json TEXT);
+      INSERT INTO pdpp_replica_operations VALUES (1, '{}'), (2, '{}'), (4, '{}'), (5, '{}');
+      CREATE TABLE pdpp_replica_baseline (sequence INTEGER);
+      INSERT INTO pdpp_replica_baseline VALUES (1), (2), (4);
+    `);
+    const { exporter } = createReplicationJournal(db, () => "synthetic-writer");
+    const baseline = exporter.readBaselinePage({ limit: 1 });
+    expect(baseline).toMatchObject({ nextAfterSequence: 2, hasMore: true });
+    expect(baseline.operations).toHaveLength(1);
+    const tail = exporter.readTailPage({ limit: 1 });
+    expect(tail).toMatchObject({ nextAfterSequence: 5, hasMore: false });
+    expect(tail.operations).toHaveLength(1);
+    expect(exporter.getBaselineCheckpoint()).toBe(1);
+  } finally {
+    db.close();
+  }
+});
+
+it("returns the caller's position when a valid tail page is empty", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE pdpp_replica_settings (id INTEGER, config_json TEXT, watermark INTEGER, checkpoint INTEGER);
+      INSERT INTO pdpp_replica_settings VALUES (1, '{}', 4, 1);
+      CREATE TABLE pdpp_replica_operations (sequence INTEGER, operation_json TEXT);
+    `);
+    const { exporter } = createReplicationJournal(db, () => "synthetic-writer");
+    expect(exporter.readTailPage({ afterSequence: 7, limit: 1 })).toEqual({
+      operations: [],
+      nextAfterSequence: 7,
+      hasMore: false,
+    });
+  } finally {
+    db.close();
+  }
 });

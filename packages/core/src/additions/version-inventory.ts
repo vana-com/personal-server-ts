@@ -326,13 +326,14 @@ export function createVersionInventoryClient(options: {
   async function head(
     scope: string,
     signal?: AbortSignal,
+    budget?: ByteBudget,
   ): Promise<{
     expectedVersion: string;
     dataHash: string;
     metadataHash: string;
     deletedAt: string | null;
   } | null> {
-    const current = (await page(scope, { limit: 1, signal })).data.head;
+    const current = (await page(scope, { limit: 1, signal, budget })).data.head;
     return current
       ? {
           expectedVersion: current.expectedVersion,

@@ -1408,6 +1408,24 @@ describe("Batch-Policy", () => {
       expect(parseBatchPolicy(bad)).toBeUndefined();
     }
   });
+
+  it("reads known policy fields regardless of their order and separator spacing", () => {
+    expect(parseBatchPolicy(" requires=3;  bytes=100 ; rows=2 ")).toEqual({
+      rows: 2,
+      bytes: 100,
+      requires: 3,
+    });
+  });
+
+  it("keeps supported policy fields when a newer format adds a numeric field", () => {
+    expect(
+      parseBatchPolicy("rows=2;futureField=5;bytes=100;requires=3"),
+    ).toEqual({
+      rows: 2,
+      bytes: 100,
+      requires: 3,
+    });
+  });
 });
 
 describe("the batch policy read (OPTIONS /v1/data/batch)", () => {
