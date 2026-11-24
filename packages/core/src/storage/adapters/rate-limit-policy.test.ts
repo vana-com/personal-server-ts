@@ -176,6 +176,14 @@ describe("parseRateLimitPolicy", () => {
     expect(pacing("put;q=240;w=60").put).toBe(4);
   });
 
+  it("requires whole request counts without narrowing the window duration", () => {
+    expect(parseRateLimitPolicy('"example";q=12.5;w=10')).toBeUndefined();
+    expect(parseRateLimitPolicy("q=12.5;w=10")).toBeUndefined();
+    expect(parseRateLimitPolicy('"example";q=12;w=10.5')).toEqual({
+      named: { example: { limit: 12, windowMs: 10_500 } },
+    });
+  });
+
   it("takes no quota that is zero, not finite or outside the bounds", () => {
     const huge = "9".repeat(400);
     for (const bad of [
