@@ -5,6 +5,7 @@
 // not what the tick learned earlier.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
 import type { LogErasurePorts } from "../../../core/src/localdb/log-erase.js";
 import {
   CONNECTOR,
@@ -16,14 +17,13 @@ import {
 // What the tick does between learning its answer and returning it.
 const gap: { afterErasures?: () => Promise<void> } = {};
 vi.mock("../../../core/src/localdb/delete.js", async (importOriginal) => {
-  const original =
-    await importOriginal<
-      typeof import("../../../core/src/localdb/delete.js")
-    >();
+  const original = await importOriginal<{
+    createConnectionDeleter: typeof createConnectionDeleter;
+  }>();
   return {
     ...original,
     createConnectionDeleter: (
-      ...args: Parameters<typeof original.createConnectionDeleter>
+      ...args: Parameters<typeof createConnectionDeleter>
     ) => {
       const deleter = original.createConnectionDeleter(...args);
       const resumeErasures = deleter.resumeErasures.bind(deleter);
