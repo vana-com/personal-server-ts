@@ -13,7 +13,11 @@ import {
   createMemoryStreamSyncBlobs,
   type StreamSyncBlobs,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
-import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  controlScope,
+  logScope,
+  streamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { openBetterSqlite3 } from "../../server/src/localdb/better-sqlite3-driver.js";
 import { createFakeGateway } from "../../server/src/localdb/fake-gateway.js";
 import { endRequest } from "../../core/src/test-utils/run-end.js";
@@ -78,10 +82,17 @@ async function savePathWorld(autoStartSync = true) {
   let releaseListings!: () => void;
   const listingsHeld = new Promise<void>((r) => (releaseListings = r));
   let holdListings = false;
+  let failListings = false;
   const reads: string[] = [];
   const timedFetch = (async (input: string, init?: RequestInit) => {
     if ((init?.method ?? "GET") === "GET") reads.push(new URL(input).pathname);
     await sleep(WIRE_MS);
+    if (
+      failListings &&
+      (init?.method ?? "GET") === "GET" &&
+      new URL(input).pathname === "/v1/data"
+    )
+      throw new TypeError("listing unreachable");
     if (
       holdListings &&
       (init?.method ?? "GET") === "GET" &&
@@ -163,10 +174,10 @@ async function savePathWorld(autoStartSync = true) {
   } as never);
   servers.push(server);
   /** What a connect-sheet save does before it awaits `publish()`. */
-  const collect = async (runId: string) => {
+  const collect = async (runId: string, connector = CONNECTOR) => {
     await server.streamSyncIntake!.begin(runId, {
-      connector: CONNECTOR,
-      artifactDigest: CONNECTOR,
+      connector,
+      artifactDigest: connector,
       join: true,
       owner: { address: ownerAddress, leaseId: null },
       observedAt: Date.now(),
@@ -195,6 +206,10 @@ async function savePathWorld(autoStartSync = true) {
     segmentPuts,
     gateway,
     reads,
+    /** From now on every registry listing rejects. */
+    failListings: () => {
+      failListings = true;
+    },
     /** From now on a registry listing answers only after the returned release. */
     holdListings: () => {
       holdListings = true;
@@ -239,6 +254,89 @@ describe("the save path of a Web write", () => {
     await collect("run-1");
     await expect(server.publish()).rejects.toThrow(/no reply/);
     expect(commits).toEqual([]);
+  });
+
+  describe("when a sibling connection's registry commit fails", () => {
+    const SIBLING = "beta";
+    async function withFailingSibling() {
+      // No background cycle: it could publish the caller's run before the
+      // publish under test, leaving that publish nothing to receipt.
+      const world = await savePathWorld(false);
+      world.gateway.beforeBatch = (call) => {
+        if (call.body.rows.some((row) => row.scope === logScope(SIBLING, "")))
+          throw new TypeError("commit timed out");
+      };
+      await world.collect("run-own");
+      await world.collect("run-sibling", SIBLING);
+      return world;
+    }
+
+    it("resolves for the caller's own connection and returns every connection's result", async () => {
+      const { server } = await withFailingSibling();
+      const own = controlScope(CONNECTOR, "");
+      const receipt = await server.publish({ connections: [own] });
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
+      expect(
+        receipt.connections.map((c) => [c.connectionId, c.outcome]),
+      ).toEqual(
+        expect.arrayContaining([
+          [own, "published"],
+          [controlScope(SIBLING, ""), "failed"],
+        ]),
+      );
+      expect(
+        receipt.connections.find(
+          (c) => c.connectionId === controlScope(SIBLING, ""),
+        )?.error,
+      ).toMatch(/no reply/);
+    });
+
+    it("keeps the caller's acknowledged receipt when the fallback's registry listing rejects", async () => {
+      const { server, failListings } = await withFailingSibling();
+      failListings();
+      const own = controlScope(CONNECTOR, "");
+      const receipt = await server.publish({ connections: [own] });
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
+    });
+
+    it("keeps the caller's receipt when its own log holds a row this build cannot read", async () => {
+      const { server, gateway } = await withFailingSibling();
+      // A later build reserved another `~` name beside the caller's log.
+      gateway.write(streamScope(CONNECTOR, "", "~future"), {
+        dataHash: `0x${"ab".repeat(32)}`,
+        metadataHash: `0x${"cd".repeat(32)}`,
+      });
+      const own = controlScope(CONNECTOR, "");
+      const receipt = await server.publish({ connections: [own] });
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
+      const mine = receipt.connections.find((c) => c.connectionId === own);
+      expect(mine).toMatchObject({ connectionId: own, outcome: "published" });
+      // The fallback does not apply the caller's connection.
+      expect(mine).not.toHaveProperty("error");
+    });
+
+    it("still rejects for the sibling when the caller names it", async () => {
+      const { server } = await withFailingSibling();
+      await expect(
+        server.publish({ connections: [controlScope(SIBLING, "")] }),
+      ).rejects.toThrow(/no reply/);
+    });
+
+    it("still rejects a publish that names no connection", async () => {
+      const { server } = await withFailingSibling();
+      await expect(server.publish()).rejects.toThrow(/no reply/);
+    });
+  });
+
+  it("treats an empty connections list as no scope", async () => {
+    const { server, collect } = await savePathWorld(false);
+    await collect("run-own");
+    const receipt = await server.publish({ connections: [] });
+    expect(receipt.outcome).toBe("published");
+    expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
   });
 
   it("resolves publish() at the registry commit, with every registry listing still unanswered", async () => {

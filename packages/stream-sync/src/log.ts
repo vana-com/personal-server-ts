@@ -153,6 +153,17 @@ export function isLogStream(stream: string): boolean {
   return stream === LOG_STREAM;
 }
 
+/**
+ * A `~`-prefixed stream name that is not the log's. `~` never occurs in a
+ * manifest stream name, so such a name is reserved for the protocol, and this
+ * build knows only `LOG_STREAM`. A row under another one belongs to a layout a
+ * later build wrote: it is never data, and a reader that finds one refuses
+ * (`update_required`) rather than read it as a stream.
+ */
+export function isUnknownReservedStream(stream: string): boolean {
+  return stream.startsWith("~") && !isLogStream(stream);
+}
+
 /** Registry scope of the connection's log row. */
 export function logScope(connector: string, ns: string): string {
   return streamScope(connector, ns, LOG_STREAM);

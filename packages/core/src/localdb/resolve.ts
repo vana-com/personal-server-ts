@@ -297,8 +297,10 @@ export function createLocalResolver(
   parts: LocalResolverParts,
 ): LocalResolver {
   const aliasQuery: RecordQuery = parts.aliasQuery ?? parts.query;
-  const streams = (connectionId: string): Promise<Stream[]> =>
-    loadStreams(deps, connectionId);
+  const streams = (
+    connectionId: string,
+    includeIncomplete = false,
+  ): Promise<Stream[]> => loadStreams(deps, connectionId, includeIncomplete);
 
   const connections = (connector: string): Promise<Connection[]> =>
     connectionsOf(deps, connector);
@@ -489,7 +491,12 @@ export function createLocalResolver(
       return deleted();
     }
     if (connection.control_state === "foreign") return { kind: "key_mismatch" };
-    const all = await streams(connection.connection_id);
+    const includeIncomplete =
+      input.isOwnerView &&
+      input.includeIncomplete === true &&
+      !input.requireRegistered &&
+      !candidate.target.alias;
+    const all = await streams(connection.connection_id, includeIncomplete);
     const { streams: installed, missingRequired } = servedStreams(
       candidate.target,
       candidate.target.streams.flatMap((name) => {
@@ -499,7 +506,12 @@ export function createLocalResolver(
       connection,
     );
     if (installed.some(tombstoned)) return deleted();
-    if (missingRequired || installed.some((s) => !complete(s, connection)))
+    if (
+      missingRequired ||
+      installed.some(
+        (s) => readability(s, connection, false, includeIncomplete) === "none",
+      )
+    )
       return noData();
     const current = { ...candidate, connection, streams: installed };
     const cursor = cursorFor(current);
@@ -526,6 +538,9 @@ export function createLocalResolver(
       connector: connection.connector,
       ns: connection.ns,
       cursor,
+      ...(installed.some((s) => !complete(s, connection))
+        ? { complete: false as const }
+        : {}),
       served: {
         scope:
           position === null
@@ -644,6 +659,10 @@ export function createLocalResolver(
       return { kind: "invalid_binding" };
     // A stream that is still loading is served to its owner alone.
     const progressive = progressiveFirstLoad && input.isOwnerView;
+    const includeIncomplete =
+      input.isOwnerView &&
+      input.includeIncomplete === true &&
+      !input.requireRegistered;
     const candidates: Candidate[] = [];
     let sawDeleted = false;
     let sawTombstoned = false;
@@ -701,7 +720,10 @@ export function createLocalResolver(
             !(input.requireRegistered && connection.control_state === "absent"))
         )
           continue;
-        const available = await streams(connection.connection_id);
+        const available = await streams(
+          connection.connection_id,
+          includeIncomplete && !target.alias,
+        );
         if (connection.control_state === "active")
           loaded.push({ connection, streams: available });
         if (input.requireRegistered) {
@@ -719,7 +741,10 @@ export function createLocalResolver(
             });
         }
       }
-      const picked = selectForTarget(target, loaded, { progressive });
+      const picked = selectForTarget(target, loaded, {
+        progressive,
+        includeIncomplete,
+      });
       if (picked.kind === "invalid_binding") return picked;
       if (picked.tombstoned) sawTombstoned = true;
       // A winner's tombstone says nothing about another connection whose

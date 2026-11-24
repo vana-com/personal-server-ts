@@ -31,8 +31,8 @@ import { createInventoryTombstoneFinality } from "../tombstone-finality.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import { fixedLegacyWriteSeal } from "../../test-utils/legacy-write-seal.js";
-import { legacyWriteRefusedErrorFor } from "../../api/legacy-write-gate.js";
 import type { LegacyWriteSeal } from "../../storage/legacy-write-seal.js";
+import { GatewayRefusalError } from "../delete-data-port.js";
 import type { Logger } from "../../logger/index.js";
 import type {
   DataPointFeedPort,
@@ -665,39 +665,36 @@ describe("storage cleanup converges on the user's delete", () => {
     }
 
     // TOMBSTONE_RESUBMIT_UNSEALED
-    it("does not re-submit the tombstone and spends no attempt", async () => {
+    it.each(["switched", "unknown"] as const)(
+      "re-submits the tombstone as a removal when the mode is %s: the gateway decides",
+      async (mode) => {
+        const f = await rolledBack(fixedLegacyWriteSeal(mode));
+        await f.cycle(MINUTE);
+        expect(f.deleteData.tombstone).toHaveBeenCalledTimes(2);
+        expect(f.resubmits.snapshot().retrying).toHaveLength(1);
+      },
+    );
+
+    it("stops at a terminal gateway refusal of the re-submission: one attempt, then the scope is reported failed", async () => {
       const f = await rolledBack(fixedLegacyWriteSeal("switched"));
-      for (let minute = 0; minute < 5; minute++) await f.cycle(MINUTE);
-      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
-      expect(f.resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
-    });
-
-    it("waits while the mode is unknown, with no attempt spent", async () => {
-      const f = await rolledBack(fixedLegacyWriteSeal("unknown"));
-      await f.cycle(MINUTE);
-      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
-      expect(f.resubmits.snapshot()).toEqual({ retrying: [], failed: [] });
-    });
-
-    it("treats a refusal at the tombstone as a clean stop, not a failed attempt", async () => {
-      // The early check said allow; the account switched before the commit.
-      const refusing: LegacyWriteSeal = {
-        ...fixedLegacyWriteSeal("unswitched"),
-        verdict: () => "allow",
-        commit: async () => {
-          throw legacyWriteRefusedErrorFor("switched");
-        },
-      };
-      const f = await rolledBack(refusing);
-      const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls
-        .length;
-      await expect(f.cycle(MINUTE)).resolves.toBeDefined();
-      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
-      expect(
-        (logger.warn as ReturnType<typeof vi.fn>).mock.calls
-          .slice(warned)
-          .map((call) => String(call[1])),
-      ).not.toContain("Re-submitted scope delete failed; will retry");
+      (f.deleteData.tombstone as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new GatewayRefusalError(
+          409,
+          "owner_stream_sync_required",
+          "owner_stream_sync_required",
+        ),
+      );
+      for (let minute = 0; minute < 60; minute++) await f.cycle(MINUTE);
+      // The user's own delete, then one re-submission the gateway refused for
+      // good: nothing changes on a retry, so there is no second attempt.
+      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(2);
+      expect(f.resubmits.snapshot().failed).toEqual([
+        expect.objectContaining({
+          scope: SCOPE,
+          attempts: 1,
+          reason: "gateway-refused",
+        }),
+      ]);
     });
   });
 

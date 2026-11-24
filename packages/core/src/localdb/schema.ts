@@ -703,6 +703,45 @@ END`,
   PRIMARY KEY (scope, name)) WITHOUT ROWID`,
   ],
   [
+    // The log scopes this device enumerated before it erased them
+    // (`log-erase.ts`). A log's pieces can be named only from its segments, so
+    // a device that finds the log gone and holds no row here cannot say what
+    // another device left in storage. Device-local, kept across a purge.
+    `CREATE TABLE enumerated_logs (
+  scope TEXT PRIMARY KEY, recorded_at INTEGER NOT NULL) WITHOUT ROWID`,
+  ],
+  [
+    // The control tombstone each delete of a connector confirmed, per
+    // namespace, by registry version (`delete.ts`, `purge.ts`). It is the
+    // delete's identity: the erasure stages judge "this delete" from it, never
+    // from the control row's head now, which a reconnect or a rollback moves.
+    // Written in the transaction that learned it (the fence landing, the
+    // purge) and kept until the delete's three parts are all done or a newer
+    // tombstone of the namespace replaces it. Device-local, kept across a
+    // purge.
+    `CREATE TABLE delete_tombstones (
+  connector TEXT NOT NULL, ns TEXT NOT NULL, version INTEGER NOT NULL,
+  PRIMARY KEY (connector, ns)) WITHOUT ROWID`,
+    // `enumerated_logs` is keyed by the registry head of the log it names, so
+    // a device's enumeration of one lifetime does not vouch for the next one
+    // (a log's scope is shared by a connection added again). The marks of the
+    // previous shape say nothing of a head and are dropped: a log marked
+    // before has to be enumerated again, and reads as erased elsewhere until
+    // it is.
+    `DROP TABLE enumerated_logs`,
+    `CREATE TABLE enumerated_logs (
+  scope TEXT NOT NULL, head TEXT NOT NULL, recorded_at INTEGER NOT NULL,
+  PRIMARY KEY (scope, head)) WITHOUT ROWID`,
+  ],
+  [
+    // The delete's final verdict, with its identity. `done_at` is set on the
+    // rows of a connector when all three parts of the delete they name are
+    // done, and cleared when a newer tombstone replaces a row. A restart reads
+    // `done` from here and has nothing to judge again; a row with no
+    // `done_at` is unfinished work the start sweep queues.
+    `ALTER TABLE delete_tombstones ADD COLUMN done_at INTEGER`,
+  ],
+  [
     // Scratch for the operations that fold or build the log a whole at a
     // time (`log-fold-workspace.ts`, `log-spool.ts`): the fold of a history
     // too large to hold, and the sealed objects of a candidate waiting for

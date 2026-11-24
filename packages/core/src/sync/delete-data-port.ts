@@ -8,6 +8,12 @@ import type {
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import { computeDataPointId } from "./data-point-id.js";
+import {
+  isGatewayAlreadyDeletedCode,
+  isGatewayAnswerCode,
+  isGatewayHeadAbsentCode,
+  type GatewayAnswerCode,
+} from "./gateway-refusal.js";
 import { parseGatewayNextVersion } from "./workers/upload.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
 
@@ -17,6 +23,37 @@ import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
  */
 export function isGatewayReservedScope(scope: string): boolean {
   return scope.startsWith("vana.system.");
+}
+
+/**
+ * A tombstone the gateway answered with a code no retry changes
+ * (`gateway-refusal.ts`): a terminal refusal, or the already-deleted answer.
+ */
+export class GatewayRefusalError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: GatewayAnswerCode,
+    detail: string,
+  ) {
+    super(`Gateway error: ${status} ${detail}`);
+    this.name = "GatewayRefusalError";
+  }
+}
+
+/** The terminal refusal a response body names, or null. */
+function refusalOf(
+  status: number,
+  body: unknown,
+  fallback: string,
+): GatewayRefusalError | null {
+  if (typeof body !== "object" || body === null) return null;
+  const code = (body as Record<string, unknown>).code;
+  if (!isGatewayAnswerCode(code)) return null;
+  return new GatewayRefusalError(
+    status,
+    code,
+    `${code}: ${detailFromBody(body, fallback)}`,
+  );
 }
 
 export interface GatewayDeleteDataPortOptions {
@@ -132,6 +169,38 @@ export function createGatewayDeleteDataPort(
     });
   }
 
+  /**
+   * The point is deleted already (a 410, or a 409 that says so). The winning
+   * tombstone may sit above the version we attempted (another replica
+   * advanced the scope first), and its version bounds the ciphertext to
+   * delete, so take the gateway's word: the echoed row, else a re-read of the
+   * deletion-aware feed, else unknown.
+   */
+  async function alreadyDeleted(
+    scope: string,
+    dataPointId: string,
+    body: unknown,
+  ): Promise<TombstoneOutcome> {
+    const echoed = unwrap(body);
+    let winning = normalizeVersionString(
+      stringField(echoed, "expectedVersion"),
+    );
+    let deletedAt = stringField(echoed, "deletedAt");
+    if (winning === null) {
+      const reread = await currentHead(scope).catch(() => null);
+      if (reread && reread.deletedAt !== null) {
+        winning = normalizeVersionString(reread.expectedVersion);
+        deletedAt = deletedAt ?? reread.deletedAt;
+      }
+    }
+    return {
+      status: "already-deleted",
+      dataPointId,
+      version: winning,
+      deletedAt,
+    };
+  }
+
   return {
     ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(
@@ -171,8 +240,22 @@ export function createGatewayDeleteDataPort(
       };
       let version = BigInt(current.expectedVersion) + 1n;
       let res = await sendTombstone(scope, dataPointId, version);
+      // A 409 is a version conflict, the owner's cutover refusal, or the
+      // gateway's word on the head itself (already deleted, never registered);
+      // the body says which. The head answers are read first: they are the
+      // same facts as a 410 and a 404, and the refusal is terminal.
+      const conflictBody =
+        res.status === 409 ? await res.json().catch(() => null) : null;
+      if (res.status === 409) {
+        const code = (conflictBody as Record<string, unknown> | null)?.code;
+        if (isGatewayAlreadyDeletedCode(code))
+          return alreadyDeleted(scope, dataPointId, conflictBody);
+        if (isGatewayHeadAbsentCode(code))
+          return { status: "not-registered", dataPointId };
+        const refusal = refusalOf(409, conflictBody, res.statusText);
+        if (refusal) throw refusal;
+      }
       if (res.status === 409 && fence) {
-        await res.body?.cancel();
         throw new Error(
           `Scope head is not the one the fenced delete saw (v${fence.head.expectedVersion}): another writer moved it`,
         );
@@ -182,7 +265,7 @@ export function createGatewayDeleteDataPort(
         // write. The 409 body carries `currentExpectedVersion` (and the
         // legacy message phrasing names the next valid version); re-sign
         // once against it.
-        const body = await res.json().catch(() => null);
+        const body = conflictBody;
         const conflict = unwrap(body);
         // Gateway 409 body: `nextExpectedVersion` is the version to sign
         // next; `currentExpectedVersion` is the version the gateway holds,
@@ -223,34 +306,20 @@ export function createGatewayDeleteDataPort(
         return { status: "not-registered", dataPointId };
       }
       if (res.status === 410) {
-        // Raced with a concurrent deletion: the point is already gone. The
-        // winning tombstone may sit above the version we attempted (another
-        // replica advanced the scope first), and its version bounds the
-        // ciphertext to delete, so take the gateway's word: the echoed row,
-        // else a re-read of the deletion-aware feed, else unknown.
-        const body = await res.json().catch(() => null);
-        const echoed = unwrap(body);
-        let winning = normalizeVersionString(
-          stringField(echoed, "expectedVersion"),
-        );
-        let deletedAt = stringField(echoed, "deletedAt");
-        if (winning === null) {
-          const reread = await currentHead(scope).catch(() => null);
-          if (reread && reread.deletedAt !== null) {
-            winning = normalizeVersionString(reread.expectedVersion);
-            deletedAt = deletedAt ?? reread.deletedAt;
-          }
-        }
-        return {
-          status: "already-deleted",
+        // Raced with a concurrent deletion: the point is already gone.
+        return alreadyDeleted(
+          scope,
           dataPointId,
-          version: winning,
-          deletedAt,
-        };
+          await res.json().catch(() => null),
+        );
       }
       if (!res.ok) {
-        throw new Error(
-          `Gateway error: ${res.status} ${await errorDetail(res)}`,
+        const body = await res.json().catch(() => null);
+        throw (
+          refusalOf(res.status, body, res.statusText) ??
+          new Error(
+            `Gateway error: ${res.status} ${detailFromBody(body, res.statusText)}`,
+          )
         );
       }
       const body = await res.json().catch(() => null);
@@ -310,11 +379,6 @@ export function createGatewayDeleteDataPort(
       return outcome;
     },
   };
-}
-
-async function errorDetail(res: Response): Promise<string> {
-  const body = await res.json().catch(() => null);
-  return detailFromBody(body, res.statusText);
 }
 
 function detailFromBody(body: unknown, fallback: string): string {

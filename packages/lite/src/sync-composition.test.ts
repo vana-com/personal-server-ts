@@ -519,6 +519,38 @@ describe("PS Lite local database composition", () => {
     }
   });
 
+  it("gives the local sync the erasure and legacy-delete ports of Lite's own delete path", async () => {
+    const db = driver();
+    facade(db);
+    const { lite } = await setup({ openDriver: vi.fn().mockResolvedValue(db) });
+    try {
+      const options = vi.mocked(createLocalSync).mock.calls[0]![1];
+      // A Web or phone delete erases storage objects and retires the legacy
+      // copy here: neither waits for a Desktop.
+      const erasure = options.erasure?.();
+      expect(erasure?.objects.deleteBlobVersions).toEqual(expect.any(Function));
+      expect(erasure?.versions.list).toEqual(expect.any(Function));
+      const legacy = options.legacyDelete?.();
+      expect(legacy).toBeDefined();
+      const deleteScope = vi
+        .spyOn(lite.syncManager, "deleteScope")
+        .mockResolvedValue({} as never);
+      const head = {
+        expectedVersion: "2",
+        dataHash: "0xaa",
+        metadataHash: "0xbb",
+      };
+      await legacy!.retire("notes.entries", head);
+      // The tombstone is fenced to the head the stage read.
+      expect(deleteScope).toHaveBeenCalledWith("notes.entries", undefined, {
+        fence: { head },
+      });
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
   it("routes Lite intake through createLocalSync over the opened database", async () => {
     const db = driver();
     const { localSync, intake } = facade(db);

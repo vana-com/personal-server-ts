@@ -606,6 +606,12 @@ export async function createIndexedDbPsLiteRuntime(
             (await syncRuntime!.getLocalSync()).deleter.readConnectionLifetime(
               connector,
             ),
+          deleteStatus: async (connector) =>
+            (await syncRuntime!.getLocalSync()).deleter.deleteStatus(connector),
+          deleteStatusSnapshot: async (connector) =>
+            (await syncRuntime!.getLocalSync()).deleter.deleteStatusSnapshot(
+              connector,
+            ),
         }
       : null,
     diagnostics,
