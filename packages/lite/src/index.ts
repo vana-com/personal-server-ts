@@ -1,4 +1,5 @@
 export type {
+  FailedStream,
   PublicationReceipt,
   ViewChange,
   ViewChangeListener,
@@ -11,8 +12,10 @@ export {
 
 export {
   startPersonalServer,
+  type PersonalServerLiteConnectionPublication,
   type PersonalServerLiteHandle,
   type PersonalServerLitePublicationResult,
+  type PersonalServerLitePublishOptions,
   type StartPersonalServerLiteOptions,
   type StartPersonalServerLiteRelayOptions,
 } from "./client.js";

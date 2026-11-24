@@ -25,8 +25,22 @@ export interface CycleReport {
      * before the unreadable segment was reached (a snapshot, earlier segments)
      * stay applied (see `UpdateRequiredError`).
      */
-    readonly status?: "update_required";
+    readonly status?: "update_required" | "degraded";
+    /**
+     * Set with `status: "degraded"`: the streams a load of this connection
+     * stopped on, each with the reason it stopped (`stream_partial`). The
+     * streams the load had not reached were not applied; the rest are as
+     * the last complete apply left them. Any acknowledged early publication
+     * remains in `published`.
+     */
+    readonly failedStreams?: readonly FailedStream[];
   }[];
+}
+
+/** A stream a load of the connection stopped on, and why (`failureCode`). */
+export interface FailedStream {
+  readonly stream: string;
+  readonly reason: string;
 }
 
 /** The connections a retry owes while the registry position is unchanged. */
@@ -249,7 +263,8 @@ export async function syncConnection(
 ): Promise<CycleReport["connections"][number]> {
   let published: readonly PublishResult[] = early?.published ?? [];
   let error: string | null = null;
-  let status: "update_required" | undefined;
+  let status: "update_required" | "degraded" | undefined;
+  let failedStreams: readonly FailedStream[] = [];
   try {
     // A pass includes publish, so it must not join an apply-only operation.
     const outcome = await deps.queue.run(connectionId, "publish", () =>
@@ -278,11 +293,35 @@ export async function syncConnection(
       { connectionId, error },
       "Stream sync cycle failed for a connection",
     );
+    // A load that stopped marks the streams it stopped on (`stream_partial`).
+    // Say which, so one bad object reads as that and not as a connection
+    // that failed whole. Reading them must not hide the failure above.
+    if (status === undefined)
+      failedStreams = await failedStreamsOf(deps, connectionId).catch(() => []);
+    if (failedStreams.length > 0) status = "degraded";
   }
   return {
     connectionId,
     published,
     error,
     ...(status ? { status } : {}),
+    ...(failedStreams.length > 0 ? { failedStreams } : {}),
   };
+}
+
+async function failedStreamsOf(
+  deps: LocalSyncDeps,
+  connectionId: string,
+): Promise<readonly FailedStream[]> {
+  const rows = await deps.db.query<{
+    stream: string;
+    last_error: string | null;
+  }>(
+    "SELECT stream, last_error FROM stream_partial WHERE connection_id = ? AND failed = 1 ORDER BY stream",
+    [connectionId],
+  );
+  return rows.map((row) => ({
+    stream: row.stream,
+    reason: row.last_error ?? "unknown",
+  }));
 }

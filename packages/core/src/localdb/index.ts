@@ -48,6 +48,7 @@ export {
   syncConnection,
   type CycleReport,
   type CycleScope,
+  type FailedStream,
 } from "./cycle.js";
 export { UpdateRequiredError } from "./update-required.js";
 export { purgeConnection } from "./purge.js";
