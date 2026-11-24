@@ -30,10 +30,10 @@ vi.mock("../../../core/src/localdb/delete.js", async (importOriginal) => {
       ...args: Parameters<typeof createConnectionDeleter>
     ) => {
       const deleter = original.createConnectionDeleter(...args);
-      const resumeErasures = deleter.resumeErasures.bind(deleter);
+      const startErasures = deleter.startErasures.bind(deleter);
       gap.deleter = deleter;
-      deleter.resumeErasures = async () => {
-        const answer = await resumeErasures();
+      deleter.startErasures = async () => {
+        const answer = await startErasures();
         await gap.afterErasures?.();
         return answer;
       };
@@ -53,7 +53,9 @@ const RETRY = { first: 5, max: 20 };
 const nextTask = () => new Promise<void>((resolve) => setImmediate(resolve));
 /** Wait on state with real macrotasks only: the timers under test are faked. */
 async function until(done: () => boolean | Promise<boolean>) {
-  for (let spins = 0; spins < 2000; spins += 1) {
+  // Real time, not a count of tasks: a loaded host runs the database slowly.
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
     if (await done()) return;
     await nextTask();
   }
@@ -65,6 +67,10 @@ describe("the delete retry timer follows the work owed when it is decided", () =
     const w = await world({ streams: 1, partTargetBytes: 65536 });
     const logKeys = () =>
       w.innerBlobs.keys().filter((key) => key.startsWith(`${LOG}/`));
+    // What the erasure must leave: no log object but a version's own marker.
+    const left = () => logKeys().filter((key) => !key.includes("/v-"));
+    let erased!: () => void;
+    const erasedSignal = new Promise<void>((resolve) => (erased = resolve));
     // The finality read waits on the test, then says "not final" once: the
     // erasure is unfinished after its first pass and finishes on a retry.
     let release!: () => void;
@@ -104,6 +110,7 @@ describe("the delete retry timer follows the work owed when it is decided", () =
               ? out.deleted
               : out.missing
             ).push(name);
+          if (left().length === 0) erased();
           return out;
         },
       },
@@ -134,20 +141,25 @@ describe("the delete retry timer follows the work owed when it is decided", () =
     gap.afterErasures = async () => {
       gap.afterErasures = undefined;
       release();
-      await until(() => vi.getTimerCount() > 0);
+      // The run ends while the tick is still on its way out.
+      await until(() => gap.deleter!.erasureOwed());
     };
     await a.sync.deleter.resumeDeletes();
 
-    // The erasure is owed: the timer the run armed is still there.
-    expect(vi.getTimerCount()).toBe(1);
+    // The erasure is owed, and the loop looked again after the tick: the
+    // timer is armed.
+    await until(() => vi.getTimerCount() === 1);
     expect(logKeys().length).toBeGreaterThan(0);
 
     // And the retry it fires finishes the erasure.
-    for (let rounds = 0; rounds < 200 && logKeys().length > 0; rounds += 1) {
+    // The storage port says when it is done; the test's own timeout bounds it.
+    let done = false;
+    void erasedSignal.then(() => (done = true));
+    while (!done) {
       await vi.advanceTimersByTimeAsync(RETRY.max);
       await nextTask();
     }
-    expect(logKeys().filter((key) => !key.includes("/v-"))).toEqual([]);
+    expect(left()).toEqual([]);
   });
 });
 
@@ -199,7 +211,11 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
 
     // The next tick owes nothing: the delete is gone, so no timer is armed.
     await a.sync.deleter.resumeDeletes();
-    expect(gap.deleter!.retryOwed()).toBe(false);
+    await settle();
+    expect(await gap.deleter!.retryOwed()).toBe(false);
+    // The loop decides at the end of its last pass, and stays decided.
+    await until(() => vi.getTimerCount() === 0);
+    await settle();
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -221,13 +237,120 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
     // The landing keeps failing: the loop is armed, as it should be.
     await vi.advanceTimersByTimeAsync(RETRY.max);
     await settle();
-    expect(gap.deleter!.retryOwed()).toBe(true);
+    expect(await gap.deleter!.retryOwed()).toBe(true);
 
     // The intent goes (another process finished or replaced the delete). The
     // next tick finds nothing to land and nothing owed.
     await a.db.batch([{ sql: "DELETE FROM delete_intents" }]);
     await a.sync.deleter.resumeDeletes();
-    expect(gap.deleter!.retryOwed()).toBe(false);
+    expect(await gap.deleter!.retryOwed()).toBe(false);
+    // The loop decides at the end of its last pass, and stays decided.
+    await until(() => vi.getTimerCount() === 0);
+    await settle();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  /** The registry refuses every control post while `registry.down`. */
+  function registryDown(a: Awaited<ReturnType<typeof collected>>["a"]) {
+    const registry = { down: true };
+    const post = a.deps.registry.post.bind(a.deps.registry);
+    const postBatch = a.deps.registry.postBatch!.bind(a.deps.registry);
+    a.deps.registry.post = async (request, signal) => {
+      if (registry.down && request.scope === CONTROL)
+        throw new Error("registry down");
+      return post(request, signal);
+    };
+    a.deps.registry.postBatch = async (request, signal) => {
+      if (registry.down && request.rows.some((row) => row.scope === CONTROL))
+        throw new Error("registry down");
+      return postBatch(request, signal);
+    };
+    return registry;
+  }
+  /** Fire the retry timer and let what it starts run. */
+  const fire = async () => {
+    await vi.advanceTimersByTimeAsync(RETRY.max);
+    await settle();
+  };
+
+  it("keeps the retry armed when a delete for the connector fails to land while a scan that found none is still being applied", async () => {
+    const { a } = await collected();
+    const registry = registryDown(a);
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await until(async () => (await intents(a)).length === 1);
+    await settle();
+    // Another process finished the delete: the next scan will find no row.
+    await a.db.batch([{ sql: "DELETE FROM delete_intents" }]);
+
+    // The scan reads its rows (none) and is held before it applies them.
+    const query = a.db.query.bind(a.db);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let scanned = false;
+    a.db.query = (async (sql: string, params?: readonly unknown[]) => {
+      const rows = await query(sql, params);
+      if (!scanned && sql.includes("FROM delete_intents ORDER BY connector")) {
+        scanned = true;
+        await held;
+      }
+      return rows;
+    }) as typeof a.db.query;
+    await vi.advanceTimersByTimeAsync(RETRY.max);
+    await until(() => scanned);
+
+    // A new delete for the connector fails to land before the scan's rows are
+    // applied: its intent is durable, and it is owed a retry.
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await until(async () => (await intents(a)).length === 1);
+    await settle();
+    release();
+    // The loop looks again after the scan and arms the timer for the intent.
+    await until(() => vi.getTimerCount() === 1);
+    await settle();
+
+    expect((await intents(a)).length).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    // The registry comes back: the retry it armed lands the delete.
+    registry.down = false;
+    for (let rounds = 0; rounds < 50 && (await intents(a)).length > 0;) {
+      await fire();
+      rounds += 1;
+    }
+    expect(await intents(a)).toEqual([]);
+  });
+
+  it("keeps the retry armed when a resume that scanned earlier ends after a later resume's scan failed", async () => {
+    const { a } = await collected();
+    // Resume A has scanned and is on its way out when resume B's scan fails.
+    const query = a.db.query.bind(a.db);
+    let failScan = false;
+    a.db.query = (async (sql: string, params?: readonly unknown[]) => {
+      if (failScan && sql.includes("FROM delete_intents ORDER BY connector")) {
+        failScan = false;
+        throw new Error("database busy");
+      }
+      return query(sql, params);
+    }) as typeof a.db.query;
+    let second: Promise<unknown> = Promise.resolve();
+    gap.afterErasures = async () => {
+      gap.afterErasures = undefined;
+      failScan = true;
+      second = a.sync.deleter.resumeDeletes().catch(() => undefined);
+      await settle();
+    };
+    await a.sync.deleter.resumeDeletes();
+    await second;
+    await settle();
+
+    // B's scan failed after A's: what B did not get to is still owed.
+    expect(vi.getTimerCount()).toBe(1);
+
+    // The retry scans again, succeeds and has nothing left: it stops.
+    await fire();
+    // The loop decides at the end of its last pass, and stays decided.
+    await until(() => vi.getTimerCount() === 0);
+    await settle();
     expect(vi.getTimerCount()).toBe(0);
   });
 });

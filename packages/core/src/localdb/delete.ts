@@ -261,12 +261,18 @@ export function createConnectionDeleter(
     /**
      * What the retry loop owes may have changed: a connector's erasure run is
      * over (its verdict read, and no longer in flight) or a landing ended.
-     * Called with no argument on purpose: the host reads `retryOwed()` when it
-     * decides, never a result computed earlier. Per connector, not when every
-     * connector's run has ended, so one waiting on storage never holds back
-     * another's retry.
+     * Called with no argument on purpose: the host sets a "look again" flag
+     * and reads `retryOwed()` when it decides, never a result computed
+     * earlier. Per connector, not when every connector's run has ended, so
+     * one waiting on storage never holds back another's retry.
      */
     readonly onRetryStateChange?: () => void;
+    /**
+     * @deprecated Shipped in v1.43.2. Use `onRetryStateChange`. Still called,
+     * as before, when a connector's erasure run is over and its erasure is
+     * still owed: the connector is queued again for the retry loop.
+     */
+    readonly onUnfinished?: () => void;
   } = {},
 ) {
   // Each registry request gets the same budget as the first resume wait.
@@ -322,14 +328,6 @@ export function createConnectionDeleter(
   };
   const keccak = keccakOf(deps.streamCrypto);
   const flights = new Map<string, Landing>();
-  /**
-   * Connectors whose delete failed to land and is retried by the loop. A
-   * mirror of a durable fact: the connector's intent row is still there. It
-   * is cleared when a landing succeeds, when a failed landing finds its
-   * intent gone (a landing superseded by a newer delete clears the intent
-   * itself), and when the retry scan finds no intent row for it.
-   */
-  const unlanded = new Set<string>();
   const requests = new Set<Promise<ConnectionDeleteRequest>>();
   /** Erasures running, by connector: one at a time per connector. */
   const erasures = new Map<string, Promise<void>>();
@@ -1180,7 +1178,15 @@ export function createConnectionDeleter(
       do {
         const owed = erasing.get(connector) ?? BOTH;
         erasing.delete(connector);
-        const unfinished = await eraseSettled(connector, owed);
+        let unfinished: Owed;
+        try {
+          unfinished = await eraseSettled(connector, owed);
+        } catch (error) {
+          // The entry was taken when the pass started: a pass that threw has
+          // not finished it, so it is owed again.
+          owe(connector, owed);
+          throw error;
+        }
         again = erasing.has(connector) && !stop.signal.aborted;
         if (unfinished.legacy || unfinished.storage) owe(connector, unfinished);
       } while (again);
@@ -1201,6 +1207,7 @@ export function createConnectionDeleter(
       // The run is over: its verdict is read and the connector is no longer in
       // flight, so a retry that looks now finds any work left owed queued.
       options.onRetryStateChange?.();
+      if (erasing.has(connector)) options.onUnfinished?.();
     });
     erasures.set(connector, run);
     return run;
@@ -1254,19 +1261,6 @@ export function createConnectionDeleter(
     const fenced = new Promise<boolean>((resolve) => (fencesEnded = resolve));
     const done: Promise<void> = deps.queue
       .run(`delete:${connector}`, "purge", () => land(connector, fencesEnded))
-      .then(
-        () => {
-          unlanded.delete(connector);
-        },
-        async (error) => {
-          // A landing that cleared its own intent (it was superseded) has
-          // nothing left to retry. A failed read keeps the retry.
-          const kept = await readIntent(connector).then(Boolean, () => true);
-          if (kept) unlanded.add(connector);
-          else unlanded.delete(connector);
-          throw error;
-        },
-      )
       .finally(() => {
         fencesEnded(false); // a landing that failed before its fence says "not fenced"
         if (flights.get(connector) === landing) flights.delete(connector);
@@ -1288,10 +1282,7 @@ export function createConnectionDeleter(
     connector: string,
   ): Promise<PendingDelete | null> {
     if (stop.signal.aborted) return null;
-    if (!(await readIntent(connector))) {
-      unlanded.delete(connector);
-      return null;
-    }
+    if (!(await readIntent(connector))) return null;
     if (stop.signal.aborted) return null;
     try {
       await schedule(connector).done;
@@ -1418,15 +1409,9 @@ export function createConnectionDeleter(
     },
     readConnectionLifetime,
     async resumeDeletes() {
-      // Marked before the scan: one marked after it may have been made by a
-      // landing that began after the rows were read.
-      const marked = [...unlanded];
       const rows = await deps.db.query<{ connector: string }>(
         "SELECT connector FROM delete_intents ORDER BY connector",
       );
-      const held = new Set(rows.map((row) => row.connector));
-      for (const connector of marked)
-        if (!held.has(connector)) unlanded.delete(connector);
       return (
         await Promise.all(rows.map(({ connector }) => resumeDelete(connector)))
       ).filter((p): p is PendingDelete => p !== null);
@@ -1472,54 +1457,72 @@ export function createConnectionDeleter(
     /** Whether erasure work is owed: the start sweep, or an unfinished erasure. */
     erasureOwed: () => sweepOwed || erasing.size > 0,
     /**
-     * Whether the retry loop has work to come back to now: a delete landing or
-     * failed to land, an erasure queued or left unfinished, or the start sweep.
-     * Read at the moment of deciding; a connector's erasure that runs with
-     * nothing more owed is not work for a tick.
+     * Whether the retry loop has work to come back to: a delete not landed (its
+     * intent row is still there: the one durable fact, read now, that a landing
+     * clears when it ends, supersession included), an erasure queued or left
+     * unfinished, or the start sweep. The in-memory parts are read after the
+     * database read, so the answer is one fact at the moment it returns. An
+     * erasure that runs with nothing more owed is not work for a tick.
      */
-    retryOwed: () =>
-      sweepOwed || erasing.size > 0 || flights.size > 0 || unlanded.size > 0,
+    async retryOwed(): Promise<boolean> {
+      const intents = await deps.db.query(
+        "SELECT 1 FROM delete_intents LIMIT 1",
+      );
+      return intents.length > 0 || sweepOwed || erasing.size > 0;
+    },
     /**
-     * Run the owed erasures: first, once, every connector with a connection
+     * Start the owed erasures: first, once, every connector with a connection
      * deleted here (a delete settled before this process started, or adopted
-     * from another device); then every connector whose erasure is unfinished.
-     * Answers true while one is still unfinished, so the caller retries.
+     * from another device); then every connector whose erasure is queued. Only
+     * the connectors queued and not in flight start, and only their runs are
+     * returned: a pass in flight is never joined, since a caller that joined it
+     * would stay pending as long as that connector's storage does, and would
+     * hold back what is queued behind it. That pass takes what arrives while it
+     * runs (`again`) and tells the host when it is over (`onRetryStateChange`).
+     * A run that throws queues its connector again.
+     */
+    async startErasures(): Promise<readonly Promise<void>[]> {
+      if (!owesErasure || stop.signal.aborted) return [];
+      if (sweepOwed) {
+        // Claimed before the reads: a purge that arrives while they run sets
+        // it again, and a read that fails gives it back.
+        sweepOwed = false;
+        try {
+          // A purge whose connector lookup failed wrote its tombstone all the
+          // same: read the table again.
+          await loadTombstones();
+          // A final verdict is read against the registry too: another device
+          // may have deleted again while this process was off.
+          await refreshTombstones(tombstones.keys());
+          const rows = await deps.db.query<{ connector: string }>(
+            "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
+          );
+          for (const { connector } of rows) owe(connector);
+          // A delete this device confirmed and has no final verdict for is
+          // owed too, though a reconnect replaced its local connection: the
+          // tombstone rows say it is unfinished, not the connection rows.
+          const unfinished = await deps.db.query<{ connector: string }>(
+            "SELECT DISTINCT connector FROM delete_tombstones WHERE done_at IS NULL ORDER BY connector",
+          );
+          for (const { connector } of unfinished) owe(connector);
+        } catch (error) {
+          sweepOwed = true;
+          throw error;
+        }
+      }
+      return [...erasing.keys()]
+        .filter((connector) => !erasures.has(connector))
+        .map((connector) => eraseLogsOf(connector));
+    },
+    /**
+     * Start the owed erasures and wait for the ones started. Answers true while
+     * one is still queued, so the caller retries. The answer is a fact at the
+     * moment it returns: a timer is never decided from it, only from
+     * `retryOwed()` when the timer is decided.
      */
     async resumeErasures(): Promise<boolean> {
-      if (!owesErasure || stop.signal.aborted) return false;
-      if (sweepOwed) {
-        // A purge whose connector lookup failed wrote its tombstone all the
-        // same: read the table again.
-        await loadTombstones();
-        // A final verdict is read against the registry too: another device
-        // may have deleted again while this process was off.
-        await refreshTombstones(tombstones.keys());
-        const rows = await deps.db.query<{ connector: string }>(
-          "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
-        );
-        for (const { connector } of rows) owe(connector);
-        // A delete this device confirmed and has no final verdict for is
-        // owed too, though a reconnect replaced its local connection: the
-        // tombstone rows say it is unfinished, not the connection rows.
-        const unfinished = await deps.db.query<{ connector: string }>(
-          "SELECT DISTINCT connector FROM delete_tombstones WHERE done_at IS NULL ORDER BY connector",
-        );
-        for (const { connector } of unfinished) owe(connector);
-        // Only once the rows are queued: a query that failed leaves it owed.
-        sweepOwed = false;
-      }
-      // Only the connectors queued and not in flight run here, and only they
-      // are waited for. A pass in flight is never joined: a tick that joined
-      // it would stay pending as long as that connector's storage does, one
-      // more with each tick, and would hold back what is queued behind it.
-      // That pass takes what arrives while it runs (`again`) and tells the
-      // host when it is over (`onRetryStateChange`). The answer is a fact at
-      // the moment it returns: a timer is never decided from it, only from
-      // `retryOwed()` when the timer is decided.
-      const queued = () =>
-        [...erasing.keys()].filter((connector) => !erasures.has(connector));
-      await Promise.all(queued().map((connector) => eraseLogsOf(connector)));
-      return queued().length > 0;
+      await Promise.all(await this.startErasures());
+      return [...erasing.keys()].some((connector) => !erasures.has(connector));
     },
     async close() {
       stop.abort(new Error("sync closed"));

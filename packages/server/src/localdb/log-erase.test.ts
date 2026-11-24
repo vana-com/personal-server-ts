@@ -1340,12 +1340,14 @@ describe("erasure wired into the connection delete", () => {
               return report;
             },
             onRetryStateChange: () => {
-              // What the host does: decide from the work owed now.
-              if (!deleter.retryOwed()) return;
-              armed += 1;
-              hold = false;
-              // The retry timer firing at once.
-              tick = deleter.resumeErasures();
+              // What the host does: look at the work owed now, then decide.
+              void deleter.retryOwed().then((owed) => {
+                if (!owed) return;
+                armed += 1;
+                hold = false;
+                // The retry timer firing at once.
+                tick = deleter.resumeErasures();
+              });
             },
           },
         );
@@ -1358,7 +1360,7 @@ describe("erasure wired into the connection delete", () => {
 
       release();
       await run;
-      expect(armed).toBe(1);
+      await vi.waitFor(() => expect(armed).toBe(1));
       // The tick found the connector queued, not in flight, and ran it.
       expect(await tick).toBe(false);
       expect(eraseLogs).toHaveBeenCalledTimes(2);
@@ -1508,6 +1510,57 @@ describe("erasure wired into the connection delete", () => {
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it("a purge that arrives while the start sweep reads is not lost: the sweep is owed again", async () => {
+      const a = await settled();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      let reading = false;
+      const db = {
+        ...a.db,
+        query: (async (sql: string, params?: readonly unknown[]) => {
+          const rows = await a.db.query(sql, params as never);
+          if (sql.includes("control_state='deleted'")) {
+            reading = true;
+            await gate;
+          }
+          return rows;
+        }) as typeof a.db.query,
+      };
+      const deleter = createConnectionDeleter(
+        { ...a.deps, db },
+        { eraseLogs: vi.fn().mockResolvedValue(erased) },
+      );
+      const sweep = deleter.resumeErasures();
+      await vi.waitFor(() => expect(reading).toBe(true));
+      // A purge whose connector is unknown: its tombstone is written, and
+      // only a new sweep finds it.
+      deleter.noteSweepOwed();
+      release();
+      await sweep;
+      expect(deleter.erasureOwed()).toBe(true);
+    });
+
+    it("the deprecated onUnfinished still fires, once the run has left the flight, when its erasure is still owed", async () => {
+      const a = await settled();
+      const eraseLogs = vi
+        .fn()
+        .mockResolvedValueOnce(unfinished)
+        .mockResolvedValue(erased);
+      const seen: boolean[] = [];
+      const deleter: ReturnType<typeof createConnectionDeleter> =
+        createConnectionDeleter(a.deps, {
+          eraseLogs,
+          onUnfinished: () => seen.push(deleter.erasureOwed()),
+        });
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
+      expect(await deleter.resumeErasures()).toBe(true);
+      // Fired once, and the erasure was queued again by then.
+      expect(seen).toEqual([true]);
+      expect(await deleter.resumeErasures()).toBe(false);
+      // Finished: nothing more to report.
+      expect(seen).toEqual([true]);
     });
 
     it("a purge that cannot look up the connector still commits, with or without a listener", async () => {
