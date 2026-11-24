@@ -258,6 +258,12 @@ export function createConnectionDeleter(
      * takes (tests only).
      */
     readonly fenceWaitMs?: number;
+    /**
+     * A pass left a connector's erasure unfinished: it is queued again for the
+     * retry loop. Called when that pass ends, not when every connector's pass
+     * has, so a connector waiting on storage never holds back another's retry.
+     */
+    readonly onUnfinished?: () => void;
   } = {},
 ) {
   // Each registry request gets the same budget as the first resume wait.
@@ -1165,7 +1171,10 @@ export function createConnectionDeleter(
         erasing.delete(connector);
         const unfinished = await eraseSettled(connector, owed);
         again = erasing.has(connector) && !stop.signal.aborted;
-        if (unfinished.legacy || unfinished.storage) owe(connector, unfinished);
+        if (unfinished.legacy || unfinished.storage) {
+          owe(connector, unfinished);
+          options.onUnfinished?.();
+        }
       } while (again);
       // Settled for good: the delete's tombstones are not needed any more.
       try {

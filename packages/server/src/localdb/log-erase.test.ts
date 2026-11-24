@@ -4,6 +4,7 @@
 // fake gateway the publisher commits to; storage is its in-memory store.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  controlScope,
   logScope,
   segmentBlobName,
 } from "@opendatalabs/personal-server-ts-stream-sync";
@@ -493,6 +494,51 @@ describe("erasure wired into the connection delete", () => {
     const b = await w.device("b");
     await b.cycle();
     expect(await b.records()).toEqual(await a.records());
+  });
+
+  it("retries one connector's unfinished erasure while another connector's storage request is still waiting", async () => {
+    const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+    const base = ports(w, { finalized: "99" }).erasure;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    // The other connector's finality read waits; this one's tombstone is not
+    // final for its first five reads, so its erasure is unfinished each time.
+    let asked = 0;
+    const erasure: LogErasurePorts = {
+      ...base,
+      finality: {
+        tombstoneState: async (scope) => {
+          if (scope === controlScope(OTHER, "")) {
+            await gate;
+            return { finalized: "99", rolledBack: null };
+          }
+          asked += 1;
+          return { finalized: asked > 5 ? "99" : null, rolledBack: null };
+        },
+      },
+    };
+    const a = await w.device("a", {
+      erasure: () => erasure,
+      deleteRetryMs: RETRY,
+    });
+    try {
+      for (const connector of [CONNECTOR, OTHER]) {
+        await a.run(`run-${connector}`, [{ stream: sName(0), id: "x", v: 0 }], {
+          connector,
+          observedAt: 1100,
+        });
+        await a.cycle();
+      }
+      await a.sync.deleter.requestConnectionDelete(OTHER);
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+
+      await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+      // The other connector's erasure has not finished: it is still waiting.
+      expect(logKeys(w, OTHER_LOG).length).toBeGreaterThan(0);
+    } finally {
+      release();
+    }
+    await vi.waitFor(() => expect(logKeys(w, OTHER_LOG)).toEqual([]));
   });
 
   it("erases a delete another device wrote once this device has adopted it", async () => {
