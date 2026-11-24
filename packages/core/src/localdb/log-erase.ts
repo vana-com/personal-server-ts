@@ -313,6 +313,14 @@ export interface ErasureReport {
   readonly connections: readonly ConnectionErasure[];
   /** True when a later call can still make progress (a `pending` outcome). */
   readonly pending: boolean;
+  /**
+   * Namespaces whose deleted control head the pass found and left alone:
+   * `skipNamespaces` named them, because a local connection of theirs is not
+   * deleted. Their log scope belongs to that connection too, so nothing of
+   * the deleted lifetime is erased or shown gone. Listed, so the caller
+   * judges them from this report instead of from what it does not mention.
+   */
+  readonly skipped: readonly string[];
   /** This device has no ports to delete from storage: nothing was tried. */
   readonly unavailable?: true;
 }
@@ -328,7 +336,7 @@ const DELETE_BATCH = 15;
  * comes back as a `pending` outcome for the caller to repeat later.
  * `skipNamespaces` are namespaces of `connector` whose delete has not settled
  * here (a local connection of theirs is not deleted): they are left alone and
- * do not appear in the report, and the rest are erased.
+ * are listed in the report's `skipped`, and the rest are erased.
  */
 export async function eraseDeletedConnectionLogs(
   deps: LogErasureDeps,
@@ -347,6 +355,7 @@ export async function eraseDeletedConnectionLogs(
   } = {},
 ): Promise<ErasureReport> {
   const connections: ConnectionErasure[] = [];
+  const skipped: string[] = [];
   try {
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
@@ -364,7 +373,10 @@ export async function eraseDeletedConnectionLogs(
       if (state.kind === "deleted") deletedAt.set(parsed.ns, state.version);
       if (state.kind !== "deleted") continue;
       const { connector, ns } = parsed;
-      if (options.skipNamespaces?.has(ns)) continue;
+      if (options.skipNamespaces?.has(ns)) {
+        skipped.push(ns);
+        continue;
+      }
       const outcome = await eraseOne(
         deps,
         { connector, ns, keyCheck, hashes, tombstone: state.version },
@@ -399,11 +411,12 @@ export async function eraseDeletedConnectionLogs(
       { error: error instanceof Error ? error.message : String(error) },
       "stream sync: connection log erasure could not list the deleted connections",
     );
-    return { connections, pending: true };
+    return { connections, pending: true, skipped };
   }
   return {
     connections,
     pending: connections.some((c) => c.outcome.kind === "pending"),
+    skipped,
   };
 }
 

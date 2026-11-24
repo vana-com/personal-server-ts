@@ -33,7 +33,7 @@ import {
   type DeletePart,
 } from "./delete-status.js";
 import { retireLegacyOf, type LegacyDeletePorts } from "./legacy-delete.js";
-import { purgeConnection } from "./purge.js";
+import { KEEP_TOMBSTONE_CONFLICT, purgeConnection } from "./purge.js";
 import {
   ConnectionLifetimeChanged,
   formatLifetime,
@@ -63,11 +63,19 @@ function storagePartOf(
   const worse = (next: DeletePart) => {
     if (rankOf(next) > rankOf(part)) part = next;
   };
-  // A namespace whose delete this device confirmed, and the pass said nothing
-  // of (a local connection of it is not purged yet), has not been judged.
-  const reported = new Set(report.connections.map((c) => c.ns));
-  for (const ns of tombstones.keys())
-    if (!reported.has(ns)) worse(PART_PENDING);
+  // A namespace a local connection holds (a reconnect, or another lifetime)
+  // shares its log scope with the deleted one: nothing of it is erased, and
+  // nothing shows it gone. The report lists these, and they are final until a
+  // newer delete of the namespace.
+  for (const ns of report.skipped)
+    if (tombstones.has(ns)) worse(blocked("re_added"));
+  // A namespace whose delete this device confirmed is either judged or listed
+  // as skipped. One the report names neither way is not judged yet.
+  const named = new Set([
+    ...report.connections.map((c) => c.ns),
+    ...report.skipped,
+  ]);
+  for (const ns of tombstones.keys()) if (!named.has(ns)) worse(PART_PENDING);
   for (const { outcome } of report.connections)
     worse(
       outcome.kind === "pending"
@@ -91,8 +99,7 @@ function storagePartOf(
 const rankOf = (p: DeletePart) =>
   p.state === "blocked" ? 2 : p.state === "pending" ? 1 : 0;
 const KEEP_TOMBSTONE_SQL = `INSERT INTO delete_tombstones(connector, ns, version) VALUES (?, ?, ?)
-   ON CONFLICT(connector, ns) DO UPDATE SET version = excluded.version
-   WHERE excluded.version > delete_tombstones.version`;
+   ${KEEP_TOMBSTONE_CONFLICT}`;
 /** The stages of an erasure pass. */
 interface Owed {
   readonly legacy: boolean;
@@ -174,6 +181,12 @@ export interface ConnectionDeleter {
    * part no pass has judged yet is `pending`.
    */
   deleteStatus(connector: string): Promise<ConnectionDeleteStatus>;
+  /**
+   * Whether work is queued that can change a part now reading `pending`: an
+   * erasure pass owed here (the start sweep, or one a pass left unfinished).
+   * A delete still landing is not counted: its intent row is its queue.
+   */
+  erasureOwed(): boolean;
 }
 /**
  * The erasure of deleted connections' log objects, as the deleter drives it
@@ -301,6 +314,10 @@ export function createConnectionDeleter(
    * fresh news (a delete settled) owes both, an unfinished pass owes only the
    * stage that can still make progress. What a part shows is a separate fact
    * (`judged`): a stage that ended `blocked` is not owed again.
+   *
+   * A part that reads `pending` always has a pass owed behind it: here while
+   * the process runs, and after a restart in the start sweep, which reads the
+   * tombstone rows with no verdict (`done_at`).
    */
   const erasing = new Map<string, Owed>();
   const owe = (connector: string, which: Owed = BOTH) => {
@@ -346,15 +363,24 @@ export function createConnectionDeleter(
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([ns, version]) => `${ns}@${version}`)
       .join(",");
-  /** A delete confirmed this tombstone: a higher one than known is a newer delete. */
-  function learnTombstone(connector: string, ns: string, version: number) {
+  /**
+   * A delete confirmed this tombstone: a higher one than known is a newer
+   * delete, and answers true. The same one again is news of nothing.
+   */
+  function learnTombstone(
+    connector: string,
+    ns: string,
+    version: number,
+  ): boolean {
     const held = tombstones.get(connector) ?? new Map<string, number>();
-    if ((held.get(ns) ?? 0) >= version) return;
+    if ((held.get(ns) ?? 0) >= version) return false;
     held.set(ns, version);
     tombstones.set(connector, held);
-    // What an earlier pass judged says nothing of a newer delete.
+    // What an earlier pass judged, and what the gateway refused, say nothing
+    // of a newer delete: this is the only place either is dropped.
     judged.delete(connector);
     refusals.delete(connector);
+    return true;
   }
   /**
    * The tombstones the local database holds (`delete_tombstones`), learned
@@ -379,19 +405,20 @@ export function createConnectionDeleter(
       throw error;
     }));
   /**
-   * The delete's three parts are all done: nothing is left to judge by its
-   * tombstone. The rows are removed only at the version this pass judged, so
-   * a newer delete's tombstone, written meanwhile, stays.
+   * The delete's three parts are all done: its verdict is final. It is kept
+   * with the delete's identity (`done_at` on the tombstone rows, at the
+   * versions this pass judged), so a restart reads it back and a newer
+   * delete's tombstone, written meanwhile, is left without one.
    */
-  async function releaseTombstones(
+  async function recordVerdict(
     connector: string,
-    judged: ConnectionDeleteStatus,
+    status: ConnectionDeleteStatus,
   ) {
     if (
       stop.signal.aborted ||
       erasing.has(connector) ||
       flights.has(connector) ||
-      ![judged.fence, judged.legacy, judged.storage].every(
+      ![status.fence, status.legacy, status.storage].every(
         (part) => part.state === "done",
       )
     )
@@ -400,11 +427,21 @@ export function createConnectionDeleter(
     if (held.size === 0) return;
     await deps.db.batch(
       [...held].map(([ns, version]) => ({
-        sql: "DELETE FROM delete_tombstones WHERE connector=? AND ns=? AND version=?",
+        sql: "UPDATE delete_tombstones SET done_at = CAST(strftime('%s','now') AS INTEGER) * 1000 WHERE connector=? AND ns=? AND version=? AND done_at IS NULL",
         params: [connector, ns, version],
       })),
     );
   }
+  /** The durable rows of a connector's delete: its identity and whether it finished. */
+  const rowsOf = (connector: string) =>
+    deps.db.query<{ ns: string; version: number; done_at: number | null }>(
+      "SELECT ns, version, done_at FROM delete_tombstones WHERE connector=?",
+      [connector],
+    );
+  /** Every row says the delete finished: all three parts were done at these versions. */
+  const finishedIn = (
+    rows: readonly { version: number; done_at: number | null }[],
+  ) => rows.length > 0 && rows.every((row) => row.done_at !== null);
   /**
    * The control rows the plan listed, by delete id, then by scope. Only a
    * delete this process just planned has one; the landing takes it. Each
@@ -857,6 +894,9 @@ export function createConnectionDeleter(
     const key = deleteKey(connector);
     const judge = (part: JudgedPart) => judgeFor(connector, key, part);
     try {
+      // A delete whose verdict is final has nothing left to judge: the same
+      // tombstone read again (a sync cycle, a restart) changes nothing.
+      if (finishedIn(await rowsOf(connector))) return NONE;
       const skipNamespaces = await unsettledNamespaces(connector);
       if (skipNamespaces === null) return NONE;
       // The legacy copy first: it needs no log port, so a device that cannot
@@ -887,7 +927,12 @@ export function createConnectionDeleter(
             legacy: outcome.part,
             ...(outcome.rolledBack && { rolledBack: true as const }),
           });
-          left = { ...left, legacy: outcome.pending };
+          // Retry is decided by the part as well as by the stage's own flag:
+          // a part that reads pending always has a pass queued behind it.
+          left = {
+            ...left,
+            legacy: outcome.pending || outcome.part.state === "pending",
+          };
         }
       }
       if (!options.eraseLogs || !owed.storage) return left;
@@ -895,10 +940,15 @@ export function createConnectionDeleter(
         skipNamespaces,
         tombstones: held,
       });
-      judge({ storage: storagePartOf(report, held) });
+      const storage = storagePartOf(report, held);
+      judge({ storage });
       if (report.connections.some((c) => isRolledBack(c.outcome)))
         judge({ rolledBack: true });
-      return { ...left, storage: report.pending };
+      // The same report drives the part and the retry.
+      return {
+        ...left,
+        storage: report.pending || storage.state === "pending",
+      };
     } catch (error) {
       // The eraser reports a failure as pending; this is its own bug or a
       // database that went away. Try again later, never fail the delete.
@@ -911,6 +961,19 @@ export function createConnectionDeleter(
       );
       return owed;
     }
+  }
+  /**
+   * The stages of the delete known now that no pass has given a verdict a
+   * later pass cannot change: not judged yet, still pending, or waiting for
+   * a device that can (`needs_another_device`).
+   */
+  function unfinishedStages(connector: string): Owed {
+    const seen = judged.get(connector);
+    const open = (part: DeletePart | undefined) =>
+      part === undefined ||
+      part.state === "pending" ||
+      (part.state === "blocked" && part.reason === "needs_another_device");
+    return { legacy: open(seen?.legacy), storage: open(seen?.storage) };
   }
   interface JudgedPart {
     legacy?: DeletePart;
@@ -947,14 +1010,14 @@ export function createConnectionDeleter(
       } while (again);
       // Settled for good: the delete's tombstones are not needed any more.
       try {
-        await releaseTombstones(connector, await deleteStatus(connector));
+        await recordVerdict(connector, await deleteStatus(connector));
       } catch (error) {
         deps.logger.warn(
           {
             connector,
             error: error instanceof Error ? error.message : String(error),
           },
-          "stream sync: the settled delete's tombstones could not be released",
+          "stream sync: the settled delete's verdict could not be recorded",
         );
       }
     })().finally(() => {
@@ -981,6 +1044,10 @@ export function createConnectionDeleter(
         legacy: PART_PENDING,
         storage: PART_PENDING,
       };
+    // A verdict that is final is read from the rows that hold it, so a
+    // restart, a reconnect or a sync cycle cannot turn it back into pending.
+    if (finishedIn(await rowsOf(connector)))
+      return { fence: PART_DONE, legacy: PART_DONE, storage: PART_DONE };
     const seen = judged.get(connector);
     // A host with no stage cannot do it: another device of the account must.
     // A stage no pass has judged is not done: `done` is only ever a pass's
@@ -1165,10 +1232,14 @@ export function createConnectionDeleter(
       connector: string,
       tombstone: { readonly ns: string; readonly version: number },
     ) {
-      learnTombstone(connector, tombstone.ns, tombstone.version);
-      if (owesErasure) owe(connector);
-      // News of this connector: a gateway answer given earlier may differ now.
-      refusals.delete(connector);
+      // A higher tombstone is a newer delete: both stages judge it afresh and
+      // the gateway is asked again. The same one again (a sync cycle reads the
+      // deleted control row every time) is news of nothing: a final verdict
+      // and a terminal refusal stand, and only a stage with none is owed.
+      const newer = learnTombstone(connector, tombstone.ns, tombstone.version);
+      if (!owesErasure) return;
+      const owed = newer ? BOTH : unfinishedStages(connector);
+      if (owed.legacy || owed.storage) owe(connector, owed);
     },
     /**
      * A connection was purged and its connector is unknown: the sweep of
@@ -1195,10 +1266,13 @@ export function createConnectionDeleter(
           "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
         );
         for (const { connector } of rows) owe(connector);
-        // A delete this device confirmed and has not finished judging is
+        // A delete this device confirmed and has no final verdict for is
         // owed too, though a reconnect replaced its local connection: the
-        // table is what says it is unfinished, not the connection rows.
-        for (const connector of tombstones.keys()) owe(connector);
+        // tombstone rows say it is unfinished, not the connection rows.
+        const unfinished = await deps.db.query<{ connector: string }>(
+          "SELECT DISTINCT connector FROM delete_tombstones WHERE done_at IS NULL ORDER BY connector",
+        );
+        for (const { connector } of unfinished) owe(connector);
         // Only once the rows are queued: a query that failed leaves it owed.
         sweepOwed = false;
       }

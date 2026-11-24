@@ -733,4 +733,12 @@ END`,
   scope TEXT NOT NULL, head TEXT NOT NULL, recorded_at INTEGER NOT NULL,
   PRIMARY KEY (scope, head)) WITHOUT ROWID`,
   ],
+  [
+    // The delete's final verdict, with its identity. `done_at` is set on the
+    // rows of a connector when all three parts of the delete they name are
+    // done, and cleared when a newer tombstone replaces a row. A restart reads
+    // `done` from here and has nothing to judge again; a row with no
+    // `done_at` is unfinished work the start sweep queues.
+    `ALTER TABLE delete_tombstones ADD COLUMN done_at INTEGER`,
+  ],
 ];

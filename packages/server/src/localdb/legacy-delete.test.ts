@@ -706,6 +706,96 @@ describe("the legacy stage of a connection delete after the switch", () => {
     });
   });
 
+  describe("a delete's final verdict is durable", () => {
+    it("reads done in every part after the connection is added again and the process restarts, with nothing queued and nothing sent", async () => {
+      const { w, a, fake } = await collected({ dbFile: dbFile() });
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+      // The connection is added again: the control row's head is live data.
+      const control = controlScope(GH, "");
+      w.gateway.write(control, { ...w.gateway.versions.get(control)![0]! });
+      const sent = fake.requests.length;
+
+      const restarted = await a.restart();
+      expect(allDone(await restarted.sync.deleter.deleteStatus(GH))).toBe(true);
+      await restarted.sync.deleter.resumeDeletes();
+
+      expect(allDone(await restarted.sync.deleter.deleteStatus(GH))).toBe(true);
+      expect(restarted.sync.deleter.erasureOwed()).toBe(false);
+      expect(fake.requests).toHaveLength(sent);
+    });
+
+    it("drops the verdict when a newer delete of the connection lands", async () => {
+      const { a } = await collected({ dbFile: dbFile() });
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+      const [row] = await a.db.query<{
+        version: number;
+        done_at: number | null;
+      }>("SELECT version, done_at FROM delete_tombstones WHERE connector = ?", [
+        GH,
+      ]);
+      expect(row!.done_at).not.toBeNull();
+
+      // A later delete's tombstone replaces the row, with no verdict.
+      await a.db.batch([
+        {
+          sql: "INSERT INTO delete_tombstones(connector, ns, version) VALUES (?, '', ?) ON CONFLICT(connector, ns) DO UPDATE SET version = excluded.version, done_at = NULL WHERE excluded.version > delete_tombstones.version",
+          params: [GH, row!.version + 2],
+        },
+      ]);
+      const restarted = await a.restart();
+      expect(allDone(await restarted.sync.deleter.deleteStatus(GH))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("a terminal refusal stays terminal for the same delete", () => {
+    it("is not asked again by a sync cycle, a repeated purge note or a restart's sweep, and is asked again for a newer delete", async () => {
+      const { a, fake, legacy } = await collected({ cutover: "v1" });
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(
+          blockedBy("owner_stream_sync_required"),
+        ),
+      );
+      const tries = () => gatewayDeletes(fake).length;
+      const asked = tries();
+
+      // Full sync cycles read the deleted control row again.
+      await a.cycle();
+      await a.cycle();
+      await a.sync.deleter.resumeDeletes();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(tries()).toBe(asked);
+
+      // The same tombstone noted again, over the deleter's own memory.
+      const deleter = createConnectionDeleter(a.deps, {
+        legacy: () => legacy.ports,
+      });
+      deleter.noteSettled(GH, { ns: "", version: 2 });
+      await deleter.resumeErasures();
+      const first = tries();
+      expect((await deleter.deleteStatus(GH)).legacy).toEqual(
+        blockedBy("owner_stream_sync_required"),
+      );
+      deleter.noteSettled(GH, { ns: "", version: 2 });
+      deleter.noteSettled(GH, { ns: "", version: 2 });
+      await deleter.resumeErasures();
+      expect(tries()).toBe(first);
+
+      // A higher tombstone is a newer delete: the gateway is asked again.
+      deleter.noteSettled(GH, { ns: "", version: 4 });
+      await deleter.resumeErasures();
+      expect(tries()).toBeGreaterThan(first);
+    });
+  });
+
   describe("a deleted head whose tombstone is not final", () => {
     it("reads pending until the registry finalizes the legacy tombstone, then done", async () => {
       const legacyFinal = { value: false };

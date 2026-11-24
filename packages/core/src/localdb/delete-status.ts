@@ -11,14 +11,16 @@
 // does not: it says why, and what ends it is outside this device's retry loop
 // (another device with the access, an operator, or work not built yet).
 
+import type { GatewayRefusalCode } from "../sync/gateway-refusal.js";
+
 /** Why a part of a delete does not finish by retrying here. */
 export type DeleteBlockReason =
-  /** The account switched under cutover policy v1: the gateway refuses every legacy delete. */
-  | "owner_stream_sync_required"
-  /** The gateway refused this server's key: the owner revoked it. */
-  | "server_revoked"
-  /** The gateway refused this server's key: the owner never registered it. */
-  | "server_unregistered"
+  /**
+   * The gateway's terminal refusals (`GATEWAY_REFUSAL_CODES`: the owner
+   * switched under a policy that admits no legacy delete, or this server's
+   * key is revoked or was never registered). One list, shared with the parser.
+   */
+  | GatewayRefusalCode
   /**
    * This device cannot delete from the gateway or storage (no server key, or an
    * enclave). Any device of the account that can does it when it next runs.
@@ -64,11 +66,3 @@ export const blocked = (reason: DeleteBlockReason): DeletePart => ({
   state: "blocked",
   reason,
 });
-
-/** The gateway's terminal refusal codes, which are also block reasons. */
-export const LEGACY_REFUSALS = [
-  "owner_stream_sync_required",
-  "server_revoked",
-  "server_unregistered",
-] as const satisfies readonly DeleteBlockReason[];
-export type LegacyRefusal = (typeof LEGACY_REFUSALS)[number];

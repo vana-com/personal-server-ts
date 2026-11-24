@@ -300,7 +300,12 @@ export function createLocalSync(
                   }),
                 },
               )
-            : { connections: [], pending: false, unavailable: true as const };
+            : {
+                connections: [],
+                pending: false,
+                skipped: [],
+                unavailable: true as const,
+              };
         },
       }),
       ...(options.legacyDelete && { legacy: options.legacyDelete }),
@@ -385,6 +390,7 @@ export function createLocalSync(
     },
     resumeDeletes: resume,
     deleteStatus: (connector) => deletes().deleteStatus(connector),
+    erasureOwed: () => deletes().erasureOwed(),
   };
   const listingDeps = {
     ...deps,

@@ -35,6 +35,15 @@ function passWatermark(connectionId: string): SqlStatement {
 }
 
 /**
+ * A tombstone replaces the one held only when it is higher: a newer delete,
+ * which has no verdict yet (`done_at` cleared). The same or a lower one
+ * changes nothing.
+ */
+export const KEEP_TOMBSTONE_CONFLICT = `ON CONFLICT(connector, ns) DO UPDATE
+   SET version = excluded.version, done_at = NULL
+   WHERE excluded.version > delete_tombstones.version`;
+
+/**
  * Record the control tombstone that ended `connectionId`'s lifetime
  * (`delete_tombstones`): the delete's identity, which its erasure judges by.
  * A tombstone below the one held is an older delete and changes nothing.
@@ -46,8 +55,7 @@ export function keepTombstone(
   return {
     sql: `INSERT INTO delete_tombstones(connector, ns, version)
    SELECT connector, ns, ? FROM connections WHERE connection_id = ?
-   ON CONFLICT(connector, ns) DO UPDATE SET version = excluded.version
-   WHERE excluded.version > delete_tombstones.version`,
+   ${KEEP_TOMBSTONE_CONFLICT}`,
     params: [version, connectionId],
   };
 }

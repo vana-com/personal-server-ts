@@ -260,10 +260,12 @@ export async function world(options: {
      * handle, a new queue and a new sync, with this device's ports. Nothing
      * the old process held in memory is left.
      */
+    let live: { db: typeof db; sync: typeof sync } = { db, sync };
     const restart = async () => {
       if (!hooks.dbFile) throw new Error("a restart needs a dbFile");
-      await sync.close();
-      drivers.splice(drivers.indexOf(db), 1);
+      await live.sync.close();
+      const at = drivers.indexOf(live.db);
+      if (at >= 0) drivers.splice(at, 1);
       const reopened = await openLocalDb(
         openBetterSqlite3(hooks.dbFile),
         identity,
@@ -274,11 +276,9 @@ export async function world(options: {
         db: reopened,
         queue: connectionQueue(),
       };
-      return {
-        db: reopened,
-        deps: next,
-        sync: createLocalSync(next, syncOptions),
-      };
+      const restarted = createLocalSync(next, syncOptions);
+      live = { db: reopened, sync: restarted };
+      return { db: reopened, deps: next, sync: restarted };
     };
     /** A run's begin: the mode and state the connector starts from. */
     const begin = (

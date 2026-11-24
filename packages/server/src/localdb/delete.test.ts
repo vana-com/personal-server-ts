@@ -1300,7 +1300,11 @@ it("a delete that names a lifetime purges the connections its pins name, and lea
       params: [HOME],
     },
   ]);
-  const eraseLogs = vi.fn(async () => ({ connections: [], pending: false }));
+  const eraseLogs = vi.fn(async () => ({
+    connections: [],
+    pending: false,
+    skipped: [],
+  }));
   const deleter = createConnectionDeleter(f.a.deps, { eraseLogs });
   const lifetime = await deleter.readConnectionLifetime("fixture-source");
   await deleter.requestConnectionDelete("fixture-source", { lifetime });

@@ -8,6 +8,10 @@ import type {
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import { computeDataPointId } from "./data-point-id.js";
+import {
+  isGatewayAnswerCode,
+  type GatewayAnswerCode,
+} from "./gateway-refusal.js";
 import { parseGatewayNextVersion } from "./workers/upload.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
 
@@ -20,25 +24,13 @@ export function isGatewayReservedScope(scope: string): boolean {
 }
 
 /**
- * The gateway answers a tombstone with a machine code when it refuses the
- * signer or the owner's cutover receipt. None of these changes on a retry:
- * the owner switched under a policy that admits no legacy delete, or the
- * server key is revoked or was never registered.
+ * A tombstone the gateway answered with a code no retry changes
+ * (`gateway-refusal.ts`): a terminal refusal, or the already-deleted answer.
  */
-export type GatewayRefusalCode =
-  "owner_stream_sync_required" | "server_revoked" | "server_unregistered";
-
-const REFUSAL_CODES: ReadonlySet<string> = new Set<GatewayRefusalCode>([
-  "owner_stream_sync_required",
-  "server_revoked",
-  "server_unregistered",
-]);
-
-/** A tombstone the gateway refused with a terminal code (see `GatewayRefusalCode`). */
 export class GatewayRefusalError extends Error {
   constructor(
     readonly status: number,
-    readonly code: GatewayRefusalCode,
+    readonly code: GatewayAnswerCode,
     detail: string,
   ) {
     super(`Gateway error: ${status} ${detail}`);
@@ -54,10 +46,10 @@ function refusalOf(
 ): GatewayRefusalError | null {
   if (typeof body !== "object" || body === null) return null;
   const code = (body as Record<string, unknown>).code;
-  if (typeof code !== "string" || !REFUSAL_CODES.has(code)) return null;
+  if (!isGatewayAnswerCode(code)) return null;
   return new GatewayRefusalError(
     status,
-    code as GatewayRefusalCode,
+    code,
     `${code}: ${detailFromBody(body, fallback)}`,
   );
 }

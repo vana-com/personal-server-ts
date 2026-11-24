@@ -58,13 +58,15 @@ import type {
 import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {
   blocked,
-  LEGACY_REFUSALS,
   PART_DONE,
   PART_PENDING,
   type DeleteBlockReason,
   type DeletePart,
-  type LegacyRefusal,
 } from "./delete-status.js";
+import {
+  isGatewayAlreadyDeletedCode,
+  isGatewayRefusalCode,
+} from "../sync/gateway-refusal.js";
 import type { LocalSyncDeps } from "./deps.js";
 
 /** A legacy scope's gateway head, as the stage needs it. */
@@ -141,9 +143,6 @@ const worst = (a: DeletePart, b: DeletePart): DeletePart => {
   return rank(b) > rank(a) ? b : a;
 };
 
-const isRefusal = (code: unknown): code is LegacyRefusal =>
-  LEGACY_REFUSALS.includes(code as LegacyRefusal);
-
 /** The deletion-aware head of a legacy scope, from the gateway's feed. */
 export function legacyHeadFrom(
   feed: Pick<DataPointFeedPort, "getDataPoint">,
@@ -211,7 +210,7 @@ export interface LegacyStageDeps {
 /**
  * One pass of the legacy stage for `connector`. Never throws: a failure is a
  * `pending` outcome for the caller to repeat. Only a refusal the gateway names
- * terminal (`LEGACY_REFUSALS`) or a missing capability is `blocked`.
+ * terminal (`GATEWAY_REFUSAL_CODES`) or a missing capability is `blocked`.
  */
 export async function retireLegacyOf(
   deps: LegacyStageDeps,
@@ -329,8 +328,14 @@ async function retireScope(
   if (head.state === "live") {
     const result = await ports.retire(scope, head.fence);
     const { gateway } = result.steps;
-    if (gateway.status === "failed") {
-      if (!isRefusal(gateway.code)) return waiting;
+    // data-gateway #212: a tombstone aimed at a head that is already deleted
+    // gets a distinct answer (`gateway-refusal.ts`). The scope is retired
+    // already: read the head again below instead of waiting or blocking.
+    if (
+      gateway.status === "failed" &&
+      !isGatewayAlreadyDeletedCode(gateway.code)
+    ) {
+      if (!isGatewayRefusalCode(gateway.code)) return waiting;
       // The gateway's answer will not change: ask once, show it, and do not
       // let it hold back a scope that is only waiting.
       deps.memory?.refused.set(scope, gateway.code);

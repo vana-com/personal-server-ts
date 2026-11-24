@@ -701,6 +701,33 @@ describe("erasure wired into the connection delete", () => {
       });
     });
 
+    it("reads blocked(re_added) for a deleted namespace a local connection still holds, and owes no further pass", async () => {
+      const state: { finalized: string | null } = { finalized: null };
+      const { w, a, deleted } = await collected(state);
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+      const old = logKeys(w, LOG);
+      // The connection is added again here, not published yet: the registry's
+      // head is still the delete's tombstone, and a local connection is live.
+      await a.db.batch([
+        {
+          sql: "UPDATE connections SET control_state = 'absent' WHERE connector = ?",
+          params: [CONNECTOR],
+        },
+      ]);
+
+      state.finalized = "99";
+      await vi.waitFor(async () =>
+        expect((await a.sync.deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+          state: "blocked",
+          reason: "re_added",
+        }),
+      );
+      await vi.waitFor(() => expect(a.sync.deleter.erasureOwed()).toBe(false));
+      expect(deleted).toEqual([]);
+      expect(logKeys(w, LOG)).toEqual(old);
+    });
+
     it("reads storage as pending while the registry cannot list the deleted connections", async () => {
       const { a, erasure } = await settledDelete();
       const down = {
@@ -723,7 +750,43 @@ describe("erasure wired into the connection delete", () => {
 
   describe("storage reads done only on this delete's own evidence", () => {
     const DONE: DeletePart = { state: "done" };
-    type Deleter = Awaited<ReturnType<World["device"]>>["sync"]["deleter"];
+    type Device = Awaited<ReturnType<World["device"]>>;
+    type Deleter = Device["sync"]["deleter"];
+    /** A process over a database: its sync, and a way to restart it. */
+    interface Subject {
+      readonly sync: { readonly deleter: Deleter };
+      readonly db: Device["db"];
+      restart(): Promise<Subject>;
+    }
+    /** A process as a subject; restarting it gives the next one over the same file. */
+    const subjectOf = (
+      sync: { readonly deleter: Deleter },
+      db: Device["db"],
+      restart: () => Promise<{
+        readonly sync: { readonly deleter: Deleter };
+        readonly db: Device["db"];
+      }>,
+    ): Subject => ({
+      sync,
+      db,
+      restart: async () => {
+        const next = await restart();
+        return subjectOf(next.sync, next.db, restart);
+      },
+    });
+    /**
+     * What a part that reads `pending` stands on: a delete still landing (its
+     * intent row), or an erasure owed. A pending part with neither would read
+     * pending for good.
+     */
+    async function pendingHasWork(subject: Subject) {
+      const status = await subject.sync.deleter.deleteStatus(CONNECTOR);
+      const landing =
+        (await subject.db.query("SELECT 1 FROM delete_intents")).length > 0;
+      for (const part of [status.fence, status.legacy, status.storage])
+        if (part.state === "pending")
+          expect(subject.sync.deleter.erasureOwed() || landing).toBe(true);
+    }
     /** The storage part, once the erasure has judged it (not pending). */
     async function judged(deleter: Deleter) {
       let part: DeletePart = { state: "pending" };
@@ -743,6 +806,7 @@ describe("erasure wired into the connection delete", () => {
       const a = await w.device("a", {
         erasure: () => erasure,
         deleteRetryMs: RETRY,
+        dbFile: dbFile(),
       });
       await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
         observedAt: 1100,
@@ -750,7 +814,10 @@ describe("erasure wired into the connection delete", () => {
       await a.cycle();
       await a.sync.deleter.requestConnectionDelete(CONNECTOR);
       await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
-      return judged(a.sync.deleter);
+      return {
+        storage: await judged(a.sync.deleter),
+        subject: subjectOf(a.sync, a.db, a.restart),
+      };
     }
 
     /** Another device erased the whole log; this one finds nothing it enumerated. */
@@ -764,6 +831,7 @@ describe("erasure wired into the connection delete", () => {
       const b = await w.device("b", {
         erasure: () => erasure,
         deleteRetryMs: RETRY,
+        dbFile: dbFile(),
       });
       await a.run("run-1", [big], { observedAt: 1100 });
       await a.cycle();
@@ -779,7 +847,7 @@ describe("erasure wired into the connection delete", () => {
       await b.cycle();
       const part = await judged(b.sync.deleter);
       expect(await b.db.query("SELECT 1 FROM enumerated_logs")).toEqual([]);
-      return part;
+      return { storage: part, subject: subjectOf(b.sync, b.db, b.restart) };
     }
 
     /**
@@ -810,6 +878,7 @@ describe("erasure wired into the connection delete", () => {
       const b = await w.device("b", {
         erasure: () => erasure,
         deleteRetryMs: RETRY,
+        dbFile: dbFile(),
       });
       await a.run("run-1", [big], { observedAt: 1100 });
       await a.cycle();
@@ -836,7 +905,7 @@ describe("erasure wired into the connection delete", () => {
       await b.cycle();
       const part = await judged(b.sync.deleter);
       expect(await b.db.query("SELECT 1 FROM enumerated_logs")).toEqual([]);
-      return part;
+      return { storage: part, subject: subjectOf(b.sync, b.db, b.restart) };
     }
 
     /**
@@ -845,7 +914,11 @@ describe("erasure wired into the connection delete", () => {
      */
     async function reconnectBefore() {
       const state: { finalized: string | null } = { finalized: null };
-      const { w, a, deleted } = await collected(state);
+      const { w, a, deleted } = await collected(
+        state,
+        {},
+        { dbFile: dbFile() },
+      );
       const old = logKeys(w, LOG);
       await a.sync.deleter.requestConnectionDelete(CONNECTOR);
       await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
@@ -856,7 +929,7 @@ describe("erasure wired into the connection delete", () => {
       const part = await judged(a.sync.deleter);
       expect(deleted).toEqual([]);
       for (const key of old) expect(logKeys(w, LOG)).toContain(key);
-      return part;
+      return { storage: part, subject: subjectOf(a.sync, a.db, a.restart) };
     }
 
     /** The connection is added again while the erasure is deleting. */
@@ -865,7 +938,7 @@ describe("erasure wired into the connection delete", () => {
       const { w, a, deleted } = await collected(
         { finalized: "99" },
         { beforeFirstDelete: () => readd() },
-        { twoSegments: true },
+        { twoSegments: true, dbFile: dbFile() },
       );
       const oldHead = `${LOG}/${headOf(w)}`;
       readd = async () => {
@@ -878,7 +951,7 @@ describe("erasure wired into the connection delete", () => {
       // The pass stopped before the head: the old head is still in storage.
       expect(logKeys(w, LOG)).toContain(oldHead);
       expect(deleted.filter((name) => name.startsWith("v-"))).toEqual([]);
-      return part;
+      return { storage: part, subject: subjectOf(a.sync, a.db, a.restart) };
     }
 
     /** The eraser reports what a reconnect ended: unit mapping to the part. */
@@ -886,18 +959,22 @@ describe("erasure wired into the connection delete", () => {
       kind: "stopped";
       why: "re-added" | "rolled-back";
     }) {
-      const c = await collected({ finalized: "99" });
+      const c = await collected({ finalized: "99" }, {}, { dbFile: dbFile() });
       await c.a.sync.deleter.requestConnectionDelete(CONNECTOR);
       await vi.waitFor(async () => expect(await intents(c.a)).toEqual([]));
       const deleter = createConnectionDeleter(c.a.deps, {
         eraseLogs: async () => ({
           connections: [{ connector: CONNECTOR, ns: "", outcome }],
           pending: false,
+          skipped: [],
         }),
       });
       deleter.noteSettled(CONNECTOR, TOMBSTONE);
       await deleter.resumeErasures();
-      return (await deleter.deleteStatus(CONNECTOR)).storage;
+      return {
+        storage: (await deleter.deleteStatus(CONNECTOR)).storage,
+        subject: subjectOf({ deleter }, c.a.db, c.a.restart),
+      };
     }
 
     /**
@@ -922,13 +999,16 @@ describe("erasure wired into the connection delete", () => {
       await next.sync.deleter.resumeDeletes();
       const part = await judged(next.sync.deleter);
       for (const key of old) expect(logKeys(w, LOG)).toContain(key);
-      return part;
+      return {
+        storage: part,
+        subject: subjectOf(next.sync, next.db, a.restart),
+      };
     }
 
     const rows: {
       name: string;
       expected: DeletePart;
-      run: () => Promise<DeletePart>;
+      run: () => Promise<{ storage: DeletePart; subject: Subject }>;
     }[] = [
       {
         name: "complete and acknowledged",
@@ -973,7 +1053,14 @@ describe("erasure wired into the connection delete", () => {
     ];
 
     it.each(rows)("$name", async ({ expected, run }) => {
-      expect(await run()).toEqual(expected);
+      const { storage, subject } = await run();
+      expect(storage).toEqual(expected);
+      // A part that reads pending has work queued behind it: as the scenario
+      // ends, and again in the process that starts over the same database.
+      await pendingHasWork(subject);
+      const next = await subject.restart();
+      await next.sync.deleter.resumeDeletes();
+      await pendingHasWork(next);
     });
 
     it("lets only a complete, acknowledged enumeration read done", () => {
@@ -990,7 +1077,7 @@ describe("erasure wired into the connection delete", () => {
       await vi.waitFor(async () => expect(await intents(c.a)).toEqual([]));
       return c.a;
     };
-    const none = { connections: [], pending: false } as const;
+    const none = { connections: [], pending: false, skipped: [] } as const;
     /** A pass that erased the connector's log whole, on its own evidence. */
     const erased = {
       connections: [
@@ -1007,6 +1094,7 @@ describe("erasure wired into the connection delete", () => {
         },
       ],
       pending: false,
+      skipped: [],
     } as const;
 
     it("a delete noted while an erasure runs is erased by a pass that starts after it", async () => {
@@ -1015,9 +1103,9 @@ describe("erasure wired into the connection delete", () => {
       const eraseLogs = vi
         .fn()
         .mockImplementationOnce(
-          () => new Promise((resolve) => (release = () => resolve(none))),
+          () => new Promise((resolve) => (release = () => resolve(erased))),
         )
-        .mockResolvedValue(none);
+        .mockResolvedValue(erased);
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
       deleter.noteSettled(CONNECTOR, TOMBSTONE);
       const first = deleter.resumeErasures();
@@ -1129,7 +1217,8 @@ describe("erasure wired into the connection delete", () => {
       const eraseLogs = vi.fn().mockImplementationOnce(
         () =>
           new Promise((resolve) => {
-            release = () => resolve({ connections: [], pending: true });
+            release = () =>
+              resolve({ connections: [], pending: true, skipped: [] });
           }),
       );
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
@@ -1216,7 +1305,7 @@ describe("erasure wired into the connection delete", () => {
           _connector: string,
           _signal: AbortSignal,
           _gate?: { skipNamespaces: ReadonlySet<string> },
-        ) => ({ connections: [], pending: false }),
+        ) => ({ connections: [], pending: false, skipped: [] }),
       );
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
       // The sweep that runs first once per process, then the owed connector.

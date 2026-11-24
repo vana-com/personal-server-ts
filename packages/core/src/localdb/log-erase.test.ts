@@ -776,6 +776,25 @@ describe("eraseDeletedConnectionLogs", () => {
       expect(w.objects("alpha", NS)).toEqual(before);
     });
 
+    it("lists a deleted namespace a local connection holds as skipped, and deletes nothing of it", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const before = w.objects("alpha", NS);
+
+      const report = await eraseDeletedConnectionLogs(w.deps, {
+        connector: "alpha",
+        skipNamespaces: new Set([NS]),
+        tombstones: new Map([[NS, 2]]),
+      });
+
+      expect(report.skipped).toEqual([NS]);
+      expect(report.connections).toEqual([]);
+      expect(report.pending).toBe(false);
+      expect(w.calls).toEqual([]);
+      expect(w.objects("alpha", NS)).toEqual(before);
+    });
+
     it("a reconnect while the pass deletes ends it as re-added", async () => {
       const w = world();
       await w.compactedLog("alpha", NS);
@@ -808,6 +827,7 @@ describe("eraseDeletedConnectionLogs", () => {
       await expect(eraseDeletedConnectionLogs(deps)).resolves.toEqual({
         connections: [],
         pending: true,
+        skipped: [],
       });
     });
   });

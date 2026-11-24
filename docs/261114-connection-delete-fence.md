@@ -168,13 +168,35 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   began under the older one cannot write a verdict. A refused request changes
   nothing.
 - The identity survives a restart. Each learned tombstone is a row of
-  `delete_tombstones(connector, ns, version)`, written in the transaction that
-  taught it (the fence landing with the intent, the purge with the connection's
-  removal; a higher version replaces a lower). A start loads the table before
-  the first pass, and the start sweep owes every connector that has a row, so a
-  connection added again after its delete does not hide the delete's work. The
-  rows are removed, at the version judged, when all three parts are `done`. They
-  do not use `connections.control_version`, which a reconnect moves.
+  `delete_tombstones(connector, ns, version, done_at)`, written in the
+  transaction that taught it (the fence landing with the intent, the purge with
+  the connection's removal; a higher version replaces a lower and resets
+  `done_at`). A start loads the table before the first pass, and the start sweep
+  owes every connector that has a row with `done_at IS NULL`, so a connection
+  added again after its delete does not hide the delete's work. When all three
+  parts are `done` at the versions held, the rows are kept and `done_at` is set:
+  the final verdict is durable, so a reconnect and a restart still read `done`
+  and owe nothing. They do not use `connections.control_version`, which a
+  reconnect moves. Migration 41 adds `done_at`.
+- A part that reads `pending` always has work queued, found from the same rows
+  that gave the status. The erasure report names every deleted namespace it left
+  alone (`skipped`: a live local connection holds it). A skipped tombstone reads
+  `storage: blocked(re_added)` and owes no pass (a reconnect replaced the
+  lifetime); one the report neither erased nor skipped reads `pending` and the
+  pass retries. Retry flags come from the parts, not from a separate flag.
+  Only `done` is durable: `blocked` is judged again at each start, and a
+  gateway refusal is asked once per process for one delete identity.
+- A refusal is terminal for the same delete. Re-applying the same deleted
+  control row calls `noteSettled` with the same tombstone version; that owes
+  only stages with no final verdict, and keeps the refusal. A higher tombstone
+  version is a new delete: it clears the verdicts and the refusal and owes both
+  stages.
+- The terminal gateway codes are one list, `GATEWAY_REFUSAL_CODES` in
+  `sync/gateway-refusal.ts`. The gateway parser, the retirement scheduler, the
+  rollback resubmitter and `DeleteBlockReason` all derive from it. The answer
+  that data-gateway #212 will give for a tombstone aimed at a head already
+  deleted maps to `done` in one marked place, `GATEWAY_ALREADY_DELETED_CODES`
+  (empty until the gateway fixes the code name).
 - The rollback resubmitter stops at a terminal gateway refusal of the
   re-submitted delete (`gateway-refused`) after one attempt; only other
   failures use the attempt budget.

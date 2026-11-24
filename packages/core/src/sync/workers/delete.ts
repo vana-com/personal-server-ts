@@ -18,6 +18,7 @@ import {
   GatewayRefusalError,
   isGatewayReservedScope,
 } from "../delete-data-port.js";
+import { isGatewayRefusalCode } from "../gateway-refusal.js";
 import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
 import {
   DEFAULT_TOMBSTONE_RESUBMIT_MAX_ATTEMPTS,
@@ -86,7 +87,7 @@ export interface DeleteScopeStep {
   error?: string;
   /**
    * The gateway's terminal refusal when status is "failed" and the gateway
-   * named one (`GatewayRefusalCode`): a retry will not change it.
+   * named one (`GATEWAY_REFUSAL_CODES`) or the already-deleted answer: a retry will not change it.
    */
   code?: GatewayRefusalError["code"];
 }
@@ -1348,8 +1349,8 @@ async function resubmitRolledBackDeletion(
     });
     if (outcome.steps.gateway.status === "failed") {
       const { code, error } = outcome.steps.gateway;
-      if (code !== undefined) {
-        // A terminal refusal (`GatewayRefusalCode`): the owner switched under
+      if (isGatewayRefusalCode(code)) {
+        // A terminal refusal (`GATEWAY_REFUSAL_CODES`): the owner switched under
         // a policy that admits no legacy delete, or the server key is revoked
         // or was never registered. Asking again changes nothing, and the
         // legacy stage of a connection delete asks once for the same reason.
