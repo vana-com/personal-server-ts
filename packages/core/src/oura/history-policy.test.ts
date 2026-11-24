@@ -191,6 +191,26 @@ const cases: [string, unknown, { since: string | null } | null][] = [
     },
     null,
   ],
+  ...[null, [], "2026-01-03"].map((range): [string, unknown, null] => [
+    `a non-object range ${JSON.stringify(range)} on one otherwise valid stream`,
+    {
+      streams: unrestricted.streams.map((stream, index) =>
+        index === 0 ? { ...stream, time_range: range } : stream,
+      ),
+    },
+    null,
+  ]),
+  [
+    "a twice-prefixed stream name",
+    {
+      streams: [
+        { name: "oura.oura.sleep" },
+        { name: "readiness" },
+        { name: "activity" },
+      ],
+    },
+    null,
+  ],
 ];
 
 describe("Oura takeover selection policy", () => {
