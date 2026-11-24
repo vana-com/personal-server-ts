@@ -50,6 +50,8 @@ import {
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { PARTS_IN_FLIGHT } from "../stream-sync/storage-retry.js";
+import { openSpool, SpooledObjectGoneError, type Spool } from "./log-spool.js";
 import { resolveBodies } from "./log-bodies.js";
 import { rebaseOnLog } from "./log-rebase.js";
 import { seedFromRecords } from "./log-seed.js";
@@ -869,6 +871,72 @@ async function loadProgressively(
   snapshot: SnapshotPointer | null,
   tail: readonly SegmentRef[],
 ): Promise<number> {
+  // The ciphertext of the removing segments waits on disk between the prepass
+  // that reads them and the batches that apply them: a phone's memory is not
+  // the place for a long tail, and a second download is its data plan.
+  const ciphers = openSpool(deps.db, connectionId);
+  try {
+    return await loadProgressivelyWith(
+      ciphers,
+      deps,
+      connectionId,
+      scope,
+      context,
+      head,
+      allRefs,
+      snapshot,
+      tail,
+    );
+  } finally {
+    await ciphers.discard();
+  }
+}
+
+/**
+ * The blob store as the prepass sees it: a read keeps the ciphertext in
+ * `ciphers`. And as the batches see it: a read takes the kept ciphertext,
+ * once, and falls back to storage for a segment the prepass did not read (or
+ * one a purge took).
+ */
+function cipherCache(deps: LocalSyncDeps, ciphers: Spool) {
+  const through = (get: LocalSyncDeps["blobs"]["get"]): LocalSyncDeps => ({
+    ...deps,
+    blobs: { ...deps.blobs, get },
+  });
+  return {
+    remembering: through(async (key) => {
+      const bytes = await deps.blobs.get(key);
+      if (bytes !== null) await ciphers.add(key, bytes);
+      return bytes;
+    }),
+    replaying: through(async (key) => {
+      const kept = ciphers.get(key);
+      if (kept) {
+        try {
+          const bytes = await kept.read();
+          await ciphers.forget(key);
+          return bytes;
+        } catch (error) {
+          if (!(error instanceof SpooledObjectGoneError)) throw error;
+        }
+      }
+      return deps.blobs.get(key);
+    }),
+  };
+}
+
+async function loadProgressivelyWith(
+  ciphers: Spool,
+  deps: LocalSyncDeps,
+  connectionId: string,
+  scope: string,
+  context: LogApplyContext,
+  head: Segment,
+  allRefs: readonly SegmentRef[],
+  snapshot: SnapshotPointer | null,
+  tail: readonly SegmentRef[],
+): Promise<number> {
+  const cache = cipherCache(deps, ciphers);
   const partRefs = snapshot?.parts ?? [];
   // A part is fetched once, whoever asks first: the plan asks for the first,
   // the pass for the others as read-ahead reaches them.
@@ -897,7 +965,7 @@ async function loadProgressively(
     let fetching = segments.get(ref.position);
     if (!fetching) {
       fetching = fetchSegment(
-        deps,
+        cache.replaying,
         scope,
         context,
         ref.dataHash,
@@ -916,7 +984,7 @@ async function loadProgressively(
   );
   const deletionsOf = async (ref: SegmentRef) => {
     const { segment } = await fetchSegment(
-      deps,
+      cache.remembering,
       scope,
       context,
       ref.dataHash,
@@ -925,14 +993,28 @@ async function loadProgressively(
     );
     return segment.operations;
   };
-  let removals: Map<number, Promise<Segment["operations"]>> | undefined =
-    new Map(
-      removing.map((ref) => {
-        const reading = deletionsOf(ref);
-        reading.catch(() => undefined);
-        return [ref.position, reading] as const;
-      }),
+  // `PARTS_IN_FLIGHT` segments are read at a time; after a failure no read
+  // starts and the ones in flight end before the prepass does.
+  const deletions = new Map<number, Segment["operations"]>();
+  const prepass = (async () => {
+    let next = 0;
+    let failure: { readonly reason: unknown } | undefined;
+    const lane = async () => {
+      while (!failure && next < removing.length) {
+        const ref = removing[next++]!;
+        try {
+          deletions.set(ref.position, await deletionsOf(ref));
+        } catch (reason) {
+          failure ??= { reason };
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PARTS_IN_FLIGHT, removing.length) }, lane),
     );
+    if (failure) throw failure.reason;
+  })();
+  prepass.catch(() => undefined);
 
   // Every batch's identity: the hash and blob its stream head will name.
   const identities = [
@@ -1064,7 +1146,7 @@ async function loadProgressively(
     partRefs.length > 0
       ? partAt(0).then((part) => JSON.stringify(part.streams))
       : Promise.resolve(undefined),
-    ...removals!.values(),
+    prepass,
   ]).catch(async (error) => {
     const code = failureCode(error);
     const stopped = [...new Set([...begun, ...resumed])].map(headOf);
@@ -1095,12 +1177,12 @@ async function loadProgressively(
           operations:
             ref.position === head.position
               ? head.operations
-              : await removals!.get(ref.position)!,
+              : deletions.get(ref.position)!,
         })),
     ),
   );
   // What the removing segments said is in `removed`: they are not kept.
-  removals = undefined;
+  deletions.clear();
 
   // What each batch does for the streams that load progressively: a function
   // of its place in the pass and its own operations, so the batches can be

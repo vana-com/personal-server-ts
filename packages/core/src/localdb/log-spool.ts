@@ -32,6 +32,17 @@ export interface SpooledObject {
   read(): Promise<Uint8Array>;
 }
 
+/**
+ * A read found a spooled row missing: the spool was discarded, as a purge of
+ * the connection does. The caller decides whether the lifetime has ended.
+ */
+export class SpooledObjectGoneError extends Error {
+  constructor(name: string) {
+    super(`publish: spooled object ${name} is gone`);
+    this.name = "SpooledObjectGoneError";
+  }
+}
+
 /** Names deleted in one request: a name is a short key, so a count is a bound here. */
 const DELETES_PER_BATCH = 200;
 
@@ -42,6 +53,10 @@ export interface Spool {
   add(name: string, cipher: Uint8Array): Promise<void>;
   /** What was added, in order of addition, one entry per name. */
   objects(): readonly SpooledObject[];
+  /** The object added under `name`, if it is still held. */
+  get(name: string): SpooledObject | undefined;
+  /** Delete the object added under `name`. */
+  forget(name: string): Promise<void>;
   /** Delete the objects whose names are not in `names`. */
   keepOnly(names: ReadonlySet<string>): Promise<void>;
   /** Delete the spool's rows. */
@@ -93,8 +108,7 @@ export function openSpool(
                 WHERE connection_id = ? AND session = ? AND name = ? AND chunk = ?`,
               [...mine, name, chunk],
             );
-            if (!row)
-              throw new Error(`publish: spooled object ${name} is gone`);
+            if (!row) throw new SpooledObjectGoneError(name);
             whole.set(row.cipher, at);
             at += row.cipher.length;
           }
@@ -105,6 +119,16 @@ export function openSpool(
       });
     },
     objects: () => [...added.values()],
+    get: (name) => added.get(name),
+    async forget(name) {
+      added.delete(name);
+      await db.batch([
+        {
+          sql: `DELETE FROM ${SPOOL} WHERE connection_id = ? AND session = ? AND name = ?`,
+          params: [...mine, name],
+        },
+      ]);
+    },
     async keepOnly(names) {
       const drop = [...added.keys()].filter((name) => !names.has(name));
       for (let at = 0; at < drop.length; at += DELETES_PER_BATCH) {
