@@ -330,7 +330,7 @@ it("rejects foreign-owner discovery and cyclic scope cursors", async () => {
 });
 
 describe("version inventory head", () => {
-  function client(head: unknown) {
+  function client(head: unknown, bounded = false) {
     const fetcher = vi.fn().mockImplementation(
       async () =>
         new Response(
@@ -347,13 +347,16 @@ describe("version inventory head", () => {
         ),
     );
     const signRequest = vi.fn().mockResolvedValue("Web3Signed server-proof");
+    const boundedOwnerSigner = vi.fn().mockResolvedValue("fixture");
     return {
       fetcher,
       signRequest,
+      boundedOwnerSigner,
       inventory: createVersionInventoryClient({
         gatewayUrl: "https://gateway.example",
         ownerAddress: owner,
         ownerSigner: { signRequest },
+        ...(bounded ? { boundedOwnerSigner } : {}),
         fetch: fetcher,
       }),
     };
@@ -375,6 +378,40 @@ describe("version inventory head", () => {
     });
     expect(signRequest).toHaveBeenCalledTimes(1);
     expect(String(fetcher.mock.calls[0]![0])).toContain("limit=1");
+  });
+
+  it("forwards an optional head budget for an ordinary signed page", async () => {
+    const { inventory, fetcher, signRequest, boundedOwnerSigner } = client(
+      {
+        expectedVersion: "23",
+        dataHash: hashA,
+        metadataHash: hashB,
+        status: "finalized",
+        deletedAt: null,
+      },
+      true,
+    );
+    const budget = new AdditionsBudget(8192);
+
+    await expect(
+      inventory.head(" scope ", undefined, budget),
+    ).resolves.toMatchObject({ expectedVersion: "23", deletedAt: null });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(boundedOwnerSigner).toHaveBeenCalledTimes(1);
+    expect(signRequest).not.toHaveBeenCalled();
+    expect(budget.remaining).toBeLessThan(8192);
+  });
+
+  it("requires the bounded signer when a head budget is supplied", async () => {
+    const { inventory, fetcher, signRequest } = client(null);
+
+    await expect(
+      inventory.head(" scope ", undefined, new AdditionsBudget(8192)),
+    ).rejects.toThrow("Bounded inventory signing capability unavailable");
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(signRequest).not.toHaveBeenCalled();
   });
 
   it("returns null for a point the gateway never registered", async () => {
