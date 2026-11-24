@@ -102,6 +102,11 @@ describe("legacy store import report", () => {
       alreadyImported: 0,
       refused: [],
     });
+    // Every old row of the sources offered is imported or counted out: none is
+    // left out unexplained.
+    expect(first.rows.imported).toBeGreaterThan(0);
+    expect(first.rows.legacy).toBe(first.rows.imported);
+    expect(first.rows.quarantined).toEqual({});
     expect(first.excluded).toEqual([
       { reason: "older_instance", streams: 1, rows: 2 },
       { reason: "undeclared_source", streams: 1, rows: 3 },

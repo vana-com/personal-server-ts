@@ -19,6 +19,11 @@ import type {
   LegacyRetireAccess,
   LocalSyncDeps,
 } from "@opendatalabs/personal-server-ts-core/localdb";
+import {
+  quarantineFromReceipt,
+  quarantineTally,
+  type QuarantineCounts,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { manifestArtifact } from "@opendatalabs/personal-server-ts-core/stream-sync";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { LegacyWriteSeal } from "@opendatalabs/personal-server-ts-core/storage/legacy-write-seal";
@@ -40,6 +45,12 @@ import { importProjection } from "./sync.js";
  * - `files`: old data files seen at retirement, and those with no importable
  *   source (file-only scopes). `null` when the retirement pass failed.
  *
+ * - `rows`: for the sources the runner offered to the database (the newest
+ *   live instance of each declared source): rows the old store held, rows now
+ *   imported, and rows left out for want of a full identity, by reason. Every
+ *   old row is in one of the three, or its stream is in `refused`. The
+ *   receipt keeps the same reasons, so the count outlives the old files.
+ *
  * A source with no rows is not counted: the inventory lists every declared
  * stream of each connection, and an empty one loses nothing.
  *
@@ -54,6 +65,12 @@ export interface LegacyStoreImportReport {
   readonly alreadyImported: number;
   readonly excluded: readonly LegacyStoreImportCount[];
   readonly refused: readonly LegacyStoreImportCount[];
+  readonly rows: {
+    /** Inventory rows; null once a source did not carry a count. */
+    readonly legacy: number | null;
+    readonly imported: number;
+    readonly quarantined: QuarantineCounts;
+  };
   readonly files: {
     readonly total: number;
     readonly unimported: number;
@@ -259,6 +276,9 @@ async function importSources(
   const count = (name: string) => (counts[name] = (counts[name] ?? 0) + 1);
   const excluded = tally();
   const refused = tally();
+  const quarantined = quarantineTally();
+  let legacyRows: number | null = 0;
+  let importedRows = 0;
   for await (const entry of access.sources()) {
     if (signal.aborted) break;
     if ("kind" in entry) {
@@ -267,6 +287,10 @@ async function importSources(
       continue;
     }
     const source = entry as ImportSource;
+    legacyRows =
+      legacyRows === null || source.rows === undefined
+        ? null
+        : legacyRows + source.rows;
     sources.set(
       sourceKey(
         source.source,
@@ -284,6 +308,11 @@ async function importSources(
     );
     if (prior && prior.state !== "excluded") {
       count("already-imported");
+      importedRows += prior.rows;
+      for (const [reason, rows] of Object.entries(
+        quarantineFromReceipt(prior.reason),
+      ))
+        quarantined.add(reason, rows);
       continue;
     }
     // The import needs the connector's control row. Read the registry once per
@@ -298,6 +327,11 @@ async function importSources(
     const result = await importLegacySource(deps, ledger, source);
     count(result.kind === "refused" ? `refused:${result.reason}` : result.kind);
     if (result.kind === "refused") refused.add(result.reason, source.rows);
+    else {
+      importedRows += result.receipt.rows;
+      for (const [reason, rows] of Object.entries(result.quarantine))
+        quarantined.add(reason, rows);
+    }
   }
   logger.info(
     { ...counts, stopped: signal.aborted },
@@ -312,6 +346,11 @@ async function importSources(
       alreadyImported: counts["already-imported"] ?? 0,
       excluded: excluded.counts(),
       refused: refused.counts(),
+      rows: {
+        legacy: legacyRows,
+        imported: importedRows,
+        quarantined: quarantined.counts(),
+      },
       files: null,
     }),
   };
