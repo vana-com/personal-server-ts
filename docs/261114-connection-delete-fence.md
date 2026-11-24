@@ -139,16 +139,24 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   tombstone and the queue write, or another device's unfinished drain, leaves
   work that the next device to look re-derives this way. A restart confirms
   again; that costs delete requests, not state.
-- Storage reads `body_pieces_retained` on every pass that follows the first,
-  from the persisted record of pieces left (`retained_log_pieces`). That record
-  is per device: a device that did not run the erasure cannot learn the names
-  from storage, because the segments that named them are gone. Such a device
-  (no record, and the version inventory shows a log existed) reads storage as
-  `blocked(erased_elsewhere)`, never `done`: it cannot re-check the pieces. A
-  device marks the scopes it enumerated (`enumerated_logs`) before it deletes
-  anything, so the device that erased a log keeps answering for it after a
-  restart. A log erased before this record existed reads the same way on the
-  device that erased it.
+- Storage reads `done` only when this delete's own evidence shows that every
+  log object of the deleted lifetime is gone: this device enumerated the log
+  whole before it erased (`enumerated_logs`, one mark per registry head, so one
+  lifetime's enumeration never vouches for the next) and storage acknowledged
+  each object. Every other path reads `blocked`, never `done`:
+  - `body_pieces_retained`: this device erased the log and left body pieces
+    (`retained_log_pieces`), the record that makes later passes answer for them.
+  - `erased_elsewhere`: objects were already gone when this device looked and
+    it has no mark for this head (another device erased, or was cut off after
+    the parts and segments but before the head), or the log is gone and the
+    registry shows one existed. This device cannot re-check the pieces.
+  - `re_added`: a reconnect replaced the deleted lifetime before or during the
+    pass. The old objects stay, and the new lifetime hides what is safe to
+    erase.
+  - `tombstone_rolled_back`, `log_unreadable` as before.
+    A log the registry never held an object of counts as enumerated whole. A
+    namespace this device knows a tombstone for but no pass has judged is
+    `pending`.
 - A delete is identified by its control tombstones: the registry version each
   namespace's tombstone landed at, learned when this device lands the fence or
   purges the connection the tombstone ended. Both stages judge that tombstone's
@@ -158,8 +166,18 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   `blocked(tombstone_rolled_back)`. The cached verdict is kept under the same
   identity: a higher tombstone is a newer delete and drops it, and a pass that
   began under the older one cannot write a verdict. A refused request changes
-  nothing. The identity is in memory: after a restart the stages read the head
-  until the next purge or landing teaches it again.
+  nothing.
+- The identity survives a restart. Each learned tombstone is a row of
+  `delete_tombstones(connector, ns, version)`, written in the transaction that
+  taught it (the fence landing with the intent, the purge with the connection's
+  removal; a higher version replaces a lower). A start loads the table before
+  the first pass, and the start sweep owes every connector that has a row, so a
+  connection added again after its delete does not hide the delete's work. The
+  rows are removed, at the version judged, when all three parts are `done`. They
+  do not use `connections.control_version`, which a reconnect moves.
+- The rollback resubmitter stops at a terminal gateway refusal of the
+  re-submitted delete (`gateway-refused`) after one attempt; only other
+  failures use the attempt budget.
 - `deleter.deleteStatus(connector)` answers `{ fence, legacy, storage }`, each
   `done`, `pending` or `blocked(reason)` (`localdb/delete-status.ts`). The owner
   connector routes carry it as `deleteStatus` (202 body and `GET`). An app says

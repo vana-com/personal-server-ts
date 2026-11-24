@@ -38,7 +38,14 @@ export type DeleteBlockReason =
    * left, and only that device recorded them, so this device cannot say they
    * are gone.
    */
-  | "erased_elsewhere";
+  | "erased_elsewhere"
+  /**
+   * The connection was added again before its log was erased, or while it was.
+   * The old lifetime's objects share the log scope with the new one, so none
+   * is deleted and none can be shown gone. A later delete of the connection
+   * erases both lifetimes.
+   */
+  | "re_added";
 
 export type DeletePart =
   | { readonly state: "done" }

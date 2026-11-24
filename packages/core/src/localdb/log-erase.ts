@@ -138,7 +138,18 @@ export type LogObjectEraser = Pick<DeleteDataPort, "deleteBlobVersions">;
  * name twice is fine. A failure fails the pass before any delete.
  */
 export interface RetainedPieces {
-  keep(scope: string, names: readonly string[]): Promise<void>;
+  /**
+   * Write down `names`, the body pieces of the log whose registry head is
+   * `head`. `complete` says the pass saw every object the head reaches
+   * (nothing it listed was already gone): only then is the log marked as
+   * enumerated by this device (`enumerated`).
+   */
+  keep(
+    scope: string,
+    head: string,
+    names: readonly string[],
+    options: { readonly complete: boolean },
+  ): Promise<void>;
   /**
    * How many piece names the record holds for `scope`: every name any pass
    * wrote down, so a repeat pass that finds the log gone still answers for
@@ -146,11 +157,13 @@ export interface RetainedPieces {
    */
   count(scope: string): Promise<number>;
   /**
-   * Whether this device enumerated `scope`'s pieces (`keep` ran, even with no
-   * names) before it removed the log. Without it, an empty record says nothing
-   * of what another device left.
+   * Whether this device enumerated everything the log with registry head
+   * `head` reaches before it removed any of it (`keep` ran with `complete`).
+   * Without it, an empty record says nothing of what another device left.
+   * The head names the lifetime: a log that went on after a re-add has a
+   * newer head, and what this device enumerated before says nothing of it.
    */
-  enumerated(scope: string): Promise<boolean>;
+  enumerated(scope: string, head: string): Promise<boolean>;
 }
 
 /** Rows per batch: a large body can name many pieces. */
@@ -172,14 +185,14 @@ export function retainedPiecesIn(
       );
       return Number(row?.n ?? 0);
     },
-    async enumerated(scope) {
+    async enumerated(scope, head) {
       const rows = await db.query(
-        "SELECT 1 FROM enumerated_logs WHERE scope = ?",
-        [scope],
+        "SELECT 1 FROM enumerated_logs WHERE scope = ? AND head = ?",
+        [scope, head],
       );
       return rows.length > 0;
     },
-    async keep(scope, names) {
+    async keep(scope, head, names, { complete }) {
       for (let at = 0; at < names.length; at += KEEP_BATCH)
         await db.batch(
           names.slice(at, at + KEEP_BATCH).map((name) => ({
@@ -187,13 +200,14 @@ export function retainedPiecesIn(
             params: [scope, name],
           })),
         );
-      // Last: a scope marked here has every name above recorded.
-      await db.batch([
-        {
-          sql: "INSERT OR IGNORE INTO enumerated_logs(scope, recorded_at) VALUES (?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
-          params: [scope],
-        },
-      ]);
+      // Last: a log marked here has every name above recorded.
+      if (complete)
+        await db.batch([
+          {
+            sql: "INSERT OR IGNORE INTO enumerated_logs(scope, head, recorded_at) VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+            params: [scope, head],
+          },
+        ]);
     },
   };
 }
@@ -261,11 +275,14 @@ export type ErasureOutcome =
       readonly retained: number;
       readonly unenumerated: number;
       /**
-       * Set when the log was already gone, this device holds no record of its
-       * pieces, and the inventory shows a log existed: another device erased
-       * it, and only that device knows whether pieces were left.
+       * Whether this device's own evidence covers the log: it enumerated every
+       * object the log's head reaches before it deleted any of them
+       * (`RetainedPieces.enumerated`), or the registry shows the log never
+       * held an object. `false`: something was gone before this device could
+       * name it (another device stopped part way, or finished), and only that
+       * device knows whether body pieces were left.
        */
-      readonly unwitnessed?: true;
+      readonly witnessed: boolean;
     }
   /** Not finished; the same call again continues. */
   | {
@@ -277,7 +294,9 @@ export type ErasureOutcome =
   | {
       readonly kind: "stopped";
       /**
-       * `re-added`: the control row moved since the pass began.
+       * `re-added`: the control row moved, or a reconnect ended the delete's
+       * tombstone before the pass could start. The log scope is shared with
+       * the new lifetime, so nothing is deleted and nothing is known gone.
        * `rolled-back`: the tombstone failed; the connection is live again.
        * `head-unreadable`: the newest segment does not open with this key.
        */
@@ -320,7 +339,8 @@ export async function eraseDeletedConnectionLogs(
      * The control tombstone of the delete being erased, by namespace (see
      * `LegacyMemory.tombstones`). A namespace named here whose head is no
      * longer deleted is judged by its tombstone's own finality: rolled back
-     * is reported, and a final one means the connection was added again.
+     * and re-added (the tombstone is final, a reconnect replaced it) are both
+     * reported, and neither erases anything.
      */
     readonly tombstones?: ReadonlyMap<string, number>;
     readonly signal?: AbortSignal;
@@ -362,15 +382,17 @@ export async function eraseDeletedConnectionLogs(
           controlScope(options.connector, ns),
           String(version),
         );
-        const outcome: ErasureOutcome | null = finality.rolledBack
+        // A final tombstone under a head that is not deleted: a reconnect
+        // ended the lifetime before this pass could erase it. Its objects
+        // stay: the log scope belongs to the new lifetime too, so nothing here
+        // can tell them apart or delete them.
+        const outcome: ErasureOutcome = finality.rolledBack
           ? { kind: "stopped", why: "rolled-back" }
           : finalizedAtOrAbove(finality.finalized, version)
-            ? null
+            ? { kind: "stopped", why: "re-added" }
             : { kind: "pending", why: "finality" };
-        if (outcome) {
-          report(deps, options.connector, outcome);
-          connections.push({ connector: options.connector, ns, outcome });
-        }
+        report(deps, options.connector, outcome);
+        connections.push({ connector: options.connector, ns, outcome });
       }
   } catch (error) {
     deps.logger.warn(
@@ -475,19 +497,20 @@ async function eraseOne(
             detail: "log head is missing with listed segments still present",
           };
       }
-      // The pieces an earlier pass left are still in storage: say so. A log
-      // that existed and was erased by another device leaves no name here.
-      const retained = await deps.retained.count(scope);
-      const unwitnessed =
-        retained === 0 &&
-        segments.size > 0 &&
-        !(await deps.retained.enumerated(scope));
+      // The pieces an earlier pass left are still in storage: say so. Only
+      // this device's own enumeration of this log (this head) vouches for
+      // them; a log that is gone with no such record was erased by another
+      // device. A log the registry never held an object of has nothing to
+      // vouch for.
       return {
         kind: "erased",
         deleted: 0,
-        retained,
+        retained: await deps.retained.count(scope),
         unenumerated: 0,
-        ...(unwitnessed && { unwitnessed: true as const }),
+        witnessed:
+          headRef === null
+            ? segments.size === 0
+            : await deps.retained.enumerated(scope, headRef.dataHash),
       };
     }
     if (opened === "unreadable")
@@ -554,7 +577,16 @@ async function eraseOne(
       };
 
     // Written down before anything that names them is deleted (see 3 above).
-    await deps.retained.keep(scope, [...pieces]);
+    // An object that was already gone when this pass looked (another device
+    // stopped part way through, or an earlier pass here) cannot be read for
+    // the pieces it named. This device vouches for the log only if it
+    // enumerated it whole before: an earlier pass here marked this head.
+    const witnessed =
+      gone.size === 0 ||
+      (await deps.retained.enumerated(scope, headRef!.dataHash));
+    await deps.retained.keep(scope, headRef!.dataHash, [...pieces], {
+      complete: witnessed,
+    });
 
     const rest = [...segments.keys()].filter(
       (name) => name !== headName && !gone.has(name),
@@ -604,6 +636,7 @@ async function eraseOne(
       deleted,
       retained: await deps.retained.count(scope),
       unenumerated,
+      witnessed,
     };
   } catch (error) {
     if (error instanceof Moved) return { kind: "stopped", why: "re-added" };

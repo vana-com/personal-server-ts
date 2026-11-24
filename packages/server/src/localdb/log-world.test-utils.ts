@@ -122,13 +122,18 @@ export async function world(options: {
       legacyDelete?: () => LegacyDeletePorts | undefined;
       /** Waits between retries of a delete or erasure (shortened for tests). */
       deleteRetryMs?: { first: number; max: number };
+      /**
+       * A database file for this device (default: in memory). With a file the
+       * device can `restart`: a new process over the same database.
+       */
+      dbFile?: string;
     } = {},
   ) {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-      owner: OWNER,
-      network: "test",
-      deviceId,
-    });
+    const identity = { owner: OWNER, network: "test", deviceId };
+    const db = await openLocalDb(
+      openBetterSqlite3(hooks.dbFile ?? ":memory:"),
+      identity,
+    );
     drivers.push(db);
     const puts: string[] = [];
     const gets: string[] = [];
@@ -228,7 +233,7 @@ export async function world(options: {
         ? { partTargetBytes: options.partTargetBytes }
         : {}),
     };
-    const sync = createLocalSync(deps, {
+    const syncOptions = {
       ...(hooks.erasure ? { erasure: hooks.erasure } : {}),
       ...(hooks.legacyDelete ? { legacyDelete: hooks.legacyDelete } : {}),
       ...(hooks.deleteRetryMs ? { deleteRetryMs: hooks.deleteRetryMs } : {}),
@@ -248,7 +253,33 @@ export async function world(options: {
             : {}),
         })),
       }),
-    });
+    };
+    const sync = createLocalSync(deps, syncOptions);
+    /**
+     * The process ends and starts again over the same database file: a new
+     * handle, a new queue and a new sync, with this device's ports. Nothing
+     * the old process held in memory is left.
+     */
+    const restart = async () => {
+      if (!hooks.dbFile) throw new Error("a restart needs a dbFile");
+      await sync.close();
+      drivers.splice(drivers.indexOf(db), 1);
+      const reopened = await openLocalDb(
+        openBetterSqlite3(hooks.dbFile),
+        identity,
+      );
+      drivers.push(reopened);
+      const next: LocalSyncDeps = {
+        ...deps,
+        db: reopened,
+        queue: connectionQueue(),
+      };
+      return {
+        db: reopened,
+        deps: next,
+        sync: createLocalSync(next, syncOptions),
+      };
+    };
     /** A run's begin: the mode and state the connector starts from. */
     const begin = (
       runId: string,
@@ -405,6 +436,7 @@ export async function world(options: {
       position,
       puts,
       gets,
+      restart,
     };
   }
 

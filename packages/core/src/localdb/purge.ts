@@ -35,6 +35,24 @@ function passWatermark(connectionId: string): SqlStatement {
 }
 
 /**
+ * Record the control tombstone that ended `connectionId`'s lifetime
+ * (`delete_tombstones`): the delete's identity, which its erasure judges by.
+ * A tombstone below the one held is an older delete and changes nothing.
+ */
+export function keepTombstone(
+  connectionId: string,
+  version: number,
+): SqlStatement {
+  return {
+    sql: `INSERT INTO delete_tombstones(connector, ns, version)
+   SELECT connector, ns, ? FROM connections WHERE connection_id = ?
+   ON CONFLICT(connector, ns) DO UPDATE SET version = excluded.version
+   WHERE excluded.version > delete_tombstones.version`,
+    params: [version, connectionId],
+  };
+}
+
+/**
  * Who hears that a connection of a database was purged: the sync that owns the
  * database (`createLocalSync`), by the database object, as the lifetime tokens
  * above are kept. A host's `LocalSyncDeps` is shared and mutated by its
@@ -189,6 +207,9 @@ export async function purgeConnection(
         },
         // A later lifetime is a connection this device has not joined.
         endParticipation(connectionId),
+        // The tombstone that ended the lifetime is the delete's identity,
+        // written with the purge that adopts it. A higher one replaces it.
+        keepTombstone(connectionId, deleted.controlVersion),
       ]),
     );
     // Rotate only after the purge batch commits, before releasing its slot.

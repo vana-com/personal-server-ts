@@ -2,6 +2,9 @@
 // real deleter, the real seal and the real `deleteScope` worker, over a fake
 // gateway that enforces cutover policy v3 (an exact tombstone over a live head,
 // signed by the owner or a registered server) and a fake storage.
+import { mkdtempSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   controlScope,
@@ -31,7 +34,18 @@ import {
   world,
 } from "./log-world.test-utils.js";
 
-afterEach(closeWorldDrivers);
+const dirs: string[] = [];
+afterEach(async () => {
+  await closeWorldDrivers();
+  for (const dir of dirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
+});
+/** A database file of one test, on disk (not in the RAM-backed temp directory). */
+const dbFile = () => {
+  const dir = mkdtempSync(join(homedir(), ".tmp", "ps-restart-"));
+  dirs.push(dir);
+  return join(dir, "a.db");
+};
 
 const RETRY = { first: 5, max: 20 };
 /** A connector with legacy scopes bound to it. */
@@ -91,6 +105,10 @@ async function collected(
     big?: boolean;
     /** This device's erasure ports (default: storage as the world holds it). */
     erasure?: (w: World) => LogErasurePorts;
+    /** The device's database file: it can restart (`device.restart`). */
+    dbFile?: string;
+    /** Whether the device can retire a legacy copy now (default: it can). */
+    legacyOn?: () => boolean;
   } & NonNullable<Parameters<typeof legacyPortsOver>[1]> = {},
 ) {
   const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
@@ -103,8 +121,10 @@ async function collected(
   const legacy = await legacyPortsOver(fake, options);
   const a = await w.device("a", {
     erasure: () => (options.erasure ?? erasurePorts)(w),
-    legacyDelete: () => legacy.ports,
+    legacyDelete: () =>
+      (options.legacyOn?.() ?? true) ? legacy.ports : undefined,
     deleteRetryMs: RETRY,
+    ...(options.dbFile && { dbFile: options.dbFile }),
   });
   await a.run(
     "run-1",
@@ -601,6 +621,83 @@ describe("the legacy stage of a connection delete after the switch", () => {
 
       await vi.waitFor(async () => {
         const s = await statusOf(a);
+        expect(s.fence).toEqual(blockedBy("tombstone_rolled_back"));
+        expect(s.legacy).toEqual(blockedBy("tombstone_rolled_back"));
+        expect(s.storage).toEqual(blockedBy("tombstone_rolled_back"));
+      });
+      expect(gatewayDeletes(fake)).toEqual([]);
+    });
+  });
+
+  describe("a restart between a delete and its erasure", () => {
+    it("retires the legacy copy of a delete a reconnect replaced before the first pass", async () => {
+      const on = { legacy: false };
+      const { w, a, fake, legacy } = await collected({
+        dbFile: dbFile(),
+        legacyOn: () => on.legacy,
+      });
+      await a.sync.deleter.requestConnectionDelete(GH);
+      // This device cannot retire the legacy copy yet: no pass has.
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(
+          blockedBy("needs_another_device"),
+        ),
+      );
+      expect(SCOPES.every((scope) => fake.isLive(scope))).toBe(true);
+      // The connection is added again: the control row's head is live data.
+      const control = controlScope(GH, "");
+      w.gateway.write(control, { ...w.gateway.versions.get(control)![0]! });
+      const head = await a.deps.registry.read(controlScope(GH, ""));
+      expect(head).toMatchObject({ found: true, version: 3 });
+
+      on.legacy = true;
+      const restarted = await a.restart();
+      await restarted.sync.deleter.resumeDeletes();
+
+      // The deleter reads its delete from the tombstone it wrote to disk, not
+      // from the head the registry holds now.
+      await vi.waitFor(async () =>
+        expect((await restarted.sync.deleter.deleteStatus(GH)).legacy).toEqual(
+          DONE,
+        ),
+      );
+      for (const scope of SCOPES) {
+        expect(fake.isLive(scope)).toBe(false);
+        expect(fake.tombstones.get(scope)).toEqual([3]);
+      }
+      expect(legacy.retired.sort()).toEqual([...SCOPES].sort());
+    });
+
+    it("reads blocked(tombstone_rolled_back) in every part when the rollback restored the registry's live head before the restart", async () => {
+      const finality = {
+        finalized: null as string | null,
+        settling: true,
+        rolledBack: null as unknown,
+      };
+      const { w, a, fake } = await collected({
+        dbFile: dbFile(),
+        finality: () => finality,
+        erasure: (world) => ({
+          ...erasurePorts(world),
+          finality: { tombstoneState: async () => finality },
+        }),
+      });
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(PENDING),
+      );
+      w.gateway.versions.get(controlScope(GH, ""))!.pop();
+      finality.settling = false;
+      finality.rolledBack = {
+        tombstoneVersion: "2",
+        head: { expectedVersion: "1", dataHash: "0x00", metadataHash: "0x00" },
+      };
+
+      const restarted = await a.restart();
+      await restarted.sync.deleter.resumeDeletes();
+
+      await vi.waitFor(async () => {
+        const s = await restarted.sync.deleter.deleteStatus(GH);
         expect(s.fence).toEqual(blockedBy("tombstone_rolled_back"));
         expect(s.legacy).toEqual(blockedBy("tombstone_rolled_back"));
         expect(s.storage).toEqual(blockedBy("tombstone_rolled_back"));

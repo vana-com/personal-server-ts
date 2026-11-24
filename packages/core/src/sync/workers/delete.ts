@@ -1347,8 +1347,22 @@ async function resubmitRolledBackDeletion(
       storagePass: false,
     });
     if (outcome.steps.gateway.status === "failed") {
+      const { code, error } = outcome.steps.gateway;
+      if (code !== undefined) {
+        // A terminal refusal (`GatewayRefusalCode`): the owner switched under
+        // a policy that admits no legacy delete, or the server key is revoked
+        // or was never registered. Asking again changes nothing, and the
+        // legacy stage of a connection delete asks once for the same reason.
+        const state = tracker.giveUp(scope, failedVersion, "gateway-refused");
+        logger.error(
+          { scope, attempt, code, tombstoneVersion: failedVersion },
+          "Scope deletion did not complete: the gateway refuses the re-submitted delete for good, so it is not sent again. Delete it again to retry.",
+        );
+        deps.onDeletionAbandoned?.(state);
+        return;
+      }
       logger.warn(
-        { scope, attempt, error: outcome.steps.gateway.error },
+        { scope, attempt, error },
         "Re-submitted scope delete was refused by the gateway; will retry",
       );
     }

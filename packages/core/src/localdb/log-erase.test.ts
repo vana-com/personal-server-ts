@@ -70,7 +70,13 @@ function world() {
   let rolledBack: unknown = null;
   const hooks: { afterDelete?: (batchNo: number) => Promise<void> } = {};
   /** The piece names written down, and how many deletes had been sent by then. */
-  const kept: { scope: string; names: string[]; callsBefore: number }[] = [];
+  const kept: {
+    scope: string;
+    head: string;
+    names: string[];
+    complete: boolean;
+    callsBefore: number;
+  }[] = [];
   let keepFails = false;
   const logger = { info() {}, warn() {} };
 
@@ -216,14 +222,21 @@ function world() {
     blobs: { get: async (key) => store.get(key) ?? null },
     keys,
     retained: {
-      keep: async (scope, names) => {
+      keep: async (scope, head, names, { complete }) => {
         if (keepFails) throw new Error("database is locked");
-        kept.push({ scope, names: [...names], callsBefore: calls.length });
+        kept.push({
+          scope,
+          head,
+          names: [...names],
+          complete,
+          callsBefore: calls.length,
+        });
       },
       count: async (scope) =>
         new Set(kept.filter((k) => k.scope === scope).flatMap((k) => k.names))
           .size,
-      enumerated: async (scope) => kept.some((k) => k.scope === scope),
+      enumerated: async (scope, head) =>
+        kept.some((k) => k.scope === scope && k.head === head && k.complete),
     },
     objects: {
       deleteBlobVersions: async (scope, names) => {
@@ -306,7 +319,13 @@ describe("eraseDeletedConnectionLogs", () => {
       {
         connector: "alpha",
         ns: NS,
-        outcome: { kind: "erased", deleted: 5, retained: 4, unenumerated: 0 },
+        outcome: {
+          kind: "erased",
+          deleted: 5,
+          retained: 4,
+          unenumerated: 0,
+          witnessed: true,
+        },
       },
     ]);
   });
@@ -623,6 +642,7 @@ describe("eraseDeletedConnectionLogs", () => {
         deleted: 5,
         retained: 4,
         unenumerated: 0,
+        witnessed: true,
       });
       w.calls.length = 0;
       let inventories = 0;
@@ -644,6 +664,7 @@ describe("eraseDeletedConnectionLogs", () => {
         // The pieces the first pass left are still in storage.
         retained: 4,
         unenumerated: 0,
+        witnessed: true,
       });
       expect(w.calls).toEqual([]);
     });
@@ -659,7 +680,9 @@ describe("eraseDeletedConnectionLogs", () => {
       const other = await eraseDeletedConnectionLogs({
         ...w.deps,
         retained: {
-          keep: async (scope) => void kept.push(scope),
+          keep: async (scope, _head, _names, { complete }) => {
+            if (complete) kept.push(scope);
+          },
           count: async () => 0,
           enumerated: async (scope) => kept.includes(scope),
         },
@@ -670,7 +693,104 @@ describe("eraseDeletedConnectionLogs", () => {
         deleted: 0,
         retained: 0,
         unenumerated: 0,
-        unwitnessed: true,
+        witnessed: false,
+      });
+    });
+
+    it("a device that finds some objects gone while the head is still there does not vouch for the pieces they named", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const scope = logScope("alpha", NS);
+      // Another device deleted the snapshot part and the oldest segment, then
+      // stopped before it reached the head. Both named pieces.
+      for (const name of w.objects("alpha", NS))
+        if (name[0] === "q") w.store.delete(`${scope}/${name}`);
+      const kept: boolean[] = [];
+
+      const report = await eraseDeletedConnectionLogs({
+        ...w.deps,
+        retained: {
+          keep: async (_scope, _head, _names, { complete }) => {
+            kept.push(complete);
+          },
+          count: async () => 0,
+          enumerated: async () => false,
+        },
+      });
+
+      // It still erases what is left, but does not mark the log enumerated.
+      expect(kept).toEqual([false]);
+      expect(w.erasable("alpha", NS)).toEqual([]);
+      expect(report.connections[0]!.outcome).toMatchObject({
+        kind: "erased",
+        witnessed: false,
+      });
+    });
+
+    it("a device that enumerated the log whole before keeps vouching for it when objects are gone on a later pass", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      const scope = logScope("alpha", NS);
+      // The first pass enumerates, then its first batch of deletes fails.
+      w.failing.add(w.objects("alpha", NS).find((n) => n[0] === "q") as string);
+      const first = await eraseDeletedConnectionLogs(w.deps);
+      expect(first.connections[0]!.outcome).toMatchObject({
+        kind: "pending",
+        why: "storage",
+      });
+      w.failing.clear();
+      // Objects that pass did delete are gone on the next one.
+      for (const name of w.objects("alpha", NS))
+        if (name[0] === "s") w.store.delete(`${scope}/${name}`);
+
+      const second = await eraseDeletedConnectionLogs(w.deps);
+
+      expect(second.connections[0]!.outcome).toMatchObject({
+        kind: "erased",
+        witnessed: true,
+      });
+    });
+
+    it("a tombstone a reconnect ended before the pass reports the lifetime as re-added, and deletes nothing", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      // The head is live data again: the connection was added again.
+      w.setControl("alpha", NS, 3, false);
+      const before = w.objects("alpha", NS);
+
+      const report = await eraseDeletedConnectionLogs(w.deps, {
+        connector: "alpha",
+        tombstones: new Map([[NS, 2]]),
+      });
+
+      expect(report.connections).toEqual([
+        {
+          connector: "alpha",
+          ns: NS,
+          outcome: { kind: "stopped", why: "re-added" },
+        },
+      ]);
+      expect(w.calls).toEqual([]);
+      expect(w.objects("alpha", NS)).toEqual(before);
+    });
+
+    it("a reconnect while the pass deletes ends it as re-added", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      // The first batch lands, then the connection is added again.
+      w.hooks.afterDelete = async () => w.setControl("alpha", NS, 3, false);
+
+      const report = await eraseDeletedConnectionLogs(w.deps, {
+        connector: "alpha",
+        tombstones: new Map([[NS, 2]]),
+      });
+
+      expect(report.connections[0]!.outcome).toEqual({
+        kind: "stopped",
+        why: "re-added",
       });
     });
 
@@ -727,6 +847,7 @@ describe("eraseDeletedConnectionLogs", () => {
       deleted: before.filter((n) => n[0] !== "v").length,
       retained: before.filter((n) => n[0] === "v").length,
       unenumerated: 0,
+      witnessed: true,
     });
   });
 

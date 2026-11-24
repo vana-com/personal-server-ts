@@ -675,7 +675,7 @@ describe("storage cleanup converges on the user's delete", () => {
       },
     );
 
-    it("counts a terminal gateway refusal of the re-submission as a failed attempt, and the tracker bounds it", async () => {
+    it("stops at a terminal gateway refusal of the re-submission: one attempt, then the scope is reported failed", async () => {
       const f = await rolledBack(fixedLegacyWriteSeal("switched"));
       (f.deleteData.tombstone as ReturnType<typeof vi.fn>).mockRejectedValue(
         new GatewayRefusalError(
@@ -685,12 +685,16 @@ describe("storage cleanup converges on the user's delete", () => {
         ),
       );
       for (let minute = 0; minute < 60; minute++) await f.cycle(MINUTE);
-      // One tombstone from the user's delete, then at most the tracker's
-      // attempts: the refusal never turns into a retry loop.
-      expect(
-        (f.deleteData.tombstone as ReturnType<typeof vi.fn>).mock.calls.length,
-      ).toBeLessThanOrEqual(1 + TOMBSTONE_RESUBMIT_MAX_ATTEMPTS);
-      expect(f.resubmits.snapshot().failed).toHaveLength(1);
+      // The user's own delete, then one re-submission the gateway refused for
+      // good: nothing changes on a retry, so there is no second attempt.
+      expect(f.deleteData.tombstone).toHaveBeenCalledTimes(2);
+      expect(f.resubmits.snapshot().failed).toEqual([
+        expect.objectContaining({
+          scope: SCOPE,
+          attempts: 1,
+          reason: "gateway-refused",
+        }),
+      ]);
     });
   });
 
