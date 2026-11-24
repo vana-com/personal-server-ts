@@ -2,6 +2,7 @@ import { forgetUploadedBlobs } from "./blobs.js";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { endParticipation } from "./lifetime.js";
+import { scratchDeletes } from "./log-scratch.js";
 import { withOrigin } from "./merge.js";
 
 // A purge ends the local lifetime even if a later observation restores the
@@ -209,6 +210,9 @@ export async function purgeConnection(
         // gone, so none of them is left to publish. The watermark passes them
         // (the purge's own changes included, which are not publishable).
         passWatermark(connectionId),
+        // The fold and spool scratch holds the lifetime's bodies and keys: a
+        // crash may have left it, and a purge must leave none of them.
+        ...scratchDeletes(connectionId),
         // The log position and tombstones belong to the lifetime that ended.
         {
           sql: "DELETE FROM log_state WHERE connection_id = ?",

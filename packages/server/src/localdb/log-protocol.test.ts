@@ -2118,9 +2118,13 @@ describe("log protocol: an omission reads a bounded page of bodies", () => {
       params?: unknown[],
     ) => {
       const rows = await real(sql, params as never);
-      if (/SELECT pk_hash, body FROM records/.test(sql))
+      // A body is read as a blob, `CASE … END AS body`.
+      if (/AS body FROM records/.test(sql))
         bodyReads.push(
-          (rows as { body: string }[]).reduce((n, r) => n + r.body.length, 0),
+          (rows as { body: Uint8Array | null }[]).reduce(
+            (n, r) => n + (r.body?.length ?? 0),
+            0,
+          ),
         );
       return rows;
     };

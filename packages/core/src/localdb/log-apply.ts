@@ -46,6 +46,8 @@ import {
   type SegmentRef,
   type SnapshotPart,
   type SnapshotPointer,
+  type WireSegment,
+  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { resolveBodies } from "./log-bodies.js";
@@ -644,6 +646,41 @@ export async function fetchSegment(
   position: number,
   deletionsOnly = false,
 ): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
+  const { segment, bytes, cipherBytes } = await fetchWireSegment(
+    deps,
+    scope,
+    context,
+    dataHash,
+    position,
+  );
+  return {
+    segment: {
+      ...segment,
+      operations: await resolveBodies(
+        deps,
+        scope,
+        deletionsOnly
+          ? segment.operations.filter((op) => !isUpsert(op))
+          : segment.operations,
+      ),
+    },
+    bytes,
+    cipherBytes,
+  };
+}
+
+/**
+ * A segment fetched, decrypted and verified, its out-of-line bodies still
+ * named, not read. A caller that only carries a body forward (a fold into a
+ * snapshot) has no use for its bytes, and a record may be megabytes.
+ */
+export async function fetchWireSegment(
+  deps: LocalSyncDeps,
+  scope: string,
+  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
+  dataHash: string,
+  position: number,
+): Promise<{ segment: WireSegment; bytes: number; cipherBytes: number }> {
   const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
   if (cipher === null)
     throw new Error(`apply: missing log segment ${position}`);
@@ -667,17 +704,11 @@ export async function fetchSegment(
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
     );
-  const segment: Segment = {
-    ...verified.segment,
-    operations: await resolveBodies(
-      deps,
-      scope,
-      deletionsOnly
-        ? verified.segment.operations.filter((op) => !isUpsert(op))
-        : verified.segment.operations,
-    ),
+  return {
+    segment: verified.segment,
+    bytes: verified.bytes,
+    cipherBytes: cipher.length,
   };
-  return { segment, bytes: verified.bytes, cipherBytes: cipher.length };
 }
 
 const isUpsert = (op: { readonly kind: string }) =>
@@ -692,6 +723,33 @@ export async function fetchSnapshotPart(
   position: number,
   deletionsOnly = false,
 ): Promise<SnapshotPart> {
+  const part = await fetchWireSnapshotPart(
+    deps,
+    scope,
+    context,
+    dataHash,
+    position,
+  );
+  return {
+    ...part,
+    entries: await resolveBodies(
+      deps,
+      scope,
+      deletionsOnly
+        ? part.entries.filter((entry) => !isUpsert(entry))
+        : part.entries,
+    ),
+  };
+}
+
+/** A snapshot part fetched, decrypted and verified, its bodies still named (see `fetchWireSegment`). */
+export async function fetchWireSnapshotPart(
+  deps: LocalSyncDeps,
+  scope: string,
+  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
+  dataHash: string,
+  position: number,
+): Promise<WireSnapshotPart> {
   const cipher = await deps.blobs.get(
     `${scope}/${snapshotPartBlobName(dataHash)}`,
   );
@@ -714,16 +772,7 @@ export async function fetchSnapshotPart(
     );
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
-  return {
-    ...verified.part,
-    entries: await resolveBodies(
-      deps,
-      scope,
-      deletionsOnly
-        ? verified.part.entries.filter((entry) => !isUpsert(entry))
-        : verified.part.entries,
-    ),
-  };
+  return verified.part;
 }
 
 /**
@@ -859,11 +908,31 @@ async function loadProgressively(
     }
     return fetching;
   };
-  // The segments the head does not say remove nothing: those are read first.
+  // The segments the head does not say remove nothing: those are read first,
+  // for what they remove alone: a removing segment is read whole again when
+  // its batch comes, so the pass does not hold it meanwhile.
   const removing = tail.filter(
     (ref) => ref.position !== head.position && ref.removes !== false,
   );
-  for (const ref of removing) void segmentAt(ref);
+  const deletionsOf = async (ref: SegmentRef) => {
+    const { segment } = await fetchSegment(
+      deps,
+      scope,
+      context,
+      ref.dataHash,
+      ref.position,
+      true,
+    );
+    return segment.operations;
+  };
+  let removals: Map<number, Promise<Segment["operations"]>> | undefined =
+    new Map(
+      removing.map((ref) => {
+        const reading = deletionsOf(ref);
+        reading.catch(() => undefined);
+        return [ref.position, reading] as const;
+      }),
+    );
 
   // Every batch's identity: the hash and blob its stream head will name.
   const identities = [
@@ -991,9 +1060,11 @@ async function loadProgressively(
 
   // What a later batch removes: read from the segments that say they remove,
   // which are in hand (or on their way) before the first batch applies.
-  const [firstPart] = await Promise.all([
-    partRefs.length > 0 ? partAt(0) : Promise.resolve(undefined),
-    ...removing.map(segmentAt),
+  const [firstStreams] = await Promise.all([
+    partRefs.length > 0
+      ? partAt(0).then((part) => JSON.stringify(part.streams))
+      : Promise.resolve(undefined),
+    ...removals!.values(),
   ]).catch(async (error) => {
     const code = failureCode(error);
     const stopped = [...new Set([...begun, ...resumed])].map(headOf);
@@ -1021,10 +1092,15 @@ async function loadProgressively(
         )
         .map(async (ref) => ({
           index: partRefs.length + tail.indexOf(ref),
-          operations: (await segmentAt(ref)).operations,
+          operations:
+            ref.position === head.position
+              ? head.operations
+              : await removals!.get(ref.position)!,
         })),
     ),
   );
+  // What the removing segments said is in `removed`: they are not kept.
+  removals = undefined;
 
   // What each batch does for the streams that load progressively: a function
   // of its place in the pass and its own operations, so the batches can be
@@ -1196,9 +1272,11 @@ async function loadProgressively(
       let batch: OperationBatch;
       if (index < partRefs.length) {
         const part = await partAt(index);
+        // The pass does not keep a part it has applied.
+        parts[index] = undefined;
         if (
           part.index !== index ||
-          JSON.stringify(part.streams) !== JSON.stringify(firstPart!.streams)
+          JSON.stringify(part.streams) !== firstStreams
         )
           throw new Error("apply: invalid log snapshot part (inconsistent)");
         batch = {
@@ -1210,6 +1288,7 @@ async function loadProgressively(
       } else {
         const ref = tail[index - partRefs.length]!;
         const segment = await segmentAt(ref);
+        if (ref.position !== head.position) segments.delete(ref.position);
         // A segment the head says removes nothing was not read first. If it
         // removes a key, rows of the keys it removes may be showing.
         if (ref.removes === false && segmentRemoves(segment.operations))

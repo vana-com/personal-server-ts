@@ -5,7 +5,7 @@
 // position first leaves 0: by its own first write (`log-publish.ts`), or by
 // the first apply that installs another device's log (`log-apply.ts`).
 
-import type { LogEntry } from "@opendatalabs/personal-server-ts-stream-sync";
+import type { WireEntry } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement, SqlValue } from "./driver.js";
 import {
@@ -52,18 +52,18 @@ export async function seedFromRecords(
 
 /**
  * Queue every key a history this device applied touched (`entries`, the fold
- * of its segments: `foldLog`) at what this device holds of the key now. A key
+ * of its segments: `foldLog`, or a page of it from the disk fold) at what this device holds of the key now. A key
  * it holds a record of goes as that record. A key it holds none of goes as the
  * deletion the history made, of the same kind (a delete, or the omission of a
  * pass that proved it absent at its cutoff, which ranks below an observation
  * at that stamp), and leaves its tombstone here, so an older upsert from
  * another history cannot bring it back. A key with a change pending is left
- * alone, as in `seedFromRecords`. The statements go in one transaction with
- * whatever moves the position (`log-rebase.ts`).
+ * alone, as in `seedFromRecords`, so the entries can go in as many calls as
+ * the caller likes (`log-rebase.ts`).
  */
 export function seedFromHistory(
   connectionId: string,
-  entries: readonly LogEntry[],
+  entries: readonly WireEntry[],
   primaryKeyOf: ReadonlyMap<string, readonly string[]>,
 ): SqlStatement[] {
   const pending = (stream: string, pk: string): [string, SqlValue[]] => [
@@ -76,7 +76,7 @@ export function seedFromHistory(
   const statements: SqlStatement[] = [];
   for (const entry of entries) {
     const [notPending, pendingParams] = pending(entry.stream, entry.pkHash);
-    if (entry.kind === "upsert") {
+    if (entry.kind === "upsert" || entry.kind === "upsert-ref") {
       statements.push({
         sql: `INSERT INTO record_changes(connection_id,stream,pk_hash,record_key,op,stamp_o,stamp_r,origin)
               SELECT r.connection_id,r.stream,r.pk_hash,r.record_key,'upsert',r.stamp_o,r.stamp_r,'import'
