@@ -187,3 +187,34 @@ describe("one error object that an adapter rejects several calls with", () => {
     expect(second.failedStreams).toBeUndefined();
   });
 });
+
+describe("a reserved stream name beside a log whose current fetch fails", () => {
+  it("is update_required, not the fetch error", async () => {
+    const w = await world({ streams: 2 });
+    const peer = await w.device("peer");
+    let failing = false;
+    const here = await w.device("here", {
+      beforeGet: async () => {
+        if (failing) throw new Error("storage unreachable");
+      },
+    });
+    await peer.run("run-1", records("a"));
+    await peer.cycle();
+    await here.cycle();
+    await peer.run("run-2", [{ stream: sName(0), id: "late" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await peer.cycle();
+    w.gateway.write(streamScope(CONNECTOR, "", "~future"), {
+      dataHash: `0x${"ab".repeat(32)}`,
+      metadataHash: `0x${"cd".repeat(32)}`,
+    });
+    failing = true;
+    const connection = (await here.sync.cycle()).connections.find(
+      (c) => c.connectionId === CONNECTION_ID,
+    )!;
+    expect(connection.status).toBe("update_required");
+    expect(connection.error).toMatch(/~future/);
+  });
+});

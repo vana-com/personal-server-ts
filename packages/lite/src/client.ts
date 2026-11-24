@@ -106,8 +106,6 @@ export type PersonalServerLiteConnectionPublication = {
   /** `update_required`: this build cannot read the connection's log. `degraded`: a load stopped on `failedStreams`. */
   readonly status?: "update_required" | "degraded";
   readonly failedStreams?: readonly FailedStream[];
-  /** A later pass of the cycle failed after this connection's publication settled; the receipt stands. */
-  readonly followUpError?: string;
   readonly publications: readonly PublicationReceipt[];
 };
 
@@ -117,6 +115,8 @@ export type PersonalServerLitePublicationResult = {
   readonly publications: readonly PublicationReceipt[];
   /** Every connection the pass took, the caller's own and the others. */
   readonly connections: readonly PersonalServerLiteConnectionPublication[];
+  /** A failure of the pass that belongs to no connection (the listing, saving controls, a purge). It never rejects. */
+  readonly cycleError?: string;
 };
 
 export type PersonalServerLitePublishOptions = {
@@ -718,6 +718,9 @@ export async function startPersonalServer(
       outcome: publications.length ? "published" : "noop",
       publications,
       connections,
+      ...(report.cycleError !== undefined
+        ? { cycleError: report.cycleError }
+        : {}),
     };
   }
 
@@ -809,9 +812,6 @@ function connectionPublication(
     ...(connection.status ? { status: connection.status } : {}),
     ...(connection.failedStreams
       ? { failedStreams: connection.failedStreams }
-      : {}),
-    ...(connection.followUpError
-      ? { followUpError: connection.followUpError }
       : {}),
     publications,
   };

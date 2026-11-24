@@ -16,6 +16,7 @@ import type {
   LocalSyncDeps,
 } from "../../../core/src/localdb/deps.js";
 import { publishLog } from "../../../core/src/localdb/log-publish.js";
+import { UpdateRequiredError } from "../../../core/src/localdb/update-required.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 
 vi.mock("../../../core/src/localdb/bootstrap.js", () => ({
@@ -68,7 +69,169 @@ beforeEach(() => {
   vi.mocked(connectionsWithStreams).mockResolvedValue([]);
 });
 
+describe("a scoped caller's result is decided only by its own connections", () => {
+  const OWN_RECEIPT = {
+    connectionId: "own",
+    published: published("own"),
+    error: null,
+  };
+  /** `own` settles in the early publish; `sibling` does not, so the fallback runs. */
+  function scoped(step: (deps: LocalSyncDeps) => void) {
+    const deps = dependencies();
+    vi.mocked(knownActiveConnections).mockResolvedValue([connection("own")]);
+    vi.mocked(newConnectionsWithStreams).mockResolvedValue([
+      connection("sibling"),
+    ]);
+    const calls = new Map<string, number>();
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
+      const n = (calls.get(id) ?? 0) + 1;
+      calls.set(id, n);
+      if (id === "own") return published(id);
+      // First pass: a deferral (another device made the row). Later: see step.
+      return n === 1
+        ? [{ stream: id, outcome: "deferred" as const, watermark: 1 }]
+        : published(id);
+    });
+    vi.mocked(bootstrapConnections).mockResolvedValue([
+      connection("own"),
+      connection("sibling"),
+    ]);
+    vi.mocked(applyConnection).mockResolvedValue({
+      kind: "applied",
+    } as never);
+    step(deps);
+    return { deps, calls };
+  }
+  const fails = (what: string) => new Error(`${what} failed`);
+  it.each([
+    [
+      "registry listing",
+      (deps: LocalSyncDeps) =>
+        vi
+          .spyOn(deps.registry, "listOwnerRows")
+          .mockRejectedValue(fails("listing")),
+    ],
+    [
+      "control save or purge",
+      () => vi.mocked(bootstrapConnections).mockRejectedValue(fails("purge")),
+    ],
+    [
+      "apply",
+      () =>
+        vi.mocked(applyConnection).mockImplementation(async (_d, id) => {
+          if (id === "sibling") throw fails("apply");
+          return { kind: "applied" } as never;
+        }),
+    ],
+    [
+      "apply that needs an update",
+      () =>
+        vi.mocked(applyConnection).mockImplementation(async (_d, id) => {
+          if (id === "sibling")
+            throw new UpdateRequiredError("unknown stream", 99);
+          return { kind: "applied" } as never;
+        }),
+    ],
+    [
+      "publish",
+      () =>
+        vi.mocked(publishLog).mockImplementation(async (_d, id) => {
+          if (id === "sibling" && vi.mocked(publishLog).mock.calls.length > 2)
+            throw fails("publish");
+          return id === "own"
+            ? published(id)
+            : [{ stream: id, outcome: "deferred" as const, watermark: 1 }];
+        }),
+    ],
+  ])("is unchanged when the sibling's %s fails", async (_step, fail) => {
+    const { deps } = scoped(fail);
+    const report = await runPublish(deps, ["own"]);
+    expect(report.connections.find((c) => c.connectionId === "own")).toEqual(
+      OWN_RECEIPT,
+    );
+    // The caller's connection is neither applied nor published again.
+    expect(
+      vi.mocked(publishLog).mock.calls.filter(([, id]) => id === "own"),
+    ).toHaveLength(1);
+    expect(
+      vi.mocked(applyConnection).mock.calls.filter(([, id]) => id === "own"),
+    ).toHaveLength(0);
+    // The sibling's failure is reported, against it or at cycle level.
+    const sibling = report.connections.find(
+      (c) => c.connectionId === "sibling",
+    );
+    expect(sibling?.error !== null || report.cycleError !== undefined).toBe(
+      true,
+    );
+  });
+
+  it("rejects nothing when a sibling's purge fails after the caller's commit", async () => {
+    const { deps } = scoped(() =>
+      vi.mocked(bootstrapConnections).mockRejectedValue(fails("purge")),
+    );
+    const report = await runPublish(deps, ["own"]);
+    expect(report.cycleError).toBe("purge failed");
+    expect(
+      report.connections.find((c) => c.connectionId === "sibling")?.error,
+    ).toBe("purge failed");
+  });
+
+  it("does not settle a connection that has one published and one deferred stream", async () => {
+    const deps = dependencies();
+    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
+      new Error("listing unreachable"),
+    );
+    vi.mocked(newConnectionsWithStreams).mockResolvedValue([connection("own")]);
+    vi.mocked(publishLog).mockResolvedValue([
+      { stream: "a", outcome: "published" as const, watermark: 1 },
+      { stream: "b", outcome: "deferred" as const, watermark: 1 },
+    ]);
+    await expect(runPublish(deps, ["own"])).rejects.toThrow(
+      /listing unreachable/,
+    );
+  });
+});
+
 describe("local database cycle", () => {
+  it("lists a connection only the listing could place as failed when the fallback listing fails", async () => {
+    const deps = dependencies();
+    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
+      new Error("listing unreachable"),
+    );
+    vi.mocked(knownActiveConnections).mockResolvedValue([connection("own")]);
+    vi.mocked(connectionsWithStreams).mockResolvedValue([
+      connection("own"),
+      connection("orphan"),
+    ]);
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) =>
+      published(id),
+    );
+    const report = await runPublish(deps, ["own"]);
+    const byId = new Map(report.connections.map((c) => [c.connectionId, c]));
+    expect(byId.get("own")).toMatchObject({ error: null });
+    expect(byId.get("orphan")).toMatchObject({ published: [] });
+    expect(byId.get("orphan")?.error).toMatch(/listing unreachable/);
+  });
+
+  it("reports a sibling's own early error, not the listing error, when the fallback listing fails", async () => {
+    const deps = dependencies();
+    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
+      new Error("listing unreachable"),
+    );
+    vi.mocked(knownActiveConnections).mockResolvedValue([
+      connection("own"),
+      connection("sibling"),
+    ]);
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
+      if (id === "sibling") throw new Error("commit failed");
+      return published(id);
+    });
+    const report = await runPublish(deps, ["own"]);
+    const byId = new Map(report.connections.map((c) => [c.connectionId, c]));
+    expect(byId.get("own")).toMatchObject({ error: null });
+    expect(byId.get("sibling")?.error).toBe("commit failed");
+  });
+
   it("reports a fresh sibling's dropped deferral as failed when the fallback listing fails", async () => {
     const deps = dependencies();
     vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
@@ -92,7 +255,7 @@ describe("local database cycle", () => {
     expect(byId.get("sibling")?.error).toMatch(/listing unreachable/);
   });
 
-  it("lets a bootstrap failure propagate when a sibling forced the fallback", async () => {
+  it("lets a bootstrap failure propagate to an unscoped caller when a sibling forced the fallback", async () => {
     const deps = dependencies();
     vi.mocked(knownActiveConnections).mockResolvedValue([
       connection("own"),
@@ -105,9 +268,7 @@ describe("local database cycle", () => {
     vi.mocked(bootstrapConnections).mockRejectedValue(
       new Error("controls write failed"),
     );
-    await expect(runPublish(deps, ["own"])).rejects.toThrow(
-      /controls write failed/,
-    );
+    await expect(runPublish(deps)).rejects.toThrow(/controls write failed/);
   });
 
   it.each([[], ["missing"]])(

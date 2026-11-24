@@ -288,8 +288,10 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return { kind: "deferred", reason: "inactive-control" } as const;
     }
-    if (logResult.status === "rejected") throw logResult.reason;
+    // A reserved row this build cannot read is the answer, whatever the
+    // current log's fetch did: check the listing first.
     if (flight.listed) refuseReservedRows(flight.listed, connection, hashes);
+    if (logResult.status === "rejected") throw logResult.reason;
     await applyLog(
       {
         ...locked,

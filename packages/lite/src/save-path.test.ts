@@ -301,7 +301,7 @@ describe("the save path of a Web write", () => {
       expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
     });
 
-    it("keeps the caller's receipt when the fallback's apply of its connection also fails", async () => {
+    it("keeps the caller's receipt when its own log holds a row this build cannot read", async () => {
       const { server, gateway } = await withFailingSibling();
       // A later build reserved another `~` name beside the caller's log.
       gateway.write(streamScope(CONNECTOR, "", "~future"), {
@@ -314,7 +314,8 @@ describe("the save path of a Web write", () => {
       expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
       const mine = receipt.connections.find((c) => c.connectionId === own);
       expect(mine?.outcome).toBe("published");
-      expect(mine?.followUpError).toMatch(/~future/);
+      // The fallback does not apply the caller's connection.
+      expect(mine?.error).toBeUndefined();
     });
 
     it("still rejects for the sibling when the caller names it", async () => {

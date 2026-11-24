@@ -465,14 +465,11 @@ async function runBootstrap(input: {
       "SELECT stream FROM stream_partial WHERE connection_id=?",
       [connectionId],
     );
+    const falseRemoval = error instanceof FalseRemovalFact;
+    const code = falseRemoval ? "invalid_segment" : "apply_failed";
     const statements = stopped.flatMap((row) => [
-      ...(error instanceof FalseRemovalFact
-        ? hideStoredRows(connectionId, row.stream)
-        : []),
-      failedRowStatement(
-        identity(row.stream),
-        error instanceof FalseRemovalFact ? "invalid_segment" : "apply_failed",
-      ),
+      ...(falseRemoval ? hideStoredRows(connectionId, row.stream) : []),
+      failedRowStatement(identity(row.stream), code),
     ]);
     if (statements.length)
       await deps.db.batch(statements).then(
@@ -480,9 +477,7 @@ async function runBootstrap(input: {
           noteMarkedFailed(
             deps.attemptFailures,
             stopped.map((row) => row.stream),
-            error instanceof FalseRemovalFact
-              ? "invalid_segment"
-              : "apply_failed",
+            code,
           );
           announceApplied(deps, connectionId);
         },
