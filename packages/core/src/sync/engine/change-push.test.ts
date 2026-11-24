@@ -550,6 +550,27 @@ describe("the database epoch", () => {
     s.stop();
   });
 
+  it("an epoch first seen while a cursor is held is a reset, even with the same sequence and nothing changed", async () => {
+    const s = withEpochs();
+    await flush();
+    // An epoch-less gateway: the cursor is held with no epoch beside it.
+    s.calls[0].answer({ seq: "4", changed: true });
+    await flush();
+    // An epoch-aware gateway with a restored database at the same sequence.
+    s.calls[1].answer({ seq: "4", changed: false, epoch: A });
+    await flush();
+    expect(s.changes).toEqual([
+      undefined,
+      { since: "4", seq: "4", reset: true },
+    ]);
+    expect(s.calls[2].epoch).toBe(A);
+    // Under the same epoch again, nothing more.
+    s.calls[2].answer({ seq: "4", changed: false, epoch: A });
+    await flush();
+    expect(s.changes).toHaveLength(2);
+    s.stop();
+  });
+
   it("a gateway without the epoch keeps today's behaviour, and does not lose the epoch it held", async () => {
     const s = withEpochs();
     await flush();

@@ -97,7 +97,8 @@ export function createRegistryChangePush(
       // answer under another epoch means the database was replaced (a dev
       // reset, a restore), so the cursor and the `since` built on it say
       // nothing: that answer is a reset, whatever its `changed` says. A gateway
-      // that sends none leaves the push as it was, and one seen earlier stays.
+      // that sends none leaves the push as it was, and one seen earlier stays. The
+      // first epoch to arrive beside a cursor held without one is a reset too.
       let epoch: string | undefined;
       let healthy = false;
       let afterFailure = false;
@@ -162,10 +163,14 @@ export function createRegistryChangePush(
           wait.catch(() => {}); // a late failure after the race is not ours
           const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
+          // A cursor held with no epoch beside it came from an epoch-less
+          // gateway; the first epoch seen then names a generation the cursor
+          // was never checked against, so it counts as a move too.
           const epochMoved =
-            epoch !== undefined &&
             answer.epoch !== undefined &&
-            answer.epoch !== epoch;
+            (epoch === undefined
+              ? cursor !== undefined
+              : answer.epoch !== epoch);
           if (answer.epoch !== undefined) epoch = answer.epoch;
           cursor = answer.seq;
           failures = 0;

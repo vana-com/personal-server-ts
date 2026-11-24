@@ -229,7 +229,11 @@ export interface RegistryChangeAnswer {
    * What changed after the request's `since`, read in one snapshot at `seq`.
    * Present on, and only on, a changed answer to a request that sent `since`
    * (a gateway that cannot read the delta answers `reset`). A changed answer
-   * to such a request without a readable delta fails the request.
+   * to such a request without a readable delta fails the request, with one
+   * exception: when `epoch` differs from the one the request carried, the
+   * answer may omit the delta. The cursor and `since` belong to another
+   * database generation then, so the caller must treat that answer as a reset
+   * (list in full) and not wait for a delta.
    */
   readonly delta?: RegistryChangeDelta;
   /**
