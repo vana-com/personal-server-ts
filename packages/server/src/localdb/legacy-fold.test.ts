@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from "vitest";
 import { foldLayers, type FoldLayer } from "../../../core/src/localdb/index.js";
-import { drivers, world } from "./late-seed-harness.test-utils.js";
+import { drivers, state, world } from "./late-seed-harness.test-utils.js";
 
 // Layers are stored versions of one stream, newest first: the `{records}`
 // files a source left, one after another. The fold lets the newest version of
@@ -676,4 +676,76 @@ it("an identical repeat of a row is counted by the direct importer too", async (
     kind: "imported",
     quarantine: { duplicate_key: 1 },
   });
+});
+
+// A delete envelope in the old store is a claim about the old store. A delete
+// that has already landed here decides first: the import never contradicts it.
+const tombstones = (
+  device: Awaited<ReturnType<Awaited<ReturnType<typeof world>>["device"]>>,
+) =>
+  device.db.query(
+    "SELECT record_key, stamp_o, stamp_r FROM log_tombstones WHERE stream = 'items' ORDER BY record_key",
+  );
+const envelopeLayers = () => [
+  layer([deleteEnvelope("A")]),
+  layer([tagged("A", "old"), tagged("B", "old-b")]),
+];
+
+it.each([
+  [
+    "a connection that was deleted",
+    "UPDATE connections SET deleted_at = 1, control_state = 'deleted' WHERE connection_id = 'pdpp.fixture~'",
+  ],
+  [
+    "a connection whose delete is landing",
+    "INSERT INTO delete_intents (connector, delete_id, intent) VALUES ('fixture', 'd1', 'delete')",
+  ],
+])(
+  "a delete-envelope import into %s is refused and writes no row and no tombstone",
+  async (_name, sql) => {
+    const w = await world();
+    const a = await w.device("a");
+    await a.run("real", ["R"]);
+    await a.publish();
+    await a.db.batch([{ sql }]);
+    const result = await a.importSource("files", (base) =>
+      foldLayers(base, envelopeLayers(), { sourceId: SOURCE }),
+    );
+    expect(result).toEqual({ kind: "refused", reason: "connection_deleted" });
+    expect(await a.keys()).toEqual(["R"]);
+    expect(await tombstones(a)).toEqual([]);
+  },
+);
+
+it("a delete envelope never replaces the tombstone of a delete that already landed", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("delete", ["A"], { remove: true });
+  await a.publish();
+  const landed = await tombstones(a);
+  expect(landed).toMatchObject([{ record_key: "A", stamp_r: "delete" }]);
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, envelopeLayers(), { sourceId: SOURCE }),
+  );
+  expect(result).toMatchObject({ kind: "imported" });
+  // The landed tombstone is the only one for the key, with its own stamp; the
+  // old row of the key stayed out, and the other key filled.
+  expect(await tombstones(a)).toEqual(landed);
+  expect(await a.keys()).toEqual(["B"]);
+});
+
+it("a delete envelope never removes a row a real write holds", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  const before = await state(a);
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, envelopeLayers(), { sourceId: SOURCE }),
+  );
+  expect(result).toMatchObject({ kind: "imported" });
+  expect(await state(a)).toEqual(before);
+  expect(await tombstones(a)).toEqual([]);
 });

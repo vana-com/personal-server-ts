@@ -155,17 +155,20 @@ async function world() {
       });
       expect(response.status).toBe(200);
       const body = (await response.json()) as {
-        scopes: { scope: string }[];
+        scopes: { scope: string; dataStatus?: string }[];
       };
-      return body.scopes.map((s) => s.scope);
+      return body.scopes;
     },
     async read(stream: string) {
       const response = await context.app.request(
         `/v1/data/pdpp.fixture-source.${stream}`,
         { headers },
       );
-      await response.text();
-      return response.status;
+      return {
+        status: response.status,
+        complete: response.headers.get("X-Stream-Sync-Complete"),
+        body: await response.text(),
+      };
     },
   };
 }
@@ -240,17 +243,40 @@ describe("a failed run's finished streams are served", () => {
       ).toMatchObject({ result: "queued" });
       await w.publish();
       const listed = await w.listed();
-      expect(listed).toEqual(
+      expect(listed.map((s) => s.scope)).toEqual(
         expect.arrayContaining([
           "pdpp.fixture-source.profile",
           "pdpp.fixture-source.following",
         ]),
       );
-      expect(await w.read("profile")).toBe(200);
-      expect(await w.read("following")).toBe(200);
-      // The stream that failed is not served, however many earlier runs held it.
-      expect(listed).not.toContain("pdpp.fixture-source.ads");
-      expect(await w.read("ads")).toBe(404);
+      expect((await w.read("profile")).status).toBe(200);
+      expect((await w.read("following")).status).toBe(200);
+      const ads = await w.read("ads");
+      if (shape.earlier.length > 0) {
+        // Owners can inspect the installed records from the earlier run,
+        // without treating the failed stream as a complete collection.
+        expect(listed).toContainEqual(
+          expect.objectContaining({
+            scope: "pdpp.fixture-source.ads",
+            dataStatus: "incomplete",
+          }),
+        );
+        expect(ads).toMatchObject({ status: 200, complete: "false" });
+        const records = JSON.parse(ads.body).data.records as {
+          id: string;
+          v: number;
+        }[];
+        expect(records.sort((a, b) => a.id.localeCompare(b.id))).toEqual([
+          { id: "ads-0", v: 0 },
+          { id: "ads-1", v: 0 },
+          { id: "ads-2", v: 0 },
+        ]);
+      } else {
+        expect(listed.map((s) => s.scope)).not.toContain(
+          "pdpp.fixture-source.ads",
+        );
+        expect(ads.status).toBe(404);
+      }
     });
   }
 
@@ -270,8 +296,8 @@ describe("a failed run's finished streams are served", () => {
       upsertOnly,
     );
     await w.publish();
-    expect(await w.read("profile")).toBe(200);
-    expect(await w.read("following")).toBe(200);
+    expect((await w.read("profile")).status).toBe(200);
+    expect((await w.read("following")).status).toBe(200);
   });
 
   it("makes no storage read in a cycle that has nothing to publish", async () => {

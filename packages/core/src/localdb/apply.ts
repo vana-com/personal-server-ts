@@ -7,6 +7,7 @@ import {
   controlScope,
   deriveKeyCheck,
   isLogStream,
+  isUnknownReservedStream,
   parseScope,
   type ControlHashes,
   type ControlRead,
@@ -18,6 +19,7 @@ import { createApplyMeter } from "./apply-meter.js";
 import { readLogState } from "./log-state.js";
 import { applyLog } from "./log-apply.js";
 import { installControl } from "./lifetime.js";
+import { UpdateRequiredError } from "./update-required.js";
 import { purgeConnection } from "./purge.js";
 import {
   RegistryUnavailableBeforeWriteError,
@@ -286,6 +288,9 @@ function runJob(deps: LocalSyncDeps, id: string, flight: Flight, reuse: Reuse) {
       if (initial.kind === "deleted") await clearPartial(deps, id, reuse);
       return { kind: "deferred", reason: "inactive-control" } as const;
     }
+    // A reserved row this build cannot read is the answer, whatever the
+    // current log's fetch did: check the listing first.
+    if (flight.listed) refuseReservedRows(flight.listed, connection, hashes);
     if (logResult.status === "rejected") throw logResult.reason;
     await applyLog(
       {
@@ -336,6 +341,35 @@ function logRowOf(
       return row.read;
   }
   return undefined;
+}
+
+/**
+ * A listed row of this connection under a reserved stream name this build does
+ * not know belongs to a layout a later build wrote. It is never read as a
+ * stream (nothing is fetched for it): the apply stops with `update_required`,
+ * as for a log format it cannot read. A tombstoned row is gone and does not
+ * count. Without a listing the apply has no row to see; the log row it reads
+ * itself is the one reserved name it knows.
+ */
+function refuseReservedRows(
+  listed: OwnerRows,
+  connection: Connection,
+  hashes: ControlHashes,
+): void {
+  for (const row of listed) {
+    const scope = parseScope(row.scope);
+    if (
+      scope?.kind === "stream" &&
+      scope.connector === connection.connector &&
+      scope.ns === connection.ns &&
+      isUnknownReservedStream(scope.stream) &&
+      classifyStreamRow(row.read, hashes) === "present"
+    )
+      throw new UpdateRequiredError(
+        `apply: unknown reserved stream ${scope.stream}`,
+        undefined,
+      );
+  }
 }
 
 /**

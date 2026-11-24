@@ -229,9 +229,22 @@ export interface RegistryChangeAnswer {
    * What changed after the request's `since`, read in one snapshot at `seq`.
    * Present on, and only on, a changed answer to a request that sent `since`
    * (a gateway that cannot read the delta answers `reset`). A changed answer
-   * to such a request without a readable delta fails the request.
+   * to such a request without a readable delta fails the request, with one
+   * exception: when `epoch` differs from the one the request carried (or the
+   * request carried none), the answer may omit the delta. The cursor and `since` belong to another
+   * database generation then, so the caller must treat that answer as a reset
+   * (list in full) and not wait for a delta.
    */
   readonly delta?: RegistryChangeDelta;
+  /**
+   * The gateway database's epoch: the generation its sequences belong to. A
+   * dev reset or a restore starts a new one, and a cursor from the old one
+   * means nothing in the new one even when its number is in range. The caller
+   * sends back the epoch it last saw; the gateway answers a different one with
+   * a reset. Absent from a gateway that predates the epoch, which is then
+   * answered as before.
+   */
+  readonly epoch?: string;
 }
 
 /**
@@ -413,13 +426,16 @@ export interface StreamSyncRegistry {
    * when the gateway has no such route, and any other error on a failed read.
    * `signal` ends the request. `since`: the position up to which the caller
    * holds the registry; a changed answer may then carry the rows changed after
-   * it (`RegistryChangeAnswer.delta`).
+   * it (`RegistryChangeAnswer.delta`). `epoch`: the epoch of the answer that
+   * gave `after` and `since` their numbers (`RegistryChangeAnswer.epoch`), if
+   * the caller has seen one.
    */
   waitForChange?(
     after: string | undefined,
     waitMs: number,
     signal: AbortSignal,
     since: string | undefined,
+    epoch?: string,
   ): Promise<RegistryChangeAnswer>;
 }
 

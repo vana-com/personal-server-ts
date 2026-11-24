@@ -13,6 +13,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -43,7 +44,7 @@ describe("the server's hold on the account mode records", () => {
   const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(process.env.HOME ?? "", ".tmp", "boot-owner-"));
+    dir = await mkdtemp(join(tmpdir(), "boot-owner-"));
   });
   afterEach(async () => {
     for (const ctx of open.splice(0)) await ctx.cleanup().catch(() => {});

@@ -299,6 +299,11 @@ export interface SyncManager {
   deleteScope(
     scope: string,
     within?: LegacyWriteSeal["commit"],
+    /**
+     * `fence` sends the tombstone only over the head the caller read: a head
+     * that moved is refused (a failed gateway step), not tombstoned.
+     */
+    options?: Pick<DeleteScopeOptions, "fence">,
   ): Promise<DeleteScopeResult>;
 
   /** Whether the sync manager is currently running */
@@ -1758,15 +1763,22 @@ export function createSyncManager(
       }
     },
 
-    async deleteScope(scope: string, within?: LegacyWriteSeal["commit"]) {
+    async deleteScope(
+      scope: string,
+      within?: LegacyWriteSeal["commit"],
+      deleteOptions?: Pick<DeleteScopeOptions, "fence">,
+    ) {
       const result = await exclusive(async () => {
         // A delete the user asks for starts a fresh set of re-submissions.
         tombstoneResubmits.reset(scope);
         const outcome = within
           ? await within((hold) =>
-              deleteScope(deleteScopeDeps(), scope, { hold }),
+              deleteScope(deleteScopeDeps(), scope, {
+                ...deleteOptions,
+                hold,
+              }),
             )
-          : await deleteScope(deleteScopeDeps(), scope);
+          : await deleteScope(deleteScopeDeps(), scope, deleteOptions);
         // Upload state follows the rows. A failed delete removed nothing, so
         // its entries keep their budget and status; entries the delete did
         // remove are forgotten by comparing with what is still unsynced.

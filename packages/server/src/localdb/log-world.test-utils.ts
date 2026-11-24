@@ -2,6 +2,9 @@
 // and any number of devices of one owner, each with its own real SQLite and the
 // real publish and apply drivers (see log-protocol.test.ts).
 import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { keccak_256 } from "@noble/hashes/sha3";
 import type { StreamCryptoPort } from "../../../core/src/stream-sync/crypto-port.js";
 import {
@@ -51,6 +54,19 @@ const drivers: SqlDriver[] = [];
 /** Closes the databases of the devices a test opened; call it from `afterEach`. */
 export async function closeWorldDrivers(): Promise<void> {
   for (const db of drivers.splice(0)) await db.close();
+  for (const dir of tempDirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
+}
+const tempDirs: string[] = [];
+/**
+ * A database file of one test, on disk, for a device that restarts
+ * (`dbFile`). Removed by `closeWorldDrivers`. Under the system's temporary
+ * directory: a home-relative path exists on one machine only.
+ */
+export function tempDbFile(): string {
+  const dir = mkdtempSync(join(tmpdir(), "ps-restart-"));
+  tempDirs.push(dir);
+  return join(dir, "device.sqlite");
 }
 
 export async function world(options: {
@@ -118,15 +134,22 @@ export async function world(options: {
       streamCrypto?: StreamCryptoPort;
       /** The host's ports for erasing a deleted connection's log objects. */
       erasure?: () => LogErasurePorts | undefined;
+      /** The host's ports for retiring a deleted connection's legacy copy. */
+      legacyDelete?: () => LegacyDeletePorts | undefined;
       /** Waits between retries of a delete or erasure (shortened for tests). */
       deleteRetryMs?: { first: number; max: number };
+      /**
+       * A database file for this device (default: in memory). With a file the
+       * device can `restart`: a new process over the same database.
+       */
+      dbFile?: string;
     } = {},
   ) {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-      owner: OWNER,
-      network: "test",
-      deviceId,
-    });
+    const identity = { owner: OWNER, network: "test", deviceId };
+    const db = await openLocalDb(
+      openBetterSqlite3(hooks.dbFile ?? ":memory:"),
+      identity,
+    );
     drivers.push(db);
     const puts: string[] = [];
     const gets: string[] = [];
@@ -226,8 +249,9 @@ export async function world(options: {
         ? { partTargetBytes: options.partTargetBytes }
         : {}),
     };
-    const sync = createLocalSync(deps, {
+    const syncOptions = {
       ...(hooks.erasure ? { erasure: hooks.erasure } : {}),
+      ...(hooks.legacyDelete ? { legacyDelete: hooks.legacyDelete } : {}),
       ...(hooks.deleteRetryMs ? { deleteRetryMs: hooks.deleteRetryMs } : {}),
       // A digest `<connector>@<version>` names a connector version; a bare
       // connector name is version 1.
@@ -245,7 +269,33 @@ export async function world(options: {
             : {}),
         })),
       }),
-    });
+    };
+    const sync = createLocalSync(deps, syncOptions);
+    /**
+     * The process ends and starts again over the same database file: a new
+     * handle, a new queue and a new sync, with this device's ports. Nothing
+     * the old process held in memory is left.
+     */
+    let live: { db: typeof db; sync: typeof sync } = { db, sync };
+    const restart = async () => {
+      if (!hooks.dbFile) throw new Error("a restart needs a dbFile");
+      await live.sync.close();
+      const at = drivers.indexOf(live.db);
+      if (at >= 0) drivers.splice(at, 1);
+      const reopened = await openLocalDb(
+        openBetterSqlite3(hooks.dbFile),
+        identity,
+      );
+      drivers.push(reopened);
+      const next: LocalSyncDeps = {
+        ...deps,
+        db: reopened,
+        queue: connectionQueue(),
+      };
+      const restarted = createLocalSync(next, syncOptions);
+      live = { db: reopened, sync: restarted };
+      return { db: reopened, deps: next, sync: restarted };
+    };
     /** A run's begin: the mode and state the connector starts from. */
     const begin = (
       runId: string,
@@ -402,6 +452,7 @@ export async function world(options: {
       position,
       puts,
       gets,
+      restart,
     };
   }
 

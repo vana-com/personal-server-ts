@@ -110,31 +110,43 @@ export type OwnerRows = readonly {
  * row per control scope (classification is `classifyControl`). A deleted
  * control row whose connection still has rows, a checkpoint or this device's
  * participation row runs the local purge (F.5).
+ * Every connection is tried: one whose save or purge fails does not stop the
+ * others. With `failures`, each failure is recorded there against its own
+ * connection and the call returns; without it, the first failure is thrown
+ * once every connection was tried.
  * Returns the connections now known. Spec: C.0.
  */
 export async function bootstrapConnections(
   deps: LocalSyncDeps,
   /** The owner's rows, when the caller already listed them (`listOwnerRows`). */
   listed?: OwnerRows,
+  /** Receives the failure of each connection whose save or purge threw. */
+  failures?: Map<string, unknown>,
 ): Promise<readonly ConnectionRow[]> {
   const control = await hashes(deps);
   const rows = listed ?? (await deps.registry.listControlRows());
+  const failed = failures ?? new Map<string, unknown>();
   for (const row of rows) {
     const parsed = parseScope(row.scope);
     if (parsed?.kind !== "control") continue;
     const id = connectionId(parsed.connector, parsed.ns);
-    await deps.queue.run(id, "end", async () => {
-      const locked = insideQueue(deps, id);
-      const connection = await saveControl(
-        locked,
-        parsed.connector,
-        parsed.ns,
-        row.read,
-        control,
-      );
-      await purgeDeleted(locked, connection);
-    });
+    try {
+      await deps.queue.run(id, "end", async () => {
+        const locked = insideQueue(deps, id);
+        const connection = await saveControl(
+          locked,
+          parsed.connector,
+          parsed.ns,
+          row.read,
+          control,
+        );
+        await purgeDeleted(locked, connection);
+      });
+    } catch (cause) {
+      failed.set(id, cause);
+    }
   }
+  if (!failures && failed.size > 0) throw failed.values().next().value;
   return deps.db.query<SqlConnection>(
     `${SELECT_CONNECTIONS} ORDER BY connection_id`,
   );

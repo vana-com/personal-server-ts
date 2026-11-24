@@ -2,8 +2,11 @@
  * The delete worker and the legacy-write seal.
  *
  * Classification of the worker's durable steps:
- * - gateway tombstone: writes a NEW registry fact, so it is sealed like a
- *   write (refused once the account has moved to stream sync);
+ * - gateway tombstone: a removal, taken under the seal's `remove` in every
+ *   mode. After the switch the gateway decides (cutover policy v3 admits the
+ *   exact tombstone over a live head); `delete-switched.test.ts` runs that
+ *   against a gateway fake. The seal's lock still orders it against the On
+ *   latch;
  * - blob deletes at the storage backend and the retry markers: they remove
  *   remote objects or record bookkeeping, and add no visible legacy version;
  * - local removal: a pure removal, sealed in every mode by the storage's own
@@ -89,20 +92,18 @@ const on = (authority: Awaited<ReturnType<typeof setup>>["authority"]) =>
     state: "on",
   });
 
-describe("the gateway tombstone is a sealed write", () => {
+describe("the gateway tombstone is a removal under the seal's lock", () => {
   // TOMBSTONE_UNSEALED
-  it("is refused on a switched account: nothing is sent and the local copy is kept", async () => {
+  it("is sent on a switched account: the gateway, not the seal, decides", async () => {
     const f = await setup("on");
-    const refused = await deleteScope(f.deps, SCOPE).catch(
-      (error: unknown) => error,
+    const result = await deleteScope(f.deps, SCOPE);
+    expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
+    expect(result.steps.gateway.status).toBe("ok");
+    expect(result.durable).toBe(true);
+    // Only the write that adds data stays closed.
+    await expect(f.seal.commit(async () => undefined)).rejects.toBeInstanceOf(
+      LegacyWriteRefusedError,
     );
-    expect(refused).toBeInstanceOf(LegacyWriteRefusedError);
-    expect((refused as LegacyWriteRefusedError).verdict).toBe("switched");
-    expect(f.deleteData.tombstone).not.toHaveBeenCalled();
-    expect(f.deleteData.deleteBlobVersions).not.toHaveBeenCalled();
-    expect(f.storage.entries).toHaveLength(1);
-    // A refusal is not a gateway failure: nobody reads "gateway failed".
-    expect(f.deps.logger.error).not.toHaveBeenCalled();
   });
 
   it("runs on an unswitched account and removes the local copy", async () => {
@@ -134,23 +135,21 @@ describe("the gateway tombstone is a sealed write", () => {
     expect(f.storage.entries).toHaveLength(0);
   });
 
-  it("is refused for a delete that starts after On was submitted", async () => {
+  it("waits behind an On that was submitted first, then goes out as a removal", async () => {
     const barrier = gate();
     const f = await setup("off");
     const write = f.seal.commit(() => barrier.opened);
     await tick();
     const latch = on(f.authority);
     await tick();
-    const deleting = deleteScope(f.deps, SCOPE).catch(
-      (error: unknown) => error,
-    );
+    const deleting = deleteScope(f.deps, SCOPE);
     await tick();
+    expect(f.deleteData.tombstone).not.toHaveBeenCalled();
     barrier.open();
     await write;
     await latch;
-    expect(await deleting).toBeInstanceOf(LegacyWriteRefusedError);
-    expect(f.deleteData.tombstone).not.toHaveBeenCalled();
-    expect(f.storage.entries).toHaveLength(1);
+    expect((await deleting).steps.gateway.status).toBe("ok");
+    expect(f.deleteData.tombstone).toHaveBeenCalledTimes(1);
   });
 });
 

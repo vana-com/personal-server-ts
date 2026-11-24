@@ -18,6 +18,7 @@ import {
   controlScope,
   deriveKeyCheck,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { handleOwnerConnectorDelete } from "../../../core/src/api/owner-connector-delete.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import {
@@ -551,6 +552,120 @@ it("a foreign row that moved past the pin without a tombstone supersedes the del
     dataHash: OTHER.dataHash,
   });
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+});
+
+/** The tombstones a device's database holds as confirmed, and whether each has a verdict. */
+const ledger = (f: World) =>
+  f.a.db.query<{ ns: string; version: number; done_at: number | null }>(
+    "SELECT ns, version, done_at FROM delete_tombstones ORDER BY ns",
+  );
+
+it("writes only confirmed tombstones to the ledger: a fence a foreign head superseded is not one, and a restart owes nothing forever", async () => {
+  const f = await world(undefined, ["items"], true, [WORK]);
+  const [work] = f.others;
+  let raced = false;
+  f.registry.beforePost = async (row) => {
+    if (row.scope !== work || raced) return;
+    raced = true;
+    await rivalPost(f, work!, 2, OTHER);
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  f.registry.beforePost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+
+  // The default namespace's fence landed (version 2). The other namespace's
+  // never did: its head is a foreign write, not a tombstone.
+  expect(await ledger(f)).toEqual([{ ns: "", version: 2, done_at: null }]);
+
+  // A restart: the ledger names only what can finish.
+  const eraseLogs = vi.fn(async () => ({
+    connections: [
+      {
+        connector: "fixture-source",
+        ns: "",
+        outcome: {
+          kind: "erased" as const,
+          deleted: 1,
+          retained: 0,
+          unenumerated: 0,
+          witnessed: true,
+        },
+      },
+    ],
+    pending: false,
+    skipped: [],
+  }));
+  const restarted = createConnectionDeleter(f.a.deps, { eraseLogs });
+  expect(await restarted.resumeErasures()).toBe(false);
+  expect(restarted.erasureOwed()).toBe(false);
+  expect((await restarted.deleteStatus("fixture-source")).storage).toEqual({
+    state: "done",
+  });
+});
+
+it("writes no tombstone for a local-only purge: nothing was confirmed, so a restart owes nothing", async () => {
+  const f = await world(undefined, ["items"], false);
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state) VALUES ('local-only', 'fixture-source', '', 1, 'absent')",
+    },
+  ]);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+
+  expect(await ledger(f)).toEqual([]);
+  const eraseLogs = vi.fn(async () => ({
+    connections: [],
+    pending: false,
+    skipped: [],
+  }));
+  const restarted = createConnectionDeleter(f.a.deps, { eraseLogs });
+  expect(await restarted.resumeErasures()).toBe(false);
+  expect(restarted.erasureOwed()).toBe(false);
+  expect(
+    await f.a.db.query(
+      "SELECT connector FROM delete_tombstones WHERE done_at IS NULL",
+    ),
+  ).toEqual([]);
+});
+
+it("answers a delete request from the status held here: a stalled registry is read once, by the plan, and the answer is 202 not fenced", async () => {
+  const f = await world();
+  const lists = vi.fn();
+  const list = f.registry.listControlRows.bind(f.registry);
+  f.registry.listControlRows = (signal) => {
+    lists();
+    // The plan's listing answers; anything after it stalls.
+    return lists.mock.calls.length === 1
+      ? list(signal)
+      : new Promise<never>(() => {});
+  };
+  // The fence never lands: the registry does not answer the post.
+  f.registry.beforePost = () => new Promise<never>(() => {});
+  const deleter = createConnectionDeleter(f.a.deps, { fenceWaitMs: 100 });
+  // A delete of this connector is known here already.
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO delete_tombstones(connector, ns, version) VALUES ('fixture-source', '', 1)",
+    },
+  ]);
+
+  const response = await handleOwnerConnectorDelete(
+    new Request("https://example.test/v1/owner/connectors/fixture-source", {
+      method: "DELETE",
+    }),
+    "fixture-source",
+    {
+      authorizeOwner: async () => {},
+      mode: { read: () => "switched" },
+      connectionDelete: deleter,
+    },
+  );
+
+  expect(response.status).toBe(202);
+  expect(await response.json()).toMatchObject({ fenced: false });
+  // The plan listed once; the status of the answer listed nothing.
+  expect(lists).toHaveBeenCalledTimes(1);
 });
 
 it("a request with no answer is sent once more, then leaves its fences to the per-row pass, which lands them (mutant: NO_RESEND_AMBIGUOUS)", async () => {
@@ -1300,7 +1415,11 @@ it("a delete that names a lifetime purges the connections its pins name, and lea
       params: [HOME],
     },
   ]);
-  const eraseLogs = vi.fn(async () => ({ connections: [], pending: false }));
+  const eraseLogs = vi.fn(async () => ({
+    connections: [],
+    pending: false,
+    skipped: [],
+  }));
   const deleter = createConnectionDeleter(f.a.deps, { eraseLogs });
   const lifetime = await deleter.readConnectionLifetime("fixture-source");
   await deleter.requestConnectionDelete("fixture-source", { lifetime });
@@ -1319,7 +1438,11 @@ it("a delete that names a lifetime purges the connections its pins name, and lea
   expect(eraseLogs).toHaveBeenLastCalledWith(
     "fixture-source",
     expect.anything(),
-    { skipNamespaces: new Set([HOME]) },
+    {
+      skipNamespaces: new Set([HOME]),
+      // The tombstone this delete landed: the namespace's own, at pin + 1.
+      tombstones: new Map([["", 2]]),
+    },
   );
 });
 

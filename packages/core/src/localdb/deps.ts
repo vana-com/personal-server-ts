@@ -1,3 +1,4 @@
+import type { AttemptFailures } from "./partial-load.js";
 import type { SqlDriver } from "./driver.js";
 import type { connectionQueue } from "./queue.js";
 import type {
@@ -22,6 +23,11 @@ export interface LocalSyncDeps {
   /** Force the shared-table finish for a measured shadow comparison. */
   readonly bootstrapFirstLoadFinish?: "copy";
   readonly db: SqlDriver;
+  /**
+   * Set by the caller of one apply attempt: the streams that attempt marks
+   * failed are added here, for the attempt's own report (`syncConnection`).
+   */
+  readonly attemptFailures?: AttemptFailures;
   readonly queue: ConnectionQueue;
   readonly ownerAddress: `0x${string}`;
   readonly registry: StreamSyncRegistry;
