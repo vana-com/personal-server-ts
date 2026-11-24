@@ -223,6 +223,67 @@ describe("local database bootstrap", () => {
     );
   });
 
+  it("tries every connection and records a failed purge against its own connection", async () => {
+    const control = await controlHashes(
+      streamSyncHashes.keccak256,
+      "0707070707070707",
+    );
+    const doomed = controlScope("doomed", "");
+    const healthy = controlScope("healthy", "");
+    const listed = [
+      {
+        scope: doomed,
+        read: {
+          found: true,
+          version: 4,
+          deleted: false,
+          dataHash: control.tombstoneData,
+          metadataHash: control.tombstoneMetadata,
+        } as ControlRead,
+      },
+      {
+        scope: healthy,
+        read: {
+          found: true,
+          version: 2,
+          deleted: false,
+          dataHash: control.activeData,
+          metadataHash: control.activeMetadata,
+        } as ControlRead,
+      },
+    ];
+    const db = await fresh();
+    await db.batch([
+      {
+        sql: "INSERT INTO connections (connection_id, connector, ns) VALUES (?, 'doomed', '')",
+        params: [doomed],
+      },
+      {
+        sql: "INSERT INTO connection_participation(connection_id, joined_at) VALUES (?, 1)",
+        params: [doomed],
+      },
+    ]);
+    vi.mocked(purgeConnection).mockRejectedValue(new Error("purge failed"));
+    const d = deps(db, registryWith(listed[1]!.read));
+
+    const failures = new Map<string, unknown>();
+    const known = await bootstrapConnections(d, listed, failures);
+    expect(known.map((row) => row.connectionId).sort()).toEqual(
+      [doomed, healthy].sort(),
+    );
+    expect([...failures.keys()]).toEqual([doomed]);
+    expect(failures.get(doomed)).toEqual(new Error("purge failed"));
+
+    // Without a collector the first failure is thrown, after every connection
+    // was tried.
+    await expect(bootstrapConnections(d, listed)).rejects.toThrow(
+      "purge failed",
+    );
+    expect(
+      (await db.query("SELECT connection_id FROM connections")).length,
+    ).toBe(2);
+  });
+
   it("ends participation only when an accepted control installs a new generation", async () => {
     const control = await controlHashes(
       streamSyncHashes.keccak256,

@@ -114,6 +114,22 @@ export function failedRowStatement(
   };
 }
 
+/**
+ * The streams one apply attempt marked failed, with the reason of each. The
+ * attempt owns it (`LocalSyncDeps.attemptFailures`); nothing outlives it.
+ */
+export type AttemptFailures = Map<string, string>;
+
+/** Say that this attempt marked `streams` failed for `code`. */
+export function noteMarkedFailed(
+  into: AttemptFailures | undefined,
+  streams: Iterable<string>,
+  code: string,
+): void {
+  if (!into) return;
+  for (const stream of streams) into.set(stream, code);
+}
+
 /** Rows a statement binds at most; SQLite 3.22 allows 999 variables. */
 const HELD_PER_STATEMENT = 200;
 

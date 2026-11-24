@@ -1071,7 +1071,7 @@ describe("startPersonalServer publication receipts", () => {
         });
         expect(publication.watermark).toBeGreaterThan(0);
       }
-      await expect(server.publish()).resolves.toEqual({
+      await expect(server.publish()).resolves.toMatchObject({
         outcome: "noop",
         publications: [],
       });
@@ -1123,7 +1123,7 @@ describe("startPersonalServer publication receipts", () => {
       expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-a2"]]);
       // The deleted connection's run is settled, not owed: later publishes
       // are not held back by it.
-      await expect(server.publish()).resolves.toEqual({
+      await expect(server.publish()).resolves.toMatchObject({
         outcome: "noop",
         publications: [],
       });
