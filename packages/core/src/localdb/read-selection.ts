@@ -72,10 +72,12 @@ export type Candidate = {
    * every stream is complete, which is the only case when `progressive` is off.
    */
   partialStreams?: readonly string[];
+  /** Owner inspection of installed heads without whole-collection evidence. */
+  incompleteStreams?: readonly string[];
 };
 
 /** What a read of one stream can serve now. */
-export type Readability = "complete" | "partial" | "none";
+export type Readability = "complete" | "partial" | "incomplete" | "none";
 
 /**
  * The name rule: which connector streams a scope name reads. A logical
@@ -211,27 +213,33 @@ export const partialReadable = (s: Stream, c: Connection) =>
 
 /**
  * Complete when the head is complete and live, as always. Partial only for a
- * progressive read of a stream with a first load in progress. A stream with
- * neither serves nothing.
+ * progressive read of a stream with a first load in progress. Explicit owner
+ * inspection can also serve a live installed incomplete head, after its apply
+ * finished. It never treats an in-progress transfer as an installed view.
  */
 export const readability = (
   s: Stream,
   c: Connection,
   progressive: boolean,
+  includeIncomplete = false,
 ): Readability =>
   complete(s, c)
     ? "complete"
     : progressive && partialReadable(s, c)
       ? "partial"
-      : "none";
+      : includeIncomplete && live(s, c) && s.partial == null
+        ? "incomplete"
+        : "none";
 
 /**
- * Every stream of one connection (or of all connections) with its newest
- * complete head above the deletion floor.
+ * Every stream with its newest complete head above the deletion floor.
+ * Explicit owner inspection instead selects the installed head, including an
+ * incomplete one; aliases and default readers retain complete-head selection.
  */
 export async function loadStreams(
   deps: { readonly db: SqlReader },
   connectionId?: string,
+  includeIncomplete = false,
 ): Promise<Stream[]> {
   const rows = await deps.db.query<
     Omit<Stream, "partial"> & {
@@ -263,7 +271,7 @@ export async function loadStreams(
            SELECT max(h.version) FROM stream_versions h
            JOIN connections c ON c.connection_id = h.connection_id
            WHERE h.connection_id = s.connection_id AND h.stream = s.stream
-             AND h.generation = c.generation AND h.complete = 1
+             AND h.generation = c.generation ${includeIncomplete ? "AND h.version = s.head_version" : "AND h.complete = 1"}
              AND h.kind != 'delete' AND h.version > s.last_delete_version
          )
        LEFT JOIN stream_partial p ON p.connection_id = s.connection_id AND p.stream = s.stream
@@ -328,7 +336,10 @@ export function selectForTarget(
     readonly connection: Connection;
     readonly streams: readonly Stream[];
   }[],
-  options: { readonly progressive?: boolean } = {},
+  options: {
+    readonly progressive?: boolean;
+    readonly includeIncomplete?: boolean;
+  } = {},
 ):
   | { candidate: Candidate | undefined; tombstoned: boolean; kind?: "selected" }
   | { kind: "invalid_binding"; candidate: undefined; tombstoned: false } {
@@ -337,6 +348,7 @@ export function selectForTarget(
   // A first load's applied parts are served for a logical stream only: an
   // alias projects the whole head, which a partial head cannot give.
   const progressive = options.progressive === true && !target.alias;
+  const includeIncomplete = options.includeIncomplete === true && !target.alias;
   const active: (Candidate & { readonly missingRequired: boolean })[] = [];
   for (const { connection, streams: all } of connections) {
     if (connection.control_state !== "active" || connection.deleted_at !== null)
@@ -387,14 +399,18 @@ export function selectForTarget(
     return { candidate: undefined, tombstoned: false };
   }
   const states = selected.streams.map((s) =>
-    readability(s, selected.connection, progressive),
+    readability(s, selected.connection, progressive, includeIncomplete),
   );
   if (states.includes("none"))
     return { candidate: undefined, tombstoned: false };
-  if (!progressive) return { candidate: selected, tombstoned: false };
+  if (!progressive && !includeIncomplete)
+    return { candidate: selected, tombstoned: false };
   return {
     candidate: {
       ...selected,
+      incompleteStreams: selected.streams
+        .filter((_, i) => states[i] === "incomplete")
+        .map((s) => s.stream),
       partialStreams: selected.streams
         .filter((_, i) => states[i] === "partial")
         .map((s) => s.stream),

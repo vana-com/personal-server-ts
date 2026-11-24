@@ -87,6 +87,77 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     ).toEqual({ connector: "spotify", namespace: "" });
   });
 
+  it("links a registered browser method to its actual connector key instead of the source URL basename", () => {
+    const declaration = {
+      ...DECLARATION,
+      source_id: "https://registry.pdpp.dev/sources/github",
+    };
+    const auth = fakePdppAuth();
+    const deps = createPdppRecordsDeps({
+      pdppAuth: auth,
+      declarations: [declaration],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      replication: false,
+      logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: declaration.source_id, methodId: "github-browser" },
+      ],
+    })!;
+    const instance = "conn_123e4567-e89b-42d3-a456-426614174000";
+    deps.bindingStore.registerConnection({
+      instance,
+      sourceId: declaration.source_id,
+      method: "github-browser",
+      label: "Personal",
+    });
+    expect(deps.connectionLink!(instance, "top_artists")).toEqual({
+      connector: "github-browser",
+      namespace: "",
+    });
+    expect(deps.sourceIdForConnector!("github-browser")).toBe(
+      declaration.source_id,
+    );
+    expect(auth.resolveConnectionSourceId?.("github-browser")).toBe(
+      declaration.source_id,
+    );
+    expect(auth.resolveConnectionSourceId?.("not-a-method")).toBeUndefined();
+    expect(deps.sourceIdForConnector!("github")).toBeUndefined();
+    expect(deps.connectionLink!(instance, "unselected")).toBeNull();
+  });
+
+  it("refuses qualified record links when a collector method is ambiguous across sources", () => {
+    const sources = ["source-a", "source-b"].map((name) => ({
+      ...DECLARATION,
+      source_id: `https://registry.pdpp.dev/sources/${name}`,
+    }));
+    const auth = fakePdppAuth();
+    const deps = createPdppRecordsDeps({
+      pdppAuth: auth,
+      declarations: sources,
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      replication: false,
+      logger: pino({ level: "silent" }),
+      configuredMethods: sources.map((source) => ({
+        sourceId: source.source_id,
+        methodId: "github-browser",
+      })),
+    })!;
+    expect(deps.sourceIdForConnector!("github-browser")).toBeUndefined();
+    expect(auth.resolveConnectionSourceId?.("github-browser")).toBeUndefined();
+    for (const source of sources) {
+      const instances = deps.instancesForSource!(
+        SERVER_OWNER,
+        source.source_id,
+      );
+      expect(instances).toHaveLength(1);
+      expect(deps.connectionLink!(instances[0]!, "top_artists")).toBeNull();
+    }
+  });
+
   it("normalizes the server owner's address casing the same way subjectId is derived", () => {
     const deps = createPdppRecordsDeps({
       pdppAuth: fakePdppAuth(),

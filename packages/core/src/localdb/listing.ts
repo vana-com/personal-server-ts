@@ -52,7 +52,8 @@ export interface ListedScope {
    * returns the rows applied so far (`X-Stream-Sync-Partial` says how many).
    * Absent means ready, as on every other listing that carries the field.
    */
-  readonly dataStatus?: "indexing";
+  /** `incomplete`: installed and owner-readable, without collection-completeness proof. */
+  readonly dataStatus?: "indexing" | "incomplete";
 }
 
 function collectedAt(updatedAt: number | null): { latestCollectedAt?: string } {
@@ -86,6 +87,8 @@ export interface LocalListing {
      * that serves progressive loads lists them; a grantee's listing never does.
      */
     readonly includeLoading?: boolean;
+    /** Owner inspection of installed incomplete logical streams; never grant listings. */
+    readonly includeIncomplete?: boolean;
   }): Promise<readonly ListedScope[]>;
   /**
    * `audit` adds what two devices are compared by: a digest of each live,
@@ -157,13 +160,19 @@ export function createLocalListing(
    * five queries however many scopes there are. Nothing here depends on the
    * caller's authority, so overlapping callers share one.
    */
-  async function readSnapshot(progressive: boolean): Promise<readonly Entry[]> {
+  async function readSnapshot(
+    progressive: boolean,
+    includeIncomplete: boolean,
+  ): Promise<readonly Entry[]> {
     const rows = await reads.db.query<SelectionConnection>(
       `SELECT connection_id, connector, ns, generation,
        ${effectiveControl("connections")} AS control_state, deleted_at
        FROM connections ORDER BY connector, ns, connection_id`,
     );
     const streams = await loadStreams(reads);
+    const ownerStreams = includeIncomplete
+      ? await loadStreams(reads, undefined, true)
+      : streams;
     const stamps = await reads.db.query<{
       connection_id: string;
       stream: string;
@@ -187,6 +196,12 @@ export function createLocalListing(
       const list = streamsOf.get(stream.connection_id) ?? [];
       list.push(stream);
       streamsOf.set(stream.connection_id, list);
+    }
+    const ownerStreamsOf = new Map<string, Stream[]>();
+    for (const stream of ownerStreams) {
+      const list = ownerStreamsOf.get(stream.connection_id) ?? [];
+      list.push(stream);
+      ownerStreamsOf.set(stream.connection_id, list);
     }
     const byConnector = new Map<string, SelectionConnection[]>();
     for (const row of rows) {
@@ -257,9 +272,12 @@ export function createLocalListing(
           target,
           (byConnector.get(target.connector) ?? []).map((connection) => ({
             connection,
-            streams: streamsOf.get(connection.connection_id) ?? [],
+            streams:
+              (target.alias ? streamsOf : ownerStreamsOf).get(
+                connection.connection_id,
+              ) ?? [],
           })),
-          { progressive },
+          { progressive, includeIncomplete },
         );
         if (picked.kind === "invalid_binding") {
           invalidBinding = true;
@@ -298,6 +316,9 @@ export function createLocalListing(
           records: logicalStreamScopeParts(scope) ? records : null,
           updatedAt,
           ...collectedAt(updatedAt),
+          ...(chosen.incompleteStreams?.length
+            ? { dataStatus: "incomplete" as const }
+            : {}),
           ...(chosen.partialStreams?.length
             ? { dataStatus: "indexing" as const }
             : {}),
@@ -439,23 +460,27 @@ export function createLocalListing(
 
   // Overlapping calls share one read of local state; the next call after it
   // settles starts a new one, so nothing is served from a cache.
-  const inflight = new Map<boolean, Promise<readonly Entry[]>>();
-  const snapshot = (progressive: boolean) => {
+  const inflight = new Map<string, Promise<readonly Entry[]>>();
+  const snapshot = (progressive: boolean, includeIncomplete: boolean) => {
+    const key = `${progressive}:${includeIncomplete}`;
     const running =
-      inflight.get(progressive) ??
-      readSnapshot(progressive).finally(() => {
-        if (inflight.get(progressive) === running) inflight.delete(progressive);
+      inflight.get(key) ??
+      readSnapshot(progressive, includeIncomplete).finally(() => {
+        if (inflight.get(key) === running) inflight.delete(key);
       });
-    inflight.set(progressive, running);
+    inflight.set(key, running);
     return running;
   };
 
   return {
-    async listScopes({ canRead, includeLoading }) {
+    async listScopes({ canRead, includeLoading, includeIncomplete }) {
       const out: ListedScope[] = [];
       const progressive =
         includeLoading === true && deps.progressiveFirstLoad === true;
-      for (const entry of await snapshot(progressive)) {
+      for (const entry of await snapshot(
+        progressive,
+        includeIncomplete === true,
+      )) {
         try {
           if (!(await canRead(entry.scope))) continue;
           if (!entry.listed || !(await entry.bodyBuilds())) continue;
