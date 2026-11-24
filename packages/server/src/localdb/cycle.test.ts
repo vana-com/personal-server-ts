@@ -208,16 +208,21 @@ describe("local database cycle", () => {
       "succeeds",
     ]);
     // The failure is logged, not only returned: the timer drops the report.
-    expect(vi.mocked(deps.logger.warn).mock.calls).toEqual([
-      [
-        { connectionId: "apply-fails", error: "apply failed" },
-        "Stream sync cycle failed for a connection",
-      ],
-      [
-        { connectionId: "publish-fails", error: "publish failed" },
-        "Stream sync cycle failed for a connection",
-      ],
-    ]);
+    // The connections run concurrently, so their log order is not fixed.
+    const warned = vi.mocked(deps.logger.warn).mock.calls;
+    expect(warned).toHaveLength(2);
+    expect(warned).toEqual(
+      expect.arrayContaining([
+        [
+          { connectionId: "apply-fails", error: "apply failed" },
+          "Stream sync cycle failed for a connection",
+        ],
+        [
+          { connectionId: "publish-fails", error: "publish failed" },
+          "Stream sync cycle failed for a connection",
+        ],
+      ]),
+    );
   });
 
   it("publishes the other connections while one is still failing", async () => {

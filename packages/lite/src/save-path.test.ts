@@ -81,10 +81,17 @@ async function savePathWorld(autoStartSync = true) {
   let releaseListings!: () => void;
   const listingsHeld = new Promise<void>((r) => (releaseListings = r));
   let holdListings = false;
+  let failListings = false;
   const reads: string[] = [];
   const timedFetch = (async (input: string, init?: RequestInit) => {
     if ((init?.method ?? "GET") === "GET") reads.push(new URL(input).pathname);
     await sleep(WIRE_MS);
+    if (
+      failListings &&
+      (init?.method ?? "GET") === "GET" &&
+      new URL(input).pathname === "/v1/data"
+    )
+      throw new TypeError("listing unreachable");
     if (
       holdListings &&
       (init?.method ?? "GET") === "GET" &&
@@ -198,6 +205,10 @@ async function savePathWorld(autoStartSync = true) {
     segmentPuts,
     gateway,
     reads,
+    /** From now on every registry listing rejects. */
+    failListings: () => {
+      failListings = true;
+    },
     /** From now on a registry listing answers only after the returned release. */
     holdListings: () => {
       holdListings = true;
@@ -247,7 +258,9 @@ describe("the save path of a Web write", () => {
   describe("when a sibling connection's registry commit fails", () => {
     const SIBLING = "beta";
     async function withFailingSibling() {
-      const world = await savePathWorld();
+      // No background cycle: it could publish the caller's run before the
+      // publish under test, leaving that publish nothing to receipt.
+      const world = await savePathWorld(false);
       world.gateway.beforeBatch = (call) => {
         if (call.body.rows.some((row) => row.scope === logScope(SIBLING, "")))
           throw new TypeError("commit timed out");
@@ -276,6 +289,15 @@ describe("the save path of a Web write", () => {
           (c) => c.connectionId === controlScope(SIBLING, ""),
         )?.error,
       ).toMatch(/no reply/);
+    });
+
+    it("keeps the caller's acknowledged receipt when the fallback's registry listing rejects", async () => {
+      const { server, failListings } = await withFailingSibling();
+      failListings();
+      const own = controlScope(CONNECTOR, "");
+      const receipt = await server.publish({ connections: [own] });
+      expect(receipt.outcome).toBe("published");
+      expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
     });
 
     it("still rejects for the sibling when the caller names it", async () => {

@@ -83,3 +83,30 @@ describe("a stream name this build does not know", () => {
     );
   });
 });
+
+describe("a publish that fails while a stream is already marked failed", () => {
+  it("reports the publish error without the stale failed streams", async () => {
+    const w = await world({ streams: 1 });
+    const here = await w.device("here", {
+      beforePut: async () => {
+        throw new Error("storage unreachable");
+      },
+    });
+    await here.run("run-1", [{ stream: sName(0), id: "a" }]);
+    // A failed row an earlier load left; this pass's apply does not touch it.
+    await here.db.batch([
+      {
+        sql: `INSERT INTO stream_partial (connection_id, stream, version, generation, data_hash, head_blob, observed_at, parts_applied, parts_total, records_total, failed, last_error)
+       VALUES (?, ?, 1, 1, 'h', 'b', 0, 0, 1, 1, 1, 'missing_log_segment_2')`,
+        params: [CONNECTION_ID, sName(0)],
+      },
+    ]);
+    const report = await here.sync.cycle();
+    const connection = report.connections.find(
+      (c) => c.connectionId === CONNECTION_ID,
+    )!;
+    expect(connection.error).toMatch(/storage unreachable/);
+    expect(connection.status).toBeUndefined();
+    expect(connection.failedStreams).toBeUndefined();
+  });
+});

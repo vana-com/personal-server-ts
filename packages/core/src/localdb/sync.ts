@@ -92,7 +92,7 @@ export interface LocalSync {
    * committed it (`runPublish`). Apply and the registry listing run in the
    * next `cycle()`, not here.
    */
-  publish(): Promise<CycleReport>;
+  publish(awaited?: readonly string[]): Promise<CycleReport>;
   /** Apply remote logs without publishing (download hook). */
   apply(): Promise<void>;
   /**
@@ -466,9 +466,9 @@ export function createLocalSync(
       await accessActivity.project();
       return report;
     },
-    async publish() {
+    async publish(awaited) {
       await kickDeletes();
-      const report = await runPublish(deps);
+      const report = await runPublish(deps, awaited);
       await accessActivity.project();
       return report;
     },

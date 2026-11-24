@@ -700,7 +700,9 @@ export async function startPersonalServer(
       !runtimeBundle?.getLocalSync
     )
       throw new Error("Stream publication is unavailable");
-    const report = await (await runtimeBundle.getLocalSync()).publish();
+    const report = await (
+      await runtimeBundle.getLocalSync()
+    ).publish(options.connections);
     const connections = report.connections.map(connectionPublication);
     const own = options.connections ? new Set(options.connections) : null;
     const mine = connections.filter(
