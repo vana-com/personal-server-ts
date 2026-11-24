@@ -34,6 +34,66 @@ describe("memory data storage findEntry", () => {
   });
 });
 
+describe("memory data storage scope summaries", () => {
+  it("filters and pages sorted scopes while counting all matching scopes", async () => {
+    const storage = createMemoryDataStorage();
+    const insert = (scope: string, fileId: string, collectedAt: string) =>
+      storage.insertEntry({
+        scope,
+        fileId,
+        collectedAt,
+        path: `${scope}/${fileId}.json`,
+        sizeBytes: 1,
+      });
+    await insert("sample.z", "z", "2026-01-01T00:00:00Z");
+    await insert("unrelated.a", "other", "2026-01-01T00:00:00Z");
+    await insert("sample.a", "a-old", "2026-02-01T00:00:00Z");
+    await insert("sample.a", "a-new", "2026-01-01T00:00:00Z");
+
+    expect(storage.listScopes({ scopePrefix: "sample.", limit: 1 })).toEqual({
+      scopes: [
+        {
+          scope: "sample.a",
+          latestCollectedAt: "2026-01-01T00:00:00Z",
+          versionCount: 2,
+        },
+      ],
+      total: 2,
+    });
+    expect(
+      storage.listScopes({ scopePrefix: "sample.", limit: 1, offset: 1 }),
+    ).toEqual({
+      scopes: [
+        {
+          scope: "sample.z",
+          latestCollectedAt: "2026-01-01T00:00:00Z",
+          versionCount: 1,
+        },
+      ],
+      total: 2,
+    });
+  });
+
+  it("finds the highest public version sharing a data point id", async () => {
+    const storage = createMemoryDataStorage();
+    const insert = (fileId: string, version: number, dataPointId: string) =>
+      storage.insertEntry({
+        scope: "sample.records",
+        fileId,
+        collectedAt: "2026-01-01T00:00:00Z",
+        path: `sample/${fileId}.json`,
+        sizeBytes: 1,
+        version,
+        dataPointId,
+      });
+    const winner = await insert("winner", 8, "target");
+    await insert("later-lower-version", 4, "target");
+    await insert("unrelated-higher", 9, "other");
+    expect(storage.findByDataPointId("target")).toEqual(winner);
+    expect(storage.findByDataPointId("missing")).toBeUndefined();
+  });
+});
+
 describe("memory data storage index projections", () => {
   it("pages unsynced rows by increasing index id across a synced row", async () => {
     const storage = createMemoryDataStorage();
