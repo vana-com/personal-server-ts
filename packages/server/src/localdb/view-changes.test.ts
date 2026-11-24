@@ -1006,6 +1006,8 @@ describe("view changes", () => {
       { sql: "ALTER TABLE connections DROP COLUMN tombstone_wm_r" },
       // The log's typed deletion keys are columns on tables that stay.
       { sql: "ALTER TABLE run_rows DROP COLUMN pk_values" },
+      // A later migration's partial index names the column dropped next.
+      { sql: "DROP INDEX IF EXISTS record_changes_untyped_deletes" },
       { sql: "ALTER TABLE record_changes DROP COLUMN pk_values" },
       { sql: "ALTER TABLE stream_state DROP COLUMN key_types" },
       // The batch ordinal that orders two bodies of a key at one stamp.

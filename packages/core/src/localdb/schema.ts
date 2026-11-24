@@ -750,4 +750,14 @@ END`,
     `CREATE INDEX log_tombstones_by_record_key ON log_tombstones(connection_id, stream, record_key)`,
     `CREATE INDEX record_changes_by_record_key ON record_changes(connection_id, stream, record_key, seq)`,
   ],
+  [
+    // The explicit deletes made before typed keys were kept (`pk_values`
+    // null) are the only ones a publish round has to look for before it
+    // reads a replace (`untypedDeletePages`). They are few and old; the
+    // index holds them alone, so finding them does not read the changes still
+    // to publish. `IF NOT EXISTS` keeps the statement safe to run again.
+    `CREATE INDEX IF NOT EXISTS record_changes_untyped_deletes
+       ON record_changes(connection_id, stream, seq)
+       WHERE op = 'remove' AND explicit_delete = 1 AND pk_values IS NULL`,
+  ],
 ];

@@ -46,8 +46,12 @@ import {
   type SegmentRef,
   type SnapshotPart,
   type SnapshotPointer,
+  type WireSegment,
+  type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { keccakOf } from "../stream-sync/crypto-port.js";
+import { PARTS_IN_FLIGHT } from "../stream-sync/storage-retry.js";
+import { openSpool, SpooledObjectGoneError, type Spool } from "./log-spool.js";
 import { resolveBodies } from "./log-bodies.js";
 import { rebaseOnLog } from "./log-rebase.js";
 import { seedFromRecords } from "./log-seed.js";
@@ -644,6 +648,41 @@ export async function fetchSegment(
   position: number,
   deletionsOnly = false,
 ): Promise<{ segment: Segment; bytes: number; cipherBytes: number }> {
+  const { segment, bytes, cipherBytes } = await fetchWireSegment(
+    deps,
+    scope,
+    context,
+    dataHash,
+    position,
+  );
+  return {
+    segment: {
+      ...segment,
+      operations: await resolveBodies(
+        deps,
+        scope,
+        deletionsOnly
+          ? segment.operations.filter((op) => !isUpsert(op))
+          : segment.operations,
+      ),
+    },
+    bytes,
+    cipherBytes,
+  };
+}
+
+/**
+ * A segment fetched, decrypted and verified, its out-of-line bodies still
+ * named, not read. A caller that only carries a body forward (a fold into a
+ * snapshot) has no use for its bytes, and a record may be megabytes.
+ */
+export async function fetchWireSegment(
+  deps: LocalSyncDeps,
+  scope: string,
+  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
+  dataHash: string,
+  position: number,
+): Promise<{ segment: WireSegment; bytes: number; cipherBytes: number }> {
   const cipher = await deps.blobs.get(`${scope}/${segmentBlobName(dataHash)}`);
   if (cipher === null)
     throw new Error(`apply: missing log segment ${position}`);
@@ -667,17 +706,11 @@ export async function fetchSegment(
     throw new Error(
       `apply: invalid log segment ${position} (${verified.kind})`,
     );
-  const segment: Segment = {
-    ...verified.segment,
-    operations: await resolveBodies(
-      deps,
-      scope,
-      deletionsOnly
-        ? verified.segment.operations.filter((op) => !isUpsert(op))
-        : verified.segment.operations,
-    ),
+  return {
+    segment: verified.segment,
+    bytes: verified.bytes,
+    cipherBytes: cipher.length,
   };
-  return { segment, bytes: verified.bytes, cipherBytes: cipher.length };
 }
 
 const isUpsert = (op: { readonly kind: string }) =>
@@ -692,6 +725,33 @@ export async function fetchSnapshotPart(
   position: number,
   deletionsOnly = false,
 ): Promise<SnapshotPart> {
+  const part = await fetchWireSnapshotPart(
+    deps,
+    scope,
+    context,
+    dataHash,
+    position,
+  );
+  return {
+    ...part,
+    entries: await resolveBodies(
+      deps,
+      scope,
+      deletionsOnly
+        ? part.entries.filter((entry) => !isUpsert(entry))
+        : part.entries,
+    ),
+  };
+}
+
+/** A snapshot part fetched, decrypted and verified, its bodies still named (see `fetchWireSegment`). */
+export async function fetchWireSnapshotPart(
+  deps: LocalSyncDeps,
+  scope: string,
+  context: Pick<LogApplyContext, "connector" | "ns" | "keyCheck">,
+  dataHash: string,
+  position: number,
+): Promise<WireSnapshotPart> {
   const cipher = await deps.blobs.get(
     `${scope}/${snapshotPartBlobName(dataHash)}`,
   );
@@ -714,16 +774,7 @@ export async function fetchSnapshotPart(
     );
   if (verified.kind !== "ok")
     throw new Error(`apply: invalid log snapshot part (${verified.kind})`);
-  return {
-    ...verified.part,
-    entries: await resolveBodies(
-      deps,
-      scope,
-      deletionsOnly
-        ? verified.part.entries.filter((entry) => !isUpsert(entry))
-        : verified.part.entries,
-    ),
-  };
+  return verified.part;
 }
 
 /**
@@ -820,6 +871,72 @@ async function loadProgressively(
   snapshot: SnapshotPointer | null,
   tail: readonly SegmentRef[],
 ): Promise<number> {
+  // The ciphertext of the removing segments waits on disk between the prepass
+  // that reads them and the batches that apply them: a phone's memory is not
+  // the place for a long tail, and a second download is its data plan.
+  const ciphers = openSpool(deps.db, connectionId);
+  try {
+    return await loadProgressivelyWith(
+      ciphers,
+      deps,
+      connectionId,
+      scope,
+      context,
+      head,
+      allRefs,
+      snapshot,
+      tail,
+    );
+  } finally {
+    await ciphers.discard();
+  }
+}
+
+/**
+ * The blob store as the prepass sees it: a read keeps the ciphertext in
+ * `ciphers`. And as the batches see it: a read takes the kept ciphertext,
+ * once, and falls back to storage for a segment the prepass did not read (or
+ * one a purge took).
+ */
+function cipherCache(deps: LocalSyncDeps, ciphers: Spool) {
+  const through = (get: LocalSyncDeps["blobs"]["get"]): LocalSyncDeps => ({
+    ...deps,
+    blobs: { ...deps.blobs, get },
+  });
+  return {
+    remembering: through(async (key) => {
+      const bytes = await deps.blobs.get(key);
+      if (bytes !== null) await ciphers.add(key, bytes);
+      return bytes;
+    }),
+    replaying: through(async (key) => {
+      const kept = ciphers.get(key);
+      if (kept) {
+        try {
+          const bytes = await kept.read();
+          await ciphers.forget(key);
+          return bytes;
+        } catch (error) {
+          if (!(error instanceof SpooledObjectGoneError)) throw error;
+        }
+      }
+      return deps.blobs.get(key);
+    }),
+  };
+}
+
+async function loadProgressivelyWith(
+  ciphers: Spool,
+  deps: LocalSyncDeps,
+  connectionId: string,
+  scope: string,
+  context: LogApplyContext,
+  head: Segment,
+  allRefs: readonly SegmentRef[],
+  snapshot: SnapshotPointer | null,
+  tail: readonly SegmentRef[],
+): Promise<number> {
+  const cache = cipherCache(deps, ciphers);
   const partRefs = snapshot?.parts ?? [];
   // A part is fetched once, whoever asks first: the plan asks for the first,
   // the pass for the others as read-ahead reaches them.
@@ -848,7 +965,7 @@ async function loadProgressively(
     let fetching = segments.get(ref.position);
     if (!fetching) {
       fetching = fetchSegment(
-        deps,
+        cache.replaying,
         scope,
         context,
         ref.dataHash,
@@ -859,11 +976,45 @@ async function loadProgressively(
     }
     return fetching;
   };
-  // The segments the head does not say remove nothing: those are read first.
+  // The segments the head does not say remove nothing: those are read first,
+  // for what they remove alone: a removing segment is read whole again when
+  // its batch comes, so the pass does not hold it meanwhile.
   const removing = tail.filter(
     (ref) => ref.position !== head.position && ref.removes !== false,
   );
-  for (const ref of removing) void segmentAt(ref);
+  const deletionsOf = async (ref: SegmentRef) => {
+    const { segment } = await fetchSegment(
+      cache.remembering,
+      scope,
+      context,
+      ref.dataHash,
+      ref.position,
+      true,
+    );
+    return segment.operations;
+  };
+  // `PARTS_IN_FLIGHT` segments are read at a time; after a failure no read
+  // starts and the ones in flight end before the prepass does.
+  const deletions = new Map<number, Segment["operations"]>();
+  const prepass = (async () => {
+    let next = 0;
+    let failure: { readonly reason: unknown } | undefined;
+    const lane = async () => {
+      while (!failure && next < removing.length) {
+        const ref = removing[next++]!;
+        try {
+          deletions.set(ref.position, await deletionsOf(ref));
+        } catch (reason) {
+          failure ??= { reason };
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PARTS_IN_FLIGHT, removing.length) }, lane),
+    );
+    if (failure) throw failure.reason;
+  })();
+  prepass.catch(() => undefined);
 
   // Every batch's identity: the hash and blob its stream head will name.
   const identities = [
@@ -991,9 +1142,11 @@ async function loadProgressively(
 
   // What a later batch removes: read from the segments that say they remove,
   // which are in hand (or on their way) before the first batch applies.
-  const [firstPart] = await Promise.all([
-    partRefs.length > 0 ? partAt(0) : Promise.resolve(undefined),
-    ...removing.map(segmentAt),
+  const [firstStreams] = await Promise.all([
+    partRefs.length > 0
+      ? partAt(0).then((part) => JSON.stringify(part.streams))
+      : Promise.resolve(undefined),
+    prepass,
   ]).catch(async (error) => {
     const code = failureCode(error);
     const stopped = [...new Set([...begun, ...resumed])].map(headOf);
@@ -1021,10 +1174,15 @@ async function loadProgressively(
         )
         .map(async (ref) => ({
           index: partRefs.length + tail.indexOf(ref),
-          operations: (await segmentAt(ref)).operations,
+          operations:
+            ref.position === head.position
+              ? head.operations
+              : deletions.get(ref.position)!,
         })),
     ),
   );
+  // What the removing segments said is in `removed`: they are not kept.
+  deletions.clear();
 
   // What each batch does for the streams that load progressively: a function
   // of its place in the pass and its own operations, so the batches can be
@@ -1196,9 +1354,11 @@ async function loadProgressively(
       let batch: OperationBatch;
       if (index < partRefs.length) {
         const part = await partAt(index);
+        // The pass does not keep a part it has applied.
+        parts[index] = undefined;
         if (
           part.index !== index ||
-          JSON.stringify(part.streams) !== JSON.stringify(firstPart!.streams)
+          JSON.stringify(part.streams) !== firstStreams
         )
           throw new Error("apply: invalid log snapshot part (inconsistent)");
         batch = {
@@ -1210,6 +1370,7 @@ async function loadProgressively(
       } else {
         const ref = tail[index - partRefs.length]!;
         const segment = await segmentAt(ref);
+        if (ref.position !== head.position) segments.delete(ref.position);
         // A segment the head says removes nothing was not read first. If it
         // removes a key, rows of the keys it removes may be showing.
         if (ref.removes === false && segmentRemoves(segment.operations))
