@@ -84,9 +84,11 @@ class SourceChanged extends Error {
   }
 }
 
-/** What a pass saw: a digest of the upload lines, and the rows left out. The
- * upload's own count check only compares line counts, so a row that changed
- * between the passes would pass it. The digest compares content. */
+/** What a pass saw: a digest of every stored record it read (the ones the fold
+ * leaves out included, not only their count per reason) and of the upload
+ * lines, and the totals left out. The upload's own count check only compares
+ * line counts, so a row that changed between the passes would pass it. The
+ * digest compares content. */
 function fingerprint(
   digest: ReturnType<typeof sha256.create>,
   quarantine: QuarantineCounts,
@@ -97,31 +99,71 @@ function fingerprint(
   ]);
 }
 
+/** A record's text for the digest. A value with no JSON form (a cycle, a
+ * BigInt) has the same stand-in each pass. */
+function textOf(record: unknown): string {
+  try {
+    return JSON.stringify(record) ?? "undefined";
+  } catch {
+    return "unserializable";
+  }
+}
+
+/** The layers, each stored record also fed to `digest` as it is read. */
+function digesting(
+  layers: readonly FoldLayer[],
+  digest: ReturnType<typeof sha256.create>,
+): FoldLayer[] {
+  return layers.map((layer, index) => ({
+    async *records() {
+      for await (const record of layer.records()) {
+        digest.update(encoder.encode(`${index}:r:${textOf(record)}\n`));
+        yield record;
+      }
+    },
+    ...(layer.deletions
+      ? {
+          async *deletions() {
+            for await (const key of layer.deletions!()) {
+              digest.update(encoder.encode(`${index}:d:${textOf(key)}\n`));
+              yield key;
+            }
+          },
+        }
+      : {}),
+  }));
+}
+
 /** The importable rows of a stream, and what was left out, in one traversal.
  * The signal is checked at every stored record, the ones the fold leaves out
- * included, so a long skip cannot outlast an abort. */
+ * included, so a long skip cannot outlast an abort. A pass feeds every stored
+ * record it reads to `digest`. */
 function importable(stream: LegacySeedStream, signal?: AbortSignal) {
-  const source = foldLayers(
-    {
-      source: "producer",
-      owner: "",
-      network: "",
-      revision: "",
-      target: {
-        connectionId: "",
-        connector: stream.connector,
-        stream: stream.stream,
-        primaryKey: stream.primaryKey,
-        semantics: "mutable_state",
-        incremental: true,
+  const fold = (digest: ReturnType<typeof sha256.create>) =>
+    foldLayers(
+      {
+        source: "producer",
+        owner: "",
+        network: "",
+        revision: "",
+        target: {
+          connectionId: "",
+          connector: stream.connector,
+          stream: stream.stream,
+          primaryKey: stream.primaryKey,
+          semantics: "mutable_state",
+          incremental: true,
+        },
+        exclusions: [],
       },
-      exclusions: [],
-    },
-    stream.layers,
-    stream.sourceId === undefined ? {} : { sourceId: stream.sourceId },
-  );
-  return async function* (quarantine: ReturnType<typeof quarantineTally>) {
-    for await (const record of source.records()) {
+      digesting(stream.layers, digest),
+      stream.sourceId === undefined ? {} : { sourceId: stream.sourceId },
+    );
+  return async function* (
+    quarantine: ReturnType<typeof quarantineTally>,
+    digest: ReturnType<typeof sha256.create>,
+  ) {
+    for await (const record of fold(digest).records()) {
       signal?.throwIfAborted();
       const classified = await classifyImportRow(record, stream.primaryKey);
       if ("quarantine" in classified) quarantine.add(classified.quarantine);
@@ -173,7 +215,7 @@ export async function seedLegacyStore(
     const counted = sha256.create();
     // `for await` closes the readers when the pass ends early, by abort or fault.
     try {
-      for await (const row of read(quarantine)) {
+      for await (const row of read(quarantine, counted)) {
         count++;
         counted.update(encoder.encode(JSON.stringify(row) + "\n"));
       }
@@ -228,14 +270,23 @@ export async function seedLegacyStore(
       };
       const written = sha256.create();
       const writtenQuarantine = quarantineTally();
-      for await (const row of read(writtenQuarantine)) {
-        const line = encoder.encode(JSON.stringify(row) + "\n");
-        written.update(line);
-        // Flush before the line that would pass the bound, so a chunk holds
-        // whole lines within it; a line over the bound alone travels alone.
-        if (bytes > 0 && bytes + line.byteLength > CHUNK_BYTES) yield flush();
-        pending.push(line);
-        bytes += line.byteLength;
+      try {
+        for await (const row of read(writtenQuarantine, written)) {
+          const line = encoder.encode(JSON.stringify(row) + "\n");
+          written.update(line);
+          // Flush before the line that would pass the bound, so a chunk holds
+          // whole lines within it; a line over the bound alone travels alone.
+          if (bytes > 0 && bytes + line.byteLength > CHUNK_BYTES) yield flush();
+          pending.push(line);
+          bytes += line.byteLength;
+        }
+      } catch (error) {
+        // The counting pass found no conflict, so one found now means the store
+        // changed between the passes: this stream is refused as changed, and
+        // the next stream goes on.
+        if (error instanceof Error && error.message === "invalid_record")
+          throw new SourceChanged();
+        throw error;
       }
       // Before the last chunk leaves, so the staging never sees a complete
       // upload of changed content.

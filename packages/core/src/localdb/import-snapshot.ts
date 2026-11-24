@@ -6,7 +6,7 @@ import {
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
-import type { SqlDriver } from "./driver.js";
+import type { SqlDriver, SqlStatement } from "./driver.js";
 import type { ImportFingerprint, ImportSource } from "./legacy-import-types.js";
 import {
   quarantineTally,
@@ -141,6 +141,11 @@ export async function stageImportSnapshot(
     blocked INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (op, pk_hash), UNIQUE (op, record_key)) WITHOUT ROWID`,
     },
+    {
+      sql: `CREATE TEMP TABLE IF NOT EXISTS import_deletions (
+    op TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
+    PRIMARY KEY (op, pk_hash)) WITHOUT ROWID`,
+    },
   ]);
   // One worker round trip per chunk, not per row: each driver call clones its
   // message across the SQLite worker's thread boundary.
@@ -222,7 +227,55 @@ export async function* snapshotDigests(db: SqlDriver, op: string) {
 export async function clearImportSnapshot(db: SqlDriver, op: string) {
   await db.batch([
     { sql: "DELETE FROM import_snapshot WHERE op = ?", params: [op] },
+    { sql: "DELETE FROM import_deletions WHERE op = ?", params: [op] },
   ]);
+}
+
+/** Holds deleted keys outside `log_tombstones` until the source's last check
+ * passes: a refused import then leaves no tombstone behind. The temp table
+ * exists once `stageImportSnapshot` has run for this connection. */
+export async function stageImportDeletions(
+  db: SqlDriver,
+  op: string,
+  keys: readonly { pk_hash: string; record_key: string }[],
+) {
+  if (keys.length === 0) return;
+  await db.batch(
+    keys.map((key) => ({
+      sql: "INSERT OR IGNORE INTO import_deletions (op, pk_hash, record_key) VALUES (?, ?, ?)",
+      params: [op, key.pk_hash, key.record_key],
+    })),
+  );
+}
+
+/** One statement that turns the staged keys into seed tombstones. A live row
+ * or an earlier tombstone for the key keeps the key out. A tombstone with no
+ * record key (written before the column) has the same hash, so the primary
+ * key's `INSERT OR IGNORE` keeps it. */
+export function commitImportDeletions(
+  op: string,
+  target: { connectionId: string; stream: string },
+  rank: number,
+): SqlStatement {
+  return {
+    sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
+      SELECT ?, ?, d.pk_hash, d.record_key, 0, 'seed', ? FROM import_deletions d
+      WHERE d.op = ?
+        AND NOT EXISTS (SELECT 1 FROM records r
+          WHERE r.connection_id = ? AND r.stream = ? AND r.record_key = d.record_key)
+        AND NOT EXISTS (SELECT 1 FROM log_tombstones t
+          WHERE t.connection_id = ? AND t.stream = ? AND t.record_key = d.record_key)`,
+    params: [
+      target.connectionId,
+      target.stream,
+      rank,
+      op,
+      target.connectionId,
+      target.stream,
+      target.connectionId,
+      target.stream,
+    ],
+  };
 }
 
 /** The shared composition used by import staging and committed-row validation. */

@@ -364,4 +364,67 @@ describe("seedLegacyStore drift", () => {
     ]);
     expect(puts).toEqual(["items"]);
   });
+
+  it("refuses a stream whose skipped rows changed between the passes under the same reason", async () => {
+    const { port, puts } = intake();
+    const report = await seedLegacyStore(
+      port,
+      store(
+        stream([
+          // Both passes leave out one row for `missing_key_field`: the totals
+          // agree, the skipped row does not.
+          drifting([{ id: "a" }, { nope: 1 }], [{ id: "a" }, { nope: 2 }]),
+        ]),
+      ),
+    );
+    expect(report.streams).toMatchObject([
+      { outcome: "refused", reason: "source_changed" },
+    ]);
+    expect(puts).toEqual([]);
+  });
+
+  it("refuses a stream whose rows a fold left out changed under the same reason", async () => {
+    const { port, puts } = intake();
+    const report = await seedLegacyStore(
+      port,
+      store(
+        stream([
+          // `superseded` both times; the older layer's skipped row differs.
+          { ...drifting([{ id: "a", v: 9 }]) },
+          drifting([{ id: "a", v: 1 }], [{ id: "a", v: 2 }]),
+        ]),
+      ),
+    );
+    expect(report.streams).toMatchObject([
+      { outcome: "refused", reason: "source_changed" },
+    ]);
+    expect(puts).toEqual([]);
+  });
+
+  it("turns a conflict the fold finds in the upload pass into source_changed for that stream, and carries on", async () => {
+    const { port, puts } = intake();
+    const steady = { ...stream([drifting([{ id: "z" }])]), stream: "steady" };
+    const report = await seedLegacyStore(
+      port,
+      store(
+        // The counting pass is clean; the upload pass reads a repeat of `a`
+        // with another body, which the fold refuses as `invalid_record`.
+        stream([
+          drifting(
+            [{ id: "a", v: 1 }],
+            [
+              { id: "a", v: 1 },
+              { id: "a", v: 2 },
+            ],
+          ),
+        ]),
+        steady,
+      ),
+    );
+    expect(report.streams).toMatchObject([
+      { stream: "items", outcome: "refused", reason: "source_changed" },
+      { stream: "steady", outcome: "staged" },
+    ]);
+    expect(puts).toEqual(["steady"]);
+  });
 });
