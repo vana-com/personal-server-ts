@@ -1562,7 +1562,9 @@ describe("in-process scope scheduling", () => {
     const { withScopeLock } = await import("./scope-lock.js");
     const order: string[] = [];
     let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const failure = new Error("synthetic first task failed");
     const first = withScopeLock("fixture.lock-order", async () => {
       order.push("first");
@@ -1588,7 +1590,9 @@ describe("in-process scope scheduling", () => {
     const { withScopeLock } = await import("./scope-lock.js");
     const order: string[] = [];
     let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const first = withScopeLock("fixture.lock-a", async () => {
       await gate;
       order.push("first finished");
