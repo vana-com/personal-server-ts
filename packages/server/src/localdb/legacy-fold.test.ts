@@ -749,3 +749,73 @@ it("a delete envelope never removes a row a real write holds", async () => {
   expect(await state(a)).toEqual(before);
   expect(await tombstones(a)).toEqual([]);
 });
+
+it("a primary-key field named __proto__ still writes its tombstone", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  // JSON.parse makes `__proto__` an own property, as a stored row has it.
+  const own = (json: string) => JSON.parse(json) as unknown;
+  const result = await a.importSource("files", (base) =>
+    foldLayers(
+      { ...base, target: { ...base.target, primaryKey: ["__proto__"] } },
+      [
+        layer([
+          own(
+            `{"__proto__":"a","$pdpp":{"sourceId":"${SOURCE}","record":{"key":{"__proto__":"a"},"op":"delete"}}}`,
+          ),
+        ]),
+        layer([
+          own(`{"__proto__":"a","v":"old","$pdpp":{"sourceId":"${SOURCE}"}}`),
+          own(`{"__proto__":"b","v":"kept","$pdpp":{"sourceId":"${SOURCE}"}}`),
+        ]),
+      ],
+      { sourceId: SOURCE },
+    ),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    tombstoned: 1,
+    quarantine: { deleted_in_newer_layer: 1, delete_envelope: 1 },
+  });
+  expect(await a.keys()).toEqual(["b"]);
+  expect(
+    await a.db.query(
+      "SELECT record_key FROM log_tombstones WHERE stream = 'items'",
+    ),
+  ).toEqual([{ record_key: "a" }]);
+});
+
+it("a key object keeps a field named __proto__ as its own property", async () => {
+  const fold = foldLayers(
+    {
+      source: "s",
+      owner: "o",
+      network: "test",
+      revision: "r",
+      target: {
+        connectionId: "c",
+        connector: "fixture",
+        stream: "items",
+        primaryKey: ["__proto__", "id"],
+        semantics: "mutable_state",
+        incremental: true,
+      },
+      exclusions: [],
+    },
+    [
+      layer(
+        [],
+        [
+          JSON.parse('{"__proto__":"t","id":1}'),
+          JSON.parse('{"__proto__":"u","id":2}'),
+        ],
+      ),
+    ],
+  );
+  const keys: unknown[] = [];
+  for await (const key of fold.deletions!()) keys.push(key);
+  expect(keys.map((k) => JSON.stringify(k))).toEqual([
+    '{"__proto__":"t","id":1}',
+    '{"__proto__":"u","id":2}',
+  ]);
+});

@@ -159,9 +159,16 @@ export async function openLegacyAccess(
   };
   let bindingAfter: string | null = null;
   for (;;) {
-    const row = prepare(
-      "SELECT * FROM pdpp_instance_binding WHERE (? IS NULL OR instance > ?) ORDER BY instance LIMIT 1",
-    ).get(bindingAfter, bindingAfter) as Record<string, unknown> | undefined;
+    // A first and a continuation query: a nullable cursor predicate cannot seek.
+    const row = (
+      bindingAfter === null
+        ? prepare(
+            "SELECT * FROM pdpp_instance_binding ORDER BY instance LIMIT 1",
+          ).get()
+        : prepare(
+            "SELECT * FROM pdpp_instance_binding WHERE instance > ? ORDER BY instance LIMIT 1",
+          ).get(bindingAfter)
+    ) as Record<string, unknown> | undefined;
     if (!row) break;
     frame(row);
     bindingAfter = row.instance as string;
@@ -224,6 +231,9 @@ export async function openLegacyAccess(
   }
   releaseReadPages();
   const revision = hash.digest("hex");
+  // The newest deletion of each instance, read once: the source is fenced by
+  // `revision`, so it cannot change under this reader.
+  const deletedAt = new Map<string, number>();
   const reader: CanonicalImportPageReader = {
     declarations: options.declarations,
     async assertRevision(expected) {
@@ -241,12 +251,20 @@ export async function openLegacyAccess(
       let stream = "";
       for (;;) {
         await reader.assertRevision(expected);
-        const row = prepare(
-          `SELECT p.instance, p.stream, b.source_id AS sourceId, count(*) AS rows
+        // A first and a continuation query: a nullable cursor predicate keeps
+        // the planner from seeking, so each group would rescan the table.
+        const groups = `SELECT p.instance, p.stream, b.source_id AS sourceId, count(*) AS rows
           FROM pdpp_records p LEFT JOIN pdpp_instance_binding b ON b.instance = p.instance
-          WHERE p.deleted = 0 AND (? IS NULL OR p.instance > ? OR (p.instance = ? AND p.stream > ?))
-          GROUP BY p.instance,p.stream ORDER BY p.instance,p.stream LIMIT 1`,
-        ).get(instance, instance, instance, stream) as
+          WHERE p.deleted = 0`;
+        const order =
+          "GROUP BY p.instance,p.stream ORDER BY p.instance,p.stream LIMIT 1";
+        const row = (
+          instance === null
+            ? prepare(`${groups} ${order}`).get()
+            : prepare(
+                `${groups} AND (p.instance, p.stream) > (?, ?) ${order}`,
+              ).get(instance, stream)
+        ) as
           | {
               instance: string;
               stream: string;
@@ -279,11 +297,27 @@ export async function openLegacyAccess(
     },
     async connections(sourceId) {
       await authorized();
+      // An instance's activity is its newest write, a deletion included: the
+      // instance whose last live row was deleted is still the newest, and its
+      // tombstone must outrank an older copy of the row. A tombstone's
+      // `emitted_at` is the time of the deletion.
+      const lastDeleted = (instance: string) => {
+        const known = deletedAt.get(instance);
+        if (known !== undefined) return known;
+        const row = prepare(
+          "SELECT emitted_at, MAX(emitted_key) AS newest FROM pdpp_records WHERE instance = ? AND deleted = 1",
+        ).get(instance) as { emitted_at: string | null; newest: string | null };
+        const at =
+          row.newest && row.emitted_at ? Date.parse(row.emitted_at) : 0;
+        deletedAt.set(instance, at);
+        return at;
+      };
       return store.listConnections(sourceId).map((c) => ({
         instance: c.instance,
         deleted: c.deletedAt !== null,
         lastActive: Math.max(
           0,
+          lastDeleted(c.instance),
           ...store
             .listStreams([c.instance])
             .map((s) => (s.lastUpdated ? Date.parse(s.lastUpdated) : 0)),
@@ -299,13 +333,18 @@ export async function openLegacyAccess(
     },
     async deletedKeys(instance, stream, after, limit, expected) {
       await reader.assertRevision(expected);
-      const keys = (
-        prepare(
-          `SELECT record_key FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 1 AND (? IS NULL OR record_key > ?) ORDER BY record_key LIMIT ?`,
-        ).all(instance, stream, after, after, limit + 1) as {
-          record_key: string;
-        }[]
-      ).map((r) => r.record_key);
+      // A first-page and a continuation query, as `page` has: a nullable
+      // cursor predicate (`? IS NULL OR record_key > ?`) keeps the planner from
+      // seeking to the cursor, so each page would rescan the stream.
+      const found =
+        after === null
+          ? prepare(
+              `SELECT record_key FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 1 ORDER BY record_key LIMIT ?`,
+            ).all(instance, stream, limit + 1)
+          : prepare(
+              `SELECT record_key FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 1 AND record_key > ? ORDER BY record_key LIMIT ?`,
+            ).all(instance, stream, after, limit + 1);
+      const keys = (found as { record_key: string }[]).map((r) => r.record_key);
       const more = keys.length > limit;
       if (more) keys.pop();
       releaseReadPages();

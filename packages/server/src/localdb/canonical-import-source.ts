@@ -24,6 +24,10 @@ export interface CanonicalImportPageReader {
   /** Check the entire snapshot, not just one stream; call before/after each
    * inventory and records pass. Source quiescence is owned by legacy-access. */
   assertRevision(revision: string): Promise<void>;
+  /** The connections of a source id. `lastActive` is the time of the
+   * instance's newest write, a deletion included: an instance whose last live
+   * row was deleted is still the newest, and its tombstone outranks an older
+   * instance's copy of the row. */
   connections(
     sourceId: string,
   ): Promise<
@@ -68,7 +72,7 @@ export interface CanonicalImportPageReader {
  * connector/stream/key from declarations, never connector-id literals. Do not
  * invert legacy projected JSON or add transition tables. Record acceptance follows run intake; no import-only size limit. Factory returns descriptors lazily.
  * incremental defaults true as in IntakeStreamDeclaration; it is not inferred
- * from semantics or a new declaration field. Most recently active live instance wins (stable instance tie break).
+ * from semantics or a new declaration field. Most recently active live instance wins, a deletion counting as activity (stable instance tie break).
  * Unknown inventory yields ImportExclusion; never invent declaration/key/target.
  *
  * Older live instances of the same source id merge into the newest one's

@@ -112,15 +112,20 @@ const isKeyValue = (value: unknown): boolean =>
   (typeof value === "number" && Number.isFinite(value));
 
 /** Only the primary-key fields of `source`, taken from the first of `sources`
- * that holds each: all a tombstone needs, and all the fold keeps. */
+ * that holds each: all a tombstone needs, and all the fold keeps. The field
+ * names come from the stored record, so the object is built with own
+ * properties (`Object.fromEntries`): assigning `key["__proto__"]` would set a
+ * prototype instead and drop the field, and the key would have no identity. */
 function keyFields(
   primaryKey: readonly string[],
   ...sources: readonly Record<string, unknown>[]
 ): Record<string, unknown> {
-  const key: Record<string, unknown> = {};
-  for (const field of primaryKey)
-    key[field] = sources.find((s) => Object.hasOwn(s, field))?.[field];
-  return key;
+  return Object.fromEntries(
+    primaryKey.map((field) => [
+      field,
+      sources.find((s) => Object.hasOwn(s, field))?.[field],
+    ]),
+  );
 }
 
 /** The key a v1-full delete names, or why it names none. The claim must be a

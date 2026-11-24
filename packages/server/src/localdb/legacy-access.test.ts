@@ -748,3 +748,136 @@ it("legacy-access-revision-binds-deletion-keys", async () => {
   const second = (await collect(two.sources()))[0] as ImportSource;
   expect(first.revision).not.toBe(second.revision);
 });
+
+/** One row of `instance` in the fixture's profile stream, upserted or deleted. */
+function write(
+  f: Awaited<ReturnType<typeof fixture>>,
+  instance: string,
+  op: "upsert" | "delete",
+  emittedAt: string,
+) {
+  return f.store.ingestBatch(
+    [
+      {
+        instance,
+        stream: "profile",
+        key: "account",
+        data: op === "delete" ? null : body,
+        emitted_at: emittedAt,
+        op,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "profile-source", generation: 1 },
+  );
+}
+
+it("an instance whose last live row was deleted still outranks an older copy of the row", async () => {
+  const f = await fixture();
+  f.store.registerConnection({
+    instance: "newer",
+    sourceId: "urn:fixture",
+    method: "profile-source",
+    label: "Newer",
+  });
+  write(f, "newer", "upsert", "2026-02-01T00:00:00.000Z");
+  write(f, "newer", "delete", "2026-03-01T00:00:00.000Z");
+  // The newer instance holds no live row: only the tombstone of "account".
+  expect(
+    f.db
+      .prepare(
+        "SELECT count(*) AS n FROM pdpp_records WHERE instance = 'newer' AND deleted = 0",
+      )
+      .get(),
+  ).toEqual({ n: 0 });
+  const access = await openLegacyAccess(f.options);
+  const merged = (await collect(access.sources())) as ImportSource[];
+  expect(merged).toHaveLength(1);
+  // The older copy of the deleted row stays out, counted, and the key is
+  // tombstoned.
+  expect(await collect(merged[0]!.records())).toMatchObject([
+    { reason: "deleted_in_newer_layer" },
+  ]);
+  expect(await collect(merged[0]!.deletions!())).toEqual([{ id: "account" }]);
+  await access.close();
+});
+
+it("an instance deleted after another's last write outranks it; one written after does not", async () => {
+  const f = await fixture();
+  f.store.registerConnection({
+    instance: "newer",
+    sourceId: "urn:fixture",
+    method: "profile-source",
+    label: "Newer",
+  });
+  // The fixture's instance wrote at 2026-01-01. "newer" deleted before that:
+  // its tombstone is the older fact, so the live row of "instance" stands.
+  write(f, "newer", "upsert", "2025-11-01T00:00:00.000Z");
+  write(f, "newer", "delete", "2025-12-01T00:00:00.000Z");
+  const access = await openLegacyAccess(f.options);
+  const merged = (await collect(access.sources())) as ImportSource[];
+  expect(merged).toHaveLength(1);
+  expect(await collect(merged[0]!.records())).toEqual([body]);
+  expect(await collect(merged[0]!.deletions!())).toEqual([]);
+  await access.close();
+});
+
+it("every paged native reader seeks past its cursor instead of rescanning", async () => {
+  const f = await fixture();
+  f.store.registerConnection({
+    instance: "newer",
+    sourceId: "urn:fixture",
+    method: "profile-source",
+    label: "Newer",
+  });
+  write(f, "newer", "upsert", "2026-02-01T00:00:00.000Z");
+  // More tombstones than one deletion page holds, so a continuation runs.
+  const insert = f.db.prepare(
+    "INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, emitted_key, deleted, deleted_at) VALUES ('newer', 'profile', ?, NULL, 1, '2026-03-01T00:00:00.000Z', pdpp_time_key('2026-03-01T00:00:00.000Z'), 1, '2026-03-01T00:00:00.000Z')",
+  );
+  f.db.transaction(() => {
+    for (let i = 0; i < 1030; i++)
+      insert.run(`gone-${String(i).padStart(4, "0")}`);
+  })();
+  const prepare = vi.spyOn(f.db, "prepare");
+  try {
+    const access = await openLegacyAccess(f.options);
+    const merged = (await collect(access.sources())) as ImportSource[];
+    expect(merged).toHaveLength(1);
+    await collect(merged[0]!.records());
+    await access.close();
+    const planOf = (needle: string) => {
+      const sql = prepare.mock.calls
+        .map(([text]) => text)
+        .find((text) => text.includes(needle));
+      expect(sql, needle).toBeDefined();
+      return (
+        f.db
+          .prepare("EXPLAIN QUERY PLAN " + sql)
+          .all(...Array(sql!.match(/\?/g)?.length ?? 0).fill("x")) as {
+          detail: string;
+        }[]
+      ).map((row) => row.detail);
+    };
+    // Deletion keys: the continuation seeks on the key.
+    expect(planOf("deleted = 1 AND record_key > ?")).toEqual([
+      expect.stringMatching(
+        /SEARCH pdpp_records.+instance=\? AND stream=\? AND record_key>\?/,
+      ),
+    ]);
+    // Inventory groups and instance bindings: no `? IS NULL OR` cursor, and
+    // the continuation seeks on the cursor.
+    expect(planOf("(p.instance, p.stream) > (?, ?)")).toEqual([
+      expect.stringMatching(/SEARCH p .+\(instance,stream\)>\(\?,\?\)/),
+      expect.stringMatching(/SEARCH b /),
+    ]);
+    expect(planOf("FROM pdpp_instance_binding WHERE instance > ?")).toEqual([
+      expect.stringMatching(/SEARCH pdpp_instance_binding .+instance>\?/),
+    ]);
+    const sqls = prepare.mock.calls.map(([text]) => text);
+    expect(sqls.filter((text) => text.includes("? IS NULL OR"))).toEqual([]);
+  } finally {
+    prepare.mockRestore();
+  }
+});

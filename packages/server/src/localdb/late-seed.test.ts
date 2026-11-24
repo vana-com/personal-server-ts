@@ -7,6 +7,7 @@ import {
   createLocalSeed,
   createSeedIntake,
 } from "../../../core/src/localdb/index.js";
+import { rebaselineKeyedLoad } from "../../../core/src/localdb/log-keyed.js";
 import { createSeedStaging } from "../../../core/src/stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
@@ -718,4 +719,58 @@ it("an accepted run that declared a stream but wrote nothing leaves it open to a
       "SELECT stamp_r FROM records WHERE record_key = 'R' AND stream = 'items'",
     ),
   ).toEqual([{ stamp_r: "real" }]);
+});
+
+it("a seed tombstone survives a keyed-load rebaseline, so a late fill stays deleted", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["B"]);
+  await a.publish();
+  // The first import deleted "A" in the old store: a seed tombstone, which
+  // only this device holds (it is never published to the log).
+  const first = await a.importSource("install-1", (base) => ({
+    ...base,
+    async *records() {},
+    async *deletions() {
+      yield { id: "A" };
+    },
+  }));
+  expect(first).toMatchObject({ kind: "imported", tombstoned: 1 });
+  const tombstones = () =>
+    a.db.query(
+      "SELECT record_key, stamp_o, stamp_r FROM log_tombstones WHERE stream = 'items'",
+    );
+  expect(await tombstones()).toEqual([
+    { record_key: "A", stamp_o: 0, stamp_r: "seed" },
+  ]);
+  // Recovery ends an unfinished key-ordered load and drops the log's tombstones.
+  await rebaselineKeyedLoad(
+    { db: a.db, logger: { info() {} } as never },
+    connectionId,
+    "test",
+  );
+  expect(await tombstones()).toEqual([
+    { record_key: "A", stamp_o: 0, stamp_r: "seed" },
+  ]);
+  // A later seed from another install cannot bring "A" back.
+  expect((await a.seed("install-2", ["A", "Z"])).kind).toBe("imported");
+  expect(await a.keys()).toEqual(["B", "Z"]);
+});
+
+it("a rebaseline still drops the tombstones the log delivered", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("real", ["A", "B"]);
+  await a.publish();
+  await a.run("delete", ["A"], { remove: true });
+  await a.publish();
+  const tombstones = () =>
+    a.db.query("SELECT record_key FROM log_tombstones WHERE stream = 'items'");
+  expect(await tombstones()).toEqual([{ record_key: "A" }]);
+  await rebaselineKeyedLoad(
+    { db: a.db, logger: { info() {} } as never },
+    connectionId,
+    "test",
+  );
+  expect(await tombstones()).toEqual([]);
 });
