@@ -11,6 +11,12 @@ import {
   createMemoryStreamSyncRegistry,
   createMemoryStreamSyncBlobs,
 } from "@opendatalabs/personal-server-ts-core/stream-sync";
+import {
+  seedLegacyStore,
+  type FoldLayer,
+  type LegacySeedStream,
+  type SeedIntake,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
 import type { SqlDriver } from "../../core/src/localdb/driver.js";
 import { createSwitchedIndexedDbPsLiteRuntime } from "./test-support/unswitched-runtime.js";
@@ -225,7 +231,16 @@ it("fills a late seed into a stream a real collection owns, without overwriting 
     await f
       .driver()
       .query("SELECT stream, state, reason, rows FROM import_ledger"),
-  ).toEqual([{ stream: "items", state: "imported", reason: null, rows: 2 }]);
+  ).toEqual([
+    // Two staged rows; the real "a" blocks the seed's old "a": a counted
+    // outcome, not an import.
+    {
+      stream: "items",
+      state: "imported",
+      reason: 'outcomes:{"blocked":1}',
+      rows: 2,
+    },
+  ]);
   expect(
     await context.runtime.streamSyncSeed!.status("fixture-source"),
   ).toEqual({ targetKnown: true, streams: { items: { state: "merged" } } });
@@ -392,4 +407,140 @@ it("exposes seed intake through the public Lite handle", async () => {
   } finally {
     await handle.stop();
   }
+});
+
+// The producer a host with a legacy store only it can read (a browser's
+// IndexedDB, a phone's files) calls with that store's layers.
+const layer = (rows: () => AsyncIterable<unknown>): FoldLayer => ({
+  records: rows,
+});
+const stream = (layers: FoldLayer[], sourceId?: string): LegacySeedStream => ({
+  connector: "fixture-source",
+  stream: "items",
+  primaryKey: ["id"],
+  version: "1",
+  layers,
+  ...(sourceId ? { sourceId } : {}),
+});
+const storeOf = (...streams: LegacySeedStream[]) => ({
+  async *streams() {
+    yield* streams;
+  },
+});
+async function* rowsOf(...rows: unknown[]) {
+  yield* rows;
+}
+
+it("seeds a Web-only legacy store through the real runtime: newest layer wins, unfit rows are counted, a second run adds nothing", async () => {
+  const f = await fixture();
+  const context = await f.boot();
+  const seed = context.runtime.streamSyncSeed!;
+  const SOURCE = "urn:fixture";
+  const tag = { $pdpp: { sourceId: SOURCE } };
+  const store = storeOf(
+    stream(
+      [
+        layer(() =>
+          rowsOf(
+            { id: "a", v: "new", ...tag },
+            { v: "no key", ...tag },
+            { id: null, ...tag },
+          ),
+        ),
+        layer(() =>
+          rowsOf(
+            { id: "a", v: "old", ...tag },
+            { id: "b", v: "old-b", ...tag },
+            { id: "c", v: "untagged" },
+          ),
+        ),
+      ],
+      SOURCE,
+    ),
+  );
+  const report = await seedLegacyStore(seed, store);
+  expect(report).toEqual({
+    rows: 2,
+    quarantine: {
+      bad_key_value: 1,
+      missing_key_field: 1,
+      superseded: 1,
+      untagged: 1,
+    },
+    streams: [
+      {
+        connector: "fixture-source",
+        stream: "items",
+        outcome: "staged",
+        rows: 2,
+        quarantine: {
+          bad_key_value: 1,
+          missing_key_field: 1,
+          superseded: 1,
+          untagged: 1,
+        },
+        invalid: 0,
+      },
+    ],
+  });
+  expect(await read(context)).toMatchObject({
+    data: {
+      records: expect.arrayContaining([
+        { id: "a", v: "new" },
+        { id: "b", v: "old-b" },
+      ]),
+    },
+  });
+  const changes = await f.driver().query("SELECT * FROM record_changes");
+  expect(changes).toHaveLength(2);
+  // A second run reads nothing and changes nothing.
+  const again = await seedLegacyStore(seed, {
+    async *streams() {
+      yield stream([
+        layer(() => {
+          throw new Error("receipt replay read the layers");
+        }),
+      ]);
+    },
+  });
+  expect(again.streams).toEqual([
+    expect.objectContaining({ outcome: "merged", rows: 0 }),
+  ]);
+  expect(await f.driver().query("SELECT * FROM record_changes")).toEqual(
+    changes,
+  );
+});
+
+it("seeds a large phone store in bounded chunks from lazily read layers", async () => {
+  const f = await fixture();
+  const context = await f.boot();
+  const real = context.runtime.streamSyncSeed!;
+  const TOTAL = 6000;
+  const chunkSizes: number[] = [];
+  const spy: SeedIntake = {
+    status: (connector) => real.status(connector),
+    async put(connector, name, body) {
+      async function* measured() {
+        for await (const chunk of body) {
+          chunkSizes.push(chunk.byteLength);
+          yield chunk;
+        }
+      }
+      return real.put(connector, name, measured());
+    },
+  };
+  const padding = "x".repeat(1024);
+  const big = layer(async function* () {
+    for (let i = 0; i < TOTAL; i++) {
+      yield { id: `k${String(i).padStart(5, "0")}`, padding };
+    }
+  });
+  const report = await seedLegacyStore(spy, storeOf(stream([big])));
+  expect(report.rows).toBe(TOTAL);
+  expect(chunkSizes.length).toBeGreaterThan(10);
+  // A chunk is about one staging batch, never the stream: the bound plus one row.
+  expect(Math.max(...chunkSizes)).toBeLessThan(256 * 1024 + 2 * 1024);
+  expect(await f.driver().query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: TOTAL },
+  ]);
 });

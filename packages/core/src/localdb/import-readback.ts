@@ -49,7 +49,11 @@ export async function readBackLegacyImport(
   if (receipt.revision !== source.revision) return result("source_changed");
   const op = deps.newOp();
   try {
-    const expected = await stageImportSnapshot(deps.db, source, op);
+    const { fingerprint: expected } = await stageImportSnapshot(
+      deps.db,
+      source,
+      op,
+    );
     if (
       expected.rows !== receipt.rows ||
       expected.fingerprint !== receipt.fingerprint
@@ -65,11 +69,11 @@ export async function readBackLegacyImport(
             body: string;
             body_sha256: string;
           }>(
-            "SELECT pk_hash, record_key, body, body_sha256 FROM records WHERE connection_id = ? AND stream = ? AND pk_hash = ?",
+            "SELECT pk_hash, record_key, body, body_sha256 FROM records WHERE connection_id = ? AND stream = ? AND record_key = ?",
             [
               source.target.connectionId,
               source.target.stream,
-              expectedRow.pk_hash,
+              expectedRow.record_key,
             ],
           );
           if (!row) {
@@ -90,7 +94,9 @@ export async function readBackLegacyImport(
             })
           )
             throw new Error("stored_row_invalid");
-          yield row;
+          // The record key found the row; the digest keeps the snapshot's
+          // order, whichever typed key a live row holds.
+          yield { pk_hash: expectedRow.pk_hash, body_sha256: row.body_sha256 };
         }
       })(),
     );

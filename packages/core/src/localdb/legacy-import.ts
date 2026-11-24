@@ -3,14 +3,22 @@ import {
   IDENTITYLESS_NS,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { syncBeforeBegin } from "./bootstrap.js";
+import { EXPLICIT_DELETE_RANK } from "./log-batch.js";
 import { recoverLogTombstones } from "./log-tombstone-recovery.js";
 import { TEMP_TABLES, mergeIncoming, withOrigin } from "./merge.js";
 import {
   stageImportSnapshot,
-  canonicalImportRow,
+  classifyImportKey,
+  classifyImportRow,
   clearImportSnapshot,
   type ImportRow,
 } from "./import-snapshot.js";
+import {
+  receiptOutcomes,
+  receiptReason,
+  quarantineTally,
+  type QuarantineCounts,
+} from "./legacy-quarantine.js";
 import type { SqlStatement } from "./driver.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
@@ -55,6 +63,16 @@ export type LegacyImportResult =
   | {
       readonly kind: "imported" | "already-imported";
       readonly receipt: ImportReceipt;
+      /** Rows left out for want of a full identity, by reason (also on the
+       * receipt). A stream with some of them still imports the rest. A
+       * deletion with no full key counts as `deletion_<reason>`. */
+      readonly quarantine: QuarantineCounts;
+      /** Seed tombstones this call wrote (`ImportSource.deletions`). */
+      readonly tombstoned: number;
+      /** Staged rows the fill-only rules kept out because the stream holds,
+       * or deleted, the key with other content. They are in `receipt.rows`
+       * and are not imported: imported = `receipt.rows - blocked`. */
+      readonly blocked: number;
     }
   | {
       readonly kind: "refused";
@@ -80,6 +98,8 @@ export type LegacyImportResult =
  * per-stream deletion history too. Stage sorted digests only, then replay source
  * rows and check each digest before merging. Missing/extra/changed rows cannot
  * earn a receipt. Replays/crash retries add no rows or changes.
+ * A row with no full identity (`classifyImportRow`) is left out and counted on
+ * the receipt; the rest of its stream imports.
  * A seed only fills (`fillOnly`): it never changes a key the stream holds,
  * and never brings back a key a delete, an omission or a pending removal
  * covers, so it can land after any real write. Before it fills, the log's own
@@ -142,7 +162,11 @@ async function importSource(
     const op = deps.newOp();
     await deps.db.batch(TEMP_TABLES.map((sql) => ({ sql })));
     try {
-      const fingerprint = await stageImportSnapshot(deps.db, source, op);
+      const { fingerprint, quarantine } = await stageImportSnapshot(
+        deps.db,
+        source,
+        op,
+      );
       const prior = await ledger.get(source.source, connectionId, stream);
       // An excluded receipt (the earlier build's `seed_window_closed`) holds
       // the fingerprint of no rows, whatever the upload held: it proves nothing
@@ -158,12 +182,22 @@ async function importSource(
         "SELECT coalesce(max(seq),0) AS seq FROM record_changes WHERE connection_id = ? AND stream = ?",
         [connectionId, stream],
       );
+      const countTombstones = async () =>
+        (
+          await deps.db.query<{ n: number }>(
+            "SELECT count(*) AS n FROM log_tombstones WHERE connection_id = ? AND stream = ?",
+            [connectionId, stream],
+          )
+        )[0]!.n;
       let lastRow: ImportRow | null = null;
       const guard = guardImport(source, op);
       const merge = [
         ...fillOnly(op, connectionId),
         ...mergeIncoming(op, connectionId),
       ];
+      // Only the batches that bring the rows mark what the rules keep out; the
+      // closing merge replays the last row, which this call already wrote.
+      const markBlocked = markBlockedRows(op, connectionId);
       const incomingInsert = (row: ImportRow): SqlStatement => ({
         sql: `INSERT INTO incoming (op, stream, pk_hash, record_key, stamp_o, stamp_r, body, body_sha256, first_o) VALUES (?, ?, ?, ?, 0, 'seed', ?, ?, NULL)`,
         params: [
@@ -195,22 +229,27 @@ async function importSource(
         chunk = [];
         chunkBytes = 0;
         const snapshot = await deps.db.query<{
+          record_key: string;
           pk_hash: string;
           body_sha256: string;
           seen: number;
         }>(
-          "SELECT pk_hash, body_sha256, seen FROM import_snapshot WHERE op = ? AND pk_hash IN (SELECT value FROM json_each(?))",
-          [op, JSON.stringify(rows.map((r) => r.pk_hash))],
+          "SELECT record_key, pk_hash, body_sha256, seen FROM import_snapshot WHERE op = ? AND record_key IN (SELECT value FROM json_each(?))",
+          [op, JSON.stringify(rows.map((r) => r.record_key))],
         );
-        const expected = new Map(snapshot.map((r) => [r.pk_hash, r]));
+        const expected = new Map(snapshot.map((r) => [r.record_key, r]));
         const todo: ImportRow[] = [];
         const taken = new Set<string>();
         for (const row of rows) {
-          const known = expected.get(row.pk_hash);
-          if (!known || known.body_sha256 !== row.body_sha256)
+          const known = expected.get(row.record_key);
+          if (
+            !known ||
+            known.pk_hash !== row.pk_hash ||
+            known.body_sha256 !== row.body_sha256
+          )
             return "source_changed";
-          if (known.seen || taken.has(row.pk_hash)) continue;
-          taken.add(row.pk_hash);
+          if (known.seen || taken.has(row.record_key)) continue;
+          taken.add(row.record_key);
           todo.push(row);
         }
         if (todo.length === 0) return null;
@@ -220,11 +259,12 @@ async function importSource(
           withOrigin("import", [
             ...guard,
             ...todo.map(incomingInsert),
+            ...markBlocked,
             ...merge,
             { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
             ...todo.map((row) => ({
-              sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND pk_hash = ?",
-              params: [op, row.pk_hash],
+              sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND record_key = ?",
+              params: [op, row.record_key],
             })),
           ]),
         );
@@ -232,7 +272,14 @@ async function importSource(
         return null;
       };
       for await (const record of source.records()) {
-        const row = await canonicalImportRow(record, source.target.primaryKey);
+        const classified = await classifyImportRow(
+          record,
+          source.target.primaryKey,
+        );
+        // The staging pass counted this row out. A source that changed its
+        // mind between passes fails the digest check below.
+        if ("quarantine" in classified) continue;
+        const row = classified.row;
         chunk.push(row);
         chunkBytes += row.body.length;
         // Checked after the append: the batch ends with the row that crosses a
@@ -253,6 +300,80 @@ async function importSource(
       );
       if (remaining!.n !== 0)
         return { kind: "refused", reason: "source_changed" };
+      // A replay of a completed import reports what that import did: a live
+      // write since then does not turn an imported row into a blocked one.
+      const completedBefore =
+        prior?.revision === source.revision && prior.state !== "excluded";
+      const [held] = await deps.db.query<{ n: number }>(
+        "SELECT count(*) AS n FROM import_snapshot WHERE op = ? AND blocked = 1",
+        [op],
+      );
+      const blocked = completedBefore
+        ? receiptOutcomes(prior!.reason).blocked
+        : held!.n;
+      // Deletions the source records become seed tombstones, after the rows:
+      // no row for a deleted key reaches the merge (the source drops it), and
+      // the tombstone keeps another copy's seed from bringing it back.
+      const faults = quarantineTally();
+      for (const [reason, rows] of Object.entries(quarantine))
+        faults.add(reason, rows);
+      const tombstonesBefore = await countTombstones();
+      if (source.deletions) {
+        let keys: { pk_hash: string; record_key: string }[] = [];
+        const writeKeys = async (): Promise<
+          Extract<LegacyImportResult, { kind: "refused" }>["reason"] | null
+        > => {
+          if (keys.length === 0) return null;
+          const batch = keys;
+          keys = [];
+          const fenced = await importFence(deps, source);
+          if (fenced) return fenced;
+          await deps.db.batch([
+            ...guard,
+            ...batch.map((key): SqlStatement => ({
+              sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
+                  SELECT ?, ?, ?, ?, 0, 'seed', ? WHERE NOT EXISTS (SELECT 1 FROM records r
+                    WHERE r.connection_id = ? AND r.stream = ? AND r.record_key = ?)
+                  AND NOT EXISTS (SELECT 1 FROM log_tombstones t
+                    WHERE t.connection_id = ? AND t.stream = ? AND t.record_key = ?)`,
+              // A tombstone with no record key (written before the column) has
+              // the same hash, so the primary key's `INSERT OR IGNORE` keeps it.
+              params: [
+                connectionId,
+                stream,
+                key.pk_hash,
+                key.record_key,
+                EXPLICIT_DELETE_RANK,
+                connectionId,
+                stream,
+                key.record_key,
+                connectionId,
+                stream,
+                key.record_key,
+              ],
+            })),
+          ]);
+          return null;
+        };
+        for await (const record of source.deletions()) {
+          const classified = await classifyImportKey(
+            record,
+            source.target.primaryKey,
+          );
+          if ("quarantine" in classified) {
+            faults.add(`deletion_${classified.quarantine}`);
+            continue;
+          }
+          keys.push(classified.key);
+          if (keys.length >= IMPORT_CHUNK_ROWS) {
+            const stopped = await writeKeys();
+            if (stopped) return { kind: "refused", reason: stopped };
+          }
+        }
+        const stopped = await writeKeys();
+        if (stopped) return { kind: "refused", reason: stopped };
+      }
+      const tombstoned = (await countTombstones()) - tombstonesBefore;
       const fence = await importFence(deps, source);
       if (fence) return { kind: "refused", reason: fence };
       const [high] = await deps.db.query<{ seq: number }>(
@@ -268,7 +389,7 @@ async function importSource(
         generation: 1,
         highestSeq: high!.seq,
         state: "imported",
-        reason: null,
+        reason: receiptReason({ blocked, quarantined: faults.counts() }),
         at: deps.now(),
       };
       // Final idempotent merge and receipt share this transaction. A crash
@@ -286,14 +407,15 @@ async function importSource(
       // A reopened `seed_window_closed` receipt is `excluded`: it completed
       // nothing, so this call writes the first receipt that did, however few
       // keys it filled.
-      const completedBefore =
-        prior?.revision === source.revision && prior.state !== "excluded";
       return {
         kind:
           completedBefore && high!.seq === before!.seq
             ? "already-imported"
             : "imported",
         receipt,
+        quarantine: faults.counts(),
+        tombstoned,
+        blocked,
       };
     } catch (error) {
       const fence = await importFence(deps, source);
@@ -366,7 +488,7 @@ async function importFence(
 
 /**
  * Old data fills; it never overwrites and never resurrects. A record whose key
- * the stream holds, or that a tombstone covers, or that has a removal waiting
+ * (the legacy record key, in whatever type its fields were stored) the stream holds, or that a tombstone covers, or that has a removal waiting
  * to be published, is left out of the batch before it merges. The merge cannot
  * do this alone: it inserts an absent key whatever its stamp, and for a held
  * key an import nulls the row's first-seen checkpoint. A tombstone is written
@@ -379,17 +501,42 @@ async function importFence(
 function fillOnly(op: string, connectionId: string): SqlStatement[] {
   return [
     {
-      sql: `DELETE FROM temp.incoming WHERE op = ? AND (
+      sql: `DELETE FROM temp.incoming WHERE op = ? AND ${HELD}`,
+      params: [op, ...heldParams(connectionId)],
+    },
+  ];
+}
+
+/** The incoming row's key is held: by a row, a tombstone, or a removal not yet
+ * published. Identity is the record key. A tombstone written before the column
+ * (`record_key IS NULL`) has only its hash, so the hash answers for it: the
+ * primary key reaches it with no further index. */
+const HELD = `(
         EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ?
-          AND r.stream = incoming.stream AND r.pk_hash = incoming.pk_hash)
+          AND r.stream = incoming.stream AND r.record_key = incoming.record_key)
         OR EXISTS (SELECT 1 FROM log_tombstones t WHERE t.connection_id = ?
-          AND t.stream = incoming.stream AND t.pk_hash = incoming.pk_hash)
+          AND t.stream = incoming.stream AND t.record_key = incoming.record_key)
+        OR EXISTS (SELECT 1 FROM log_tombstones t WHERE t.connection_id = ?
+          AND t.stream = incoming.stream AND t.pk_hash = incoming.pk_hash
+          AND t.record_key IS NULL)
         OR EXISTS (SELECT 1 FROM record_changes ch WHERE ch.connection_id = ?
-          AND ch.stream = incoming.stream AND ch.pk_hash = incoming.pk_hash
+          AND ch.stream = incoming.stream AND ch.record_key = incoming.record_key
           AND ch.op = 'remove'
           AND ch.seq > COALESCE((SELECT publish_watermark FROM stream_state
-            WHERE connection_id = ? AND stream = incoming.stream), 0)))`,
-      params: [op, connectionId, connectionId, connectionId, connectionId],
+            WHERE connection_id = ? AND stream = incoming.stream), 0)))`;
+const heldParams = (connectionId: string) => Array(5).fill(connectionId);
+
+/** Marks the staged rows `fillOnly` is about to keep out. A row the stream
+ * already holds byte for byte is not blocked: the same row is there. */
+function markBlockedRows(op: string, connectionId: string): SqlStatement[] {
+  return [
+    {
+      sql: `UPDATE import_snapshot SET blocked = 1 WHERE op = ? AND record_key IN (
+        SELECT incoming.record_key FROM temp.incoming WHERE incoming.op = ? AND ${HELD}
+          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ?
+            AND r.stream = incoming.stream AND r.pk_hash = incoming.pk_hash
+            AND r.body_sha256 = incoming.body_sha256))`,
+      params: [op, op, ...heldParams(connectionId), connectionId],
     },
   ];
 }

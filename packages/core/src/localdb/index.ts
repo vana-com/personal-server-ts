@@ -146,6 +146,9 @@ export {
 export type * from "./legacy-import-types.js";
 export * from "./import-ledger.js";
 export * from "./legacy-import.js";
+export * from "./legacy-quarantine.js";
+export * from "./legacy-fold.js";
+export * from "./legacy-seed-producer.js";
 export * from "./import-readback.js";
 export * from "./legacy-retire.js";
 
