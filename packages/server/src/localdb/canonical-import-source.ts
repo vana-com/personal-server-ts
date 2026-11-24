@@ -1,8 +1,11 @@
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
-import type {
-  ImportInventoryEntry,
-  ImportTarget,
-  ImportProjectionPort,
+import {
+  foldLayers,
+  type FoldLayer,
+  type ImportInventoryEntry,
+  type ImportSource,
+  type ImportTarget,
+  type ImportProjectionPort,
 } from "@opendatalabs/personal-server-ts-core/localdb";
 
 /** F.2/F.4: bounded page port implemented privately by legacy-access; no store opened here. */
@@ -26,6 +29,22 @@ export interface CanonicalImportPageReader {
   ): Promise<
     readonly { instance: string; deleted: boolean; lastActive: number }[]
   >;
+  /** Live rows of a stream, for the report of a source that merges instances.
+   * Optional: a reader without it leaves the merged source's count unset. */
+  rows?(instance: string, stream: string, revision: string): Promise<number>;
+  /** Record keys of the rows a stream deleted, keyset paged like `page`. A
+   * newer instance's deletion keeps an older instance's copy out. Optional:
+   * a reader without it names no deletions. */
+  deletedKeys?(
+    instance: string,
+    stream: string,
+    after: string | null,
+    limit: number,
+    revision: string,
+  ): Promise<{
+    readonly keys: readonly string[];
+    readonly next: string | null;
+  }>;
   page(
     instance: string,
     stream: string,
@@ -36,7 +55,7 @@ export interface CanonicalImportPageReader {
     revision: string,
   ): Promise<{
     /** Stored rows as parsed. A row that is not a JSON object (or not JSON) is
-     * `null`; the import counts it out instead of refusing the stream. */
+     * `null`: the import counts it out (`not_an_object`), it does not stop. */
     readonly rows: readonly unknown[];
     readonly next: string | null;
   }>;
@@ -51,6 +70,14 @@ export interface CanonicalImportPageReader {
  * incremental defaults true as in IntakeStreamDeclaration; it is not inferred
  * from semantics or a new declaration field. Most recently active live instance wins (stable instance tie break).
  * Unknown inventory yields ImportExclusion; never invent declaration/key/target.
+ *
+ * Older live instances of the same source id merge into the newest one's
+ * stream (`olderInstances: "merge"`, the default): one source per stream, its
+ * layers the live instances by rank, newest first, so the newest body of a
+ * key wins whatever order anything reads or submits in (`foldLayers`). A
+ * deleted instance (the person removed the connection) is never merged: its
+ * rows stay excluded as `deleted_instance`. `"exclude"` keeps the newest
+ * instance only, as before.
  */
 export async function* createCanonicalImportSource(options: {
   readonly owner: string;
@@ -58,6 +85,9 @@ export async function* createCanonicalImportSource(options: {
   readonly revision: string;
   readonly bindings: ImportProjectionPort["bindings"];
   readonly reader: CanonicalImportPageReader;
+  /** What becomes of the live instances that are not the newest of their
+   * source id. Default `"merge"`. */
+  readonly olderInstances?: "merge" | "exclude";
   /** Same authenticated connection authority as host uploads; null excludes.
    * Never turn a legacy instance/install id into a new sync namespace. */
   readonly resolveTarget: (
@@ -67,6 +97,7 @@ export async function* createCanonicalImportSource(options: {
   ) => Promise<ImportTarget | null>;
 }): AsyncIterable<ImportInventoryEntry> {
   const { owner, network, revision, reader, resolveTarget } = options;
+  const merge = (options.olderInstances ?? "merge") === "merge";
   const check = () => reader.assertRevision(revision);
   await check();
   for await (const entry of reader.inventory(revision)) {
@@ -109,8 +140,15 @@ export async function* createCanonicalImportSource(options: {
       (a, b) =>
         b.lastActive - a.lastActive || a.instance.localeCompare(b.instance),
     );
-    if (!live.length || live[0]!.instance !== entry.instance) {
-      yield exclude(live.length ? "older_instance" : "deleted_instance");
+    const rank = live.findIndex((c) => c.instance === entry.instance);
+    if (rank < 0) {
+      yield exclude("deleted_instance");
+      continue;
+    }
+    // An older live instance is a layer of the newest one's source, below.
+    if (rank > 0) {
+      if (merge) continue;
+      yield exclude("older_instance");
       continue;
     }
     const resolved = await resolveTarget(
@@ -143,9 +181,12 @@ export async function* createCanonicalImportSource(options: {
       semantics: stream.semantics ?? "mutable_state",
     });
     // Capture scalars, not mutable inventory objects from the adapter.
-    const instance = entry.instance;
     const streamName = entry.stream;
-    yield {
+    const instances = merge ? live.map((c) => c.instance) : [entry.instance];
+    const layers = instances.map((instance) =>
+      layerOf(reader, revision, check, instance, streamName),
+    );
+    const base: Omit<ImportSource, "records" | "deletions"> = {
       source,
       owner,
       network,
@@ -153,42 +194,98 @@ export async function* createCanonicalImportSource(options: {
       target,
       exclusions: [],
       rows: entry.rows,
-      async *records() {
-        await check();
-        let cursor: string | null = null;
-        do {
-          await check();
-          let page:
-            Awaited<ReturnType<CanonicalImportPageReader["page"]>> | undefined =
-            await reader.page(
-              instance,
-              streamName,
-              cursor,
-              128,
-              4 * 1024 * 1024,
-              revision,
-            );
-          await check();
-          if (page.rows.length > 128) throw new Error("invalid_page_size");
-          if (
-            page.next !== null &&
-            (page.next === cursor || page.rows.length === 0)
-          ) {
-            throw new Error("invalid_page_cursor");
-          }
-          for (const record of page.rows) yield record;
-          cursor = page.next;
-          // A suspended generator keeps locals rooted. Drop the consumed page
-          // before the host handoff and the next decoded page allocation.
-          page = undefined;
-          // A native reader can resolve every page synchronously. Let host
-          // tasks and collection run before allocating the next decoded page.
-          if (cursor !== null)
-            await new Promise<void>((resolve) => setTimeout(resolve, 0));
-        } while (cursor !== null);
-        await check();
-      },
     };
+    if (instances.length === 1) {
+      yield { ...base, records: layers[0]!.records };
+      continue;
+    }
+    // Several live instances: one source, named for the merge, over their layers.
+    let rows: number | undefined = entry.rows;
+    if (reader.rows)
+      for (const instance of instances.slice(1))
+        rows += await reader.rows(instance, streamName, revision);
+    else rows = undefined;
+    yield foldLayers(
+      {
+        ...base,
+        source: JSON.stringify(["merged", entry.sourceId, revision]),
+        ...(rows === undefined ? {} : { rows }),
+      },
+      layers,
+    );
   }
   await check();
+}
+
+/** One instance's stream as a layer: its rows, and the keys it deleted. */
+function layerOf(
+  reader: CanonicalImportPageReader,
+  revision: string,
+  check: () => Promise<void>,
+  instance: string,
+  streamName: string,
+): FoldLayer {
+  return {
+    async *records() {
+      await check();
+      let cursor: string | null = null;
+      do {
+        await check();
+        let page:
+          Awaited<ReturnType<CanonicalImportPageReader["page"]>> | undefined =
+          await reader.page(
+            instance,
+            streamName,
+            cursor,
+            128,
+            4 * 1024 * 1024,
+            revision,
+          );
+        await check();
+        if (page.rows.length > 128) throw new Error("invalid_page_size");
+        if (
+          page.next !== null &&
+          (page.next === cursor || page.rows.length === 0)
+        ) {
+          throw new Error("invalid_page_cursor");
+        }
+        // A row with no full key is the import's to count, not this reader's
+        // to refuse: one bad row must not hide the rest of its stream.
+        for (const record of page.rows) yield record;
+        cursor = page.next;
+        // A suspended generator keeps locals rooted. Drop the consumed page
+        // before the host handoff and the next decoded page allocation.
+        page = undefined;
+        // A native reader can resolve every page synchronously. Let host
+        // tasks and collection run before allocating the next decoded page.
+        if (cursor !== null)
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      } while (cursor !== null);
+      await check();
+    },
+    async *deletedRecordKeys() {
+      if (!reader.deletedKeys) return;
+      let cursor: string | null = null;
+      do {
+        await check();
+        const page: Awaited<
+          ReturnType<NonNullable<typeof reader.deletedKeys>>
+        > = await reader.deletedKeys(
+          instance,
+          streamName,
+          cursor,
+          1024,
+          revision,
+        );
+        await check();
+        if (
+          page.next !== null &&
+          (page.next === cursor || page.keys.length === 0)
+        )
+          throw new Error("invalid_page_cursor");
+        yield* page.keys;
+        cursor = page.next;
+      } while (cursor !== null);
+    },
+  };
 }

@@ -138,7 +138,9 @@ it("canonical-limit-pages", async () => {
 it("canonical-selects-the-most-recently-active-instance", async () => {
   const f = fixture();
   f.ambiguous();
-  const inventory = await collect(createCanonicalImportSource(f.options));
+  const inventory = await collect(
+    createCanonicalImportSource({ ...f.options, olderInstances: "exclude" }),
+  );
   expect(inventory).toHaveLength(2);
   expect(inventory[0]).toMatchObject({
     kind: "excluded",
@@ -147,6 +149,18 @@ it("canonical-selects-the-most-recently-active-instance", async () => {
   });
   expect(inventory[1]).not.toHaveProperty("kind");
   expect(JSON.parse(inventory[1]!.source)[0]).toBe("other");
+});
+it("canonical-merges-older-live-instances-into-the-newest-ones-stream", async () => {
+  const f = fixture();
+  f.ambiguous();
+  const inventory = await collect(createCanonicalImportSource(f.options));
+  expect(inventory).toHaveLength(1);
+  expect(inventory[0]).not.toHaveProperty("kind");
+  expect(JSON.parse(inventory[0]!.source)).toEqual([
+    "merged",
+    "urn:fixture",
+    "revision",
+  ]);
 });
 it("canonical-counts-stores-outside-the-frozen-bindings-without-reading", async () => {
   const f = fixture();

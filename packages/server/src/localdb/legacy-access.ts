@@ -53,6 +53,10 @@ export interface LegacyAccessOptions {
   /** Canonical data directory bound to the server's index; defaults to root/data. */
   readonly dataDir?: string;
   readonly declarations: readonly DeclarationSnapshot[];
+  /** What becomes of live instances older than the newest of their source id:
+   * `"merge"` (default) imports them as lower layers of one stream, `"exclude"`
+   * leaves them out. See `createCanonicalImportSource`. */
+  readonly olderInstances?: "merge" | "exclude";
   /** Existing storage removal authority; no new parallel lock/seal. */
   readonly legacyWriteSeal: LegacyWriteSeal;
   /** All legacy writers must be quiescent for the lifetime of this access.
@@ -262,6 +266,27 @@ export async function openLegacyAccess(
         ),
       }));
     },
+    async rows(instance, stream, expected) {
+      await reader.assertRevision(expected);
+      const row = prepare(
+        "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+      ).get(instance, stream) as { n: number };
+      return row.n;
+    },
+    async deletedKeys(instance, stream, after, limit, expected) {
+      await reader.assertRevision(expected);
+      const keys = (
+        prepare(
+          `SELECT record_key FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 1 AND (? IS NULL OR record_key > ?) ORDER BY record_key LIMIT ?`,
+        ).all(instance, stream, after, after, limit + 1) as {
+          record_key: string;
+        }[]
+      ).map((r) => r.record_key);
+      const more = keys.length > limit;
+      if (more) keys.pop();
+      releaseReadPages();
+      return { keys, next: more ? keys[keys.length - 1]! : null };
+    },
     async page(instance, stream, after, limit, maxBytes, expected) {
       await reader.assertRevision(expected);
       const rows: unknown[] = [];
@@ -317,6 +342,9 @@ export async function openLegacyAccess(
       bindings: options.importProjection.bindings,
       reader,
       resolveTarget: options.resolveTarget,
+      ...(options.olderInstances
+        ? { olderInstances: options.olderInstances }
+        : {}),
     });
   async function safePath(path: string, missing = false) {
     const absolute = resolve(path);

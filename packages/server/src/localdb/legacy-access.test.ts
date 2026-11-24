@@ -585,7 +585,10 @@ it("native access selects the latest active account and counts the older rows", 
       { method: "profile-source", generation: 1 },
     ).accepted,
   ).toBe(1);
-  const access = await openLegacyAccess(f.options);
+  const access = await openLegacyAccess({
+    ...f.options,
+    olderInstances: "exclude",
+  });
   const inventory = await collect(access.sources());
   expect(inventory).toHaveLength(2);
   expect(inventory.find((s) => "kind" in s)).toMatchObject({
@@ -595,6 +598,13 @@ it("native access selects the latest active account and counts the older rows", 
   });
   const selected = inventory.find((s) => !("kind" in s))!;
   expect(JSON.parse(selected.source)[0]).toBe("newer");
+  await access.close();
+  // By default the older account is a lower layer of the newer one's stream.
+  const merging = await openLegacyAccess(f.options);
+  const merged = await collect(merging.sources());
+  expect(merged).toHaveLength(1);
+  expect(JSON.parse(merged[0]!.source)[0]).toBe("merged");
+  expect((merged[0] as { rows?: number }).rows).toBe(2);
 });
 it("reuses native source statements across replay passes", async () => {
   const f = await fixture();

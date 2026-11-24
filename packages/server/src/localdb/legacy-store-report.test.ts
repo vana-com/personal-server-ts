@@ -102,13 +102,14 @@ describe("legacy store import report", () => {
       alreadyImported: 0,
       refused: [],
     });
-    // Every old row of the sources offered is imported or counted out: none is
-    // left out unexplained.
+    // Every old row of the live instances is imported, or an older copy of a
+    // key a newer instance holds (`superseded`): none is left out unexplained.
     expect(first.rows.imported).toBeGreaterThan(0);
-    expect(first.rows.legacy).toBe(first.rows.imported);
-    expect(first.rows.quarantined).toEqual({});
+    expect(first.rows.legacy).toBe(
+      first.rows.imported + (first.rows.quarantined.superseded ?? 0),
+    );
+    expect(first.rows.quarantined).toEqual({ superseded: 2 });
     expect(first.excluded).toEqual([
-      { reason: "older_instance", streams: 1, rows: 2 },
       { reason: "undeclared_source", streams: 1, rows: 3 },
     ]);
     // Six data files; the one no binding names is a file-only scope.
