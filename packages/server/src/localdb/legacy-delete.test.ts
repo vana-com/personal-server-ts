@@ -3,13 +3,17 @@
 // gateway that enforces cutover policy v3 (an exact tombstone over a live head,
 // signed by the owner or a registered server) and a fake storage.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  controlScope,
+  logScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { LegacyWriteRefusedError } from "../../../core/src/api/legacy-write-gate.js";
-import type {
-  ConnectionDeleteStatus,
-  DeleteBlockReason,
-  LegacyDeletePorts,
-  LogErasurePorts,
+import {
+  createConnectionDeleter,
+  type ConnectionDeleteStatus,
+  type DeleteBlockReason,
+  type LegacyDeletePorts,
+  type LogErasurePorts,
 } from "../../../core/src/localdb/index.js";
 import { legacyScopesOfConnector } from "../../../core/src/legacy-projection/erase-connector.js";
 import { legacyPortsOver } from "../../../core/src/test-utils/legacy-delete-ports.js";
@@ -542,6 +546,66 @@ describe("the legacy stage of a connection delete after the switch", () => {
         expect((await statusOf(a)).legacy).toEqual(DONE),
       );
       expect(bothGone(fake)).toEqual(SCOPES.map(() => 0));
+    });
+  });
+
+  describe("a delete is judged by its own control tombstone, not by the head the control row holds now", () => {
+    it("retires the legacy copy of a delete whose tombstone was replaced by a reconnect before the first pass", async () => {
+      const { a, fake, legacy } = await collected();
+      // The registry holds the connection's live head (it was added again
+      // before any pass ran); the delete this device adopted ended at the
+      // tombstone one version above the head it saw.
+      const head = await a.deps.registry.read(controlScope(GH, ""));
+      if (!head.found) throw new Error("the connection has a control row");
+      const deleter = createConnectionDeleter(a.deps, {
+        legacy: () => legacy.ports,
+      });
+
+      deleter.noteSettled(GH, { ns: "", version: head.version + 1 });
+      await deleter.resumeErasures();
+
+      expect((await deleter.deleteStatus(GH)).legacy).toEqual(DONE);
+      for (const scope of SCOPES) {
+        expect(fake.isLive(scope)).toBe(false);
+        expect(fake.tombstones.get(scope)).toEqual([3]);
+      }
+    });
+
+    it("reads blocked(tombstone_rolled_back) in every part when the rollback restored the registry's live head", async () => {
+      const finality = {
+        finalized: null as string | null,
+        settling: true,
+        rolledBack: null as unknown,
+      };
+      const { w, a, fake } = await collected({
+        finality: () => finality,
+        erasure: (world) => ({
+          ...erasurePorts(world),
+          finality: { tombstoneState: async () => finality },
+        }),
+      });
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(PENDING),
+      );
+
+      // The registry rolls the tombstone back: its row is gone and the live
+      // head is the control row again.
+      w.gateway.versions.get(controlScope(GH, ""))!.pop();
+      finality.settling = false;
+      finality.rolledBack = {
+        tombstoneVersion: "2",
+        head: { expectedVersion: "1", dataHash: "0x00", metadataHash: "0x00" },
+      };
+
+      await vi.waitFor(async () => {
+        const s = await statusOf(a);
+        expect(s.fence).toEqual(blockedBy("tombstone_rolled_back"));
+        expect(s.legacy).toEqual(blockedBy("tombstone_rolled_back"));
+        expect(s.storage).toEqual(blockedBy("tombstone_rolled_back"));
+      });
+      expect(gatewayDeletes(fake)).toEqual([]);
     });
   });
 

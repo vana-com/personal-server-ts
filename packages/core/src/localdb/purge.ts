@@ -42,11 +42,17 @@ function passWatermark(connectionId: string): SqlStatement {
  */
 const purgeListeners = new WeakMap<object, PurgeListener>();
 /**
- * `connector` is the purged connection's connector, or `null` when the
- * lookup failed after the purge committed: some connection was purged and the
+ * What a purge tells its listener: the purged connection's connector and
+ * namespace, and the control tombstone that ended it. `null` when the lookup
+ * failed after the purge committed: some connection was purged and the
  * listener must find which (the erasure sweep reads every deleted connection).
  */
-export type PurgeListener = (connector: string | null) => void;
+export interface PurgedConnection {
+  readonly connector: string;
+  readonly ns: string;
+  readonly controlVersion: number;
+}
+export type PurgeListener = (purged: PurgedConnection | null) => void;
 /** Hear every purge of `db`'s connections, until the returned function is called. */
 export function onConnectionPurged(
   db: object,
@@ -208,13 +214,18 @@ export async function purgeConnection(
     // ever queue this connection's erasure.
     const listener = purgeListeners.get(deps.db);
     if (listener) {
-      let connector: string | null = null;
+      let purged: PurgedConnection | null = null;
       try {
-        const [row] = await deps.db.query<{ connector: string }>(
-          "SELECT connector FROM connections WHERE connection_id = ?",
+        const [row] = await deps.db.query<{ connector: string; ns: string }>(
+          "SELECT connector, ns FROM connections WHERE connection_id = ?",
           [connectionId],
         );
-        if (row) connector = row.connector;
+        if (row)
+          purged = {
+            connector: row.connector,
+            ns: row.ns,
+            controlVersion: deleted.controlVersion,
+          };
         else return;
       } catch (error) {
         deps.logger.warn(
@@ -223,7 +234,7 @@ export async function purgeConnection(
         );
       }
       try {
-        listener(connector);
+        listener(purged);
       } catch (error) {
         deps.logger.warn(
           { connectionId, error: String(error) },

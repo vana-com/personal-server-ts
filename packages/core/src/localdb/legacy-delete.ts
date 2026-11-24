@@ -105,6 +105,13 @@ export interface LegacyMemory {
   readonly refused: Map<string, DeleteBlockReason>;
   /** Slots storage answered for, by `<scope>@<tombstone version>`. */
   readonly erased: Map<string, Set<string>>;
+  /**
+   * The control tombstone this delete confirmed, by namespace (its registry
+   * version). The delete is judged against these, not against whatever head
+   * the control rows hold now: a reconnect replaces a tombstone with a live
+   * head, and a rolled-back tombstone leaves the live head behind.
+   */
+  readonly tombstones?: ReadonlyMap<string, number>;
 }
 
 /** What one pass learned about a connector's legacy copy. */
@@ -264,9 +271,12 @@ export async function retireLegacyOf(
 }
 
 /**
- * Whether some deleted control row of `connector` has a final tombstone. A
- * row whose tombstone failed does not count; if every deleted row failed, the
- * connection is live again.
+ * Whether some control tombstone of `connector`'s delete is final. The
+ * tombstones are the ones the deleter confirmed (`memory.tombstones`) and any
+ * deleted head newer than them: a head that moved on (a reconnect) or came
+ * back (a rollback) does not hide the tombstone's own finality. A tombstone
+ * that failed does not count; if every one failed, the connection is live
+ * again.
  */
 async function finalControl(
   deps: LegacyStageDeps,
@@ -276,17 +286,22 @@ async function finalControl(
 ): Promise<"final" | "waiting" | "rolled-back" | "none"> {
   const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
   const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
-  let seen = 0;
-  let rolledBack = 0;
+  const tombstones = new Map(deps.memory?.tombstones);
   for (const { scope, read } of await deps.registry.listControlRows(signal)) {
     const parsed = parseScope(scope);
     if (parsed?.kind !== "control" || parsed.connector !== connector) continue;
     const state = classifyControl(read, hashes);
-    if (state.kind !== "deleted") continue;
-    seen += 1;
+    if (
+      state.kind === "deleted" &&
+      state.version > (tombstones.get(parsed.ns) ?? 0)
+    )
+      tombstones.set(parsed.ns, state.version);
+  }
+  let rolledBack = 0;
+  for (const [ns, version] of tombstones) {
     const finality = await ports.finality.tombstoneState(
-      controlScope(connector, parsed.ns),
-      String(state.version),
+      controlScope(connector, ns),
+      String(version),
     );
     if (finality.rolledBack) {
       rolledBack += 1;
@@ -294,12 +309,12 @@ async function finalControl(
     }
     if (
       finality.finalized !== null &&
-      BigInt(finality.finalized) >= BigInt(state.version)
+      BigInt(finality.finalized) >= BigInt(version)
     )
       return "final";
   }
-  if (seen === 0) return "none";
-  return rolledBack === seen ? "rolled-back" : "waiting";
+  if (tombstones.size === 0) return "none";
+  return rolledBack === tombstones.size ? "rolled-back" : "waiting";
 }
 
 async function retireScope(

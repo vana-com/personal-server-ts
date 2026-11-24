@@ -6,6 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import { createConnectionDeleter } from "../../../core/src/localdb/index.js";
 import {
+  ConnectionLifetimeChanged,
+  formatLifetime,
+} from "../../../core/src/localdb/delete-lifetime.js";
+import {
   onConnectionPurged,
   purgeConnection,
 } from "../../../core/src/localdb/purge.js";
@@ -26,6 +30,10 @@ afterEach(closeWorldDrivers);
 
 const LOG = logScope(CONNECTOR, "");
 const OTHER = "other";
+/** The control tombstone of the delete these tests adopt. */
+const TOMBSTONE = { ns: "", version: 2 };
+/** The tombstone of the connection's next delete, after it was added again. */
+const NEXT_TOMBSTONE = { ns: "", version: 4 };
 const OTHER_LOG = logScope(OTHER, "");
 // Compaction fires once a catch-up through a snapshot repays building it. A
 // small part target makes the snapshot many parts, each a costly PUT, so the
@@ -507,7 +515,7 @@ describe("erasure wired into the connection delete", () => {
     const query = desktop.db.query.bind(desktop.db);
     let lookups = 0;
     desktop.db.query = ((sql: string, params?: readonly unknown[]) => {
-      if (sql.includes("SELECT connector FROM connections WHERE")) {
+      if (sql.includes("SELECT connector, ns FROM connections WHERE")) {
         lookups += 1;
         if (lookups === 1)
           return Promise.reject(new Error("database is locked"));
@@ -580,7 +588,7 @@ describe("erasure wired into the connection delete", () => {
       const { a, erasure } = await settledDelete();
 
       const deleter = await restarted(a, erasure);
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       await deleter.resumeErasures();
 
       expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
@@ -649,7 +657,7 @@ describe("erasure wired into the connection delete", () => {
       await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
 
       const deleter = await restarted(a, erasure);
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       await deleter.resumeErasures();
 
       expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
@@ -667,7 +675,7 @@ describe("erasure wired into the connection delete", () => {
       };
 
       const deleter = await restarted(a, erasure, down);
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       await deleter.resumeErasures();
 
       expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
@@ -696,13 +704,13 @@ describe("erasure wired into the connection delete", () => {
         )
         .mockResolvedValue(none);
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       const first = deleter.resumeErasures();
       await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(1));
 
       // The connection is added again and deleted again: the second delete is
       // purged here while the first pass runs, and the retry loop looks at it.
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, NEXT_TOMBSTONE);
       const second = deleter.resumeErasures();
       // The first pass ends as it would for a tombstone that moved: not pending.
       release();
@@ -723,7 +731,7 @@ describe("erasure wired into the connection delete", () => {
         );
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
       // Delete 1 is adopted and judged done.
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       await deleter.resumeErasures();
       expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
         state: "done",
@@ -731,7 +739,7 @@ describe("erasure wired into the connection delete", () => {
 
       // The connection was added again and deleted again elsewhere; this
       // device adopts delete 2. Nothing has judged it yet.
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, NEXT_TOMBSTONE);
       const second = deleter.resumeErasures();
       await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(2));
       expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
@@ -758,12 +766,12 @@ describe("erasure wired into the connection delete", () => {
           () => new Promise((resolve) => (releaseSecond = () => resolve(none))),
         );
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       const first = deleter.resumeErasures();
       await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(1));
 
       // Delete 2 is adopted while delete 1's pass runs; that pass then ends.
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, NEXT_TOMBSTONE);
       const second = deleter.resumeErasures();
       releaseFirst();
       await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(2));
@@ -778,6 +786,26 @@ describe("erasure wired into the connection delete", () => {
       });
     });
 
+    it("keeps the status of the last delete when a request for a stale lifetime is refused", async () => {
+      const a = await settled();
+      await vi.waitFor(async () =>
+        expect((await a.sync.deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+          state: "blocked",
+          reason: "body_pieces_retained",
+        }),
+      );
+      const before = await a.sync.deleter.deleteStatus(CONNECTOR);
+
+      // A request that names a connection this one never was: refused (409).
+      await expect(
+        a.sync.deleter.requestConnectionDelete(CONNECTOR, {
+          lifetime: formatLifetime(CONNECTOR, new Map([["", 99]])),
+        }),
+      ).rejects.toBeInstanceOf(ConnectionLifetimeChanged);
+
+      expect(await a.sync.deleter.deleteStatus(CONNECTOR)).toEqual(before);
+    });
+
     it("a retry that finds a pass running waits for it and reports what it leaves unfinished", async () => {
       const a = await settled();
       let release: () => void = () => {};
@@ -788,7 +816,7 @@ describe("erasure wired into the connection delete", () => {
           }),
       );
       const deleter = createConnectionDeleter(a.deps, { eraseLogs });
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       const first = deleter.resumeErasures();
       await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(1));
       // The running pass has taken the queue entry: the retry loop sees none.
@@ -837,7 +865,7 @@ describe("erasure wired into the connection delete", () => {
       const db = {
         ...a.db,
         query: ((sql: string, params?: readonly unknown[]) => {
-          if (sql.includes("SELECT connector FROM connections")) {
+          if (sql.includes("SELECT connector, ns FROM connections")) {
             lookups.push(sql);
             return Promise.reject(new Error("database is locked"));
           }
@@ -877,7 +905,7 @@ describe("erasure wired into the connection delete", () => {
       // The sweep that runs first once per process, then the owed connector.
       await deleter.resumeErasures();
       eraseLogs.mockClear();
-      deleter.noteSettled(CONNECTOR);
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
       await deleter.resumeErasures();
       return eraseLogs;
     };

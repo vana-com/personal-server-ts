@@ -1319,7 +1319,11 @@ it("a delete that names a lifetime purges the connections its pins name, and lea
   expect(eraseLogs).toHaveBeenLastCalledWith(
     "fixture-source",
     expect.anything(),
-    { skipNamespaces: new Set([HOME]) },
+    {
+      skipNamespaces: new Set([HOME]),
+      // The tombstone this delete landed: the namespace's own, at pin + 1.
+      tombstones: new Map([["", 2]]),
+    },
   );
 });
 

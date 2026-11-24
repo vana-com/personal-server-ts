@@ -406,6 +406,27 @@ describe("eraseDeletedConnectionLogs", () => {
     expect(w.calls).toEqual([]);
   });
 
+  it("reports a tombstone the gateway rolled back although the registry's live head came back", async () => {
+    const w = world();
+    await w.compactedLog("alpha", NS);
+    w.setControl("alpha", NS, 1, false);
+    w.setFinality(null, { tombstoneVersion: "2" });
+
+    const report = await eraseDeletedConnectionLogs(w.deps, {
+      connector: "alpha",
+      tombstones: new Map([[NS, 2]]),
+    });
+
+    expect(report.connections).toEqual([
+      {
+        connector: "alpha",
+        ns: NS,
+        outcome: { kind: "stopped", why: "rolled-back" },
+      },
+    ]);
+    expect(w.calls).toEqual([]);
+  });
+
   describe("a re-add of the same connection", () => {
     /**
      * The re-add commits the control row again (version 3) and a segment of the

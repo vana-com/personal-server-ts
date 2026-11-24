@@ -316,6 +316,13 @@ export async function eraseDeletedConnectionLogs(
   options: {
     readonly connector?: string;
     readonly skipNamespaces?: ReadonlySet<string>;
+    /**
+     * The control tombstone of the delete being erased, by namespace (see
+     * `LegacyMemory.tombstones`). A namespace named here whose head is no
+     * longer deleted is judged by its tombstone's own finality: rolled back
+     * is reported, and a final one means the connection was added again.
+     */
+    readonly tombstones?: ReadonlyMap<string, number>;
     readonly signal?: AbortSignal;
   } = {},
 ): Promise<ErasureReport> {
@@ -324,6 +331,7 @@ export async function eraseDeletedConnectionLogs(
     const keyCheck = await deriveKeyCheck((m) => deps.keys.namespaceHmac(m));
     const hashes = await controlHashes(keccakOf(deps.streamCrypto), keyCheck);
     const rows = await deps.registry.listControlRows(options.signal);
+    const deletedAt = new Map<string, number>();
     for (const { scope, read } of rows) {
       const parsed = parseScope(scope);
       if (parsed?.kind !== "control") continue;
@@ -333,6 +341,7 @@ export async function eraseDeletedConnectionLogs(
       )
         continue;
       const state = classifyControl(read, hashes);
+      if (state.kind === "deleted") deletedAt.set(parsed.ns, state.version);
       if (state.kind !== "deleted") continue;
       const { connector, ns } = parsed;
       if (options.skipNamespaces?.has(ns)) continue;
@@ -344,6 +353,25 @@ export async function eraseDeletedConnectionLogs(
       report(deps, connector, outcome);
       connections.push({ connector, ns, outcome });
     }
+    // A tombstone the delete confirmed whose head is not deleted any more:
+    // rolled back (the live head came back) or ended by a reconnect.
+    if (options.connector !== undefined)
+      for (const [ns, version] of options.tombstones ?? []) {
+        if ((deletedAt.get(ns) ?? 0) >= version) continue;
+        const finality = await deps.finality.tombstoneState(
+          controlScope(options.connector, ns),
+          String(version),
+        );
+        const outcome: ErasureOutcome | null = finality.rolledBack
+          ? { kind: "stopped", why: "rolled-back" }
+          : finalizedAtOrAbove(finality.finalized, version)
+            ? null
+            : { kind: "pending", why: "finality" };
+        if (outcome) {
+          report(deps, options.connector, outcome);
+          connections.push({ connector: options.connector, ns, outcome });
+        }
+      }
   } catch (error) {
     deps.logger.warn(
       { error: error instanceof Error ? error.message : String(error) },

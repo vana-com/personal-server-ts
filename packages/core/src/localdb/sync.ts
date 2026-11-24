@@ -294,7 +294,10 @@ export function createLocalSync(
                 {
                   connector,
                   signal,
-                  ...(gate && { skipNamespaces: gate.skipNamespaces }),
+                  ...(gate && {
+                    skipNamespaces: gate.skipNamespaces,
+                    tombstones: gate.tombstones,
+                  }),
                 },
               )
             : { connections: [], pending: false, unavailable: true as const };
@@ -327,9 +330,13 @@ export function createLocalSync(
   // the retry loop runs the erasure (and decides whether it is time).
   const stopHearingPurges =
     options.erasure || options.legacyDelete
-      ? onConnectionPurged(deps.db, (connector) => {
-          if (connector === null) deletes().noteSweepOwed();
-          else deletes().noteSettled(connector);
+      ? onConnectionPurged(deps.db, (purged) => {
+          if (purged === null) deletes().noteSweepOwed();
+          else
+            deletes().noteSettled(purged.connector, {
+              ns: purged.ns,
+              version: purged.controlVersion,
+            });
           armRetry();
         })
       : () => {};

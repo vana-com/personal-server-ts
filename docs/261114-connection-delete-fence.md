@@ -149,9 +149,17 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   anything, so the device that erased a log keeps answering for it after a
   restart. A log erased before this record existed reads the same way on the
   device that erased it.
-- A cached verdict belongs to one delete. Starting or adopting a delete of a
-  connector drops the verdict, and a pass that began before that cannot write
-  one; the parts read `pending` until a pass judges the new delete.
+- A delete is identified by its control tombstones: the registry version each
+  namespace's tombstone landed at, learned when this device lands the fence or
+  purges the connection the tombstone ended. Both stages judge that tombstone's
+  own finality (`tombstoneState`), not the control head as it is now, so a
+  reconnect (a live head over a final tombstone) still retires the legacy copy
+  and a rollback (the live head back, the tombstone failed) reads
+  `blocked(tombstone_rolled_back)`. The cached verdict is kept under the same
+  identity: a higher tombstone is a newer delete and drops it, and a pass that
+  began under the older one cannot write a verdict. A refused request changes
+  nothing. The identity is in memory: after a restart the stages read the head
+  until the next purge or landing teaches it again.
 - `deleter.deleteStatus(connector)` answers `{ fence, legacy, storage }`, each
   `done`, `pending` or `blocked(reason)` (`localdb/delete-status.ts`). The owner
   connector routes carry it as `deleteStatus` (202 body and `GET`). An app says
