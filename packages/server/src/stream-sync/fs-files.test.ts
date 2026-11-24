@@ -126,6 +126,37 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(dec.decode((await files.read("s/0"))!)).toBe("b");
   });
 
+  it("preserves each file's order within an interleaved append batch", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.appendMany([
+      { path: "batch/a", bytes: enc.encode("a1") },
+      { path: "batch/b", bytes: enc.encode("b1") },
+      { path: "batch/a", bytes: enc.encode("a2") },
+      { path: "batch/b", bytes: enc.encode("b2") },
+    ]);
+    await files.sync("batch");
+    expect(dec.decode((await files.read("batch/a"))!)).toBe("a1a2");
+    expect(dec.decode((await files.read("batch/b"))!)).toBe("b1b2");
+  });
+
+  it("removes a selected prefix without removing a neighbouring prefix", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.appendMany([
+      { path: "run/entry", bytes: enc.encode("first") },
+      { path: "run-extra/entry", bytes: enc.encode("keep") },
+    ]);
+    await files.remove("run");
+    await files.remove("run");
+    await files.appendMany([
+      { path: "run-extra/entry", bytes: enc.encode(" more") },
+    ]);
+    await files.sync("run-extra");
+    expect(await files.list("run")).toEqual([]);
+    expect(dec.decode((await files.read("run-extra/entry"))!)).toBe(
+      "keep more",
+    );
+  });
+
   it("sync of one prefix leaves other prefixes' handles and bytes alone", async () => {
     const files = createFsStreamSyncFiles(root);
     await files.appendMany([
