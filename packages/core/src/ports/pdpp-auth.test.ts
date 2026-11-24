@@ -34,6 +34,30 @@ describe("findStreamGrant", () => {
     } as unknown as Grant;
     expect(findStreamGrant(grant, "playlists")).toBeUndefined();
   });
+
+  const catalogueGrant: Grant = {
+    version: "0.2.0",
+    grant_id: "sample-grant",
+    issued_at: "2026-06-01T00:00:00Z",
+    subject: { id: "sample-subject" },
+    client: { client_id: "sample-client" },
+    source: { kind: "connector", id: "sample-source" },
+    source_declaration: { version: "0.1.0" },
+    purpose_code: "sample-purpose",
+    access_mode: "continuous",
+    streams: [
+      { name: "playlist", instance_ids: ["sample-connection"], fields: ["id"] },
+      { name: "playlists", instance_ids: ["sample-connection"], fields: ["id", "label"] },
+    ],
+  };
+
+  it("returns the original typed entry for the exact name, even with a similar earlier name", () => {
+    expect(findStreamGrant(catalogueGrant, "playlists")).toBe(catalogueGrant.streams[1]);
+  });
+
+  it("returns no entry for an empty stream list", () => {
+    expect(findStreamGrant({ ...catalogueGrant, streams: [] }, "playlists")).toBeUndefined();
+  });
 });
 
 describe("withinTimeConstraint", () => {
