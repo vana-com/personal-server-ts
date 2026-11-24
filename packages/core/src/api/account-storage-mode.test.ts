@@ -87,7 +87,9 @@ describe("account mode helper contracts", () => {
       error: {
         code: 503,
         errorCode: "ACCOUNT_MODE_UNKNOWN",
-        message: expect.stringMatching(/legacy writes are paused\. Retry shortly\.$/),
+        message: expect.stringMatching(
+          /legacy writes are paused\. Retry shortly\.$/,
+        ),
       },
     });
   });

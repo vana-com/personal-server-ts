@@ -36,14 +36,22 @@ describe("runStateMigrations", () => {
   it("continues when a failed check's warning sink also throws", () => {
     const next = vi.fn();
     const skipped = vi.fn();
-    const warn = vi.fn(() => { throw new Error("sink failed"); });
-    const state = runStateMigrations({ ...ctx, logger: { warn, info: vi.fn() } }, undefined, {
-      migrations: [
-        oneShot("skipped", skipped, () => { throw new Error("check failed"); }),
-        oneShot("next", next),
-      ],
-      now,
+    const warn = vi.fn(() => {
+      throw new Error("sink failed");
     });
+    const state = runStateMigrations(
+      { ...ctx, logger: { warn, info: vi.fn() } },
+      undefined,
+      {
+        migrations: [
+          oneShot("skipped", skipped, () => {
+            throw new Error("check failed");
+          }),
+          oneShot("next", next),
+        ],
+        now,
+      },
+    );
     expect(warn).toHaveBeenCalledWith(
       { migration: "skipped", error: "check failed" },
       "State migration check failed; skipping",
