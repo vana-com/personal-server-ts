@@ -51,6 +51,7 @@ export {
 export {
   GRANT_FINGERPRINT_DOMAIN,
   GRANT_FINGERPRINT_PREFIX,
+  canonicalDataScopes,
   grantFingerprint,
   grantMatchesFingerprint,
   isGrantFingerprint,
