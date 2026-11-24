@@ -1,4 +1,3 @@
-import { connectorOfSourceId } from "@opendatalabs/personal-server-ts-core/api";
 import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/localdb";
 /**
  * Boot the PDPP Resource Server for a real Personal Server.
@@ -376,6 +375,26 @@ export function createPdppRecordsDeps(
     list: () => sourceRegistry.list(),
   };
 
+  const sourcesForMethod = (connector: string) =>
+    sources.filter((source) =>
+      configuredMethods.get(source.sourceId)?.includes(connector),
+    );
+  const sourceIdForConnector = (connector: string) => {
+    const matching = sourcesForMethod(connector);
+    return matching.length === 1 ? matching[0]!.sourceId : undefined;
+  };
+  // Desktop exchanges the logical stream's connector key for its owner token.
+  // AS and RS must resolve that same verified method to the same source.
+  const previousSourceResolver = pdppAuth.resolveConnectionSourceId;
+  pdppAuth.resolveConnectionSourceId = (requested) => {
+    const matching = sourcesForMethod(requested);
+    return matching.length > 0
+      ? matching.length === 1
+        ? matching[0]!.sourceId
+        : undefined
+      : previousSourceResolver?.(requested);
+  };
+
   const connectionInventory = (sourceId: string) => ({
     eligibleFor: () =>
       store.listConnections(sourceId).map((connection) => connection.instance),
@@ -409,13 +428,15 @@ export function createPdppRecordsDeps(
         (candidate) => candidate.sourceId === binding.sourceId,
       );
       if (!source || !sourceRegistry.get(stream, source.sourceId)) return null;
-      const connector = connectorOfSourceId(source.sourceId);
-      return connector ? { connector, namespace: "" } : null;
+      // Source identity and collector identity differ (github vs github-browser).
+      // The bound method is the connector_key of a verified retained manifest;
+      // a source URL's basename is not authority to select its local database.
+      const connector = binding.method;
+      return connector && sourceIdForConnector(connector) === source.sourceId
+        ? { connector, namespace: "" }
+        : null;
     },
-    sourceIdForConnector: (connector) =>
-      sources.find(
-        (source) => connectorOfSourceId(source.sourceId) === connector,
-      )?.sourceId,
+    sourceIdForConnector,
     store,
     // Without a replica receiver every reader reads the canonical store.
     reads: options.replica?.reads ?? (() => store),

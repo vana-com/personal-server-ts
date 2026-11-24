@@ -331,6 +331,118 @@ async function fixture() {
 }
 
 describe("local resolve", () => {
+  it("lets an explicit owner inspect an installed incomplete head without certifying it", async () => {
+    const f = await fixture();
+    await f.connection();
+    await f.head("items", { complete: false });
+    await f.record();
+    const listing = createLocalListing(f.deps);
+    expect(await listing.listScopes({ canRead: () => true })).toEqual([]);
+    expect(
+      await listing.listScopes({
+        canRead: () => true,
+        includeIncomplete: true,
+      }),
+    ).toMatchObject([
+      {
+        scope: "pdpp.fixture-source.items",
+        records: 1,
+        dataStatus: "incomplete",
+      },
+    ]);
+    expect(
+      verdict(
+        await f.resolver.resolve(input(undefined, { includeIncomplete: true })),
+      ),
+    ).toBe("no_data");
+    const read = await f.resolver.resolve(
+      input(undefined, { isOwnerView: true, includeIncomplete: true }),
+    );
+    expect(read).toMatchObject({ kind: "view", complete: false });
+    expect((await drain(read)).data.records).toEqual([
+      { id: "key", value: "installed" },
+    ]);
+    expect(await f.db.query("SELECT complete FROM stream_state")).toEqual([
+      { complete: 0 },
+    ]);
+    expect(await f.db.query("SELECT complete FROM stream_versions")).toEqual([
+      { complete: 0 },
+    ]);
+    expect(
+      verdict(
+        await f.resolver.resolve(
+          input(undefined, {
+            isOwnerView: true,
+            includeIncomplete: true,
+            requireRegistered: true,
+          }),
+        ),
+      ),
+    ).toBe("read_not_registered");
+    await f.connection("deleted");
+    expect(
+      await listing.listScopes({
+        canRead: () => true,
+        includeIncomplete: true,
+      }),
+    ).toEqual([]);
+    expect(
+      verdict(
+        await f.resolver.resolve(
+          input(undefined, { isOwnerView: true, includeIncomplete: true }),
+        ),
+      ),
+    ).toBe("deleted");
+  });
+
+  it("serves saved incomplete rows through the owner HTTP route and refuses a grant", async () => {
+    const f = await fixture();
+    await f.connection();
+    await f.head("items", { complete: false });
+    await f.record();
+    const listing = createLocalListing(f.deps);
+    const deps = {
+      storage: createMemoryDataStorage(),
+      accessLogWriter: { write: async () => undefined },
+      accountStorageMode: { owner: "fixture", read: () => "switched" },
+      streamSyncRead: { ...f.resolver, listScopes: listing.listScopes },
+      auth: {
+        authorizeBuilderList: async () => undefined,
+        authorizeBuilderRead: async ({ request }: { request: Request }) => ({
+          builder: "0x000000000000000000000000000000000000bEEF",
+          grantId: request.headers.has("x-test-grant") ? "grant-1" : "owner",
+        }),
+      },
+    } as unknown as PersonalServerDataApiDeps;
+    const scopes = await handlePersonalServerDataRequest(
+      new Request("https://ps.test/"),
+      deps,
+    );
+    expect((await scopes.json()).scopes).toMatchObject([
+      {
+        scope: "pdpp.fixture-source.items",
+        dataStatus: "incomplete",
+        records: 1,
+      },
+    ]);
+    const response = await handlePersonalServerDataRequest(
+      new Request("https://ps.test/pdpp.fixture-source.items"),
+      deps,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-stream-sync-complete")).toBe("false");
+    expect((await response.json()).data.records).toEqual([
+      { id: "key", value: "installed" },
+    ]);
+    const grant = await handlePersonalServerDataRequest(
+      new Request("https://ps.test/pdpp.fixture-source.items", {
+        headers: { "x-test-grant": "1" },
+      }),
+      deps,
+    );
+    expect(grant.status).toBe(404);
+  });
+
   it("ranks x independently of unrelated y and keeps listing and reads together", async () => {
     const f = await fixture();
     const a = "aaaaaaaaaaaaaaaa";
@@ -376,7 +488,7 @@ describe("local resolve", () => {
     });
     const explicit = await f.resolver.resolve(input(scope, { connection: b }));
     expect(explicit).toMatchObject({ kind: "view", ns: b });
-    expect((await drain(explicit)).data.records[0]?.value).toBe("from B");
+    expect((await drain(explicit)).data.records[0]?.value).toBe("from B"); // copy-assertion-ok: stored fixture value proves which connection the read selected
     await f.head("x", { id: "c2", version: 2, floor: 2 });
     expect(
       (await listing.listScopes({ canRead: () => true })).some(
@@ -478,7 +590,7 @@ describe("local resolve", () => {
     await f.record("x", "namespace B", "c2");
     const read = await f.resolver.resolve(input("pdpp.fixture-source.x"));
     expect(read).toMatchObject({ kind: "view", ns: "aaaaaaaaaaaaaaaa" });
-    expect((await drain(read)).data.records[0]?.value).toBe("namespace A");
+    expect((await drain(read)).data.records[0]?.value).toBe("namespace A"); // copy-assertion-ok: stored fixture value proves which connection the read selected
     const listing = createLocalListing(f.deps);
     expect(
       (await listing.listScopes({ canRead: () => true })).find(
@@ -1055,7 +1167,7 @@ describe("local resolve", () => {
       ns: "",
       served: { version: 9 },
     });
-    expect((await drain(unqualified)).data.records[0]?.value).toBe("newer c1");
+    expect((await drain(unqualified)).data.records[0]?.value).toBe("newer c1"); // copy-assertion-ok: stored fixture value proves which connection the read selected
   });
 
   it("keeps deleted precedence when every refused connection is tombstoned", async () => {

@@ -94,6 +94,8 @@ export interface ResolveInput {
   readonly legacyFile: boolean;
   /** The caller reads as the owner (`isOwnerView`), not as a grantee. */
   readonly isOwnerView: boolean;
+  /** Explicit owner inspection only; never enables grantee or paid reads. */
+  readonly includeIncomplete?: boolean;
 }
 
 /**
@@ -211,9 +213,12 @@ export type ReadDecision =
       readonly withheld?: readonly WithheldRun[];
       /**
        * Present only while a first load is still applying parts: the body is
-       * the rows applied so far. Absent: the view is complete.
+       * the rows applied so far. An installed incomplete collection instead
+       * carries `complete: false`; absence of partial alone is not completeness.
        */
       readonly partial?: PartialView;
+      /** False for an explicit owner view of an installed incomplete head. */
+      readonly complete?: false;
       /**
        * Absent here, always: this decision's body is memory, so a consumer
        * may read it whole. A body that waits in a file is a `SpooledView`,
