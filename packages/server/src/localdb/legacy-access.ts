@@ -264,7 +264,7 @@ export async function openLegacyAccess(
     },
     async page(instance, stream, after, limit, maxBytes, expected) {
       await reader.assertRevision(expected);
-      const rows: Record<string, unknown>[] = [];
+      const rows: unknown[] = [];
       let cursor = after;
       let bytes = 0;
       // The decoded page owns these rows now. Source pages have no reuse until
@@ -292,14 +292,13 @@ export async function openLegacyAccess(
         const row = prepare(
           "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0",
         ).get(instance, stream, next.record_key) as { data: string };
-        let value: Record<string, unknown>;
+        // Stored text that is not a JSON object is one row the import counts
+        // out (`not_an_object`); it does not refuse the stream.
+        let value: unknown;
         try {
-          const parsed: unknown = JSON.parse(row.data);
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-            throw new Error();
-          value = parsed as Record<string, unknown>;
+          value = JSON.parse(row.data);
         } catch {
-          throw new Error("invalid_record");
+          value = null;
         }
         rows.push(value);
         bytes += next.bytes + next.keyBytes;

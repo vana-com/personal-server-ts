@@ -1,4 +1,3 @@
-import { computeRecordKeyFromData } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   ImportInventoryEntry,
@@ -36,7 +35,9 @@ export interface CanonicalImportPageReader {
     maxBytes: number,
     revision: string,
   ): Promise<{
-    readonly rows: readonly Record<string, unknown>[];
+    /** Stored rows as parsed. A row that is not a JSON object (or not JSON) is
+     * `null`; the import counts it out instead of refusing the stream. */
+    readonly rows: readonly unknown[];
     readonly next: string | null;
   }>;
 }
@@ -175,14 +176,7 @@ export async function* createCanonicalImportSource(options: {
           ) {
             throw new Error("invalid_page_cursor");
           }
-          for (const record of page.rows) {
-            try {
-              computeRecordKeyFromData(record, [...target.primaryKey]);
-            } catch {
-              throw new Error("invalid_record");
-            }
-            yield record;
-          }
+          for (const record of page.rows) yield record;
           cursor = page.next;
           // A suspended generator keeps locals rooted. Drop the consumed page
           // before the host handoff and the next decoded page allocation.

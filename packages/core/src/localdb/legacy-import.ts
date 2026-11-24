@@ -3,14 +3,21 @@ import {
   IDENTITYLESS_NS,
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import { syncBeforeBegin } from "./bootstrap.js";
+import { EXPLICIT_DELETE_RANK } from "./log-batch.js";
 import { recoverLogTombstones } from "./log-tombstone-recovery.js";
 import { TEMP_TABLES, mergeIncoming, withOrigin } from "./merge.js";
 import {
   stageImportSnapshot,
-  canonicalImportRow,
+  classifyImportKey,
+  classifyImportRow,
   clearImportSnapshot,
   type ImportRow,
 } from "./import-snapshot.js";
+import {
+  quarantineReceiptReason,
+  quarantineTally,
+  type QuarantineCounts,
+} from "./legacy-quarantine.js";
 import type { SqlStatement } from "./driver.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { ImportLedger } from "./import-ledger.js";
@@ -55,6 +62,12 @@ export type LegacyImportResult =
   | {
       readonly kind: "imported" | "already-imported";
       readonly receipt: ImportReceipt;
+      /** Rows left out for want of a full identity, by reason (also on the
+       * receipt). A stream with some of them still imports the rest. A
+       * deletion with no full key counts as `deletion_<reason>`. */
+      readonly quarantine: QuarantineCounts;
+      /** Seed tombstones this call wrote (`ImportSource.deletions`). */
+      readonly tombstoned: number;
     }
   | {
       readonly kind: "refused";
@@ -80,6 +93,8 @@ export type LegacyImportResult =
  * per-stream deletion history too. Stage sorted digests only, then replay source
  * rows and check each digest before merging. Missing/extra/changed rows cannot
  * earn a receipt. Replays/crash retries add no rows or changes.
+ * A row with no full identity (`classifyImportRow`) is left out and counted on
+ * the receipt; the rest of its stream imports.
  * A seed only fills (`fillOnly`): it never changes a key the stream holds,
  * and never brings back a key a delete, an omission or a pending removal
  * covers, so it can land after any real write. Before it fills, the log's own
@@ -142,7 +157,11 @@ async function importSource(
     const op = deps.newOp();
     await deps.db.batch(TEMP_TABLES.map((sql) => ({ sql })));
     try {
-      const fingerprint = await stageImportSnapshot(deps.db, source, op);
+      const { fingerprint, quarantine } = await stageImportSnapshot(
+        deps.db,
+        source,
+        op,
+      );
       const prior = await ledger.get(source.source, connectionId, stream);
       // An excluded receipt (the earlier build's `seed_window_closed`) holds
       // the fingerprint of no rows, whatever the upload held: it proves nothing
@@ -158,6 +177,13 @@ async function importSource(
         "SELECT coalesce(max(seq),0) AS seq FROM record_changes WHERE connection_id = ? AND stream = ?",
         [connectionId, stream],
       );
+      const countTombstones = async () =>
+        (
+          await deps.db.query<{ n: number }>(
+            "SELECT count(*) AS n FROM log_tombstones WHERE connection_id = ? AND stream = ?",
+            [connectionId, stream],
+          )
+        )[0]!.n;
       let lastRow: ImportRow | null = null;
       const guard = guardImport(source, op);
       const merge = [
@@ -232,7 +258,14 @@ async function importSource(
         return null;
       };
       for await (const record of source.records()) {
-        const row = await canonicalImportRow(record, source.target.primaryKey);
+        const classified = await classifyImportRow(
+          record,
+          source.target.primaryKey,
+        );
+        // The staging pass counted this row out. A source that changed its
+        // mind between passes fails the digest check below.
+        if ("quarantine" in classified) continue;
+        const row = classified.row;
         chunk.push(row);
         chunkBytes += row.body.length;
         // Checked after the append: the batch ends with the row that crosses a
@@ -253,6 +286,62 @@ async function importSource(
       );
       if (remaining!.n !== 0)
         return { kind: "refused", reason: "source_changed" };
+      // Deletions the source records become seed tombstones, after the rows:
+      // no row for a deleted key reaches the merge (the source drops it), and
+      // the tombstone keeps another copy's seed from bringing it back.
+      const faults = quarantineTally();
+      for (const [reason, rows] of Object.entries(quarantine))
+        faults.add(reason, rows);
+      const tombstonesBefore = await countTombstones();
+      if (source.deletions) {
+        let keys: { pk_hash: string; record_key: string }[] = [];
+        const writeKeys = async (): Promise<
+          Extract<LegacyImportResult, { kind: "refused" }>["reason"] | null
+        > => {
+          if (keys.length === 0) return null;
+          const batch = keys;
+          keys = [];
+          const fenced = await importFence(deps, source);
+          if (fenced) return fenced;
+          await deps.db.batch([
+            ...guard,
+            ...batch.map((key): SqlStatement => ({
+              sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
+                  SELECT ?, ?, ?, ?, 0, 'seed', ? WHERE NOT EXISTS (SELECT 1 FROM records r
+                    WHERE r.connection_id = ? AND r.stream = ? AND r.pk_hash = ?)`,
+              params: [
+                connectionId,
+                stream,
+                key.pk_hash,
+                key.record_key,
+                EXPLICIT_DELETE_RANK,
+                connectionId,
+                stream,
+                key.pk_hash,
+              ],
+            })),
+          ]);
+          return null;
+        };
+        for await (const record of source.deletions()) {
+          const classified = await classifyImportKey(
+            record,
+            source.target.primaryKey,
+          );
+          if ("quarantine" in classified) {
+            faults.add(`deletion_${classified.quarantine}`);
+            continue;
+          }
+          keys.push(classified.key);
+          if (keys.length >= IMPORT_CHUNK_ROWS) {
+            const stopped = await writeKeys();
+            if (stopped) return { kind: "refused", reason: stopped };
+          }
+        }
+        const stopped = await writeKeys();
+        if (stopped) return { kind: "refused", reason: stopped };
+      }
+      const tombstoned = (await countTombstones()) - tombstonesBefore;
       const fence = await importFence(deps, source);
       if (fence) return { kind: "refused", reason: fence };
       const [high] = await deps.db.query<{ seq: number }>(
@@ -268,7 +357,7 @@ async function importSource(
         generation: 1,
         highestSeq: high!.seq,
         state: "imported",
-        reason: null,
+        reason: quarantineReceiptReason(faults.counts()),
         at: deps.now(),
       };
       // Final idempotent merge and receipt share this transaction. A crash
@@ -294,6 +383,8 @@ async function importSource(
             ? "already-imported"
             : "imported",
         receipt,
+        quarantine: faults.counts(),
+        tombstoned,
       };
     } catch (error) {
       const fence = await importFence(deps, source);

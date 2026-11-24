@@ -49,7 +49,11 @@ export async function readBackLegacyImport(
   if (receipt.revision !== source.revision) return result("source_changed");
   const op = deps.newOp();
   try {
-    const expected = await stageImportSnapshot(deps.db, source, op);
+    const { fingerprint: expected } = await stageImportSnapshot(
+      deps.db,
+      source,
+      op,
+    );
     if (
       expected.rows !== receipt.rows ||
       expected.fingerprint !== receipt.fingerprint

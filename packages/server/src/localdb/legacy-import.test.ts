@@ -9,6 +9,7 @@ import {
   importLegacySource,
 } from "../../../core/src/localdb/legacy-import.js";
 import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
+import { quarantineFromReceipt } from "../../../core/src/localdb/legacy-quarantine.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
@@ -378,6 +379,48 @@ it("import-conflicting-duplicates-refuse-and-identical-deduplicate", async () =>
   expect(await f.db.query("SELECT rows FROM import_ledger")).toEqual([
     { rows: 1 },
   ]);
+});
+it("import-quarantines-bad-keys-per-row-and-imports-the-rest", async () => {
+  const f = await fixture();
+  const good = Array.from({ length: 99 }, (_, i) => ({
+    id: `k${i}`,
+    n: i,
+  }));
+  f.setValues([
+    ...good.slice(0, 50),
+    { n: "no key field" },
+    ...good.slice(50),
+    null,
+    { id: null },
+    { id: { nested: 1 } },
+    { id: Number.NaN },
+  ] as Record<string, unknown>[]);
+  const result = await f.run();
+  expect(result).toMatchObject({
+    kind: "imported",
+    quarantine: {
+      missing_key_field: 1,
+      not_an_object: 1,
+      bad_key_value: 3,
+    },
+  });
+  expect(await f.db.query("SELECT count(*) AS n FROM records")).toEqual([
+    { n: 99 },
+  ]);
+  const [ledger] = await f.db.query<{ rows: number; reason: string }>(
+    "SELECT rows, reason FROM import_ledger",
+  );
+  expect(ledger.rows).toBe(99);
+  expect(quarantineFromReceipt(ledger.reason)).toEqual({
+    bad_key_value: 3,
+    missing_key_field: 1,
+    not_an_object: 1,
+  });
+  // The same rows again add nothing and still report what was left out.
+  expect(await f.run()).toMatchObject({
+    kind: "already-imported",
+    quarantine: { bad_key_value: 3 },
+  });
 });
 it("import-transaction-fence-closes-check-commit-race", async () => {
   const f = await fixture();

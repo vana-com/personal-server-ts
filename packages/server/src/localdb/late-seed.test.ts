@@ -1,29 +1,23 @@
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import {
-  createImportLedger,
   importFingerprint,
   createLocalSeed,
-  createLocalSync,
   createSeedIntake,
-  importLegacySource,
-  openLocalDb,
-  connectionQueue,
-  syncBeforeBegin,
-  type ImportSource,
-  type LocalSyncDeps,
-  type SqlDriver,
 } from "../../../core/src/localdb/index.js";
-import {
-  createMemoryStreamSyncRegistry,
-  createMemoryStreamSyncBlobs,
-} from "../../../core/src/stream-sync/index.js";
 import { createSeedStaging } from "../../../core/src/stream-sync/seed-staging.js";
 import { createFsStreamSyncFiles } from "../stream-sync/fs-files.js";
 import { endRequest } from "../../../core/src/test-utils/run-end.js";
-import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import type { openDevice } from "./late-seed-harness.js";
+import {
+  connectionId,
+  drivers,
+  owner,
+  state,
+  world,
+} from "./late-seed-harness.js";
 
 // A seed after a stream's first real write is fill-only: it adds a record the
 // stream never saw, and leaves a record the stream holds, or ever deleted or
@@ -31,183 +25,12 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 // then seed from another install. Each invariant of the late-seed model
 // (docs/formal/late-seed) has a test here.
 
-const drivers: SqlDriver[] = [];
 const dirs: string[] = [];
 afterEach(async () => {
   for (const db of drivers.splice(0)) await db.close();
   for (const dir of dirs.splice(0))
     rmSync(dir, { recursive: true, force: true });
 });
-const owner = `0x${"11".repeat(20)}` as const;
-const connectionId = "pdpp.fixture~";
-
-function newDeps(
-  db: SqlDriver,
-  registry: ReturnType<typeof createMemoryStreamSyncRegistry>,
-  blobs: ReturnType<typeof createMemoryStreamSyncBlobs>,
-  id: string,
-  clock: { now: number },
-): LocalSyncDeps {
-  let op = 0;
-  return {
-    db,
-    queue: connectionQueue(),
-    registry,
-    blobs,
-    ownerAddress: owner,
-    keys: {
-      namespaceHmac: async () => new Uint8Array(32),
-      encrypt: async (_s, b) => b,
-      encryptPart: async (_s, b) => b,
-      decrypt: async (_s, b) => b,
-    },
-    signer: { signAddData: async () => "0x00" },
-    logger: { info: vi.fn(), warn: vi.fn() },
-    now: () => clock.now,
-    newOp: () => `${id}-${++op}`,
-  };
-}
-
-async function openDevice(
-  registry: ReturnType<typeof createMemoryStreamSyncRegistry>,
-  blobs: ReturnType<typeof createMemoryStreamSyncBlobs>,
-  deviceId: string,
-  clock: { now: number },
-  path = ":memory:",
-  streams = ["items"],
-) {
-  const db = await openLocalDb(openBetterSqlite3(path), {
-    owner,
-    network: "test",
-    deviceId,
-  });
-  drivers.push(db);
-  const deps = newDeps(db, registry, blobs, deviceId, clock);
-  const sync = createLocalSync(deps, {
-    resolveArtifact: () => ({
-      connector: "fixture",
-      version: "1",
-      streams: streams.map((name) => ({
-        name,
-        semantics: "mutable_state" as const,
-        primaryKey: ["id"],
-        coverageStrategy: "full_inventory" as const,
-      })),
-    }),
-  });
-  const keys = async (stream = "items") =>
-    (await sync.query.listRecords({ connectionId, stream, limit: 100 })).records
-      .map((r) => r.recordKey)
-      .sort();
-  return {
-    db,
-    deps,
-    sync,
-    keys,
-    /** A real run: a proven full refresh, or explicit deletes of `rows`. */
-    async run(
-      id: string,
-      rows: string[],
-      options: { remove?: boolean; stream?: string; observedAt?: number } = {},
-    ) {
-      clock.now++;
-      const stream = options.stream ?? "items";
-      await sync.intake.begin(id, {
-        connector: "fixture",
-        artifactDigest: "fixture",
-        join: true,
-        streams: [{ name: stream }],
-        wantFull: !options.remove,
-        observedAt: options.observedAt,
-        owner: { address: owner, leaseId: null },
-      });
-      await sync.intake.batch(id, {
-        batch: 0,
-        records: rows.map((key) => ({
-          stream,
-          ...(options.remove ? { op: "delete" as const } : {}),
-          data: { id: key },
-        })),
-      });
-      await sync.intake.end(
-        id,
-        endRequest({
-          lastBatch: 0,
-          streams: [stream],
-          ...(rows.length === 0
-            ? {}
-            : options.remove
-              ? { deleted: [stream] }
-              : { live: [stream] }),
-          ...(options.remove ? {} : { provenFullStreams: [stream] }),
-        }),
-      );
-    },
-    async publish() {
-      expect(
-        (await sync.cycle()).connections.every((c) => c.error === null),
-      ).toBe(true);
-    },
-    /** Seed `rows` the way a host's staged upload from one install would. */
-    async seed(
-      install: string,
-      rows: string[],
-      stream = "items",
-      extra: Record<string, unknown> = {},
-    ): Promise<ReturnType<typeof importLegacySource>> {
-      await syncBeforeBegin(deps, "fixture");
-      const source: ImportSource = {
-        source: JSON.stringify([install, "fixture"]),
-        owner,
-        network: "test",
-        revision: `${install}-upload`,
-        target: {
-          connectionId,
-          connector: "fixture",
-          stream,
-          primaryKey: ["id"],
-          semantics: "mutable_state",
-          incremental: true,
-        },
-        exclusions: [],
-        async *records() {
-          for (const id of rows) yield { id, ...extra };
-        },
-      };
-      return importLegacySource(deps, createImportLedger(db), source);
-    },
-    async snapshot(stream = "items") {
-      return db.query(
-        "SELECT record_key, stamp_o, stamp_r, first_o, body FROM records WHERE stream = ? ORDER BY record_key",
-        [stream],
-      );
-    },
-  };
-}
-async function world() {
-  const registry = createMemoryStreamSyncRegistry();
-  const blobs = createMemoryStreamSyncBlobs();
-  const clock = { now: 1000 };
-  return {
-    registry,
-    blobs,
-    clock,
-    device: (id: string, path?: string, streams?: string[]) =>
-      openDevice(registry, blobs, id, clock, path, streams),
-  };
-}
-
-/** Everything a device holds of a stream, for "nothing changed" checks. */
-async function state(device: Awaited<ReturnType<typeof openDevice>>) {
-  return {
-    rows: await device.db.query(
-      "SELECT record_key, stamp_o, stamp_r, first_o, body FROM records ORDER BY stream, record_key",
-    ),
-    changes: await device.db.query("SELECT * FROM record_changes"),
-    tombstones: await device.db.query("SELECT * FROM log_tombstones"),
-  };
-}
-
 it("a seed after a real write fills the keys the stream never saw, and another device gets them", async () => {
   const w = await world();
   const a = await w.device("a");
