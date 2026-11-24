@@ -542,6 +542,31 @@ describe("samePermission", () => {
 });
 
 describe("PdppGrantBindingStore", () => {
+  it("lists permission bindings oldest first with grant ID as the tie-break", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    for (const [pdppGrantId, boundAt] of [
+      ["later", "2026-03-02T00:00:00Z"],
+      ["earlier-b", "2026-03-01T00:00:00Z"],
+      ["earlier-a", "2026-03-01T00:00:00Z"],
+    ]) {
+      store.putBinding({ ...makeBinding({ pdppGrantId }), boundAt });
+    }
+    expect(
+      store
+        .getBindingsForPermission(PERMISSION)
+        .map((entry) => entry.pdppGrantId),
+    ).toEqual(["earlier-a", "earlier-b", "later"]);
+  });
+
+  it("keeps returned permission lists independent of later retrievals", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    const binding = makeBinding();
+    store.putBinding(binding);
+    store.getBindingsForPermission(PERMISSION).splice(0);
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([binding]);
+    expect(store.getByPdppGrantId(binding.pdppGrantId)).toEqual(binding);
+  });
+
   it("retains and returns a binding by either key", () => {
     const store = createInMemoryPdppGrantBindingStore();
     const binding = makeBinding();
