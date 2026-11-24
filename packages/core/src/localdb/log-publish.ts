@@ -42,6 +42,7 @@
 // `base`, and no refs at or below it.
 
 import { sha256 } from "@noble/hashes/sha2";
+import { bytesToHex } from "@noble/hashes/utils";
 import {
   LOG_FORMAT,
   DEFAULT_PART_TARGET_BYTES,
@@ -77,7 +78,10 @@ import {
   type RegistryRequirementFailure,
   type SignedBatchRow,
 } from "../stream-sync/ports.js";
-import { StorageDeferredError } from "../stream-sync/storage-retry.js";
+import {
+  PARTS_IN_FLIGHT,
+  StorageDeferredError,
+} from "../stream-sync/storage-retry.js";
 import { sameHead, type PlanHead } from "../stream-sync/publish-plan.js";
 import { keccakOf } from "../stream-sync/crypto-port.js";
 import { putBodiesOutOfLine } from "./log-bodies.js";
@@ -94,6 +98,12 @@ import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { tombstoneOmissions } from "./admit.js";
 import { planCompaction } from "./log-compact.js";
+import {
+  clearSpool,
+  openSpool,
+  type Spool,
+  type SpooledObject,
+} from "./log-spool.js";
 import {
   logPublishPhases,
   openPhases,
@@ -240,10 +250,9 @@ type Candidate = {
    * Objects the segment names, to upload before it: snapshot parts and the
    * pieces of out-of-line bodies.
    */
-  readonly objects: readonly {
-    readonly name: string;
-    readonly cipher: Uint8Array;
-  }[];
+  readonly objects: readonly SpooledObject[];
+  /** The rows behind `objects`: deleted when the candidate is released. */
+  readonly spool: Spool;
   readonly position: number;
   readonly generation: number;
   readonly dataHash: `0x${string}`;
@@ -553,7 +562,7 @@ function transition(entry: PendingCommit, event: CandidateEvent): void {
     );
   }
 }
-function releaseCandidate(
+async function releaseCandidate(
   pending: Map<string, PendingCommit>,
   id: string,
   entry: PendingCommit,
@@ -565,6 +574,7 @@ function releaseCandidate(
   )
     throw new Error("publish: cannot release an unsettled candidate");
   pending.delete(id);
+  await entry.candidate.spool.discard();
 }
 async function invalidateExpiredCandidate(
   held: LocalSyncDeps,
@@ -633,7 +643,7 @@ async function publishRounds(
         entry.state.kind === "committed" ||
         entry.state.kind === "refused"
       ) {
-        releaseCandidate(pending, connectionId, entry);
+        await releaseCandidate(pending, connectionId, entry);
         retained = undefined;
       }
     }
@@ -683,13 +693,11 @@ async function publishRounds(
             : undefined,
           clock.time("segment-put", () =>
             allTransferred([
-              ...candidate.objects.map((object) =>
-                putIfMissing(
-                  deps,
-                  `${scope}/${object.name}`,
-                  object.cipher,
-                  retained !== undefined || attempts > 0,
-                ),
+              putSpooled(
+                deps,
+                scope,
+                candidate.objects,
+                retained !== undefined || attempts > 0,
               ),
               putIfMissing(
                 deps,
@@ -735,11 +743,11 @@ async function publishRounds(
         !hasAmbiguousCommit(transfer)
       ) {
         transition(transfer, "refused");
-        releaseCandidate(pending, connectionId, transfer);
+        await releaseCandidate(pending, connectionId, transfer);
       }
       throw error;
     }
-    releaseCandidate(pending, connectionId, transfer);
+    await releaseCandidate(pending, connectionId, transfer);
     if (committed.kind === "retry") {
       if (++attempts >= MAX_ATTEMPTS) {
         await record(await backoff(deps, connectionId));
@@ -765,6 +773,38 @@ async function putIfMissing(
 ) {
   if (!checkExisting || !(await deps.blobs.exists(key)))
     await deps.blobs.put(key, bytes);
+}
+
+/**
+ * Put the spooled objects, `PARTS_IN_FLIGHT` at a time. An object is read from
+ * the spool when its put starts and is not held after it ends, so the memory
+ * of the transfer is the pool's, whatever the size of the log. After a
+ * failure no put starts, and the ones in flight end before this returns.
+ */
+async function putSpooled(
+  deps: LocalSyncDeps,
+  scope: string,
+  objects: readonly SpooledObject[],
+  checkExisting: boolean,
+): Promise<void> {
+  let next = 0;
+  let failure: { readonly reason: unknown } | undefined;
+  const worker = async () => {
+    while (!failure && next < objects.length) {
+      const object = objects[next++]!;
+      try {
+        const key = `${scope}/${object.name}`;
+        if (checkExisting && (await deps.blobs.exists(key))) continue;
+        await deps.blobs.put(key, await object.read());
+      } catch (reason) {
+        failure ??= { reason };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(PARTS_IN_FLIGHT, objects.length) }, worker),
+  );
+  if (failure) throw failure.reason;
 }
 
 // A failed transfer must not leave another PUT running into the next retry.
@@ -1058,20 +1098,42 @@ async function snapshotRound(
       });
     };
     if (replace !== null) {
-      const { ops: found, untyped } = await operationsFor(
+      // The whole stream is looked at for deletes the log cannot say before
+      // any row goes, with no bodies read. Then bodies are read a batch at a
+      // time until they no longer fit one segment: a replace of a stream
+      // larger than the segment never has more than a segment in memory.
+      const keys = groups.map((g) => g.pk);
+      const { untyped } = await operationsFor(
         held,
         connectionId,
         stream,
-        groups.map((g) => g.pk),
+        keys,
         row.publish_watermark,
         watermark,
+        false,
       );
       if (untyped.length > 0) {
         stop(untyped);
         continue;
       }
       let size = bytes + 100 + omittedSize(omitted);
-      for (const op of found.values()) size += sizeOf(op);
+      const found = new Map<string, LogOperation>();
+      for (const batch of chunked(keys, KEYS_PER_QUERY)) {
+        if (size > target) break;
+        const read = await operationsFor(
+          held,
+          connectionId,
+          stream,
+          batch,
+          row.publish_watermark,
+          watermark,
+        );
+        for (const [pk, op] of read.ops) {
+          size += sizeOf(op);
+          found.set(pk, op);
+        }
+      }
+      if (size > target) found.clear();
       if (size <= target) {
         if (!room(size)) {
           planned.push({ ...base, ack: row.publish_watermark, rest: true });
@@ -1243,109 +1305,127 @@ async function snapshotRound(
   }
 
   const scope = logScope(connection.connector, connection.ns);
-  // The log is folded into a snapshot when that is cheaper than replaying it
-  // (or it is at the head's bound), and this segment carries the result.
-  const compaction = await planCompaction(held, {
-    connector: connection.connector,
-    ns: connection.ns,
-    generation: connection.generation,
-    keyCheck,
-    scope,
-    log,
-  });
-  const base = compaction ? log.position : log.base;
-  const refs = compaction ? [] : log.refs;
-  const snapshot = compaction ? compaction.snapshot : log.snapshot;
-  if (compactionRequired(refs.length, snapshot?.parts.length ?? 0)) {
-    held.logger.warn(
-      { connectionId, refs: refs.length, parts: snapshot?.parts.length ?? 0 },
-      "stream sync: the log head is full even after compaction",
+  // The sealed objects this round uploads wait on disk, not in the candidate.
+  // Rows of a round that did not finish are gone before this one starts.
+  await clearSpool(held.db, connectionId);
+  const spool = openSpool(held.db, connectionId, held.newOp());
+  let handedOver = false;
+  try {
+    // The log is folded into a snapshot when that is cheaper than replaying it
+    // (or it is at the head's bound), and this segment carries the result.
+    const compaction = await planCompaction(
+      held,
+      {
+        connectionId,
+        connector: connection.connector,
+        ns: connection.ns,
+        generation: connection.generation,
+        keyCheck,
+        scope,
+        log,
+      },
+      spool,
     );
-    return all("deferred");
-  }
-  const position = log.position + 1;
-  const observedAt = Math.max(
-    ...included.map((p) => p.plan.newestRunObservedAt ?? 0),
-    0,
-  );
-  const segment: Segment = {
-    format: LOG_FORMAT,
-    connector: connection.connector,
-    ns: connection.ns,
-    generation: connection.generation,
-    keyCheck,
-    position,
-    observedAt: observedAt || held.now(),
-    base,
-    snapshot,
-    refs,
-    streams: included.map((p) => p.meta!),
-    operations: included.flatMap((p) => p.operations),
-  };
-  // A deletion's key is the one its hash covers, or the segment is not written.
-  const mismatch = await firstDeletionKeyMismatch(
-    async (bytes) => sha256(bytes),
-    segment.streams,
-    segment.operations,
-  );
-  if (mismatch)
-    throw new Error(
-      `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
+    const base = compaction ? log.position : log.base;
+    const refs = compaction ? [] : log.refs;
+    const snapshot = compaction ? compaction.snapshot : log.snapshot;
+    if (compactionRequired(refs.length, snapshot?.parts.length ?? 0)) {
+      held.logger.warn(
+        { connectionId, refs: refs.length, parts: snapshot?.parts.length ?? 0 },
+        "stream sync: the log head is full even after compaction",
+      );
+      return all("deferred");
+    }
+    const position = log.position + 1;
+    const observedAt = Math.max(
+      ...included.map((p) => p.plan.newestRunObservedAt ?? 0),
+      0,
     );
-  const encodeStart = clock.now();
-  // A body larger than one object goes out of line (stream-sync `log.ts`).
-  const outOfLine = await putBodiesOutOfLine(
-    held,
-    scope,
-    segment.operations,
-    target,
-  );
-  const clear = encodeSegment({ ...segment, operations: outOfLine.ops });
-  const { dataHash, blobName } = await digestSegment(
-    keccakOf(held.streamCrypto),
-    clear,
-  );
-  // A segment that would not verify is never uploaded or posted.
-  const verified = await verifySegment(keccakOf(held.streamCrypto), clear, {
-    dataHash,
-    connector: connection.connector,
-    ns: connection.ns,
-    keyCheck,
-    position,
-  });
-  if (verified.kind !== "ok")
-    throw new Error(
-      `publish: the log segment failed verification: ${verified.kind}`,
-    );
-  const cipher = await held.keys.encrypt(scope, clear);
-  clock.record("encode", encodeStart);
-  return {
-    kind: "candidate",
-    candidate: {
-      lifetime: connectionLifetime(held.db, connectionId),
+    const segment: Segment = {
+      format: LOG_FORMAT,
       connector: connection.connector,
       ns: connection.ns,
-      basis: await basisOf(held, connectionId, planned, log),
-      state: log,
-      base,
-      refs,
-      snapshot,
-      objects: [...(compaction?.objects ?? []), ...outOfLine.pieces],
-      position,
       generation: connection.generation,
+      keyCheck,
+      position,
+      observedAt: observedAt || held.now(),
+      base,
+      snapshot,
+      refs,
+      streams: included.map((p) => p.meta!),
+      operations: included.flatMap((p) => p.operations),
+    };
+    // A deletion's key is the one its hash covers, or the segment is not written.
+    const mismatch = await firstDeletionKeyMismatch(
+      async (bytes) => sha256(bytes),
+      segment.streams,
+      segment.operations,
+    );
+    if (mismatch)
+      throw new Error(
+        `publish: a deletion's key does not match its hash (${mismatch.stream}/${mismatch.pkHash})`,
+      );
+    const encodeStart = clock.now();
+    // A body larger than one object goes out of line (stream-sync `log.ts`).
+    const outOfLine = await putBodiesOutOfLine(
+      held,
+      scope,
+      segment.operations,
+      target,
+    );
+    const clear = encodeSegment({ ...segment, operations: outOfLine.ops });
+    const { dataHash, blobName } = await digestSegment(
+      keccakOf(held.streamCrypto),
+      clear,
+    );
+    // A segment that would not verify is never uploaded or posted.
+    const verified = await verifySegment(keccakOf(held.streamCrypto), clear, {
       dataHash,
-      blobName,
-      cipher,
-      clearBytes: clear.length,
-      removes: segmentRemoves(segment.operations),
-      observedAt: segment.observedAt,
-      planned,
-      attachments,
-      controlDataHash,
-      createControl,
-      prevHash: log.refs.at(-1)?.dataHash ?? null,
-    },
-  };
+      connector: connection.connector,
+      ns: connection.ns,
+      keyCheck,
+      position,
+    });
+    if (verified.kind !== "ok")
+      throw new Error(
+        `publish: the log segment failed verification: ${verified.kind}`,
+      );
+    const cipher = await held.keys.encrypt(scope, clear);
+    clock.record("encode", encodeStart);
+    for (const piece of outOfLine.pieces)
+      await spool.add(piece.name, piece.cipher);
+    handedOver = true;
+    return {
+      kind: "candidate",
+      candidate: {
+        lifetime: connectionLifetime(held.db, connectionId),
+        connector: connection.connector,
+        ns: connection.ns,
+        basis: await basisOf(held, connectionId, planned, log),
+        state: log,
+        base,
+        refs,
+        snapshot,
+        objects: spool.objects(),
+        spool,
+        position,
+        generation: connection.generation,
+        dataHash,
+        blobName,
+        cipher,
+        clearBytes: clear.length,
+        removes: segmentRemoves(segment.operations),
+        observedAt: segment.observedAt,
+        planned,
+        attachments,
+        controlDataHash,
+        createControl,
+        prevHash: log.refs.at(-1)?.dataHash ?? null,
+      },
+    };
+  } finally {
+    if (!handedOver) await spool.discard();
+  }
 }
 
 /**
@@ -1680,27 +1760,45 @@ async function omittedBy(
   }
 }
 
-/** The hashes `omittedBy` names, for a comparison that needs no key. */
-async function omittedHashes(
+/**
+ * A digest of the hashes `omittedBy` names, for a comparison that needs no
+ * key: read a page at a time, so what a stream omits is not held to be
+ * compared.
+ */
+async function omittedDigest(
   deps: LocalSyncDeps,
   connectionId: string,
   stream: string,
   replace: { o: number; r: string },
   keys?: KeyRange,
-): Promise<string[]> {
-  const rows = await deps.db.query<{ pk_hash: string }>(
-    `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
-        AND ${SEEN_BEFORE}${keys ? " AND pk_hash >= ? AND pk_hash <= ?" : ""}
-      ORDER BY pk_hash`,
-    [
-      connectionId,
-      stream,
-      ...seenBeforeParams(replace.o, replace.r),
-      ...(keys ? [keys.from, keys.to] : []),
-    ],
-  );
-  return rows.map((row) => row.pk_hash);
+): Promise<string> {
+  const hash = sha256.create();
+  const encoder = new TextEncoder();
+  let after: string | undefined;
+  let count = 0;
+  for (;;) {
+    const rows = await deps.db.query<{ pk_hash: string }>(
+      `SELECT pk_hash FROM records WHERE connection_id = ? AND stream = ?
+          AND ${SEEN_BEFORE}${keys ? " AND pk_hash >= ? AND pk_hash <= ?" : ""}${
+            after === undefined ? "" : " AND pk_hash > ?"
+          }
+        ORDER BY pk_hash LIMIT ${DIGEST_PAGE}`,
+      [
+        connectionId,
+        stream,
+        ...seenBeforeParams(replace.o, replace.r),
+        ...(keys ? [keys.from, keys.to] : []),
+        ...(after === undefined ? [] : [after]),
+      ],
+    );
+    for (const row of rows) hash.update(encoder.encode(`${row.pk_hash}\n`));
+    count += rows.length;
+    if (rows.length < DIGEST_PAGE)
+      return `${count}:${bytesToHex(hash.digest())}`;
+    after = rows[rows.length - 1]!.pk_hash;
+  }
 }
+const DIGEST_PAGE = 4096;
 
 /** Changed keys since the watermark, oldest change first. */
 async function changedKeys(
@@ -1776,6 +1874,8 @@ async function operationsFor(
   keys: readonly string[],
   from: number,
   to: number,
+  /** Without bodies, the rows that are held have no operation: a sweep for untyped deletes. */
+  withBodies = true,
 ): Promise<{
   readonly ops: Map<string, LogOperation>;
   /** Explicit deletes of these keys have no typed key and cannot be published. */
@@ -1796,12 +1896,14 @@ async function operationsFor(
       stamp_n: number;
       body: string;
     }>(
-      `SELECT pk_hash, stamp_o, stamp_r, stamp_n, first_o, body FROM records
+      `SELECT pk_hash, stamp_o, stamp_r, stamp_n, first_o, ${
+        withBodies ? "body" : "'' AS body"
+      } FROM records
         WHERE connection_id = ? AND stream = ? AND pk_hash IN (${marks})`,
       [connectionId, stream, ...group],
     );
     const held = new Set(rows.map((row) => row.pk_hash));
-    for (const row of rows)
+    for (const row of withBodies ? rows : [])
       ops.set(row.pk_hash, {
         kind: "upsert",
         stream,
@@ -1958,16 +2060,16 @@ async function basisOf(
       [connectionId, p.stream, p.local.publish_watermark, p.ack],
     );
     const omitted = p.replace
-      ? await omittedHashes(deps, connectionId, p.stream, p.replace)
+      ? await omittedDigest(deps, connectionId, p.stream, p.replace)
       : p.replacing && p.omitting
-        ? await omittedHashes(
+        ? await omittedDigest(
             deps,
             connectionId,
             p.stream,
             p.replacing,
             p.omitting,
           )
-        : [];
+        : "";
     streams.push([p.stream, state, runs, covered, omitted]);
   }
   return JSON.stringify([connection, log, intents, streams]);

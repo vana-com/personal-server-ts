@@ -702,4 +702,23 @@ END`,
   scope TEXT NOT NULL, name TEXT NOT NULL, recorded_at INTEGER NOT NULL,
   PRIMARY KEY (scope, name)) WITHOUT ROWID`,
   ],
+  [
+    // Scratch for the operations that fold or build the log a whole at a
+    // time (`log-fold-workspace.ts`, `log-spool.ts`): the fold of a history
+    // too large to hold, and the sealed objects of a candidate waiting for
+    // upload. Both are device-local, never published, and emptied by the
+    // operation that fills them; a crash leaves rows the next operation on the
+    // connection deletes before it starts.
+    `CREATE TABLE log_fold_cells (
+  connection_id TEXT NOT NULL, workspace TEXT NOT NULL,
+  stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
+  up_o INTEGER, up_r TEXT, up_ordinal INTEGER, up_hash TEXT,
+  up_first_seen INTEGER, up_ref INTEGER, up_body TEXT,
+  del_o INTEGER, del_r TEXT, del_explicit INTEGER, del_key TEXT,
+  PRIMARY KEY (connection_id, workspace, stream, pk_hash)) WITHOUT ROWID`,
+    `CREATE TABLE log_spool (
+  connection_id TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL,
+  bytes INTEGER NOT NULL, cipher BLOB NOT NULL,
+  PRIMARY KEY (connection_id, owner, name)) WITHOUT ROWID`,
+  ],
 ];
