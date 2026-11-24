@@ -1,8 +1,60 @@
 {
   "repository_name": ".codeboarding-target",
-  "timestamp": "2026-11-02T06:43:04.040661+00:00",
-  "overall_score": 0.9713192654639174,
+  "timestamp": "2026-11-24T00:45:36.762769+00:00",
+  "overall_score": 0.9717661241711875,
   "check_summaries": [
+    {
+      "check_name": "function_size",
+      "description": "Checks that functions/methods do not exceed line count thresholds",
+      "languages": [
+        "python"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 47,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "unused_code_diagnostics",
+      "description": "Detects unused imports, variables, functions, and dead code via LSP diagnostics",
+      "languages": [
+        "python"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 0,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "function_size",
+      "description": "Checks that functions/methods do not exceed line count thresholds",
+      "languages": [
+        "rust"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 8,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "unused_code_diagnostics",
+      "description": "Detects unused imports, variables, functions, and dead code via LSP diagnostics",
+      "languages": [
+        "rust"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 0,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
     {
       "check_name": "function_size",
       "description": "Checks that functions/methods do not exceed line count thresholds",
@@ -11,10 +63,10 @@
         "typescript"
       ],
       "check_type": "standard",
-      "total_entities_checked": 6150,
-      "findings_count": 173,
-      "warning_count": 173,
-      "score": 0.971869918699187,
+      "total_entities_checked": 8228,
+      "findings_count": 227,
+      "warning_count": 227,
+      "score": 0.9724112785610112,
       "finding_groups": [
         {
           "severity": "warning",
@@ -29,32 +81,60 @@
               "metric_value": 4506
             },
             {
-              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.createSqliteRecordStore",
-              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
-              "line_start": 709,
-              "line_end": 2790,
-              "metric_value": 2081
-            },
-            {
               "entity_name": "packages.lite.src.canonical-store.createLiteCanonicalStore",
               "file_path": "packages/lite/src/canonical-store.ts",
               "line_start": 393,
-              "line_end": 2374,
-              "metric_value": 1981
+              "line_end": 2384,
+              "metric_value": 1991
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-replica-visibility-view.createReplicaVisibilityView",
               "file_path": "packages/server/src/storage/pdpp-replica-visibility-view.ts",
               "line_start": 144,
-              "line_end": 1969,
-              "metric_value": 1825
+              "line_end": 1962,
+              "metric_value": 1818
+            },
+            {
+              "entity_name": "packages.server.src.bootstrap.bootstrapServer",
+              "file_path": "packages/server/src/bootstrap.ts",
+              "line_start": 421,
+              "line_end": 2143,
+              "metric_value": 1722
+            },
+            {
+              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.createSqliteRecordStore",
+              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+              "line_start": 675,
+              "line_end": 2368,
+              "metric_value": 1693
             },
             {
               "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes",
               "file_path": "packages/server/src/routes/pdpp-records.ts",
-              "line_start": 535,
-              "line_end": 1924,
+              "line_start": 564,
+              "line_end": 2093,
+              "metric_value": 1529
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 2804,
+              "line_end": 4196,
+              "metric_value": 1392
+            },
+            {
+              "entity_name": "packages.core.src.sync.engine.sync-manager.createSyncManager",
+              "file_path": "packages/core/src/sync/engine/sync-manager.ts",
+              "line_start": 395,
+              "line_end": 1784,
               "metric_value": 1389
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest.withApiErrors() callback",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 2818,
+              "line_end": 4195,
+              "metric_value": 1377
             },
             {
               "entity_name": "scripts.e2e-x402-lite.main",
@@ -78,13 +158,6 @@
               "metric_value": 1227
             },
             {
-              "entity_name": "packages.server.src.bootstrap.createServer",
-              "file_path": "packages/server/src/bootstrap.ts",
-              "line_start": 261,
-              "line_end": 1464,
-              "metric_value": 1203
-            },
-            {
               "entity_name": "packages.server.src.routes.pdpp-auth.pdppAuthRoutes",
               "file_path": "packages/server/src/routes/pdpp-auth.ts",
               "line_start": 435,
@@ -92,25 +165,25 @@
               "metric_value": 1039
             },
             {
-              "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest",
-              "file_path": "packages/core/src/api/index.ts",
-              "line_start": 1904,
-              "line_end": 2898,
-              "metric_value": 994
-            },
-            {
-              "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest.withApiErrors() callback",
-              "file_path": "packages/core/src/api/index.ts",
-              "line_start": 1918,
-              "line_end": 2897,
-              "metric_value": 979
-            },
-            {
               "entity_name": "packages.core.src.storage.legacy-scope-view.createLegacyScopeView",
               "file_path": "packages/core/src/storage/legacy-scope-view.ts",
-              "line_start": 384,
-              "line_end": 1350,
-              "metric_value": 966
+              "line_start": 371,
+              "line_end": 1378,
+              "metric_value": 1007
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 945,
+              "line_end": 1927,
+              "metric_value": 982
+            },
+            {
+              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage",
+              "file_path": "packages/lite/src/storage.ts",
+              "line_start": 580,
+              "line_end": 1553,
+              "metric_value": 973
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-replica-reconciler.createReplicaReconciler",
@@ -120,25 +193,39 @@
               "metric_value": 944
             },
             {
-              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage",
-              "file_path": "packages/lite/src/storage.ts",
-              "line_start": 530,
-              "line_end": 1402,
-              "metric_value": 872
+              "entity_name": "packages.core.src.additions.durable.createDurableAdditions",
+              "file_path": "packages/core/src/additions/durable.ts",
+              "line_start": 293,
+              "line_end": 1144,
+              "metric_value": 851
             },
             {
-              "entity_name": "scripts.pdpp-replica-live-journey.main",
-              "file_path": "scripts/pdpp-replica-live-journey.ts",
-              "line_start": 937,
-              "line_end": 1698,
-              "metric_value": 761
+              "entity_name": "packages.server.src.app.createApp",
+              "file_path": "packages/server/src/app.ts",
+              "line_start": 389,
+              "line_end": 1196,
+              "metric_value": 807
+            },
+            {
+              "entity_name": "packages.core.src.localdb.delete.createConnectionDeleter",
+              "file_path": "packages/core/src/localdb/delete.ts",
+              "line_start": 132,
+              "line_end": 897,
+              "metric_value": 765
             },
             {
               "entity_name": "scripts.pdpp-replica-owner-composition.createOwnerComposition",
               "file_path": "scripts/pdpp-replica-owner-composition.ts",
-              "line_start": 231,
-              "line_end": 991,
-              "metric_value": 760
+              "line_start": 233,
+              "line_end": 994,
+              "metric_value": 761
+            },
+            {
+              "entity_name": "packages.core.src.localdb.run-intake.createRunIntakeStore",
+              "file_path": "packages/core/src/localdb/run-intake.ts",
+              "line_start": 208,
+              "line_end": 952,
+              "metric_value": 744
             },
             {
               "entity_name": "packages.enclave.src.fleet.placement.openFleetController",
@@ -148,25 +235,32 @@
               "metric_value": 739
             },
             {
-              "entity_name": "packages.core.src.additions.durable.createDurableAdditions",
-              "file_path": "packages/core/src/additions/durable.ts",
-              "line_start": 291,
-              "line_end": 1020,
-              "metric_value": 729
-            },
-            {
-              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime",
-              "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 799,
-              "line_end": 1496,
-              "metric_value": 697
-            },
-            {
               "entity_name": "packages.lite.src.runtime.handleMcpRoute",
               "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 1507,
-              "line_end": 2188,
-              "metric_value": 681
+              "line_start": 1938,
+              "line_end": 2664,
+              "metric_value": 726
+            },
+            {
+              "entity_name": "scripts.pdpp-replica-live-journey.main",
+              "file_path": "scripts/pdpp-replica-live-journey.ts",
+              "line_start": 930,
+              "line_end": 1648,
+              "metric_value": 718
+            },
+            {
+              "entity_name": "packages.core.src.mcp.read-client.createMcpDataReadClient",
+              "file_path": "packages/core/src/mcp/read-client.ts",
+              "line_start": 580,
+              "line_end": 1285,
+              "metric_value": 705
+            },
+            {
+              "entity_name": "packages.lite.src.relay.startPsLiteRelayClient",
+              "file_path": "packages/lite/src/relay.ts",
+              "line_start": 356,
+              "line_end": 1058,
+              "metric_value": 702
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-replication-sqlite.createReplicationJournal",
@@ -176,11 +270,32 @@
               "metric_value": 664
             },
             {
+              "entity_name": "packages.core.src.localdb.run-end.createRunEndStore",
+              "file_path": "packages/core/src/localdb/run-end.ts",
+              "line_start": 155,
+              "line_end": 785,
+              "metric_value": 630
+            },
+            {
               "entity_name": "packages.lite.src.client.startPersonalServer",
               "file_path": "packages/lite/src/client.ts",
-              "line_start": 99,
-              "line_end": 715,
-              "metric_value": 616
+              "line_start": 133,
+              "line_end": 743,
+              "metric_value": 610
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 1321,
+              "line_end": 1925,
+              "metric_value": 604
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch.withProtocolErrors() callback",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 1322,
+              "line_end": 1924,
+              "metric_value": 602
             },
             {
               "entity_name": "packages.lite.src.replication-engine.createLiteReplicaEngine",
@@ -190,32 +305,60 @@
               "metric_value": 597
             },
             {
-              "entity_name": "packages.server.src.app.createApp",
-              "file_path": "packages/server/src/app.ts",
-              "line_start": 297,
-              "line_end": 893,
-              "metric_value": 596
+              "entity_name": "packages.server.src.storage.index-manager.createIndexManager",
+              "file_path": "packages/server/src/storage/index-manager.ts",
+              "line_start": 147,
+              "line_end": 739,
+              "metric_value": 592
+            },
+            {
+              "entity_name": "packages.server.src.storage.import-operations.createImportOperations",
+              "file_path": "packages/server/src/storage/import-operations.ts",
+              "line_start": 69,
+              "line_end": 651,
+              "metric_value": 582
+            },
+            {
+              "entity_name": "packages.core.src.localdb.run-end.createRunEndStore.finish.complete",
+              "file_path": "packages/core/src/localdb/run-end.ts",
+              "line_start": 171,
+              "line_end": 752,
+              "metric_value": 581
             },
             {
               "entity_name": "scripts.pdpp-replica-live-journey.openReplicaRuntime",
               "file_path": "scripts/pdpp-replica-live-journey.ts",
               "line_start": 208,
-              "line_end": 788,
-              "metric_value": 580
-            },
-            {
-              "entity_name": "packages.server.src.storage.index-manager.createIndexManager",
-              "file_path": "packages/server/src/storage/index-manager.ts",
-              "line_start": 131,
-              "line_end": 680,
-              "metric_value": 549
+              "line_end": 781,
+              "metric_value": 573
             },
             {
               "entity_name": "packages.core.src.storage.legacy-scope-view.createLegacyScopeView.chooseBody",
               "file_path": "packages/core/src/storage/legacy-scope-view.ts",
-              "line_start": 784,
-              "line_end": 1316,
-              "metric_value": 532
+              "line_start": 786,
+              "line_end": 1344,
+              "metric_value": 558
+            },
+            {
+              "entity_name": "packages.core.src.localdb.log-publish.snapshotRound",
+              "file_path": "packages/core/src/localdb/log-publish.ts",
+              "line_start": 815,
+              "line_end": 1349,
+              "metric_value": 534
+            },
+            {
+              "entity_name": "packages.core.src.stream-sync.registry.createGatewayStreamSyncRegistry",
+              "file_path": "packages/core/src/stream-sync/registry.ts",
+              "line_start": 184,
+              "line_end": 711,
+              "metric_value": 527
+            },
+            {
+              "entity_name": "packages.core.test-support.localdb.conformance.runDriverConformance",
+              "file_path": "packages/core/test-support/localdb/conformance.ts",
+              "line_start": 28,
+              "line_end": 553,
+              "metric_value": 525
             },
             {
               "entity_name": "packages.core.src.storage.pdpp-records.memory-store.createMemoryRecordStore",
@@ -232,6 +375,27 @@
               "metric_value": 523
             },
             {
+              "entity_name": "packages.enclave.src.central.bootstrap.startFleetCentral",
+              "file_path": "packages/enclave/src/central/bootstrap.ts",
+              "line_start": 80,
+              "line_end": 598,
+              "metric_value": 518
+            },
+            {
+              "entity_name": "packages.core.src.localdb.resolve.createLocalResolver",
+              "file_path": "packages/core/src/localdb/resolve.ts",
+              "line_start": 295,
+              "line_end": 812,
+              "metric_value": 517
+            },
+            {
+              "entity_name": "packages.stream-sync.src.vectors.runVectors",
+              "file_path": "packages/stream-sync/src/vectors.ts",
+              "line_start": 84,
+              "line_end": 594,
+              "metric_value": 510
+            },
+            {
               "entity_name": "packages.server.src.storage.legacy-scope-authority.createLegacyScopeAuthority",
               "file_path": "packages/server/src/storage/legacy-scope-authority.ts",
               "line_start": 67,
@@ -241,9 +405,23 @@
             {
               "entity_name": "scripts.pdpp-replica-consent-live-journey.main",
               "file_path": "scripts/pdpp-replica-consent-live-journey.ts",
-              "line_start": 612,
-              "line_end": 1119,
+              "line_start": 615,
+              "line_end": 1122,
               "metric_value": 507
+            },
+            {
+              "entity_name": "packages.server.src.mcp.durable-state.openMcpDurableState",
+              "file_path": "packages/server/src/mcp/durable-state.ts",
+              "line_start": 152,
+              "line_end": 645,
+              "metric_value": 493
+            },
+            {
+              "entity_name": "packages.server.src.localdb.legacy-access.openLegacyAccess",
+              "file_path": "packages/server/src/localdb/legacy-access.ts",
+              "line_start": 90,
+              "line_end": 580,
+              "metric_value": 490
             },
             {
               "entity_name": "packages.core.src.replication.copies.replicaCopies",
@@ -253,11 +431,11 @@
               "metric_value": 490
             },
             {
-              "entity_name": "packages.enclave.src.central.bootstrap.startFleetCentral",
-              "file_path": "packages/enclave/src/central/bootstrap.ts",
-              "line_start": 75,
-              "line_end": 564,
-              "metric_value": 489
+              "entity_name": "packages.core.src.localdb.listing.createLocalListing",
+              "file_path": "packages/core/src/localdb/listing.ts",
+              "line_start": 134,
+              "line_end": 604,
+              "metric_value": 470
             },
             {
               "entity_name": "packages.core.src.replication.coordinator.createAsyncReplicaCoordinator",
@@ -267,18 +445,39 @@
               "metric_value": 469
             },
             {
-              "entity_name": "packages.lite.src.relay.startPsLiteRelayClient",
-              "file_path": "packages/lite/src/relay.ts",
-              "line_start": 224,
-              "line_end": 684,
-              "metric_value": 460
+              "entity_name": "packages.core.src.localdb.log-apply.loadProgressively",
+              "file_path": "packages/core/src/localdb/log-apply.ts",
+              "line_start": 805,
+              "line_end": 1262,
+              "metric_value": 457
             },
             {
-              "entity_name": "packages.server.src.mcp.durable-state.openMcpDurableState",
-              "file_path": "packages/server/src/mcp/durable-state.ts",
-              "line_start": 144,
-              "line_end": 582,
-              "metric_value": 438
+              "entity_name": "packages.lite.src.sync.createPsLiteSyncManager",
+              "file_path": "packages/lite/src/sync.ts",
+              "line_start": 393,
+              "line_end": 844,
+              "metric_value": 451
+            },
+            {
+              "entity_name": "packages.server.src.client.startPersonalServer",
+              "file_path": "packages/server/src/client.ts",
+              "line_start": 80,
+              "line_end": 528,
+              "metric_value": 448
+            },
+            {
+              "entity_name": "packages.core.src.localdb.run-intake.createRunIntakeStore.begin",
+              "file_path": "packages/core/src/localdb/run-intake.ts",
+              "line_start": 288,
+              "line_end": 733,
+              "metric_value": 445
+            },
+            {
+              "entity_name": "packages.core.src.localdb.run-intake.createRunIntakeStore.begin.serial() callback",
+              "file_path": "packages/core/src/localdb/run-intake.ts",
+              "line_start": 289,
+              "line_end": 733,
+              "metric_value": 444
             },
             {
               "entity_name": "scripts.e2e-job.main",
@@ -288,25 +487,46 @@
               "metric_value": 436
             },
             {
-              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch",
-              "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 1068,
-              "line_end": 1494,
-              "metric_value": 426
+              "entity_name": "packages.server.src.localdb.fake-gateway.createFakeGateway",
+              "file_path": "packages/server/src/localdb/fake-gateway.ts",
+              "line_start": 106,
+              "line_end": 540,
+              "metric_value": 434
             },
             {
-              "entity_name": "packages.core.src.mcp.read-client.createMcpDataReadClient",
-              "file_path": "packages/core/src/mcp/read-client.ts",
-              "line_start": 490,
-              "line_end": 915,
-              "metric_value": 425
+              "entity_name": "packages.core.src.localdb.sync.createLocalSync",
+              "file_path": "packages/core/src/localdb/sync.ts",
+              "line_start": 115,
+              "line_end": 527,
+              "metric_value": 412
             },
             {
-              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch.withProtocolErrors() callback",
-              "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 1069,
-              "line_end": 1493,
-              "metric_value": 424
+              "entity_name": "packages.core.src.localdb.log-bootstrap.runBootstrap",
+              "file_path": "packages/core/src/localdb/log-bootstrap.ts",
+              "line_start": 74,
+              "line_end": 485,
+              "metric_value": 411
+            },
+            {
+              "entity_name": "packages.lite.src.browser-runtime.createIndexedDbPsLiteRuntime",
+              "file_path": "packages/lite/src/browser-runtime.ts",
+              "line_start": 265,
+              "line_end": 675,
+              "metric_value": 410
+            },
+            {
+              "entity_name": "packages.server.src.storage.node-data-storage.createNodeDataStorage",
+              "file_path": "packages/server/src/storage/node-data-storage.ts",
+              "line_start": 221,
+              "line_end": 627,
+              "metric_value": 406
+            },
+            {
+              "entity_name": "packages.core.src.localdb.system-streams.createSystemStreamStore",
+              "file_path": "packages/core/src/localdb/system-streams.ts",
+              "line_start": 19,
+              "line_end": 425,
+              "metric_value": 406
             },
             {
               "entity_name": "packages.core.src.storage.legacy-scope-coverage.compareLegacyCoverage",
@@ -316,11 +536,18 @@
               "metric_value": 406
             },
             {
-              "entity_name": "packages.server.src.storage.import-operations.createImportOperations",
-              "file_path": "packages/server/src/storage/import-operations.ts",
-              "line_start": 45,
-              "line_end": 439,
-              "metric_value": 394
+              "entity_name": "packages.core.src.sync.upload-attempts.createUploadAttemptLedger",
+              "file_path": "packages/core/src/sync/upload-attempts.ts",
+              "line_start": 404,
+              "line_end": 809,
+              "metric_value": 405
+            },
+            {
+              "entity_name": "packages.core.src.sync.account-mode.authority.createModeAuthority",
+              "file_path": "packages/core/src/sync/account-mode/authority.ts",
+              "line_start": 152,
+              "line_end": 541,
+              "metric_value": 389
             },
             {
               "entity_name": "packages.core.src.replication.engine.createReplicaEngine.prepare.run",
@@ -330,11 +557,11 @@
               "metric_value": 388
             },
             {
-              "entity_name": "packages.server.src.client.startPersonalServer",
-              "file_path": "packages/server/src/client.ts",
-              "line_start": 75,
-              "line_end": 460,
-              "metric_value": 385
+              "entity_name": "packages.core.src.mcp.tools.searchPersonalContext.handler",
+              "file_path": "packages/core/src/mcp/tools.ts",
+              "line_start": 1626,
+              "line_end": 2003,
+              "metric_value": 377
             },
             {
               "entity_name": "scripts.e2e-identity.main",
@@ -344,18 +571,11 @@
               "metric_value": 371
             },
             {
-              "entity_name": "packages.core.src.mcp.tools.searchPersonalContext.handler",
-              "file_path": "packages/core/src/mcp/tools.ts",
-              "line_start": 1401,
-              "line_end": 1771,
+              "entity_name": "packages.server.src.localdb.fake-gateway.createFakeGateway.gateway.fetch.<function>",
+              "file_path": "packages/server/src/localdb/fake-gateway.ts",
+              "line_start": 167,
+              "line_end": 537,
               "metric_value": 370
-            },
-            {
-              "entity_name": "packages.core.src.sync.engine.sync-manager.createSyncManager",
-              "file_path": "packages/core/src/sync/engine/sync-manager.ts",
-              "line_start": 76,
-              "line_end": 435,
-              "metric_value": 359
             },
             {
               "entity_name": "packages.core.src.storage.legacy-projection.withLegacyProjection",
@@ -365,18 +585,18 @@
               "metric_value": 358
             },
             {
-              "entity_name": "packages.server.src.storage.pdpp-replica-canonical-port.createReplicaCanonicalPort",
-              "file_path": "packages/server/src/storage/pdpp-replica-canonical-port.ts",
-              "line_start": 300,
-              "line_end": 654,
-              "metric_value": 354
-            },
-            {
               "entity_name": "packages.core.src.pdpp.declaration.parseDeclaration",
               "file_path": "packages/core/src/pdpp/declaration.ts",
               "line_start": 476,
               "line_end": 829,
               "metric_value": 353
+            },
+            {
+              "entity_name": "packages.server.src.routes.mcp.mcpOAuthRoutes",
+              "file_path": "packages/server/src/routes/mcp.ts",
+              "line_start": 896,
+              "line_end": 1247,
+              "metric_value": 351
             },
             {
               "entity_name": "packages.core.src.derivatives.scheduler.createRecomputeScheduler",
@@ -386,11 +606,18 @@
               "metric_value": 351
             },
             {
-              "entity_name": "packages.server.src.routes.mcp.mcpOAuthRoutes",
+              "entity_name": "packages.server.src.storage.pdpp-replica-canonical-port.createReplicaCanonicalPort",
+              "file_path": "packages/server/src/storage/pdpp-replica-canonical-port.ts",
+              "line_start": 294,
+              "line_end": 644,
+              "metric_value": 350
+            },
+            {
+              "entity_name": "packages.server.src.routes.mcp.mcpStreamableHttpRoutes",
               "file_path": "packages/server/src/routes/mcp.ts",
-              "line_start": 750,
-              "line_end": 1101,
-              "metric_value": 351
+              "line_start": 1258,
+              "line_end": 1606,
+              "metric_value": 348
             },
             {
               "entity_name": "packages.core.src.api.scope-uploads.createScopeUploadRegistry",
@@ -407,6 +634,27 @@
               "metric_value": 335
             },
             {
+              "entity_name": "packages.core.src.sync.workers.download.downloadOne",
+              "file_path": "packages/core/src/sync/workers/download.ts",
+              "line_start": 302,
+              "line_end": 628,
+              "metric_value": 326
+            },
+            {
+              "entity_name": "packages.core.src.localdb.log-apply.applyLog",
+              "file_path": "packages/core/src/localdb/log-apply.ts",
+              "line_start": 169,
+              "line_end": 492,
+              "metric_value": 323
+            },
+            {
+              "entity_name": "packages.core.src.additions.durable.createDurableAdditions.recover",
+              "file_path": "packages/core/src/additions/durable.ts",
+              "line_start": 575,
+              "line_end": 894,
+              "metric_value": 319
+            },
+            {
               "entity_name": "packages.core.src.storage.legacy-scope-coverage.compareLegacyCoverage.compare",
               "file_path": "packages/core/src/storage/legacy-scope-coverage.ts",
               "line_start": 230,
@@ -421,39 +669,67 @@
               "metric_value": 317
             },
             {
-              "entity_name": "packages.server.src.routes.mcp.mcpStreamableHttpRoutes",
-              "file_path": "packages/server/src/routes/mcp.ts",
-              "line_start": 1112,
-              "line_end": 1429,
-              "metric_value": 317
-            },
-            {
-              "entity_name": "packages.core.src.sync.workers.download.downloadOne",
-              "file_path": "packages/core/src/sync/workers/download.ts",
-              "line_start": 274,
-              "line_end": 585,
-              "metric_value": 311
-            },
-            {
-              "entity_name": "packages.server.src.storage.node-data-storage.createNodeDataStorage",
-              "file_path": "packages/server/src/storage/node-data-storage.ts",
-              "line_start": 154,
-              "line_end": 463,
-              "metric_value": 309
-            },
-            {
               "entity_name": "packages.lite.src.canonical-store.createLiteCanonicalStore.commit",
               "file_path": "packages/lite/src/canonical-store.ts",
-              "line_start": 1082,
-              "line_end": 1386,
+              "line_start": 1083,
+              "line_end": 1387,
               "metric_value": 304
+            },
+            {
+              "entity_name": "packages.core.src.test-utils.memory-storage.createMemoryDataStorage",
+              "file_path": "packages/core/src/test-utils/memory-storage.ts",
+              "line_start": 37,
+              "line_end": 341,
+              "metric_value": 304
+            },
+            {
+              "entity_name": "packages.server.src.routes.data.dataRoutes",
+              "file_path": "packages/server/src/routes/data.ts",
+              "line_start": 175,
+              "line_end": 475,
+              "metric_value": 300
+            },
+            {
+              "entity_name": "packages.core.src.localdb.history.createLocalHistory",
+              "file_path": "packages/core/src/localdb/history.ts",
+              "line_start": 122,
+              "line_end": 417,
+              "metric_value": 295
+            },
+            {
+              "entity_name": "packages.core.src.storage.canonical-legacy-projection.collectSnapshot",
+              "file_path": "packages/core/src/storage/canonical-legacy-projection.ts",
+              "line_start": 424,
+              "line_end": 719,
+              "metric_value": 295
+            },
+            {
+              "entity_name": "packages.server.src.routes.chunked-scope-import.finalizeScopeImportAuthorized",
+              "file_path": "packages/server/src/routes/chunked-scope-import.ts",
+              "line_start": 995,
+              "line_end": 1289,
+              "metric_value": 294
+            },
+            {
+              "entity_name": "packages.server.src.stream-sync.fs-files.createFsStreamSyncFiles",
+              "file_path": "packages/server/src/stream-sync/fs-files.ts",
+              "line_start": 67,
+              "line_end": 358,
+              "metric_value": 291
             },
             {
               "entity_name": "packages.server.src.api-auth.createServerApiAuth",
               "file_path": "packages/server/src/api-auth.ts",
               "line_start": 125,
-              "line_end": 410,
-              "metric_value": 285
+              "line_end": 413,
+              "metric_value": 288
+            },
+            {
+              "entity_name": "packages.core.src.stream-sync.send-gate.createSendGate",
+              "file_path": "packages/core/src/stream-sync/send-gate.ts",
+              "line_start": 148,
+              "line_end": 434,
+              "metric_value": 286
             },
             {
               "entity_name": "packages.server.src.mcp.tee-ingress.createTeeMcpIngress",
@@ -463,11 +739,11 @@
               "metric_value": 283
             },
             {
-              "entity_name": "packages.core.src.additions.durable.createDurableAdditions.recover",
-              "file_path": "packages/core/src/additions/durable.ts",
-              "line_start": 571,
-              "line_end": 853,
-              "metric_value": 282
+              "entity_name": "packages.core.src.sync.workers.upload.uploadAll",
+              "file_path": "packages/core/src/sync/workers/upload.ts",
+              "line_start": 617,
+              "line_end": 900,
+              "metric_value": 283
             },
             {
               "entity_name": "packages.core.src.replication.engine.createReplicaEngine.importRun.run",
@@ -477,32 +753,32 @@
               "metric_value": 279
             },
             {
+              "entity_name": "packages.core.src.localdb.log-publish.commitRound",
+              "file_path": "packages/core/src/localdb/log-publish.ts",
+              "line_start": 2039,
+              "line_end": 2317,
+              "metric_value": 278
+            },
+            {
               "entity_name": "packages.core.src.storage.canonical-legacy-projection.projectSnapshot",
               "file_path": "packages/core/src/storage/canonical-legacy-projection.ts",
-              "line_start": 689,
-              "line_end": 964,
+              "line_start": 746,
+              "line_end": 1023,
+              "metric_value": 277
+            },
+            {
+              "entity_name": "packages.core.src.sync.pdpp-import.createPdppImporter",
+              "file_path": "packages/core/src/sync/pdpp-import.ts",
+              "line_start": 452,
+              "line_end": 727,
               "metric_value": 275
             },
             {
-              "entity_name": "packages.server.src.routes.pdpp-instance-bindings.pdppInstanceBindingRoutes",
-              "file_path": "packages/server/src/routes/pdpp-instance-bindings.ts",
-              "line_start": 50,
-              "line_end": 325,
-              "metric_value": 275
-            },
-            {
-              "entity_name": "packages.lite.src.browser-runtime.createIndexedDbPsLiteRuntime",
-              "file_path": "packages/lite/src/browser-runtime.ts",
-              "line_start": 154,
-              "line_end": 423,
-              "metric_value": 269
-            },
-            {
-              "entity_name": "packages.server.src.routes.chunked-scope-import.finalizeScopeImportAuthorized",
-              "file_path": "packages/server/src/routes/chunked-scope-import.ts",
-              "line_start": 912,
-              "line_end": 1179,
-              "metric_value": 267
+              "entity_name": "packages.core.src.oura.index.importLocked",
+              "file_path": "packages/core/src/oura/index.ts",
+              "line_start": 191,
+              "line_end": 462,
+              "metric_value": 271
             },
             {
               "entity_name": "packages.core.src.replication.engine.createReplicaEngine.recoverRegistration",
@@ -514,9 +790,16 @@
             {
               "entity_name": "packages.lite.src.canonical-store.createLiteCanonicalStore.commit.persistence.transaction() callback",
               "file_path": "packages/lite/src/canonical-store.ts",
-              "line_start": 1122,
-              "line_end": 1385,
+              "line_start": 1123,
+              "line_end": 1386,
               "metric_value": 263
+            },
+            {
+              "entity_name": "packages.server.src.routes.mcp.mcpConnectionsRoutes",
+              "file_path": "packages/server/src/routes/mcp.ts",
+              "line_start": 608,
+              "line_end": 869,
+              "metric_value": 261
             },
             {
               "entity_name": "packages.lite.src.additions-session.createPsLiteAdditionsSession",
@@ -533,13 +816,6 @@
               "metric_value": 260
             },
             {
-              "entity_name": "packages.lite.src.additions-worker.createService",
-              "file_path": "packages/lite/src/additions-worker.ts",
-              "line_start": 66,
-              "line_end": 324,
-              "metric_value": 258
-            },
-            {
               "entity_name": "packages.core.src.sync.scope-deletions.createScopeDeletionTracker",
               "file_path": "packages/core/src/sync/scope-deletions.ts",
               "line_start": 190,
@@ -547,11 +823,18 @@
               "metric_value": 255
             },
             {
-              "entity_name": "packages.core.src.oura.index.importLocked",
-              "file_path": "packages/core/src/oura/index.ts",
-              "line_start": 190,
-              "line_end": 443,
-              "metric_value": 253
+              "entity_name": "packages.server.src.pdpp.bootstrap.createPdppAuthDeps",
+              "file_path": "packages/server/src/pdpp/bootstrap.ts",
+              "line_start": 100,
+              "line_end": 354,
+              "metric_value": 254
+            },
+            {
+              "entity_name": "packages.lite.src.additions-worker.createService",
+              "file_path": "packages/lite/src/additions-worker.ts",
+              "line_start": 105,
+              "line_end": 357,
+              "metric_value": 252
             },
             {
               "entity_name": "packages.core.src.pdpp.selection.validateStreamRequest",
@@ -568,13 +851,6 @@
               "metric_value": 250
             },
             {
-              "entity_name": "packages.core.src.storage.canonical-legacy-projection.collectSnapshot",
-              "file_path": "packages/core/src/storage/canonical-legacy-projection.ts",
-              "line_start": 414,
-              "line_end": 662,
-              "metric_value": 248
-            },
-            {
               "entity_name": "packages.core.src.test-utils.e2ee-gateway.createFakeE2eeGateway",
               "file_path": "packages/core/src/test-utils/e2ee-gateway.ts",
               "line_start": 102,
@@ -582,25 +858,11 @@
               "metric_value": 248
             },
             {
-              "entity_name": "packages.server.src.pdpp.bootstrap.createPdppAuthDeps",
-              "file_path": "packages/server/src/pdpp/bootstrap.ts",
-              "line_start": 92,
-              "line_end": 340,
-              "metric_value": 248
-            },
-            {
-              "entity_name": "packages.server.src.routes.data.dataRoutes",
-              "file_path": "packages/server/src/routes/data.ts",
-              "line_start": 149,
-              "line_end": 395,
-              "metric_value": 246
-            },
-            {
-              "entity_name": "packages.core.src.sync.pdpp-import.createPdppImporter",
-              "file_path": "packages/core/src/sync/pdpp-import.ts",
-              "line_start": 432,
-              "line_end": 677,
-              "metric_value": 245
+              "entity_name": "packages.server.src.routes.pdpp-blobs.pdppBlobsRoutes",
+              "file_path": "packages/server/src/routes/pdpp-blobs.ts",
+              "line_start": 80,
+              "line_end": 327,
+              "metric_value": 247
             },
             {
               "entity_name": "scripts.pdpp-live-journey.main",
@@ -612,29 +874,50 @@
             {
               "entity_name": "packages.server.src.storage.pdpp-replica-visibility-view.createReplicaVisibilityView.reconcileKey",
               "file_path": "packages/server/src/storage/pdpp-replica-visibility-view.ts",
-              "line_start": 980,
-              "line_end": 1221,
+              "line_start": 973,
+              "line_end": 1214,
               "metric_value": 241
             },
             {
               "entity_name": "scripts.e2e-storage-sync.main",
               "file_path": "scripts/e2e-storage-sync.ts",
-              "line_start": 274,
-              "line_end": 515,
+              "line_start": 277,
+              "line_end": 518,
               "metric_value": 241
             },
             {
-              "entity_name": "packages.server.src.routes.pdpp-blobs.pdppBlobsRoutes",
-              "file_path": "packages/server/src/routes/pdpp-blobs.ts",
-              "line_start": 74,
-              "line_end": 312,
-              "metric_value": 238
+              "entity_name": "packages.core.src.sync.engine.sync-manager.createSyncManager.runCycle",
+              "file_path": "packages/core/src/sync/engine/sync-manager.ts",
+              "line_start": 728,
+              "line_end": 961,
+              "metric_value": 233
+            },
+            {
+              "entity_name": "packages.core.src.sync.pdpp-import.importEnvelope",
+              "file_path": "packages/core/src/sync/pdpp-import.ts",
+              "line_start": 492,
+              "line_end": 724,
+              "metric_value": 232
             },
             {
               "entity_name": "packages.core.src.legacy-projection.bindings.claudeConversationsBinding",
               "file_path": "packages/core/src/legacy-projection/bindings.ts",
               "line_start": 2215,
               "line_end": 2445,
+              "metric_value": 230
+            },
+            {
+              "entity_name": "packages.core.src.localdb.query.createRecordQuery",
+              "file_path": "packages/core/src/localdb/query.ts",
+              "line_start": 235,
+              "line_end": 465,
+              "metric_value": 230
+            },
+            {
+              "entity_name": "packages.core.src.sync.delete-data-port.createGatewayDeleteDataPort",
+              "file_path": "packages/core/src/sync/delete-data-port.ts",
+              "line_start": 83,
+              "line_end": 313,
               "metric_value": 230
             },
             {
@@ -645,46 +928,60 @@
               "metric_value": 229
             },
             {
-              "entity_name": "packages.server.src.routes.mcp.mcpConnectionsRoutes",
-              "file_path": "packages/server/src/routes/mcp.ts",
-              "line_start": 494,
-              "line_end": 723,
+              "entity_name": "packages.core.src.additions.version-inventory.createVersionInventoryClient",
+              "file_path": "packages/core/src/additions/version-inventory.ts",
+              "line_start": 118,
+              "line_end": 347,
               "metric_value": 229
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-replica-visibility-view.createReplicaVisibilityView.db.transaction() callback",
               "file_path": "packages/server/src/storage/pdpp-replica-visibility-view.ts",
-              "line_start": 204,
-              "line_end": 432,
+              "line_start": 211,
+              "line_end": 439,
               "metric_value": 228
             },
             {
-              "entity_name": "packages.core.src.test-utils.memory-storage.createMemoryDataStorage",
-              "file_path": "packages/core/src/test-utils/memory-storage.ts",
-              "line_start": 16,
-              "line_end": 241,
-              "metric_value": 225
+              "entity_name": "packages.core.src.publication.publish.publishPreparedVersion",
+              "file_path": "packages/core/src/publication/publish.ts",
+              "line_start": 223,
+              "line_end": 451,
+              "metric_value": 228
             },
             {
               "entity_name": "packages.core.src.mcp.tools.getScopeFile.handler",
               "file_path": "packages/core/src/mcp/tools.ts",
-              "line_start": 1790,
-              "line_end": 2013,
-              "metric_value": 223
-            },
-            {
-              "entity_name": "packages.core.src.additions.version-inventory.createVersionInventoryClient",
-              "file_path": "packages/core/src/additions/version-inventory.ts",
-              "line_start": 118,
-              "line_end": 340,
-              "metric_value": 222
+              "line_start": 2022,
+              "line_end": 2248,
+              "metric_value": 226
             },
             {
               "entity_name": "scripts.pdpp-replica-owner-composition.run",
               "file_path": "scripts/pdpp-replica-owner-composition.ts",
-              "line_start": 753,
-              "line_end": 974,
+              "line_start": 756,
+              "line_end": 977,
               "metric_value": 221
+            },
+            {
+              "entity_name": "packages.core.test-support.localdb.conformance.runDriverConformance.describe(\"name, migration and identity\") callback",
+              "file_path": "packages/core/test-support/localdb/conformance.ts",
+              "line_start": 84,
+              "line_end": 304,
+              "metric_value": 220
+            },
+            {
+              "entity_name": "packages.core.src.localdb.run-intake.createRunIntakeStore.batch",
+              "file_path": "packages/core/src/localdb/run-intake.ts",
+              "line_start": 734,
+              "line_end": 950,
+              "metric_value": 216
+            },
+            {
+              "entity_name": "packages.core.src.localdb.run-intake.createRunIntakeStore.batch.serial() callback",
+              "file_path": "packages/core/src/localdb/run-intake.ts",
+              "line_start": 735,
+              "line_end": 950,
+              "metric_value": 215
             },
             {
               "entity_name": "packages.enclave.src.agent.additions.signAdditions",
@@ -692,6 +989,27 @@
               "line_start": 62,
               "line_end": 276,
               "metric_value": 214
+            },
+            {
+              "entity_name": "packages.core.src.mcp.read-client.createMcpDataReadClient.readScopeBlocks",
+              "file_path": "packages/core/src/mcp/read-client.ts",
+              "line_start": 905,
+              "line_end": 1118,
+              "metric_value": 213
+            },
+            {
+              "entity_name": "packages.enclave.src.mcp.service.startMcpRouter",
+              "file_path": "packages/enclave/src/mcp/service.ts",
+              "line_start": 77,
+              "line_end": 289,
+              "metric_value": 212
+            },
+            {
+              "entity_name": "packages.core.src.localdb.legacy-import.importSource",
+              "file_path": "packages/core/src/localdb/legacy-import.ts",
+              "line_start": 105,
+              "line_end": 317,
+              "metric_value": 212
             },
             {
               "entity_name": "packages.core.src.replication.merge-plan.planReplicaMerge",
@@ -722,13 +1040,6 @@
               "metric_value": 209
             },
             {
-              "entity_name": "packages.enclave.src.fleet.worker.createFleetWorker",
-              "file_path": "packages/enclave/src/fleet/worker.ts",
-              "line_start": 52,
-              "line_end": 260,
-              "metric_value": 208
-            },
-            {
               "entity_name": "packages.server.src.storage.legacy-scope-authority.createLegacyScopeAuthority.confirmRead",
               "file_path": "packages/server/src/storage/legacy-scope-authority.ts",
               "line_start": 327,
@@ -736,11 +1047,39 @@
               "metric_value": 208
             },
             {
+              "entity_name": "packages.enclave.src.fleet.worker.createFleetWorker",
+              "file_path": "packages/enclave/src/fleet/worker.ts",
+              "line_start": 52,
+              "line_end": 260,
+              "metric_value": 208
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handleX402Cycle",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 1463,
+              "line_end": 1670,
+              "metric_value": 207
+            },
+            {
               "entity_name": "packages.lite.src.canonical-store.createLiteCanonicalStore.reconcile",
               "file_path": "packages/lite/src/canonical-store.ts",
-              "line_start": 577,
-              "line_end": 783,
+              "line_start": 578,
+              "line_end": 784,
               "metric_value": 206
+            },
+            {
+              "entity_name": "packages.server.src.localdb.legacy-retire-dry-run.runLegacyRetireDryRun",
+              "file_path": "packages/server/src/localdb/legacy-retire-dry-run.ts",
+              "line_start": 90,
+              "line_end": 295,
+              "metric_value": 205
+            },
+            {
+              "entity_name": "packages.core.src.api.pdpp-records-list.localRecordPage",
+              "file_path": "packages/core/src/api/pdpp-records-list.ts",
+              "line_start": 119,
+              "line_end": 324,
+              "metric_value": 205
             },
             {
               "entity_name": "packages.core.src.legacy-projection.bindings.claudeProjects.project",
@@ -748,13 +1087,6 @@
               "line_start": 2507,
               "line_end": 2712,
               "metric_value": 205
-            },
-            {
-              "entity_name": "packages.core.src.sync.pdpp-import.importEnvelope",
-              "file_path": "packages/core/src/sync/pdpp-import.ts",
-              "line_start": 470,
-              "line_end": 674,
-              "metric_value": 204
             },
             {
               "entity_name": "packages.server.src.routes.ui-registration.uiRegistrationRoutes",
@@ -778,17 +1110,17 @@
               "metric_value": 200
             },
             {
-              "entity_name": "packages.core.src.publication.publish.publishPreparedVersion",
-              "file_path": "packages/core/src/publication/publish.ts",
-              "line_start": 174,
-              "line_end": 374,
+              "entity_name": "packages.core.src.localdb.query.createGrantHistory",
+              "file_path": "packages/core/src/localdb/query.ts",
+              "line_start": 470,
+              "line_end": 670,
               "metric_value": 200
             },
             {
-              "entity_name": "packages.enclave.src.mcp.service.startMcpRouter",
-              "file_path": "packages/enclave/src/mcp/service.ts",
-              "line_start": 75,
-              "line_end": 274,
+              "entity_name": "packages.core.src.stream-sync.seed-staging.createSeedStaging",
+              "file_path": "packages/core/src/stream-sync/seed-staging.ts",
+              "line_start": 231,
+              "line_end": 430,
               "metric_value": 199
             },
             {
@@ -799,6 +1131,13 @@
               "metric_value": 198
             },
             {
+              "entity_name": "packages.core.src.localdb.query.createGrantHistory.<function>",
+              "file_path": "packages/core/src/localdb/query.ts",
+              "line_start": 471,
+              "line_end": 669,
+              "metric_value": 198
+            },
+            {
               "entity_name": "scripts.verify-additions-enclave.origin.createServer() callback",
               "file_path": "scripts/verify-additions-enclave.mjs",
               "line_start": 126,
@@ -806,18 +1145,11 @@
               "metric_value": 198
             },
             {
-              "entity_name": "packages.core.src.sync.delete-data-port.createGatewayDeleteDataPort",
-              "file_path": "packages/core/src/sync/delete-data-port.ts",
-              "line_start": 79,
-              "line_end": 276,
+              "entity_name": "packages.server.src.pdpp.records-bootstrap.createPdppRecordsDeps",
+              "file_path": "packages/server/src/pdpp/records-bootstrap.ts",
+              "line_start": 261,
+              "line_end": 458,
               "metric_value": 197
-            },
-            {
-              "entity_name": "packages.lite.src.additions-transport.openSession.publish",
-              "file_path": "packages/lite/src/additions-transport.ts",
-              "line_start": 276,
-              "line_end": 472,
-              "metric_value": 196
             },
             {
               "entity_name": "packages.server.src.routes.pdpp-auth.pdppAuthRoutes.app.post(\"/authorize\") callback",
@@ -829,9 +1161,51 @@
             {
               "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.post(\"/records/completions\") callback",
               "file_path": "packages/server/src/routes/pdpp-records.ts",
-              "line_start": 1614,
-              "line_end": 1808,
+              "line_start": 1781,
+              "line_end": 1977,
+              "metric_value": 196
+            },
+            {
+              "entity_name": "packages.lite.src.additions-transport.openSession.publish",
+              "file_path": "packages/lite/src/additions-transport.ts",
+              "line_start": 276,
+              "line_end": 472,
+              "metric_value": 196
+            },
+            {
+              "entity_name": "packages.core.src.localdb.legacy-import.importSource.deps.queue.run(\"end\") callback",
+              "file_path": "packages/core/src/localdb/legacy-import.ts",
+              "line_start": 120,
+              "line_end": 316,
+              "metric_value": 196
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.delete.deleteScope",
+              "file_path": "packages/core/src/sync/workers/delete.ts",
+              "line_start": 359,
+              "line_end": 554,
+              "metric_value": 195
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.download.downloadAll",
+              "file_path": "packages/core/src/sync/workers/download.ts",
+              "line_start": 634,
+              "line_end": 828,
               "metric_value": 194
+            },
+            {
+              "entity_name": "packages.core.src.mcp.tools.readScope.handler",
+              "file_path": "packages/core/src/mcp/tools.ts",
+              "line_start": 1254,
+              "line_end": 1446,
+              "metric_value": 192
+            },
+            {
+              "entity_name": "packages.core.src.lineage.gateway.createGatewayLineageClient",
+              "file_path": "packages/core/src/lineage/gateway.ts",
+              "line_start": 191,
+              "line_end": 381,
+              "metric_value": 190
             },
             {
               "entity_name": "scripts.e2e-register-pdf.main",
@@ -841,39 +1215,25 @@
               "metric_value": 190
             },
             {
-              "entity_name": "packages.core.src.lineage.gateway.createGatewayLineageClient",
-              "file_path": "packages/core/src/lineage/gateway.ts",
-              "line_start": 190,
-              "line_end": 379,
-              "metric_value": 189
-            },
-            {
-              "entity_name": "packages.core.src.mcp.tools.readScope.handler",
-              "file_path": "packages/core/src/mcp/tools.ts",
-              "line_start": 1018,
-              "line_end": 1207,
-              "metric_value": 189
-            },
-            {
-              "entity_name": "packages.lite.src.sync.createPsLiteSyncManager",
-              "file_path": "packages/lite/src/sync.ts",
-              "line_start": 252,
-              "line_end": 441,
-              "metric_value": 189
-            },
-            {
-              "entity_name": "packages.server.src.bootstrap.createServer.context.startBackgroundServices",
+              "entity_name": "packages.server.src.bootstrap.bootstrapServer.context.startBackgroundServices",
               "file_path": "packages/server/src/bootstrap.ts",
-              "line_start": 1272,
-              "line_end": 1459,
-              "metric_value": 187
+              "line_start": 1949,
+              "line_end": 2138,
+              "metric_value": 189
             },
             {
-              "entity_name": "packages.server.src.storage.strava-method-transition.createStravaMethodTransition",
-              "file_path": "packages/server/src/storage/strava-method-transition.ts",
-              "line_start": 74,
-              "line_end": 261,
-              "metric_value": 187
+              "entity_name": "packages.core.src.additions.durable.createDurableAdditions.summarize",
+              "file_path": "packages/core/src/additions/durable.ts",
+              "line_start": 897,
+              "line_end": 1082,
+              "metric_value": 185
+            },
+            {
+              "entity_name": "packages.core.src.localdb.resolve.createLocalResolver.read",
+              "file_path": "packages/core/src/localdb/resolve.ts",
+              "line_start": 621,
+              "line_end": 806,
+              "metric_value": 185
             },
             {
               "entity_name": "packages.core.src.legacy-projection.bindings.chatgptConversations.project",
@@ -885,9 +1245,16 @@
             {
               "entity_name": "scripts.e2e-stale-version-rebase.main",
               "file_path": "scripts/e2e-stale-version-rebase.ts",
-              "line_start": 289,
-              "line_end": 473,
+              "line_start": 292,
+              "line_end": 476,
               "metric_value": 184
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-connections.pdppConnectionRoutes",
+              "file_path": "packages/server/src/routes/pdpp-connections.ts",
+              "line_start": 76,
+              "line_end": 259,
+              "metric_value": 183
             },
             {
               "entity_name": "packages.enclave.src.agent.main.startJobs",
@@ -904,25 +1271,39 @@
               "metric_value": 183
             },
             {
-              "entity_name": "packages.server.src.routes.pdpp-connections.pdppConnectionRoutes",
-              "file_path": "packages/server/src/routes/pdpp-connections.ts",
-              "line_start": 76,
-              "line_end": 259,
+              "entity_name": "scripts.check-dist-imports.createLoaderAnalysis",
+              "file_path": "scripts/check-dist-imports.mjs",
+              "line_start": 195,
+              "line_end": 378,
               "metric_value": 183
+            },
+            {
+              "entity_name": "packages.core.src.localdb.log-erase.eraseOne",
+              "file_path": "packages/core/src/localdb/log-erase.ts",
+              "line_start": 346,
+              "line_end": 527,
+              "metric_value": 181
             },
             {
               "entity_name": "packages.lite.src.canonical-store.createLiteCanonicalStore.reexport",
               "file_path": "packages/lite/src/canonical-store.ts",
-              "line_start": 901,
-              "line_end": 1081,
+              "line_start": 902,
+              "line_end": 1082,
               "metric_value": 180
             },
             {
-              "entity_name": "packages.server.src.pdpp.records-bootstrap.createPdppRecordsDeps",
-              "file_path": "packages/server/src/pdpp/records-bootstrap.ts",
-              "line_start": 255,
-              "line_end": 435,
+              "entity_name": "packages.core.src.derivatives.compute.computeQuestion",
+              "file_path": "packages/core/src/derivatives/compute.ts",
+              "line_start": 527,
+              "line_end": 707,
               "metric_value": 180
+            },
+            {
+              "entity_name": "packages.core.src.localdb.blobs.createBlobStore",
+              "file_path": "packages/core/src/localdb/blobs.ts",
+              "line_start": 51,
+              "line_end": 230,
+              "metric_value": 179
             },
             {
               "entity_name": "packages.core.src.replication.engine.createReplicaEngine.publishManifest",
@@ -939,6 +1320,13 @@
               "metric_value": 179
             },
             {
+              "entity_name": "packages.core.src.mcp.server.createMcpServerForConnection",
+              "file_path": "packages/core/src/mcp/server.ts",
+              "line_start": 458,
+              "line_end": 636,
+              "metric_value": 178
+            },
+            {
               "entity_name": "packages.core.src.replication.evidence.createReplicaEvidenceAdapter",
               "file_path": "packages/core/src/replication/evidence.ts",
               "line_start": 75,
@@ -946,31 +1334,31 @@
               "metric_value": 178
             },
             {
-              "entity_name": "packages.core.src.derivatives.compute.computeQuestion",
-              "file_path": "packages/core/src/derivatives/compute.ts",
-              "line_start": 512,
-              "line_end": 684,
-              "metric_value": 172
+              "entity_name": "packages.core.src.api.index.handleScopeUploadRequest",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 2423,
+              "line_end": 2598,
+              "metric_value": 175
             },
             {
-              "entity_name": "packages.core.src.pdpp.client-identity.resolveUrlHostedClientIdentity",
-              "file_path": "packages/core/src/pdpp/client-identity.ts",
-              "line_start": 103,
-              "line_end": 274,
-              "metric_value": 171
-            },
-            {
-              "entity_name": "packages.core.src.sync.workers.download.downloadAll",
-              "file_path": "packages/core/src/sync/workers/download.ts",
-              "line_start": 591,
-              "line_end": 762,
-              "metric_value": 171
+              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.post(\"/streams/:stream/records/replace\") callback",
+              "file_path": "packages/server/src/routes/pdpp-records.ts",
+              "line_start": 1595,
+              "line_end": 1768,
+              "metric_value": 173
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-binary-chunks.createBinaryCompactor",
               "file_path": "packages/server/src/storage/pdpp-binary-chunks.ts",
               "line_start": 460,
               "line_end": 631,
+              "metric_value": 171
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.client-identity.resolveUrlHostedClientIdentity",
+              "file_path": "packages/core/src/pdpp/client-identity.ts",
+              "line_start": 103,
+              "line_end": 274,
               "metric_value": 171
             },
             {
@@ -988,45 +1376,24 @@
               "metric_value": 170
             },
             {
-              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.get(\"/streams/:stream/records\") callback",
-              "file_path": "packages/server/src/routes/pdpp-records.ts",
-              "line_start": 950,
-              "line_end": 1120,
-              "metric_value": 170
+              "entity_name": "packages.server.src.enclave-main.createEnclaveAdditionsPorts",
+              "file_path": "packages/server/src/enclave-main.ts",
+              "line_start": 240,
+              "line_end": 409,
+              "metric_value": 169
             },
             {
-              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.post(\"/streams/:stream/records/replace\") callback",
-              "file_path": "packages/server/src/routes/pdpp-records.ts",
-              "line_start": 1431,
-              "line_end": 1601,
-              "metric_value": 170
+              "entity_name": "packages.lite.src.client.openScopeUpload",
+              "file_path": "packages/lite/src/client.ts",
+              "line_start": 374,
+              "line_end": 543,
+              "metric_value": 169
             },
             {
               "entity_name": "packages.enclave.src.fleet.worker-runtime.startFleetWorker",
               "file_path": "packages/enclave/src/fleet/worker-runtime.ts",
               "line_start": 44,
               "line_end": 213,
-              "metric_value": 169
-            },
-            {
-              "entity_name": "packages.core.src.api.index.handleX402Cycle",
-              "file_path": "packages/core/src/api/index.ts",
-              "line_start": 829,
-              "line_end": 998,
-              "metric_value": 169
-            },
-            {
-              "entity_name": "packages.lite.src.client.openScopeUpload",
-              "file_path": "packages/lite/src/client.ts",
-              "line_start": 299,
-              "line_end": 468,
-              "metric_value": 169
-            },
-            {
-              "entity_name": "packages.server.src.enclave-main.createEnclaveAdditionsPorts",
-              "file_path": "packages/server/src/enclave-main.ts",
-              "line_start": 240,
-              "line_end": 409,
               "metric_value": 169
             },
             {
@@ -1037,13 +1404,6 @@
               "metric_value": 168
             },
             {
-              "entity_name": "packages.core.src.replication.coordinator-state.test-utils.replicaCoordinatorStateContract",
-              "file_path": "packages/core/src/replication/coordinator-state.test-utils.ts",
-              "line_start": 46,
-              "line_end": 213,
-              "metric_value": 167
-            },
-            {
               "entity_name": "packages.server.src.storage.declaration-witness.runDeclarationWitness",
               "file_path": "packages/server/src/storage/declaration-witness.ts",
               "line_start": 173,
@@ -1051,10 +1411,24 @@
               "metric_value": 167
             },
             {
-              "entity_name": "packages.core.src.replication.evidence.createReplicaEvidenceAdapter.<function>",
-              "file_path": "packages/core/src/replication/evidence.ts",
-              "line_start": 86,
-              "line_end": 252,
+              "entity_name": "packages.core.src.replication.coordinator-state.test-utils.replicaCoordinatorStateContract",
+              "file_path": "packages/core/src/replication/coordinator-state.test-utils.ts",
+              "line_start": 46,
+              "line_end": 213,
+              "metric_value": 167
+            },
+            {
+              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.completeStreams",
+              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+              "line_start": 1539,
+              "line_end": 1705,
+              "metric_value": 166
+            },
+            {
+              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.replaceStream",
+              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+              "line_start": 1087,
+              "line_end": 1253,
               "metric_value": 166
             },
             {
@@ -1065,17 +1439,10 @@
               "metric_value": 166
             },
             {
-              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.completeStreams",
-              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
-              "line_start": 1950,
-              "line_end": 2116,
-              "metric_value": 166
-            },
-            {
-              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.replaceStream",
-              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
-              "line_start": 1137,
-              "line_end": 1303,
+              "entity_name": "packages.core.src.replication.evidence.createReplicaEvidenceAdapter.<function>",
+              "file_path": "packages/core/src/replication/evidence.ts",
+              "line_start": 86,
+              "line_end": 252,
               "metric_value": 166
             },
             {
@@ -1086,10 +1453,24 @@
               "metric_value": 166
             },
             {
-              "entity_name": "packages.core.src.api.index.handleScopeUploadRequest",
-              "file_path": "packages/core/src/api/index.ts",
-              "line_start": 1709,
-              "line_end": 1874,
+              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.get(\"/streams\") callback",
+              "file_path": "packages/server/src/routes/pdpp-records.ts",
+              "line_start": 952,
+              "line_end": 1117,
+              "metric_value": 165
+            },
+            {
+              "entity_name": "packages.core.src.localdb.delta-apply.applyRegistryDelta",
+              "file_path": "packages/core/src/localdb/delta-apply.ts",
+              "line_start": 66,
+              "line_end": 231,
+              "metric_value": 165
+            },
+            {
+              "entity_name": "packages.core.src.localdb.seed.createLocalSeed",
+              "file_path": "packages/core/src/localdb/seed.ts",
+              "line_start": 114,
+              "line_end": 279,
               "metric_value": 165
             },
             {
@@ -1100,17 +1481,31 @@
               "metric_value": 164
             },
             {
+              "entity_name": "packages.core.src.sync.workers.delete.retryPendingBlobDeletions",
+              "file_path": "packages/core/src/sync/workers/delete.ts",
+              "line_start": 1077,
+              "line_end": 1239,
+              "metric_value": 162
+            },
+            {
               "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.createSqliteRecordStore.completeStreams.immediateConnectionMutation() callback",
               "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
-              "line_start": 1955,
-              "line_end": 2115,
+              "line_start": 1544,
+              "line_end": 1704,
               "metric_value": 160
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-replica-visibility-view.listRecords",
               "file_path": "packages/server/src/storage/pdpp-replica-visibility-view.ts",
-              "line_start": 1466,
-              "line_end": 1626,
+              "line_start": 1459,
+              "line_end": 1619,
+              "metric_value": 160
+            },
+            {
+              "entity_name": "packages.core.src.sync.upload-state.createUploadStateTracker",
+              "file_path": "packages/core/src/sync/upload-state.ts",
+              "line_start": 213,
+              "line_end": 373,
               "metric_value": 160
             },
             {
@@ -1135,18 +1530,18 @@
               "metric_value": 158
             },
             {
+              "entity_name": "packages.core.src.localdb.log-publish.publishRounds",
+              "file_path": "packages/core/src/localdb/log-publish.ts",
+              "line_start": 596,
+              "line_end": 754,
+              "metric_value": 158
+            },
+            {
               "entity_name": "scripts.e2e-read-scope-lite.main",
               "file_path": "scripts/e2e-read-scope-lite.ts",
               "line_start": 214,
               "line_end": 372,
               "metric_value": 158
-            },
-            {
-              "entity_name": "packages.core.src.derivatives.inference.createOpenAiCompatibleInferenceProvider",
-              "file_path": "packages/core/src/derivatives/inference.ts",
-              "line_start": 243,
-              "line_end": 400,
-              "metric_value": 157
             },
             {
               "entity_name": "packages.server.src.pdpp.replica-authorization.createReplicaAuthorizationService",
@@ -1163,11 +1558,39 @@
               "metric_value": 157
             },
             {
+              "entity_name": "packages.core.src.derivatives.inference.createOpenAiCompatibleInferenceProvider",
+              "file_path": "packages/core/src/derivatives/inference.ts",
+              "line_start": 243,
+              "line_end": 400,
+              "metric_value": 157
+            },
+            {
+              "entity_name": "packages.core.src.localdb.resolve.createLocalResolver.build",
+              "file_path": "packages/core/src/localdb/resolve.ts",
+              "line_start": 457,
+              "line_end": 614,
+              "metric_value": 157
+            },
+            {
               "entity_name": "packages.core.src.derivatives.e2ee.phala.createPhalaE2eeEncryption",
               "file_path": "packages/core/src/derivatives/e2ee/phala.ts",
               "line_start": 103,
               "line_end": 258,
               "metric_value": 155
+            },
+            {
+              "entity_name": "packages.core.src.localdb.listing.createLocalListing.readSnapshot",
+              "file_path": "packages/core/src/localdb/listing.ts",
+              "line_start": 160,
+              "line_end": 314,
+              "metric_value": 154
+            },
+            {
+              "entity_name": "packages.core.src.localdb.view-changes.createViewChanges",
+              "file_path": "packages/core/src/localdb/view-changes.ts",
+              "line_start": 76,
+              "line_end": 230,
+              "metric_value": 154
             },
             {
               "entity_name": "scripts.e2e-write-api.main",
@@ -1177,11 +1600,11 @@
               "metric_value": 154
             },
             {
-              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage.storagePort.readScopeBlocks",
-              "file_path": "packages/lite/src/storage.ts",
-              "line_start": 848,
-              "line_end": 1000,
-              "metric_value": 152
+              "entity_name": "packages.server.src.routes.pdpp-blobs.pdppBlobsRoutes.authorizeBlobAccess",
+              "file_path": "packages/server/src/routes/pdpp-blobs.ts",
+              "line_start": 95,
+              "line_end": 248,
+              "metric_value": 153
             },
             {
               "entity_name": "packages.server.src.storage.index-schema.migrateSchema",
@@ -1198,24 +1621,31 @@
               "metric_value": 152
             },
             {
-              "entity_name": "packages.lite.src.history-probe.worker.onmessage",
-              "file_path": "packages/lite/src/history-probe.worker.ts",
-              "line_start": 68,
-              "line_end": 219,
-              "metric_value": 151
+              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage.storagePort.readScopeBlocks",
+              "file_path": "packages/lite/src/storage.ts",
+              "line_start": 987,
+              "line_end": 1139,
+              "metric_value": 152
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.createSqliteRecordStore.replaceStream.connectionMutation() callback",
               "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
-              "line_start": 1151,
-              "line_end": 1302,
+              "line_start": 1101,
+              "line_end": 1252,
               "metric_value": 151
             },
             {
               "entity_name": "packages.server.src.storage.pdpp-replica-visibility-view.createReplicaVisibilityView.listRecords.db.transaction() callback",
               "file_path": "packages/server/src/storage/pdpp-replica-visibility-view.ts",
-              "line_start": 1473,
-              "line_end": 1624,
+              "line_start": 1466,
+              "line_end": 1617,
+              "metric_value": 151
+            },
+            {
+              "entity_name": "packages.lite.src.history-probe.worker.onmessage",
+              "file_path": "packages/lite/src/history-probe.worker.ts",
+              "line_start": 70,
+              "line_end": 221,
               "metric_value": 151
             },
             {
@@ -1228,76 +1658,13 @@
             {
               "entity_name": "packages.core.src.payment.x402.verifyPayment",
               "file_path": "packages/core/src/payment/x402.ts",
-              "line_start": 449,
-              "line_end": 599,
+              "line_start": 491,
+              "line_end": 641,
               "metric_value": 150
             }
           ]
         }
       ]
-    },
-    {
-      "check_name": "circular_dependencies",
-      "description": "Detects circular dependencies between packages",
-      "languages": [
-        "javascript",
-        "typescript"
-      ],
-      "check_type": "circular_dependencies",
-      "cycles": [
-        "packages.enclave.src.mcp -> packages.enclave.src.agent -> packages.enclave.src.fleet -> packages.enclave.src.central -> packages.enclave.src.mcp",
-        "packages.enclave.src.mcp -> packages.enclave.src.agent -> packages.enclave.src.jobs -> packages.enclave.src.fleet -> packages.enclave.src.central -> packages.enclave.src.mcp",
-        "packages.enclave.src.mcp -> packages.enclave.src.agent -> packages.enclave.src.mcp",
-        "packages.enclave.src.mcp -> packages.enclave.src.jobs -> packages.enclave.src.agent -> packages.enclave.src.fleet -> packages.enclave.src.central -> packages.enclave.src.mcp",
-        "packages.enclave.src.mcp -> packages.enclave.src.jobs -> packages.enclave.src.agent -> packages.enclave.src.mcp",
-        "packages.enclave.src.mcp -> packages.enclave.src.jobs -> packages.enclave.src.fleet -> packages.enclave.src.agent -> packages.enclave.src.mcp",
-        "packages.enclave.src.mcp -> packages.enclave.src.jobs -> packages.enclave.src.fleet -> packages.enclave.src.central -> packages.enclave.src.mcp",
-        "packages.enclave.src.agent -> packages.enclave.src.fleet -> packages.enclave.src.agent",
-        "packages.enclave.src.agent -> packages.enclave.src.fleet -> packages.enclave.src.jobs -> packages.enclave.src.agent",
-        "packages.enclave.src.agent -> packages.enclave.src.jobs -> packages.enclave.src.agent",
-        "packages.enclave.src.agent -> packages.enclave.src.jobs -> packages.enclave.src.fleet -> packages.enclave.src.agent",
-        "packages.enclave.src.jobs -> packages.enclave.src.fleet -> packages.enclave.src.jobs",
-        "packages.enclave.src.fleet -> packages.enclave.src.central -> packages.enclave.src.fleet",
-        "packages.server.src.routes -> packages.server.src -> packages.server.src.mcp -> packages.server.src.routes",
-        "packages.server.src.routes -> packages.server.src -> packages.server.src.routes",
-        "packages.server.src.tunnel -> packages.server.src -> packages.server.src.tunnel",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.storage -> packages.core.src.test-utils -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.storage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.test-utils -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.sync.workers -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.lineage -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.storage.adapters -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.oura -> packages.core.src.additions",
-        "packages.core.src.additions -> packages.core.src.policy -> packages.core.src.replication -> packages.core.src.signing -> packages.core.src.mcp -> packages.core.src.api -> packages.core.src.contracts -> packages.core.src.storage -> packages.core.src.sync.workers -> packages.core.src.lineage -> packages.core.src.test-utils -> packages.core.src.derivatives.e2ee -> packages.core.src.derivatives -> packages.core.src.sync -> packages.core.src.publication -> packages.core.src.additions"
-      ],
-      "packages_checked": 79,
-      "packages_in_cycles": 26
     },
     {
       "check_name": "unused_code_diagnostics",
@@ -1307,16 +1674,30 @@
         "typescript"
       ],
       "check_type": "standard",
-      "total_entities_checked": 10,
-      "findings_count": 10,
+      "total_entities_checked": 12,
+      "findings_count": 12,
       "warning_count": 0,
-      "score": 0.5,
+      "score": 0.3999999999999999,
       "finding_groups": [
         {
           "severity": "info",
           "threshold": 0,
           "description": "Variables declared but never used",
           "entities": [
+            {
+              "entity_name": "[unused_variable] 'options' is declared but its value is never read.",
+              "file_path": "packages/server/src/localdb/import-upload.ts",
+              "line_start": 222,
+              "line_end": 222,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'c' is declared but its value is never read.",
+              "file_path": "packages/server/src/routes/data.ts",
+              "line_start": 216,
+              "line_end": 216,
+              "metric_value": 0.0
+            },
             {
               "entity_name": "[unused_variable] 'stream' is declared but its value is never read.",
               "file_path": "packages/server/src/storage/pdpp-replication-receiver.ts",
@@ -1390,47 +1771,6 @@
           ]
         }
       ]
-    },
-    {
-      "check_name": "function_size",
-      "description": "Checks that functions/methods do not exceed line count thresholds",
-      "languages": [
-        "python"
-      ],
-      "check_type": "standard",
-      "total_entities_checked": 47,
-      "findings_count": 0,
-      "warning_count": 0,
-      "score": 1.0,
-      "finding_groups": []
-    },
-    {
-      "check_name": "unused_code_diagnostics",
-      "description": "Detects unused imports, variables, functions, and dead code via LSP diagnostics",
-      "languages": [
-        "python"
-      ],
-      "check_type": "standard",
-      "total_entities_checked": 1,
-      "findings_count": 1,
-      "warning_count": 0,
-      "score": 0.95,
-      "finding_groups": [
-        {
-          "severity": "info",
-          "threshold": 0,
-          "description": "Variables declared but never used",
-          "entities": [
-            {
-              "entity_name": "[unused_variable] \"req\" is not accessed",
-              "file_path": "scripts/tee/render-fleet.py",
-              "line_start": 665,
-              "line_end": 665,
-              "metric_value": 0.0
-            }
-          ]
-        }
-      ]
     }
   ],
   "file_summaries": [
@@ -1441,12 +1781,6 @@
       "composite_risk_score": 80.0
     },
     {
-      "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
-      "total_findings": 5,
-      "warning_findings": 5,
-      "composite_risk_score": 75.0
-    },
-    {
       "file_path": "packages/lite/src/canonical-store.ts",
       "total_findings": 5,
       "warning_findings": 5,
@@ -1454,6 +1788,18 @@
     },
     {
       "file_path": "packages/server/src/storage/pdpp-replica-visibility-view.ts",
+      "total_findings": 5,
+      "warning_findings": 5,
+      "composite_risk_score": 75.0
+    },
+    {
+      "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+      "total_findings": 5,
+      "warning_findings": 5,
+      "composite_risk_score": 75.0
+    },
+    {
+      "file_path": "packages/core/src/localdb/run-intake.ts",
       "total_findings": 5,
       "warning_findings": 5,
       "composite_risk_score": 75.0
@@ -1489,7 +1835,25 @@
       "composite_risk_score": 50.0
     },
     {
+      "file_path": "packages/core/src/additions/durable.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/core/src/localdb/log-publish.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
       "file_path": "packages/lite/src/additions-transport.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/core/src/localdb/resolve.ts",
       "total_findings": 3,
       "warning_findings": 3,
       "composite_risk_score": 45.0
@@ -1507,6 +1871,12 @@
       "composite_risk_score": 45.0
     },
     {
+      "file_path": "packages/core/src/localdb/query.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
       "file_path": "packages/server/src/storage/pdpp-replication-receiver.ts",
       "total_findings": 3,
       "warning_findings": 1,
@@ -1519,37 +1889,7 @@
       "composite_risk_score": 30.0
     },
     {
-      "file_path": "packages/server/src/routes/pdpp-auth.ts",
-      "total_findings": 2,
-      "warning_findings": 2,
-      "composite_risk_score": 30.0
-    },
-    {
-      "file_path": "packages/core/src/storage/legacy-scope-view.ts",
-      "total_findings": 2,
-      "warning_findings": 2,
-      "composite_risk_score": 30.0
-    },
-    {
-      "file_path": "packages/lite/src/storage.ts",
-      "total_findings": 2,
-      "warning_findings": 2,
-      "composite_risk_score": 30.0
-    },
-    {
-      "file_path": "scripts/pdpp-replica-live-journey.ts",
-      "total_findings": 2,
-      "warning_findings": 2,
-      "composite_risk_score": 30.0
-    },
-    {
-      "file_path": "scripts/pdpp-replica-owner-composition.ts",
-      "total_findings": 2,
-      "warning_findings": 2,
-      "composite_risk_score": 30.0
-    },
-    {
-      "file_path": "packages/core/src/additions/durable.ts",
+      "file_path": "packages/core/src/sync/engine/sync-manager.ts",
       "total_findings": 2,
       "warning_findings": 2,
       "composite_risk_score": 30.0
