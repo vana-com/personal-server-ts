@@ -2,6 +2,9 @@
 // and any number of devices of one owner, each with its own real SQLite and the
 // real publish and apply drivers (see log-protocol.test.ts).
 import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { keccak_256 } from "@noble/hashes/sha3";
 import type { StreamCryptoPort } from "../../../core/src/stream-sync/crypto-port.js";
 import {
@@ -51,6 +54,19 @@ const drivers: SqlDriver[] = [];
 /** Closes the databases of the devices a test opened; call it from `afterEach`. */
 export async function closeWorldDrivers(): Promise<void> {
   for (const db of drivers.splice(0)) await db.close();
+  for (const dir of tempDirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
+}
+const tempDirs: string[] = [];
+/**
+ * A database file of one test, on disk, for a device that restarts
+ * (`dbFile`). Removed by `closeWorldDrivers`. Under the system's temporary
+ * directory: a home-relative path exists on one machine only.
+ */
+export function tempDbFile(): string {
+  const dir = mkdtempSync(join(tmpdir(), "ps-restart-"));
+  tempDirs.push(dir);
+  return join(dir, "device.sqlite");
 }
 
 export async function world(options: {

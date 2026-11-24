@@ -2,9 +2,6 @@
 // publisher wrote: real segments, a real compaction into snapshot parts, and a
 // record whose body is stored out of line in pieces. The registry is the
 // fake gateway the publisher commits to; storage is its in-memory store.
-import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   logScope,
@@ -31,22 +28,14 @@ import {
 import {
   CONNECTOR,
   closeWorldDrivers,
+  tempDbFile,
   sName,
   world,
 } from "./log-world.test-utils.js";
 
-const dirs: string[] = [];
-afterEach(async () => {
-  await closeWorldDrivers();
-  for (const dir of dirs.splice(0))
-    rmSync(dir, { recursive: true, force: true });
-});
-/** A database file on disk, for a device that restarts. */
-const dbFile = () => {
-  const dir = mkdtempSync(join(homedir(), ".tmp", "ps-restart-"));
-  dirs.push(dir);
-  return join(dir, "device.sqlite");
-};
+afterEach(closeWorldDrivers);
+/** A database file of one test, on disk (a device can restart). */
+const dbFile = tempDbFile;
 
 const LOG = logScope(CONNECTOR, "");
 const OTHER = "other";

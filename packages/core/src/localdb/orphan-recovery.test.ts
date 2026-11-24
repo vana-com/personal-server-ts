@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
@@ -54,7 +54,7 @@ const modes = [false, true].flatMap((log) =>
 
 describe.each(modes)("orphan recovery %j", ({ log, publish, progressive }) => {
   it("ends a lost producer but preserves a live producer", async () => {
-    const root = mkdtempSync(join(homedir(), ".tmp", "orphan-recovery-"));
+    const root = mkdtempSync(join(tmpdir(), "orphan-recovery-"));
     const path = join(root, "data.db");
     const flags = streamSyncFlagsOn(log ? "logProtocol" : undefined);
     const open = async () => {

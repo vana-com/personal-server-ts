@@ -553,6 +553,81 @@ it("a foreign row that moved past the pin without a tombstone supersedes the del
   expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
 });
 
+/** The tombstones a device's database holds as confirmed, and whether each has a verdict. */
+const ledger = (f: World) =>
+  f.a.db.query<{ ns: string; version: number; done_at: number | null }>(
+    "SELECT ns, version, done_at FROM delete_tombstones ORDER BY ns",
+  );
+
+it("writes only confirmed tombstones to the ledger: a fence a foreign head superseded is not one, and a restart owes nothing forever", async () => {
+  const f = await world(undefined, ["items"], true, [WORK]);
+  const [work] = f.others;
+  let raced = false;
+  f.registry.beforePost = async (row) => {
+    if (row.scope !== work || raced) return;
+    raced = true;
+    await rivalPost(f, work!, 2, OTHER);
+  };
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  f.registry.beforePost = undefined;
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+
+  // The default namespace's fence landed (version 2). The other namespace's
+  // never did: its head is a foreign write, not a tombstone.
+  expect(await ledger(f)).toEqual([{ ns: "", version: 2, done_at: null }]);
+
+  // A restart: the ledger names only what can finish.
+  const eraseLogs = vi.fn(async () => ({
+    connections: [
+      {
+        connector: "fixture-source",
+        ns: "",
+        outcome: {
+          kind: "erased" as const,
+          deleted: 1,
+          retained: 0,
+          unenumerated: 0,
+          witnessed: true,
+        },
+      },
+    ],
+    pending: false,
+    skipped: [],
+  }));
+  const restarted = createConnectionDeleter(f.a.deps, { eraseLogs });
+  expect(await restarted.resumeErasures()).toBe(false);
+  expect(restarted.erasureOwed()).toBe(false);
+  expect((await restarted.deleteStatus("fixture-source")).storage).toEqual({
+    state: "done",
+  });
+});
+
+it("writes no tombstone for a local-only purge: nothing was confirmed, so a restart owes nothing", async () => {
+  const f = await world(undefined, ["items"], false);
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO connections(connection_id, connector, ns, generation, control_state) VALUES ('local-only', 'fixture-source', '', 1, 'absent')",
+    },
+  ]);
+  await f.a.deleter.requestConnectionDelete("fixture-source");
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+
+  expect(await ledger(f)).toEqual([]);
+  const eraseLogs = vi.fn(async () => ({
+    connections: [],
+    pending: false,
+    skipped: [],
+  }));
+  const restarted = createConnectionDeleter(f.a.deps, { eraseLogs });
+  expect(await restarted.resumeErasures()).toBe(false);
+  expect(restarted.erasureOwed()).toBe(false);
+  expect(
+    await f.a.db.query(
+      "SELECT connector FROM delete_tombstones WHERE done_at IS NULL",
+    ),
+  ).toEqual([]);
+});
+
 it("a request with no answer is sent once more, then leaves its fences to the per-row pass, which lands them (mutant: NO_RESEND_AMBIGUOUS)", async () => {
   const f = await world();
   const singles = countSingles(f);

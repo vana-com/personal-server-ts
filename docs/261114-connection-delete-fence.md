@@ -178,6 +178,19 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   the final verdict is durable, so a reconnect and a restart still read `done`
   and owe nothing. They do not use `connections.control_version`, which a
   reconnect moves. Migration 41 adds `done_at`.
+- A verdict, and a ledger row, speak only for the confirmed tombstone they were
+  judged at. The ledger takes only confirmed tombstones: a fence that landed, a
+  tombstone a purge adopted from the registry, or one a registry listing shows.
+  A purge that runs ahead of its fence (the local purge after the intent is
+  saved), or of a connection no registry row names (version 0), still trips the
+  stale runs but writes no row; a foreign head that supersedes a fence leaves
+  none behind. Before any path reads a verdict it compares it with the newest
+  tombstone a fresh listing shows, in one function (`adoptEnded`): a tombstone
+  above the one held for the same namespace is recorded, clears the connector's
+  `done_at`, drops the cached verdicts and refusals and owes both stages. The
+  status read, a delete request (its plan), the erasure pass and the start
+  sweep all make that comparison first; a listing that fails leaves the known
+  tombstones standing. A read that finds a newer delete arms the retry loop.
 - A part that reads `pending` always has work queued, found from the same rows
   that gave the status. The erasure report names every deleted namespace it left
   alone (`skipped`: a live local connection holds it). A skipped tombstone reads

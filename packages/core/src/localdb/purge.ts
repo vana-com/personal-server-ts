@@ -44,6 +44,18 @@ export const KEEP_TOMBSTONE_CONFLICT = `ON CONFLICT(connector, ns) DO UPDATE
    WHERE excluded.version > delete_tombstones.version`;
 
 /**
+ * The control version a purge ends a lifetime at. `confirmed: false` says it
+ * is the delete's own expectation (the fence it is about to land, or a
+ * connection no registry row names): the purge still trips the stale runs
+ * with it, but it is not written to the ledger. Left out, the version is a
+ * tombstone read from the registry, as an adopted delete is.
+ */
+export interface PurgedTombstone {
+  readonly controlVersion: number;
+  readonly confirmed?: boolean;
+}
+
+/**
  * Record the control tombstone that ended `connectionId`'s lifetime
  * (`delete_tombstones`): the delete's identity, which its erasure judges by.
  * A tombstone below the one held is an older delete and changes nothing.
@@ -77,6 +89,13 @@ export interface PurgedConnection {
   readonly connector: string;
   readonly ns: string;
   readonly controlVersion: number;
+  /**
+   * Whether `controlVersion` is a tombstone the delete confirmed. A purge
+   * that runs ahead of its fence, or of a connection no registry row names,
+   * ends the local lifetime on a version it only expects: it has no identity
+   * to judge a delete by.
+   */
+  readonly confirmed: boolean;
 }
 export type PurgeListener = (purged: PurgedConnection | null) => void;
 /** Hear every purge of `db`'s connections, until the returned function is called. */
@@ -105,7 +124,7 @@ export function onConnectionPurged(
 export async function adoptDelete(
   deps: LocalSyncDeps,
   connectionId: string,
-  deleted: { readonly controlVersion: number },
+  deleted: PurgedTombstone,
 ): Promise<void> {
   const [row] = await deps.db.query<{ control_state: string }>(
     "SELECT control_state FROM connections WHERE connection_id = ?",
@@ -154,7 +173,7 @@ export async function adoptDelete(
 export async function purgeConnection(
   deps: LocalSyncDeps,
   connectionId: string,
-  deleted: { readonly controlVersion: number },
+  deleted: PurgedTombstone,
 ): Promise<void> {
   await deps.queue.run(connectionId, "purge", async () => {
     const { changes } = await deps.db.batch(
@@ -217,7 +236,12 @@ export async function purgeConnection(
         endParticipation(connectionId),
         // The tombstone that ended the lifetime is the delete's identity,
         // written with the purge that adopts it. A higher one replaces it.
-        keepTombstone(connectionId, deleted.controlVersion),
+        // Only a confirmed tombstone is one: a version a purge expects of a
+        // fence not yet landed, or 0 for a connection no row names, would be
+        // a delete that never finishes.
+        ...(deleted.confirmed !== false && deleted.controlVersion >= 1
+          ? [keepTombstone(connectionId, deleted.controlVersion)]
+          : []),
       ]),
     );
     // Rotate only after the purge batch commits, before releasing its slot.
@@ -254,6 +278,8 @@ export async function purgeConnection(
             connector: row.connector,
             ns: row.ns,
             controlVersion: deleted.controlVersion,
+            confirmed:
+              deleted.confirmed !== false && deleted.controlVersion >= 1,
           };
         else return;
       } catch (error) {

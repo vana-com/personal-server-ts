@@ -2,9 +2,6 @@
 // real deleter, the real seal and the real `deleteScope` worker, over a fake
 // gateway that enforces cutover policy v3 (an exact tombstone over a live head,
 // signed by the owner or a registered server) and a fake storage.
-import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   controlScope,
@@ -30,22 +27,14 @@ import {
   CONNECTOR,
   OWNER,
   closeWorldDrivers,
+  tempDbFile,
   sName,
   world,
 } from "./log-world.test-utils.js";
 
-const dirs: string[] = [];
-afterEach(async () => {
-  await closeWorldDrivers();
-  for (const dir of dirs.splice(0))
-    rmSync(dir, { recursive: true, force: true });
-});
-/** A database file of one test, on disk (not in the RAM-backed temp directory). */
-const dbFile = () => {
-  const dir = mkdtempSync(join(homedir(), ".tmp", "ps-restart-"));
-  dirs.push(dir);
-  return join(dir, "a.db");
-};
+afterEach(closeWorldDrivers);
+/** A database file of one test, on disk (a device can restart). */
+const dbFile = tempDbFile;
 
 const RETRY = { first: 5, max: 20 };
 /** A connector with legacy scopes bound to it. */
@@ -725,6 +714,91 @@ describe("the legacy stage of a connection delete after the switch", () => {
       expect(allDone(await restarted.sync.deleter.deleteStatus(GH))).toBe(true);
       expect(restarted.sync.deleter.erasureOwed()).toBe(false);
       expect(fake.requests).toHaveLength(sent);
+    });
+
+    /**
+     * Another device adds the connection again and deletes it again. This
+     * device has not synced since: the gateway listing is the only place the
+     * newer tombstone shows.
+     */
+    async function deletedAgainElsewhere(options: { dbFile?: string } = {}) {
+      const { w, a } = await collected(options);
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+      // Another device adds the connection again (a live head) and deletes it
+      // again (a tombstone, the same bytes as the first delete's).
+      const control = controlScope(GH, "");
+      const versions = w.gateway.versions.get(control)!;
+      const live = { ...versions[0]! };
+      const tombstone = { ...versions[versions.length - 1]! };
+      w.gateway.write(control, live);
+      w.gateway.write(control, tombstone);
+      return { w, a };
+    }
+    const ledgerOf = (a: Awaited<ReturnType<World["device"]>>) =>
+      a.db.query<{ ns: string; version: number; done_at: number | null }>(
+        "SELECT ns, version, done_at FROM delete_tombstones WHERE connector = ? ORDER BY ns",
+        [GH],
+      );
+
+    it("reads pending, not done, when another device deleted again and this one has not synced; the pass that follows judges the newer tombstone", async () => {
+      const { a } = await deletedAgainElsewhere();
+      const [before] = await ledgerOf(a);
+
+      const status = await statusOf(a);
+      expect(allDone(status)).toBe(false);
+      expect(status.legacy).toEqual(PENDING);
+      expect(status.storage).toEqual(PENDING);
+      // The newer tombstone is recorded, with no verdict, and work is owed.
+      const [after] = await ledgerOf(a);
+      expect(after!.version).toBeGreaterThan(before!.version);
+      expect(after!.done_at).toBeNull();
+      expect(a.sync.deleter.erasureOwed()).toBe(true);
+
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+      expect((await ledgerOf(a))[0]!.done_at).not.toBeNull();
+    });
+
+    it("reads pending on an already-fenced delete request after another device deleted again", async () => {
+      const { a } = await deletedAgainElsewhere();
+      await a.sync.deleter.requestConnectionDelete(GH);
+      // Nothing was fenced or purged here: the request found a delete that
+      // was done, and the listing shows a newer one.
+      expect(await ledgerOf(a)).toEqual([
+        expect.objectContaining({ done_at: null }),
+      ]);
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+    });
+
+    it("reads pending after a restart when another device deleted again while this one was off, and the start sweep judges the newer tombstone", async () => {
+      const { a } = await deletedAgainElsewhere({ dbFile: dbFile() });
+      const [before] = await ledgerOf(a);
+      const restarted = await a.restart();
+
+      expect(allDone(await restarted.sync.deleter.deleteStatus(GH))).toBe(
+        false,
+      );
+      await restarted.sync.deleter.resumeDeletes();
+      await vi.waitFor(async () =>
+        expect(allDone(await restarted.sync.deleter.deleteStatus(GH))).toBe(
+          true,
+        ),
+      );
+      const rows = await restarted.db.query<{
+        version: number;
+        done_at: number | null;
+      }>("SELECT version, done_at FROM delete_tombstones WHERE connector = ?", [
+        GH,
+      ]);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.version).toBeGreaterThan(before!.version);
+      expect(rows[0]!.done_at).not.toBeNull();
     });
 
     it("drops the verdict when a newer delete of the connection lands", async () => {

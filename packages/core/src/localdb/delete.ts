@@ -501,6 +501,94 @@ export function createConnectionDeleter(
         params: [connector, id],
       },
     ]);
+  /** The connector's control rows in a listing, each read as the control head it is. */
+  function* controlRowsOf(
+    connector: string,
+    entries: Awaited<ReturnType<LocalSyncDeps["registry"]["listControlRows"]>>,
+    hashes: Hashes,
+  ) {
+    for (const entry of entries) {
+      const parsed = parseScope(entry.scope);
+      if (parsed?.kind !== "control" || parsed.connector !== connector)
+        continue;
+      yield {
+        entry,
+        ns: parsed.ns,
+        current: classifyControl(entry.read, hashes),
+      };
+    }
+  }
+  /**
+   * The one comparison between a delete's verdict and the newest tombstone
+   * this device can see. `ended` is what a registry listing shows of the
+   * connector: a tombstone above the one held for its namespace is a newer
+   * delete. It is written down (the same statement as a landed fence, which
+   * clears the connector's verdicts), learned, and owed to both stages. Every
+   * path that reads a verdict (a status, a request, an erasure pass, the
+   * start sweep) calls this first, so none can answer for a delete the
+   * registry has already moved past. A connector with no delete known here,
+   * and a namespace with no tombstone held, are not this device's to adopt:
+   * a sync of the control row does that, and names the tombstone.
+   */
+  async function adoptEnded(
+    connector: string,
+    ended: ReadonlyMap<string, number>,
+    options: { readonly owe?: boolean } = {},
+  ): Promise<boolean> {
+    if (ended.size === 0) return false;
+    await hydrated();
+    const held = tombstones.get(connector);
+    if (!held) return false;
+    const newer = [...ended].filter(
+      ([ns, version]) => held.has(ns) && version > held.get(ns)!,
+    );
+    if (newer.length === 0) return false;
+    await deps.db.batch([
+      ...newer.map(([ns, version]) => ({
+        sql: KEEP_TOMBSTONE_SQL,
+        params: [connector, ns, version],
+      })),
+      {
+        sql: "UPDATE delete_tombstones SET done_at = NULL WHERE connector=?",
+        params: [connector],
+      },
+    ]);
+    for (const [ns, version] of newer) learnTombstone(connector, ns, version);
+    if (owesErasure && options.owe !== false) owe(connector);
+    return true;
+  }
+  /**
+   * `adoptEnded` for connectors whose delete is known here, from one fresh
+   * listing. A registry that cannot be listed leaves what is known standing:
+   * the newest tombstone this device can see is the one it already holds.
+   */
+  async function refreshTombstones(
+    connectors: Iterable<string>,
+    options: { readonly owe?: boolean } = {},
+  ): Promise<ReadonlySet<string>> {
+    const newer = new Set<string>();
+    try {
+      await hydrated();
+      const known = [...connectors].filter((c) => tombstones.has(c));
+      if (known.length === 0) return newer;
+      const [hashes, entries] = await Promise.all([
+        hashesOf(),
+        deps.registry.listControlRows(),
+      ]);
+      for (const connector of known) {
+        const ended = new Map<string, number>();
+        for (const { ns, current } of controlRowsOf(connector, entries, hashes))
+          if (current.kind === "deleted") ended.set(ns, current.version);
+        if (await adoptEnded(connector, ended, options)) newer.add(connector);
+      }
+    } catch (error) {
+      deps.logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "stream sync: the registry's newest delete tombstones could not be read",
+      );
+    }
+    return newer;
+  }
   /**
    * The pins, from one listing of the control rows. A listing is as fresh as a
    * read of the row, and taken after this call; the row may still move before
@@ -525,22 +613,25 @@ export function createConnectionDeleter(
     const listing = new Map<string, ControlRead>();
     // The control rows already tombstoned, by namespace: the end of a lifetime.
     const ended = new Map<string, number>();
-    for (const entry of entries) {
-      const parsed = parseScope(entry.scope);
-      if (parsed?.kind !== "control" || parsed.connector !== connector)
-        continue;
-      const current = classifyControl(entry.read, hashes);
+    for (const { entry, ns, current } of controlRowsOf(
+      connector,
+      entries,
+      hashes,
+    )) {
       listing.set(entry.scope, { ...entry.read });
-      if (current.kind === "deleted") ended.set(parsed.ns, current.version);
+      if (current.kind === "deleted") ended.set(ns, current.version);
       // A control row of another key ends the same way: its tombstone is the
       // same for every key.
       if (current.kind === "active" || current.kind === "foreign")
         pins.push({
-          ns: parsed.ns,
+          ns,
           version:
             current.kind === "active" ? current.generation : current.version,
         });
     }
+    // A listing is the newest word on the delete: a tombstone newer than the
+    // one held ends the verdict held, whoever asked.
+    await adoptEnded(connector, ended);
     return { intent: { id: deps.newOp(), pins }, listing, ended };
   }
   async function readConnectionLifetime(connector: string): Promise<string> {
@@ -602,6 +693,8 @@ export function createConnectionDeleter(
     connector: string,
     intent: DeleteIntent,
     held: ReadonlySet<string> = new Set(),
+    /** The tombstones the registry listing showed, by namespace. */
+    ended: ReadonlyMap<string, number> = new Map(),
   ) {
     const connections = await deps.db.query<{
       connection_id: string;
@@ -636,9 +729,28 @@ export function createConnectionDeleter(
                 : deps.queue.run(id, kind, work),
           },
         };
-        await purgeConnection(nested, connection.connection_id, {
-          controlVersion: pin ? pin.version + 1 : connection.control_version,
-        });
+        // The purge may run ahead of its fence. Only a tombstone the delete
+        // confirmed is the delete's identity: a fence that landed, or one the
+        // registry listing shows. A version this purge expects, or the 0 of
+        // a connection no row names, is not written to the ledger.
+        const landed = pin
+          ? (intent.fences ?? []).find((f) => f.ns === pin.ns)?.version
+          : undefined;
+        const listed = ended.get(connection.ns);
+        await purgeConnection(
+          nested,
+          connection.connection_id,
+          landed !== undefined
+            ? { controlVersion: landed }
+            : listed !== undefined && !pin
+              ? { controlVersion: listed }
+              : {
+                  controlVersion: pin
+                    ? pin.version + 1
+                    : connection.control_version,
+                  confirmed: false,
+                },
+        );
         await deps.db.batch([
           {
             sql: "UPDATE run_streams SET decision='discarded',reason='control_deleted',replace=0 WHERE run_id IN (SELECT run_id FROM runs WHERE connection_id=?)",
@@ -890,6 +1002,10 @@ export function createConnectionDeleter(
       );
       return owed;
     }
+    // The newest tombstone the registry shows, before anything is judged by
+    // the one held: a newer delete is judged whole by this pass.
+    if ((await refreshTombstones([connector], { owe: false })).size > 0)
+      owed = BOTH;
     const held = tombstonesOf(connector);
     const key = deleteKey(connector);
     const judge = (part: JudgedPart) => judgeFor(connector, key, part);
@@ -1034,6 +1150,9 @@ export function createConnectionDeleter(
   async function deleteStatus(
     connector: string,
   ): Promise<ConnectionDeleteStatus> {
+    // A verdict speaks for the tombstone it was judged at: a newer one the
+    // registry shows ends it before it is read.
+    await refreshTombstones([connector]);
     const [open] = await deps.db.query(
       "SELECT 1 FROM delete_intents WHERE connector=?",
       [connector],
@@ -1141,7 +1260,7 @@ export function createConnectionDeleter(
               : null;
           if (open && (empty || samePlan(open, planned.intent))) return open;
           if (empty) {
-            await purgeLocal(connector, planned.intent, held);
+            await purgeLocal(connector, planned.intent, held, planned.ended);
             await options.eraseLegacy?.(connector);
             return null;
           }
@@ -1226,17 +1345,22 @@ export function createConnectionDeleter(
      * A connection of the connector was purged here: its erasure may be owed.
      * `tombstone` is the control tombstone that ended it (namespace and
      * registry version): the identity of the delete, which a delete of the
-     * same connector later replaces.
+     * same connector later replaces. A purge that ran ahead of its fence has
+     * none yet: it owes the stages with no verdict and learns nothing.
      */
     noteSettled(
       connector: string,
-      tombstone: { readonly ns: string; readonly version: number },
+      tombstone?: { readonly ns: string; readonly version: number },
     ) {
       // A higher tombstone is a newer delete: both stages judge it afresh and
       // the gateway is asked again. The same one again (a sync cycle reads the
       // deleted control row every time) is news of nothing: a final verdict
       // and a terminal refusal stand, and only a stage with none is owed.
-      const newer = learnTombstone(connector, tombstone.ns, tombstone.version);
+      // A purge that ran ahead of its fence names no tombstone: nothing is
+      // learned, and the stages with no final verdict are owed.
+      const newer = tombstone
+        ? learnTombstone(connector, tombstone.ns, tombstone.version)
+        : false;
       if (!owesErasure) return;
       const owed = newer ? BOTH : unfinishedStages(connector);
       if (owed.legacy || owed.storage) owe(connector, owed);
@@ -1262,6 +1386,9 @@ export function createConnectionDeleter(
         // A purge whose connector lookup failed wrote its tombstone all the
         // same: read the table again.
         await loadTombstones();
+        // A final verdict is read against the registry too: another device
+        // may have deleted again while this process was off.
+        await refreshTombstones(tombstones.keys());
         const rows = await deps.db.query<{ connector: string }>(
           "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
         );

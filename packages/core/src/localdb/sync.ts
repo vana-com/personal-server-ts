@@ -338,10 +338,12 @@ export function createLocalSync(
       ? onConnectionPurged(deps.db, (purged) => {
           if (purged === null) deletes().noteSweepOwed();
           else
-            deletes().noteSettled(purged.connector, {
-              ns: purged.ns,
-              version: purged.controlVersion,
-            });
+            deletes().noteSettled(
+              purged.connector,
+              purged.confirmed
+                ? { ns: purged.ns, version: purged.controlVersion }
+                : undefined,
+            );
           armRetry();
         })
       : () => {};
@@ -389,7 +391,13 @@ export function createLocalSync(
       return result;
     },
     resumeDeletes: resume,
-    deleteStatus: (connector) => deletes().deleteStatus(connector),
+    async deleteStatus(connector) {
+      const status = await deletes().deleteStatus(connector);
+      // A status that found a newer delete owes its erasure: the retry loop
+      // is what runs it, so it is armed by the read that found the work.
+      if (deletes().erasureOwed()) armRetry();
+      return status;
+    },
     erasureOwed: () => deletes().erasureOwed(),
   };
   const listingDeps = {
