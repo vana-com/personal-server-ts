@@ -1512,6 +1512,17 @@ describe("erasure wired into the connection delete", () => {
       );
     });
 
+    it("works when its methods are taken off the deleter", async () => {
+      const a = await settled();
+      const eraseLogs = vi.fn().mockResolvedValue(erased);
+      const { noteSettled, resumeErasures } = createConnectionDeleter(a.deps, {
+        eraseLogs,
+      });
+      noteSettled(CONNECTOR, TOMBSTONE);
+      expect(await resumeErasures()).toBe(false);
+      expect(eraseLogs).toHaveBeenCalledTimes(1);
+    });
+
     it("a purge that arrives while the start sweep reads is not lost: the sweep is owed again", async () => {
       const a = await settled();
       let release!: () => void;

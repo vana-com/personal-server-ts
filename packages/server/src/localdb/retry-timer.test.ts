@@ -18,6 +18,8 @@ import {
 // What the tick does between learning its answer and returning it.
 const gap: {
   afterErasures?: () => Promise<void>;
+  /** Runs the tick is handed besides its own (a test's failing run). */
+  extraRuns?: () => Promise<void>[];
   deleter?: ReturnType<typeof createConnectionDeleter>;
 } = {};
 vi.mock("../../../core/src/localdb/delete.js", async (importOriginal) => {
@@ -35,15 +37,28 @@ vi.mock("../../../core/src/localdb/delete.js", async (importOriginal) => {
       deleter.startErasures = async () => {
         const answer = await startErasures();
         await gap.afterErasures?.();
-        return answer;
+        return [...answer, ...(gap.extraRuns?.() ?? [])];
       };
       return deleter;
     },
   };
 });
 
+// Every device made here is closed after its test: a loop left running over a
+// closed database keeps failing, and arms timers in the tests that follow.
+const devices: { sync: { close(): Promise<void> } }[] = [];
+async function device(
+  w: Awaited<ReturnType<typeof world>>,
+  ...args: Parameters<Awaited<ReturnType<typeof world>>["device"]>
+) {
+  const made = await w.device(...args);
+  devices.push(made);
+  return made;
+}
 afterEach(async () => {
   gap.afterErasures = undefined;
+  gap.extraRuns = undefined;
+  await Promise.all(devices.splice(0).map((device) => device.sync.close()));
   vi.useRealTimers();
   await closeWorldDrivers();
 });
@@ -115,7 +130,7 @@ describe("the delete retry timer follows the work owed when it is decided", () =
         },
       },
     };
-    const a = await w.device("a", {
+    const a = await device(w, "a", {
       erasure: () => erasure,
       deleteRetryMs: RETRY,
     });
@@ -167,7 +182,7 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
   /** A device that collected the connector, with the retry timer faked. */
   async function collected() {
     const w = await world({ streams: 1, partTargetBytes: 65536 });
-    const a = await w.device("a", { deleteRetryMs: RETRY });
+    const a = await device(w, "a", { deleteRetryMs: RETRY });
     await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
       observedAt: 1100,
     });
@@ -352,5 +367,186 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
     await until(() => vi.getTimerCount() === 0);
     await settle();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retries a delete that fails to land while another connector's landing is stuck", async () => {
+    const w = await world({ streams: 1, partTargetBytes: 65536 });
+    const a = await device(w, "a", { deleteRetryMs: RETRY });
+    const STUCK = "stuck-source";
+    for (const connector of [CONNECTOR, STUCK])
+      await a.run(`run-${connector}`, [{ stream: sName(0), id: "x", v: 0 }], {
+        observedAt: 1100,
+        connector,
+      });
+    await a.cycle();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    // The stuck connector's landing never ends: its last write, clearing the
+    // intent, waits on the test. (A registry call is bounded by a deadline;
+    // a database write is not.)
+    let free!: () => void;
+    const gate = new Promise<void>((resolve) => (free = resolve));
+    const batch = a.db.batch.bind(a.db);
+    a.db.batch = (async (statements: Parameters<typeof a.db.batch>[0]) => {
+      if (
+        statements.some(
+          (statement) =>
+            statement.sql.startsWith("DELETE FROM delete_intents") &&
+            statement.params?.[0] === STUCK,
+        )
+      )
+        await gate;
+      return batch(statements);
+    }) as typeof a.db.batch;
+    // The registry refuses the other connector's fence; the test counts the
+    // attempts (one per single post).
+    let attempts = 0;
+    const post = a.deps.registry.post.bind(a.deps.registry);
+    a.deps.registry.post = async (request, signal) => {
+      if (request.scope === CONTROL) {
+        attempts += 1;
+        throw new Error("registry down");
+      }
+      return post(request, signal);
+    };
+    const postBatch = a.deps.registry.postBatch!.bind(a.deps.registry);
+    a.deps.registry.postBatch = async (request, signal) => {
+      if (request.rows.some((row) => row.scope === CONTROL))
+        throw new Error("registry down");
+      return postBatch(request, signal);
+    };
+    try {
+      await a.sync.deleter.requestConnectionDelete(STUCK);
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await until(() => attempts === 1);
+
+      // The stuck landing does not hold the loop: each tick that fires retries
+      // the failed delete, and the loop arms the next one. Tick until it has
+      // retried twice more (a loop held by the stuck landing stops at the
+      // first: it never decides the timer again).
+      const tick = (count: number) =>
+        until(async () => {
+          await fire();
+          return attempts >= count;
+        });
+      await tick(2);
+      await tick(3);
+    } finally {
+      free();
+    }
+  });
+
+  it("answers a resume only once the loop has decided the timer after the erasure it started has ended", async () => {
+    const w = await world({ streams: 1, partTargetBytes: 65536 });
+    // The erasure's first pass is unfinished; the second waits on the test.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let asked = 0;
+    const erasure: LogErasurePorts = {
+      versions: {
+        list: async (scope) => ({
+          complete: true,
+          versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
+            expectedVersion: String(i + 1),
+            dataHash: v.dataHash,
+            isTombstone: false,
+          })),
+        }),
+      },
+      finality: {
+        tombstoneState: async () => {
+          asked += 1;
+          if (asked === 2) await gate;
+          return { finalized: asked > 1 ? "99" : null, rolledBack: null };
+        },
+      },
+      objects: {
+        deleteBlobVersions: async (scope, names) => {
+          const out = {
+            deleted: [] as string[],
+            missing: [] as string[],
+            failed: [] as { version: string; error: string }[],
+          };
+          for (const name of names)
+            (w.innerBlobs.delete(`${scope}/${name}`)
+              ? out.deleted
+              : out.missing
+            ).push(name);
+          return out;
+        },
+      },
+    };
+    const a = await device(w, "a", {
+      erasure: () => erasure,
+      deleteRetryMs: RETRY,
+    });
+    await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
+      observedAt: 1100,
+    });
+    await a.cycle();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await until(() => gap.deleter!.erasureOwed());
+
+    // The resume's pass starts the second erasure, which waits on storage.
+    let answered = false;
+    const resumed = a.sync.deleter
+      .resumeDeletes()
+      .then(() => (answered = true));
+    await until(() => asked === 2);
+    await settle();
+
+    // Storage answers; the loop's next look at what is owed is held open.
+    const query = a.db.query.bind(a.db);
+    let reading!: () => void;
+    const looked = new Promise<void>((resolve) => (reading = resolve));
+    let open!: () => void;
+    const held = new Promise<void>((resolve) => (open = resolve));
+    a.db.query = (async (sql: string, params?: readonly unknown[]) => {
+      const rows = await query(sql, params);
+      if (sql.includes("FROM delete_intents LIMIT 1")) {
+        reading();
+        await held;
+      }
+      return rows;
+    }) as typeof a.db.query;
+    release();
+    await looked;
+    await settle();
+    expect(answered).toBe(false);
+
+    open();
+    await resumed;
+    // Answered after the decision: nothing is owed, so no timer is armed.
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("leaves no rejection unhandled when a run fails while the loop's read of what is owed fails", async () => {
+    const { a } = await collected();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      // The tick is handed a run that fails; then its read of what is owed
+      // fails, after the run has already failed.
+      gap.extraRuns = () => [Promise.reject(new Error("erasure run failed"))];
+      const query = a.db.query.bind(a.db);
+      let failRead = true;
+      a.db.query = (async (sql: string, params?: readonly unknown[]) => {
+        if (failRead && sql.includes("FROM delete_intents LIMIT 1")) {
+          failRead = false;
+          await nextTask();
+          await nextTask();
+          throw new Error("database busy");
+        }
+        return query(sql, params);
+      }) as typeof a.db.query;
+      await a.sync.deleter.resumeDeletes().catch(() => undefined);
+      gap.extraRuns = undefined;
+      await settle();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });

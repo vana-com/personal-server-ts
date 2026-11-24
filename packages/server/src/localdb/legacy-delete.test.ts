@@ -998,7 +998,9 @@ describe("the legacy stage of a connection delete after the switch", () => {
         expect(SCOPES.slice(1).every((s) => !fake.isLive(s))).toBe(true),
       );
       expect((await statusOf(a)).legacy).toEqual(PENDING);
-      expect(a.sync.deleter.erasureOwed()).toBe(true);
+      // Owed again once the failed pass has queued its connector: a pass in
+      // flight has taken its entry and not yet given it back.
+      await vi.waitFor(() => expect(a.sync.deleter.erasureOwed()).toBe(true));
 
       // The scope recovers: the retry finishes the delete.
       broken.on = false;
