@@ -520,7 +520,9 @@ describe("replica scheduling numeric boundaries", () => {
     };
     const hint = { now: cutoff - 1, head: 42n, hintRefreshAt: cutoff + 30_000 };
     expect(replicaEligibleAt(item, hint)).toBe(cutoff);
-    expect(replicaEligibleAt(item, { ...hint, now: cutoff })).toBe(item.nextEligible);
+    expect(replicaEligibleAt(item, { ...hint, now: cutoff })).toBe(
+      item.nextEligible,
+    );
   });
 
   it("caps a restored retry counter before passing it to the backoff", () => {
@@ -530,7 +532,12 @@ describe("replica scheduling numeric boundaries", () => {
       { ...base, attempts: cap },
       retryOutcome(),
       T0,
-      { backoff: (attempt) => { attempts.push(attempt); return 19; } },
+      {
+        backoff: (attempt) => {
+          attempts.push(attempt);
+          return 19;
+        },
+      },
     );
     expect(attempts).toEqual([cap]);
     expect(result.state.attempts).toBe(cap);
