@@ -603,6 +603,29 @@ describe("durable owner additions recovery", () => {
   });
 });
 
+describe("in-memory receipt diagnostics", () => {
+  it("rejects malformed byte receipts without losing an outstanding reservation", async () => {
+    const { AdditionsBudget, AdditionsBudgetExceeded } = await import("./budget.js");
+    const budget = new AdditionsBudget(12);
+    const pending = budget.reserve(4);
+    for (const invalid of [-1, 0.5]) {
+      expect(() => pending.settle(invalid)).toThrow(AdditionsBudgetExceeded);
+      expect(budget.remaining).toBe(8);
+    }
+    pending.settle(3);
+    expect(budget.remaining).toBe(9);
+  });
+
+  it("rejects duplicate settlement without changing recorded usage", async () => {
+    const { AdditionsBudget } = await import("./budget.js");
+    const budget = new AdditionsBudget(12);
+    const pending = budget.reserve(4);
+    pending.settle(2);
+    expect(() => pending.settle(2)).toThrow("Additions reservation already settled");
+    expect(budget.remaining).toBe(10);
+  });
+});
+
 it("converges after two independent actors summarize concurrently and a third restarts", async () => {
   const f = await fixture();
   await f.source("1", T1, ["a"]);
