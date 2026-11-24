@@ -32,6 +32,7 @@ import {
   additionsLedgerScope,
   ADDITIONS_SUMMARY_SCOPE,
   createDurableAdditions,
+  findCheckpointRegistration,
   type DurableAdditionsOptions,
 } from "./durable.js";
 
@@ -43,6 +44,44 @@ const T2 = "2026-10-02T12:00:00.000Z";
 const T3 = "2026-10-03T12:00:00.000Z";
 const T4 = "2026-10-04T12:00:00.000Z";
 const QUERY = { timezone: "UTC", days: 4, now: new Date(T4) };
+
+describe("checkpoint registration matching", () => {
+  const slot = {
+    expectedVersion: "1",
+    dataHash: "0x" + "ab".repeat(32),
+    metadataHash: "0x" + "cd".repeat(32),
+    status: "confirmed",
+    addedAt: T1,
+    isTombstone: false,
+  };
+  const head = {
+    expectedVersion: slot.expectedVersion,
+    dataHash: slot.dataHash,
+    metadataHash: slot.metadataHash,
+    status: slot.status,
+    deletedAt: null,
+  };
+  const snapshot = { head, versions: [slot] };
+
+  it("matches the same recorded commitments regardless of hex letter case", () => {
+    expect(findCheckpointRegistration(snapshot, "1", {
+      dataHash: "0x" + "AB".repeat(32),
+      metadataHash: "0x" + "CD".repeat(32),
+    })).toBe(slot);
+  });
+
+  it("does not treat one matching commitment as a match for the pair", () => {
+    const unrelated = "0x" + "ef".repeat(32);
+    expect(findCheckpointRegistration(snapshot, "1", {
+      dataHash: slot.dataHash,
+      metadataHash: unrelated,
+    })).toBeUndefined();
+    expect(findCheckpointRegistration(snapshot, "1", {
+      dataHash: unrelated,
+      metadataHash: slot.metadataHash,
+    })).toBeUndefined();
+  });
+});
 const slotSchema = z.object({
   expectedVersion: z.string(),
   dataHash: z.string(),
