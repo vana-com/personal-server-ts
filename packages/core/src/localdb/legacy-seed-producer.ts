@@ -42,7 +42,8 @@ export interface LegacySeedStore {
 export interface LegacySeedStreamReport {
   readonly connector: string;
   readonly stream: string;
-  /** `merged`: a final receipt already held it, nothing was read.
+  /** `merged`: a final receipt already held it (before the read, or by the time
+   * the upload arrived); nothing was imported here.
    * `staged`: the rows went through the importer (`rows` of them).
    * `empty`: the store had nothing importable, so no upload was made. */
   readonly outcome: "merged" | "staged" | "empty";
@@ -185,13 +186,26 @@ export async function seedLegacyStore(
     options.signal?.throwIfAborted();
     const put = await intake.put(connector, name, body());
     statusOf.delete(connector);
+    if (put.state === "merged") {
+      // A final receipt appeared after `status()`: the body was not consumed
+      // and nothing was imported here. The receipt holds its own counts.
+      reports.push({
+        connector,
+        stream: name,
+        outcome: "merged",
+        rows: 0,
+        quarantine: {},
+        invalid: 0,
+      });
+      continue;
+    }
     reports.push({
       connector,
       stream: name,
       outcome: "staged",
       rows: count,
       quarantine: quarantine.counts(),
-      invalid: put.state === "staged" ? put.invalid : 0,
+      invalid: put.invalid,
     });
     rows += count;
     for (const [reason, n] of Object.entries(quarantine.counts()))

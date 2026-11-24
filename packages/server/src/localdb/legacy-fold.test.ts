@@ -395,3 +395,54 @@ it("fold-a-live-row-in-the-same-or-a-newer-layer-outranks-a-v1-full-delete", asy
     m: '{"id":"m","v":"same-layer-live"}',
   });
 });
+
+it("fold-layers-collide-by-legacy-record-key-not-by-typed-key", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  // `{id: 42}` and `{id: "42"}` are one legacy record key, `42`. The newest
+  // layer's row stands; the import must not see both.
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, [
+      layer([
+        { id: 42, v: "new" },
+        { id: "7", v: "only-new" },
+      ]),
+      layer([
+        { id: "42", v: "old" },
+        { id: "9", v: "only-old" },
+      ]),
+    ]),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    quarantine: { superseded: 1 },
+  });
+  expect(await bodies(a)).toEqual({
+    "42": '{"id":42,"v":"new"}',
+    "7": '{"id":"7","v":"only-new"}',
+    "9": '{"id":"9","v":"only-old"}',
+  });
+});
+
+it("fold-a-repeat-of-a-record-key-in-another-type-is-a-duplicate-and-a-typed-delete-hides-it", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, [
+      layer(
+        [
+          { id: 5, v: "first" },
+          { id: "5", v: "repeat" },
+        ],
+        [{ id: "6" }],
+      ),
+      layer([{ id: 6, v: "old-six" }]),
+    ]),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    tombstoned: 1,
+    quarantine: { duplicate_key: 1, deleted_in_newer_layer: 1 },
+  });
+  expect(await bodies(a)).toEqual({ "5": '{"id":5,"v":"first"}' });
+});

@@ -137,3 +137,70 @@ describe("seedLegacyStore chunks", () => {
     expect(new TextDecoder().decode(big).trimEnd().split("\n")).toHaveLength(1);
   });
 });
+
+describe("seedLegacyStore counts", () => {
+  it("counts a malformed stored delete envelope in the quarantine totals", async () => {
+    const SOURCE = "urn:fixture";
+    const envelope = (id: unknown, claim: unknown, op = "delete") => ({
+      id,
+      $pdpp: { sourceId: SOURCE, record: { key: claim, op } },
+    });
+    const layer: FoldLayer = {
+      async *records() {
+        yield { id: "kept", $pdpp: { sourceId: SOURCE } };
+        yield envelope("a", "not-a-key");
+        yield envelope("b", { id: "other" });
+        yield envelope("c", { nope: 1 });
+        yield envelope("d", { id: "d" }, "patch");
+      },
+    };
+    const { port } = intake();
+    const report = await seedLegacyStore(
+      port,
+      store({ ...stream([layer]), sourceId: SOURCE }),
+    );
+    expect(report.rows).toBe(1);
+    expect(report.quarantine).toEqual({
+      deletion_not_an_object: 1,
+      deletion_record_key_mismatch: 1,
+      deletion_missing_key_field: 1,
+      unknown_op: 1,
+    });
+    expect(report.streams[0]!.quarantine).toEqual(report.quarantine);
+  });
+
+  it("reports a stream another writer finished first as merged, not staged", async () => {
+    const put: string[] = [];
+    const port: SeedIntake = {
+      async status() {
+        // Not final yet when the producer asks.
+        return { targetKnown: true, streams: {} };
+      },
+      async put(_connector, name) {
+        // A final receipt appeared in between: the body is never consumed.
+        put.push(name);
+        return { state: "merged" };
+      },
+    };
+    const layer: FoldLayer = {
+      async *records() {
+        yield { id: "a" };
+        yield { nope: 1 };
+      },
+    };
+    const report = await seedLegacyStore(port, store(stream([layer])));
+    expect(put).toEqual(["items"]);
+    expect(report.streams).toEqual([
+      {
+        connector: "fixture",
+        stream: "items",
+        outcome: "merged",
+        rows: 0,
+        quarantine: {},
+        invalid: 0,
+      },
+    ]);
+    expect(report.rows).toBe(0);
+    expect(report.quarantine).toEqual({});
+  });
+});

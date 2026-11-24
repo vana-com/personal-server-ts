@@ -709,3 +709,42 @@ it("rechecks quiescence between native snapshot hash pages", async () => {
     }),
   ).rejects.toThrow("legacy_access_unavailable");
 });
+
+it("legacy-access-revision-binds-deletion-keys", async () => {
+  // Two stores with the same live rows. One holds a tombstone for a key only
+  // an older instance could hold: its revision must differ, or a receipt for
+  // the first would stand for the second and the older copy would survive.
+  const a = await fixture();
+  const b = await fixture();
+  const gone = (
+    f: Awaited<ReturnType<typeof fixture>>,
+    op: "upsert" | "delete",
+  ) =>
+    f.store.ingestBatch(
+      [
+        {
+          instance: "instance",
+          stream: "profile",
+          key: "gone",
+          data: op === "delete" ? null : { ...body, id: "gone" },
+          emitted_at: "2026-01-02T00:00:00.000Z",
+          op,
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "profile-source", generation: 1 },
+    );
+  gone(b, "upsert");
+  gone(b, "delete");
+  expect(
+    b.db
+      .prepare("SELECT deleted FROM pdpp_records WHERE record_key = 'gone'")
+      .get(),
+  ).toEqual({ deleted: 1 });
+  const one = await openLegacyAccess(a.options);
+  const two = await openLegacyAccess(b.options);
+  const first = (await collect(one.sources()))[0] as ImportSource;
+  const second = (await collect(two.sources()))[0] as ImportSource;
+  expect(first.revision).not.toBe(second.revision);
+});

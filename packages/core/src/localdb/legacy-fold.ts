@@ -36,7 +36,15 @@ import { QuarantinedRow, isQuarantinedRow } from "./legacy-quarantine.js";
  *   second row for a key within one layer is counted as `duplicate_key`; the
  *   first stands.
  *
- * Memory: the key hashes (and deleted record keys) of the layers read so far.
+ * Identity is the legacy record key (`computeRecordKeyFromData`), the key the
+ * database keeps a row under, never the typed key hash: `{id: 42}` and
+ * `{id: "42"}` are one key, and the newest layer's row stands.
+ *
+ * Every row or deletion the fold leaves out is counted by reason in the row
+ * pass (`records()`), a malformed deletion as `deletion_<reason>`; a host that
+ * reads only `records()` loses no count.
+ *
+ * Memory: the record keys (and deleted record keys) of the layers read so far.
  * No body is kept; each traversal reads the layers again.
  */
 export interface FoldLayer {
@@ -96,9 +104,10 @@ async function deletedKey(
   const claimed = await classifyImportKey(claim, primaryKey);
   if ("quarantine" in claimed) return new QuarantinedRow(claimed.quarantine);
   const held = await classifyImportKey(payload, primaryKey);
-  if ("quarantine" in held) return { id: claimed.key.pk_hash, record: claim };
+  if ("quarantine" in held)
+    return { id: claimed.key.record_key, record: claim };
   return held.key.record_key === claimed.key.record_key
-    ? { id: held.key.pk_hash, record: payload }
+    ? { id: held.key.record_key, record: payload }
     : new QuarantinedRow("record_key_mismatch");
 }
 
@@ -116,7 +125,7 @@ export function foldLayers(
     for (const layer of layers) {
       const own = new Set<string>();
       const deleted = new Set<string>();
-      // Deletions the layer's own envelopes declare, by key hash. They are
+      // Deletions the layer's own envelopes declare, by record key. They are
       // applied after its rows, so a live row of the layer outranks them.
       const declared = new Map<string, unknown>();
       for await (const record of layer.records()) {
@@ -127,7 +136,10 @@ export function foldLayers(
             decoded.claim,
             primaryKey,
           );
-          if (isQuarantinedRow(named)) yield { deletion: named };
+          // A malformed deletion is counted in the row pass, by its own reason,
+          // so every consumer of `records()` sees it once.
+          if (isQuarantinedRow(named))
+            yield { row: new QuarantinedRow(`deletion_${named.reason}`) };
           else if (!declared.has(named.id))
             declared.set(named.id, named.record);
           continue;
@@ -140,7 +152,9 @@ export function foldLayers(
           yield { row: new QuarantinedRow(classified.quarantine) };
           continue;
         }
-        const { pk_hash: id, record_key: recordKey } = classified.row;
+        // The legacy record key is the identity the database keeps a row
+        // under: `{id: 42}` and `{id: "42"}` are one key, not two.
+        const id = classified.row.record_key;
         const decided = taken.get(id);
         if (decided !== undefined) {
           yield {
@@ -150,7 +164,7 @@ export function foldLayers(
           };
           continue;
         }
-        if (deletedByKey.has(recordKey)) {
+        if (deletedByKey.has(id)) {
           // A newer layer deleted this key and holds no version of it: leave
           // the row out, and tombstone the key so another copy cannot return it.
           taken.set(id, false);
@@ -178,10 +192,10 @@ export function foldLayers(
         for await (const record of layer.deletions()) {
           const key = await classifyImportKey(record, primaryKey);
           if ("quarantine" in key) {
-            yield { deletion: new QuarantinedRow(key.quarantine) };
+            yield { row: new QuarantinedRow(`deletion_${key.quarantine}`) };
             continue;
           }
-          const id = key.key.pk_hash;
+          const id = key.key.record_key;
           if (own.has(id) || taken.has(id) || deleted.has(id)) continue;
           deleted.add(id);
           yield { deletion: record };

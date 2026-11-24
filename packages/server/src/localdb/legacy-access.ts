@@ -198,6 +198,30 @@ export async function openLegacyAccess(
       releaseReadPages();
     }
   }
+  // Deletion keys are content too: a tombstone in a newer instance changes
+  // what the merge imports while the live rows stay the same. A store with no
+  // tombstone hashes as before.
+  const firstDeletedKey = prepare(
+    `SELECT instance,stream,record_key FROM ${recordKeyScan} WHERE deleted = 1 ORDER BY instance,stream,record_key LIMIT 1`,
+  );
+  const nextDeletedKey = prepare(
+    `SELECT instance,stream,record_key FROM ${recordKeyScan} WHERE deleted = 1 AND (instance,stream,record_key) > (?,?,?) ORDER BY instance,stream,record_key LIMIT 1`,
+  );
+  let priorDeleted: [string, string, string] | null = null;
+  let hashedDeleted = 0;
+  for (;;) {
+    const row = (
+      priorDeleted ? nextDeletedKey.get(...priorDeleted) : firstDeletedKey.get()
+    ) as { instance: string; stream: string; record_key: string } | undefined;
+    if (!row) break;
+    if (!priorDeleted) frame("deleted-keys");
+    frame([row.instance, row.stream, row.record_key]);
+    priorDeleted = [row.instance, row.stream, row.record_key];
+    if (++hashedDeleted % 128 === 0) {
+      await authorized();
+      releaseReadPages();
+    }
+  }
   releaseReadPages();
   const revision = hash.digest("hex");
   const reader: CanonicalImportPageReader = {
