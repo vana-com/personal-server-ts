@@ -1239,6 +1239,53 @@ describe("waitForChange with since", () => {
     },
   );
 
+  it("a changed epoch with no readable delta still reaches the caller, which builds the reset (mutation: delta checked before epoch)", async () => {
+    const held = "11111111-1111-4111-8111-111111111111";
+    const next = "22222222-2222-4222-8222-222222222222";
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: owner,
+      fetch: (async () =>
+        new Response(
+          JSON.stringify({ seq: "5", changed: true, epoch: next }),
+        )) as typeof fetch,
+    });
+    const answer = await registry.waitForChange!(
+      "3",
+      25_000,
+      new AbortController().signal,
+      "3",
+      held,
+    );
+    expect(answer).toEqual({ seq: "5", changed: true, epoch: next });
+  });
+
+  it("the same epoch with a malformed delta still fails the request", async () => {
+    const held = "11111111-1111-4111-8111-111111111111";
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test/",
+      ownerAddress: owner,
+      fetch: (async () =>
+        new Response(
+          JSON.stringify({
+            seq: "5",
+            changed: true,
+            epoch: held,
+            delta: "garbage",
+          }),
+        )) as typeof fetch,
+    });
+    await expect(
+      registry.waitForChange!(
+        "3",
+        25_000,
+        new AbortController().signal,
+        "3",
+        held,
+      ),
+    ).rejects.toThrow(/delta/);
+  });
+
   it("an unchanged answer carries no delta", async () => {
     const { wait } = answering({
       seq: "3",

@@ -707,6 +707,17 @@ export function createGatewayStreamSyncRegistry(
       if (!body.changed || since === undefined)
         return { seq: body.seq, changed: body.changed, ...answered };
       const delta = parseDelta(body.delta, since, body.seq);
+      // An epoch other than the one the caller sent is a reset the caller
+      // builds itself: its `since` means nothing in the new epoch, so no delta
+      // is needed, and a missing or unreadable one must not hide the epoch (the
+      // retry would send the stale epoch again). Any other answer stays strict.
+      if (
+        delta === undefined &&
+        epoch !== undefined &&
+        answered.epoch !== undefined &&
+        answered.epoch !== epoch
+      )
+        return { seq: body.seq, changed: true, ...answered };
       if (delta === undefined)
         throw new Error(
           `registry change answer has no readable delta for since=${since}`,
