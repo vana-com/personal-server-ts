@@ -799,6 +799,34 @@ describe("agent HTTP server", () => {
     expect(body.secretHash).toMatch(/^0x[0-9a-f]{64}$/);
   });
 
+  it("classifies stale delivery as a stable bad-request diagnostic", async () => {
+    const { StaleDelivery } = await import("./errors.js");
+    const error = new StaleDelivery();
+    expect({
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    }).toEqual({
+      status: 400,
+      code: "STALE_DELIVERY",
+      message: "Delivery timestamp is stale",
+    });
+  });
+
+  it("distinguishes invalid delivery from a stale timestamp", async () => {
+    const { DeliveryInvalid } = await import("./errors.js");
+    const error = new DeliveryInvalid();
+    expect({
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    }).toEqual({
+      status: 400,
+      code: "DELIVERY_INVALID",
+      message: "Delivery is invalid",
+    });
+  });
+
   it("maps a retired epoch to 409", async () => {
     const { request } = await sealRequest();
     const response = await post(SEAL_PATH, {
