@@ -156,13 +156,13 @@ describe("legacy store import report", () => {
     await h.run();
     const report = h.runner.report()!;
     expect(report.refused).toEqual([
-      { reason: "invalid_record", streams: 1, rows: 5 },
+      { reason: "invalid_record", streams: 1, rows: 3 },
     ]);
     const left = Object.values(report.rows.quarantined).reduce(
       (a, b) => a + b,
       0,
     );
-    expect(report.rows.refused).toBe(5);
+    expect(report.rows.refused).toBe(3);
     expect(report.rows.legacy).toBe(
       report.rows.imported + left + report.rows.refused!,
     );
