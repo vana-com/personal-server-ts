@@ -295,7 +295,8 @@ export function createConnectionDeleter(
   let sweepOwed = owesErasure;
   /**
    * What the last pass here judged of each connector's delete. Dropped when a
-   * delete of the connector starts: the pass that follows judges it again.
+   * delete of the connector starts or is adopted (`newLifetime`): the pass
+   * that follows judges it again.
    */
   const judged = new Map<
     string,
@@ -305,6 +306,18 @@ export function createConnectionDeleter(
       rolledBack?: true;
     }
   >();
+  /**
+   * The delete a connector's cached verdict belongs to. A pass reads the
+   * number when it starts and may only write its verdict under that number: a
+   * pass that began before a newer delete was started or adopted says nothing
+   * of the newer one.
+   */
+  const lifetimes = new Map<string, number>();
+  const lifetimeOf = (connector: string) => lifetimes.get(connector) ?? 0;
+  function newLifetime(connector: string) {
+    lifetimes.set(connector, lifetimeOf(connector) + 1);
+    judged.delete(connector);
+  }
   /**
    * The control rows the plan listed, by delete id, then by scope. Only a
    * delete this process just planned has one; the landing takes it. Each
@@ -724,6 +737,8 @@ export function createConnectionDeleter(
    * that is news from while the pass runs, and this does not touch it.
    */
   async function eraseSettled(connector: string, owed: Owed): Promise<Owed> {
+    const lifetime = lifetimeOf(connector);
+    const judge = (part: JudgedPart) => judgeFor(connector, lifetime, part);
     try {
       if (stop.signal.aborted) return NONE;
       const skipNamespaces = await unsettledNamespaces(connector);
@@ -735,7 +750,7 @@ export function createConnectionDeleter(
       if (options.legacy && owed.legacy) {
         const legacy = options.legacy();
         if (!legacy) {
-          judge(connector, { legacy: blocked("needs_another_device") });
+          judge({ legacy: blocked("needs_another_device") });
         } else {
           let refused = refusals.get(connector);
           if (!refused) refusals.set(connector, (refused = new Map()));
@@ -745,7 +760,7 @@ export function createConnectionDeleter(
             connector,
             stop.signal,
           );
-          judge(connector, {
+          judge({
             legacy: outcome.part,
             ...(outcome.rolledBack && { rolledBack: true as const }),
           });
@@ -756,9 +771,9 @@ export function createConnectionDeleter(
       const report = await options.eraseLogs(connector, stop.signal, {
         skipNamespaces,
       });
-      judge(connector, { storage: storagePartOf(report) });
+      judge({ storage: storagePartOf(report) });
       if (report.connections.some((c) => isRolledBack(c.outcome)))
-        judge(connector, { rolledBack: true });
+        judge({ rolledBack: true });
       return { ...left, storage: report.pending };
     } catch (error) {
       // The eraser reports a failure as pending; this is its own bug or a
@@ -773,14 +788,14 @@ export function createConnectionDeleter(
       return owed;
     }
   }
-  function judge(
-    connector: string,
-    part: {
-      legacy?: DeletePart;
-      storage?: DeletePart;
-      rolledBack?: true;
-    },
-  ) {
+  interface JudgedPart {
+    legacy?: DeletePart;
+    storage?: DeletePart;
+    rolledBack?: true;
+  }
+  /** Keeps a verdict only if the delete it judged is still the connector's newest. */
+  function judgeFor(connector: string, lifetime: number, part: JudgedPart) {
+    if (lifetime !== lifetimeOf(connector)) return;
     judged.set(connector, { ...judged.get(connector), ...part });
   }
   /**
@@ -898,7 +913,7 @@ export function createConnectionDeleter(
       "purge",
       async () => {
         // A new delete: what an earlier pass judged says nothing of it.
-        judged.delete(connector);
+        newLifetime(connector);
         refusals.delete(connector);
         const decide = async (
           planned: Awaited<ReturnType<typeof plan>>,
@@ -1014,6 +1029,10 @@ export function createConnectionDeleter(
     deleteStatus,
     /** A connection of the connector was purged here: its erasure may be owed. */
     noteSettled(connector: string) {
+      // A settled delete is news: what a pass judged before it was another
+      // delete's verdict (the connection may have been added and deleted
+      // again), so the part reads pending until a pass judges this one.
+      newLifetime(connector);
       if (owesErasure) owe(connector);
       // News of this connector: a gateway answer given earlier may differ now.
       refusals.delete(connector);

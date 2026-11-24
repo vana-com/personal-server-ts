@@ -644,6 +644,72 @@ describe("erasure wired into the connection delete", () => {
       expect(deleter.erasureOwed()).toBe(false);
     });
 
+    it("reads a newer delete of the connector as pending until its own pass has judged it, not done on the older delete's verdict", async () => {
+      const a = await settled();
+      let release: () => void = () => {};
+      const eraseLogs = vi
+        .fn()
+        .mockResolvedValueOnce(none)
+        .mockImplementationOnce(
+          () => new Promise((resolve) => (release = () => resolve(none))),
+        );
+      const deleter = createConnectionDeleter(a.deps, { eraseLogs });
+      // Delete 1 is adopted and judged done.
+      deleter.noteSettled(CONNECTOR);
+      await deleter.resumeErasures();
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "done",
+      });
+
+      // The connection was added again and deleted again elsewhere; this
+      // device adopts delete 2. Nothing has judged it yet.
+      deleter.noteSettled(CONNECTOR);
+      const second = deleter.resumeErasures();
+      await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(2));
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "pending",
+      });
+
+      release();
+      await second;
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "done",
+      });
+    });
+
+    it("does not take a pass that began before a newer delete was adopted as that delete's verdict", async () => {
+      const a = await settled();
+      let releaseFirst: () => void = () => {};
+      let releaseSecond: () => void = () => {};
+      const eraseLogs = vi
+        .fn()
+        .mockImplementationOnce(
+          () => new Promise((resolve) => (releaseFirst = () => resolve(none))),
+        )
+        .mockImplementationOnce(
+          () => new Promise((resolve) => (releaseSecond = () => resolve(none))),
+        );
+      const deleter = createConnectionDeleter(a.deps, { eraseLogs });
+      deleter.noteSettled(CONNECTOR);
+      const first = deleter.resumeErasures();
+      await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(1));
+
+      // Delete 2 is adopted while delete 1's pass runs; that pass then ends.
+      deleter.noteSettled(CONNECTOR);
+      const second = deleter.resumeErasures();
+      releaseFirst();
+      await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(2));
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "pending",
+      });
+
+      releaseSecond();
+      await Promise.all([first, second]);
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "done",
+      });
+    });
+
     it("a retry that finds a pass running waits for it and reports what it leaves unfinished", async () => {
       const a = await settled();
       let release: () => void = () => {};
