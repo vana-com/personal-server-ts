@@ -115,39 +115,19 @@ export function failedRowStatement(
 }
 
 /**
- * The streams this attempt marked failed, kept by the error it throws. A
- * report of the attempt reads them from the error, not from `stream_partial`,
- * where rows of earlier attempts also sit.
+ * The streams one apply attempt marked failed, with the reason of each. The
+ * attempt owns it (`LocalSyncDeps.attemptFailures`); nothing outlives it.
  */
-const markedByError = new WeakMap<object, Map<string, string>>();
+export type AttemptFailures = Map<string, string>;
 
-/** Say that the attempt throwing `error` marked `streams` failed for `code`. */
+/** Say that this attempt marked `streams` failed for `code`. */
 export function noteMarkedFailed(
-  error: unknown,
+  into: AttemptFailures | undefined,
   streams: Iterable<string>,
   code: string,
 ): void {
-  if (typeof error !== "object" || error === null) return;
-  const marked = markedByError.get(error) ?? new Map<string, string>();
-  for (const stream of streams) marked.set(stream, code);
-  markedByError.set(error, marked);
-}
-
-/** The streams the attempt that threw `error` marked failed, with the reason of each. */
-export function markedFailedBy(
-  error: unknown,
-): readonly { readonly stream: string; readonly reason: string }[] {
-  const marked =
-    typeof error === "object" && error !== null
-      ? markedByError.get(error)
-      : undefined;
-  return marked
-    ? [...marked]
-        .map(([stream, reason]) => ({ stream, reason }))
-        .sort((a, b) =>
-          a.stream < b.stream ? -1 : a.stream > b.stream ? 1 : 0,
-        )
-    : [];
+  if (!into) return;
+  for (const stream of streams) into.set(stream, code);
 }
 
 /** Rows a statement binds at most; SQLite 3.22 allows 999 variables. */

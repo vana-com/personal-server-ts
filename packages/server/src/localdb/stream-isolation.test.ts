@@ -150,3 +150,40 @@ describe("a retry that fails before it reaches the failed streams", () => {
     expect(retry.failedStreams).toBeUndefined();
   });
 });
+
+describe("one error object that an adapter rejects several calls with", () => {
+  it("does not hand a later attempt the streams an earlier attempt marked", async () => {
+    const w = await world({ streams: 2 });
+    const peer = await w.device("peer");
+    await peer.run("run-1", records("a"));
+    await peer.cycle();
+    await peer.run("run-2", [{ stream: sName(0), id: "late" }], {
+      full: false,
+      covered: [sName(0)],
+    });
+    await peer.cycle();
+    const shared = new Error("storage rejected the read");
+    let phase: "marking" | "early" | "off" = "marking";
+    let gets = 0;
+    const here = await w.device("here", {
+      progressiveFirstLoad: true,
+      beforeGet: async () => {
+        if (phase === "off") return;
+        // The first attempt fails after its load began, so it marks streams.
+        if (phase === "marking" && ++gets < 2) return;
+        throw shared;
+      },
+    });
+    const of = (report: Awaited<ReturnType<typeof here.sync.cycle>>) =>
+      report.connections.find((c) => c.connectionId === CONNECTION_ID)!;
+    const first = of(await here.sync.cycle());
+    expect(first.status).toBe("degraded");
+
+    // The same object again, now before this attempt reaches any stream.
+    phase = "early";
+    const second = of(await here.sync.cycle());
+    expect(second.error).toBe(first.error);
+    expect(second.status).toBeUndefined();
+    expect(second.failedStreams).toBeUndefined();
+  });
+});

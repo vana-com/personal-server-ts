@@ -478,7 +478,7 @@ async function runBootstrap(input: {
       await deps.db.batch(statements).then(
         () => {
           noteMarkedFailed(
-            error,
+            deps.attemptFailures,
             stopped.map((row) => row.stream),
             error instanceof FalseRemovalFact
               ? "invalid_segment"

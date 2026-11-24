@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import {
   bootstrapConnections,
+  connectionsWithStreams,
   knownActiveConnections,
   newConnectionsWithStreams,
 } from "../../../core/src/localdb/bootstrap.js";
@@ -19,6 +20,7 @@ import { connectionQueue } from "../../../core/src/localdb/queue.js";
 
 vi.mock("../../../core/src/localdb/bootstrap.js", () => ({
   bootstrapConnections: vi.fn(),
+  connectionsWithStreams: vi.fn(),
   knownActiveConnections: vi.fn(),
   newConnectionsWithStreams: vi.fn(),
 }));
@@ -63,9 +65,33 @@ beforeEach(() => {
   // No connection here is known to the device before the listing.
   vi.mocked(knownActiveConnections).mockResolvedValue([]);
   vi.mocked(newConnectionsWithStreams).mockResolvedValue([]);
+  vi.mocked(connectionsWithStreams).mockResolvedValue([]);
 });
 
 describe("local database cycle", () => {
+  it("reports a fresh sibling's dropped deferral as failed when the fallback listing fails", async () => {
+    const deps = dependencies();
+    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
+      new Error("listing unreachable"),
+    );
+    vi.mocked(knownActiveConnections).mockResolvedValue([connection("own")]);
+    vi.mocked(newConnectionsWithStreams).mockResolvedValue([
+      connection("sibling"),
+    ]);
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) =>
+      id === "own"
+        ? published(id)
+        : [{ stream: id, outcome: "deferred" as const, watermark: 1 }],
+    );
+    const report = await runPublish(deps, ["own"]);
+    const byId = new Map(report.connections.map((c) => [c.connectionId, c]));
+    expect(byId.get("own")).toMatchObject({
+      error: null,
+      published: published("own"),
+    });
+    expect(byId.get("sibling")?.error).toMatch(/listing unreachable/);
+  });
+
   it("lets a bootstrap failure propagate when a sibling forced the fallback", async () => {
     const deps = dependencies();
     vi.mocked(knownActiveConnections).mockResolvedValue([

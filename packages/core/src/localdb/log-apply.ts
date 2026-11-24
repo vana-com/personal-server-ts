@@ -782,7 +782,7 @@ async function listKeyedLoad(
         .then(
           () => {
             noteMarkedFailed(
-              error,
+              deps.attemptFailures,
               identities.map((identity) => identity.stream),
               code,
             );
@@ -1006,7 +1006,7 @@ async function loadProgressively(
         .then(
           () => {
             noteMarkedFailed(
-              error,
+              deps.attemptFailures,
               stopped.map((identity) => identity.stream),
               failureCode(error),
             );
@@ -1270,7 +1270,7 @@ async function loadProgressively(
         .then(
           () => {
             noteMarkedFailed(
-              error,
+              deps.attemptFailures,
               stopped.map((identity) => identity.stream),
               code,
             );
