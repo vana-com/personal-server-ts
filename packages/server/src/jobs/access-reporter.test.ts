@@ -147,6 +147,39 @@ describe("access reporter batching", () => {
     );
   });
 
+  it("continues sending after a refused batch's warning sink throws", async () => {
+    const send = okFetch().mockResolvedValueOnce(
+      new Response(null, { status: 400 }),
+    );
+    const warn = vi.fn(() => {
+      throw new Error("warning sink unavailable");
+    });
+    const fallback = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    try {
+      const { instance } = reporter(send as unknown as typeof fetch, warn);
+      await instance.report(event(1));
+      await expect(instance.flush()).resolves.toBeUndefined();
+
+      await instance.report(event(2));
+      await expect(instance.stop()).resolves.toBeUndefined();
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(logIdsOf(send.mock.calls[1])).toEqual(["log-2"]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(fallback).toHaveBeenCalledWith(
+        ACCESS_RECORDS_DROPPED,
+        expect.objectContaining({
+          count: 1,
+          droppedTotal: 1,
+          reason: "refused_400",
+        }),
+      );
+    } finally {
+      fallback.mockRestore();
+    }
+  });
+
   it("drops only the record a 400 names and resends the rest", async () => {
     const send = vi.fn(async () =>
       send.mock.calls.length === 1
