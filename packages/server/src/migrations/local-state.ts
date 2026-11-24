@@ -110,8 +110,9 @@ async function migrateSyncCursor(
   try {
     const raw = await readFile(configPath, "utf-8");
     const parsed = JSON.parse(raw) as LegacyConfigShape;
-    if (typeof parsed.sync?.lastProcessedTimestamp === "string") {
-      legacyTimestamp = parsed.sync.lastProcessedTimestamp;
+    const timestamp = parsed.sync?.lastProcessedTimestamp;
+    if (typeof timestamp === "string" && timestamp.trim().length > 0) {
+      legacyTimestamp = timestamp;
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
