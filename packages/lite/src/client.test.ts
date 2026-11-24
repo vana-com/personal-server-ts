@@ -189,6 +189,40 @@ describe("startPersonalServer lite handle", () => {
     });
   });
 
+  it.each([undefined, "1024", 0, -1, null])(
+    "rejects an invalid negotiated scope upload batch limit (%s)",
+    async (maxBatchBytes) => {
+      const gateway = createGateway();
+      const runtime = createRuntime(gateway);
+      const ps = await startPersonalServer({
+        runtime: {
+          ...runtime,
+          async fetch(request) {
+            if (
+              request.method === "POST" &&
+              new URL(request.url).pathname === "/v1/data/notes.entries/uploads"
+            ) {
+              return Response.json({
+                uploadId: "fixture-upload",
+                collectedAt: "2026-01-01T00:00:00Z",
+                maxBatchBytes,
+              });
+            }
+            return runtime.fetch(request);
+          },
+        },
+        relay: false,
+        localOrigin: ORIGIN,
+        gateway,
+      });
+      await expect(
+        ps.openScopeUpload!("notes.entries", {
+          signMessage: ownerWallet.signMessage,
+        }),
+      ).rejects.toThrow("expected a positive maxBatchBytes");
+    },
+  );
+
   it("posts data with owner Web3Signed auth", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({
