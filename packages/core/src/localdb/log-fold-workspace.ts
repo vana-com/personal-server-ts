@@ -23,13 +23,17 @@
 // carries a body forward has no use for its bytes, and its hash is in the
 // reference.
 //
-// Strings compare as bytes in SQLite and as UTF-16 units in JavaScript. They
-// agree on stream names, key hashes and run ids (ASCII); `foldLog` and the
-// workspace are tested against each other on such input.
+// Strings compare as UTF-8 bytes in SQLite and as UTF-16 code units in
+// JavaScript; they disagree for U+E000..U+FFFF against a supplementary
+// character, and TEXT cannot hold a lone surrogate. A stream name and a run
+// id are stored as BLOBs of their UTF-16BE code units, whose `memcmp` order is
+// the order of code units. Key hashes and body hashes are ASCII hex and stay
+// TEXT. `foldLog` and the workspace are tested against each other on names
+// where the two orders differ.
 //
-// The rows are scratch of one operation, keyed by connection and purpose. The
-// operation empties them when it is done; a crash leaves rows that the next
-// operation of the same purpose deletes before it starts.
+// The rows are scratch of one operation, keyed by connection and purpose
+// (`log-scratch.ts`). The operation empties them when it is done; the table
+// is created again on every open, and a purge deletes the connection's rows.
 
 import {
   followMeta,
@@ -44,15 +48,12 @@ import {
   type WireOperation,
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { rowsWithin, SIZE_ROWS } from "./byte-pages.js";
 import type { SqlDriver, SqlStatement } from "./driver.js";
+import { FOLD_CELLS } from "./log-scratch.js";
 
-/** What one page of folded entries holds, about: the bodies' JSON length. */
-const PAGE_BYTES = 2 * 1024 * 1024;
 /** Operations written per batch: a bound on a batch, not on the history. */
 const OPS_PER_BATCH = 200;
-/** Rows of the first page, before a row's size is known. */
-const FIRST_PAGE_ROWS = 32;
-const MAX_PAGE_ROWS = 2048;
 
 export interface FoldWorkspace {
   /** Fold a snapshot part in. Parts go in the order the pointer lists them, before any segment. */
@@ -62,8 +63,9 @@ export interface FoldWorkspace {
   /** The stream metas of everything added, as `foldLog` returns them. */
   streams(): LogStreamMeta[];
   /**
-   * The folded entries in (stream, pkHash) order, a page at a time: pages
-   * hold about `PAGE_BYTES` of bodies, or one entry.
+   * The folded entries in (stream, pkHash) order, a page at a time: the
+   * rows of a page hold at most `PAGE_BYTES` of bodies and keys (by the sizes
+   * the cells keep), or one cell.
    */
   pages(): AsyncGenerator<WireEntry[], void, void>;
   /** Delete the workspace's rows. */
@@ -71,19 +73,57 @@ export interface FoldWorkspace {
 }
 
 type CellRow = {
-  stream: string;
+  stream: Uint8Array;
   pk_hash: string;
   up_o: number | null;
-  up_r: string | null;
+  up_r: Uint8Array | null;
   up_ordinal: number | null;
   up_first_seen: number | null;
   up_ref: number | null;
   up_body: string | null;
   del_o: number | null;
-  del_r: string | null;
+  del_r: Uint8Array | null;
   del_explicit: number | null;
   del_key: string | null;
 };
+
+/** A string as the bytes of its UTF-16BE code units, lone surrogates kept: byte order is code-unit order. */
+export function utf16Key(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length * 2);
+  for (let i = 0; i < value.length; i++) {
+    const unit = value.charCodeAt(i);
+    bytes[2 * i] = unit >> 8;
+    bytes[2 * i + 1] = unit & 0xff;
+  }
+  return bytes;
+}
+
+function fromUtf16Key(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i + 1 < bytes.length; i += 2)
+    out += String.fromCharCode((bytes[i]! << 8) | bytes[i + 1]!);
+  return out;
+}
+
+/** The bytes `value` takes as UTF-8, the unit SQLite's `LENGTH(CAST(x AS BLOB))` counts. */
+function utf8Length(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const unit = value.charCodeAt(i);
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (
+      unit >= 0xd800 &&
+      unit <= 0xdbff &&
+      i + 1 < value.length &&
+      (value.charCodeAt(i + 1) & 0xfc00) === 0xdc00
+    ) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
 
 export async function openFoldWorkspace(
   db: Pick<SqlDriver, "batch" | "query">,
@@ -94,7 +134,7 @@ export async function openFoldWorkspace(
   const clear = () =>
     db.batch([
       {
-        sql: "DELETE FROM log_fold_cells WHERE connection_id = ? AND workspace = ?",
+        sql: `DELETE FROM ${FOLD_CELLS} WHERE connection_id = ? AND workspace = ?`,
         params: mine,
       },
     ]);
@@ -104,9 +144,9 @@ export async function openFoldWorkspace(
     metas.set(meta.stream, followMeta(metas.get(meta.stream), meta));
 
   const cell = (stream: string, pk: string): SqlStatement => ({
-    sql: `INSERT OR IGNORE INTO log_fold_cells(connection_id, workspace, stream, pk_hash)
+    sql: `INSERT OR IGNORE INTO ${FOLD_CELLS}(connection_id, workspace, stream, pk_hash)
           VALUES (?, ?, ?, ?)`,
-    params: [...mine, stream, pk],
+    params: [...mine, utf16Key(stream), pk],
   });
   const where =
     "connection_id = ? AND workspace = ? AND stream = ? AND pk_hash = ?";
@@ -118,28 +158,31 @@ export async function openFoldWorkspace(
       byRef ? op.body.sha256 : upsertBodyHash(op.value)
     ).toLowerCase();
     const ordinal = op.ordinal ?? null;
+    const body = JSON.stringify(byRef ? op.body : op.value);
+    const run = utf16Key(op.stamp.r);
     return [
       cell(op.stream, op.pkHash),
       {
-        sql: `UPDATE log_fold_cells
+        sql: `UPDATE ${FOLD_CELLS}
                  SET up_o = ?, up_r = ?, up_ordinal = ?, up_hash = ?,
-                     up_first_seen = ?, up_ref = ?, up_body = ?
+                     up_first_seen = ?, up_ref = ?, up_bytes = ?, up_body = ?
                WHERE ${where}
                  AND (up_o IS NULL
                       OR (?, ?, ?, ?) > (up_o, up_r, COALESCE(up_ordinal, 0), up_hash))`,
         params: [
           op.stamp.o,
-          op.stamp.r,
+          run,
           ordinal,
           hash,
           op.firstSeen,
           byRef ? 1 : 0,
-          JSON.stringify(byRef ? op.body : op.value),
+          utf8Length(body),
+          body,
           ...mine,
-          op.stream,
+          utf16Key(op.stream),
           op.pkHash,
           op.stamp.o,
-          op.stamp.r,
+          run,
           ordinal ?? 0,
           hash,
         ],
@@ -152,27 +195,32 @@ export async function openFoldWorkspace(
     stamp: { o: number; r: string },
     explicit: boolean,
     key: LogKey,
-  ): SqlStatement[] => [
-    cell(stream, pk),
-    {
-      sql: `UPDATE log_fold_cells
-               SET del_o = ?, del_r = ?, del_explicit = ?, del_key = ?
-             WHERE ${where}
-               AND (del_o IS NULL OR (?, ?, ?) > (del_o, del_r, del_explicit))`,
-      params: [
-        stamp.o,
-        stamp.r,
-        explicit ? 1 : 0,
-        JSON.stringify(key),
-        ...mine,
-        stream,
-        pk,
-        stamp.o,
-        stamp.r,
-        explicit ? 1 : 0,
-      ],
-    },
-  ];
+  ): SqlStatement[] => {
+    const run = utf16Key(stamp.r);
+    const body = JSON.stringify(key);
+    return [
+      cell(stream, pk),
+      {
+        sql: `UPDATE ${FOLD_CELLS}
+                 SET del_o = ?, del_r = ?, del_explicit = ?, del_bytes = ?, del_key = ?
+               WHERE ${where}
+                 AND (del_o IS NULL OR (?, ?, ?) > (del_o, del_r, del_explicit))`,
+        params: [
+          stamp.o,
+          run,
+          explicit ? 1 : 0,
+          utf8Length(body),
+          body,
+          ...mine,
+          utf16Key(stream),
+          pk,
+          stamp.o,
+          run,
+          explicit ? 1 : 0,
+        ],
+      },
+    ];
+  };
 
   /** The statements of `ops`, written `OPS_PER_BATCH` operations at a time. */
   const write = async (statements: Iterable<SqlStatement[]>) => {
@@ -227,38 +275,38 @@ export async function openFoldWorkspace(
         a.stream < b.stream ? -1 : a.stream > b.stream ? 1 : 0,
       ),
     async *pages() {
-      let after: readonly [string, string] | null = null;
-      let rows = FIRST_PAGE_ROWS;
+      let after: readonly [Uint8Array, string] | null = null;
+      const range = () =>
+        `connection_id = ? AND workspace = ?${
+          after ? " AND (stream, pk_hash) > (?, ?)" : ""
+        }`;
       for (;;) {
-        const page: CellRow[] = await db.query<CellRow>(
-          `SELECT stream, pk_hash, up_o, up_r, up_ordinal, up_first_seen, up_ref, up_body,
-                  del_o, del_r, del_explicit, del_key
-             FROM log_fold_cells
-            WHERE connection_id = ? AND workspace = ?${
-              after ? " AND (stream, pk_hash) > (?, ?)" : ""
-            }
-            ORDER BY stream, pk_hash LIMIT ${rows}`,
-          after ? [...mine, ...after] : [...mine],
+        const params = after ? [...mine, ...after] : [...mine];
+        // The sizes of the next cells first (small rows: they come before the
+        // bodies in a row), then the longest run of them that fits the budget.
+        const sizes: { n: number }[] = await db.query<{ n: number }>(
+          `SELECT COALESCE(up_bytes, 0) + COALESCE(del_bytes, 0) AS n
+             FROM ${FOLD_CELLS} WHERE ${range()}
+            ORDER BY stream, pk_hash LIMIT ${SIZE_ROWS}`,
+          params,
         );
-        if (page.length === 0) return;
-        const entries: WireEntry[] = [];
-        let bytes = 0;
-        for (const row of page) {
-          bytes +=
-            (row.up_body?.length ?? 0) + (row.del_key?.length ?? 0) + 100;
-          entries.push(...entriesOf(row));
-        }
-        yield entries;
-        if (page.length < rows) return;
+        if (sizes.length === 0) return;
+        const take = rowsWithin(sizes.map((row) => Number(row.n)));
+        const page: CellRow[] = await db.query<CellRow>(
+          `SELECT stream, pk_hash, up_o, up_r, up_ordinal, up_first_seen, up_ref,
+                  del_o, del_r, del_explicit, up_body, del_key
+             FROM ${FOLD_CELLS} WHERE ${range()}
+            ORDER BY stream, pk_hash LIMIT ${take}`,
+          params,
+        );
+        yield page.flatMap(entriesOf);
+        if (
+          page.length < take ||
+          (take === sizes.length && sizes.length < SIZE_ROWS)
+        )
+          return;
         const last = page[page.length - 1]!;
         after = [last.stream, last.pk_hash];
-        rows = Math.max(
-          1,
-          Math.min(
-            MAX_PAGE_ROWS,
-            Math.floor(PAGE_BYTES / (bytes / page.length)),
-          ),
-        );
       }
     },
     close: async () => {
@@ -268,11 +316,12 @@ export async function openFoldWorkspace(
 }
 
 function entriesOf(row: CellRow): WireEntry[] {
+  const stream = fromUtf16Key(row.stream);
   const upsert =
     row.up_o === null
       ? null
       : {
-          stamp: { o: row.up_o, r: row.up_r! },
+          stamp: { o: row.up_o, r: fromUtf16Key(row.up_r!) },
           ...(row.up_ordinal === null ? {} : { ordinal: row.up_ordinal }),
           firstSeen: row.up_first_seen,
           ...(row.up_ref === 1
@@ -289,14 +338,9 @@ function entriesOf(row: CellRow): WireEntry[] {
     row.del_o === null
       ? null
       : {
-          stamp: { o: row.del_o, r: row.del_r! },
+          stamp: { o: row.del_o, r: fromUtf16Key(row.del_r!) },
           explicit: row.del_explicit === 1,
           key: JSON.parse(row.del_key!) as LogKey,
         };
-  return foldCellEntries(
-    row.stream,
-    row.pk_hash,
-    upsert,
-    deletion,
-  ) as WireEntry[];
+  return foldCellEntries(stream, row.pk_hash, upsert, deletion) as WireEntry[];
 }

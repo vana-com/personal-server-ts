@@ -5,6 +5,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createPartitioner,
+  decodeSnapshotPart,
+  encodeSnapshotPart,
   foldLog,
   partitionFold,
   upsertBodyHash,
@@ -65,8 +67,42 @@ const meta = (stream: string, cursor?: number) => ({
   primaryKey: ["id"],
   profile: { key: null, version: "1" },
   complete: true,
-  ...(cursor === undefined ? {} : { cursor: { v: cursor } }),
+  ...(cursor === undefined
+    ? {}
+    : { cursor: { connectorVersion: "1", state: cursor } }),
 });
+
+/** The names a history draws its streams, run ids and key hashes from. */
+interface Names {
+  readonly streams: readonly string[];
+  readonly runs: readonly string[];
+  readonly pkHash: (k: number) => string;
+}
+const ASCII: Names = {
+  streams: ["s0", "s1"],
+  runs: ["a", "b", "c"],
+  pkHash: (k) => `h${String(k).padStart(4, "0")}`,
+};
+/**
+ * Names the wire accepts (a stream is any non-empty string, a run id likewise)
+ * that UTF-8 byte order and UTF-16 order sort differently: U+E000 and U+FFFF
+ * sort before U+10000 and U+1F600 by byte and after them by UTF-16 unit. Lone
+ * surrogates are valid in JSON text and distinct from each other.
+ */
+const WIDE: Names = {
+  streams: [
+    "s\uE000",
+    "s\u{10000}",
+    "s\u{1F600}",
+    "s\uFFFF",
+    "s\uD800",
+    "s\uDFFF",
+    "s",
+  ],
+  runs: ["\uE000", "\u{10000}", "\u{1F600}", "\uFFFF", "a", "\uD800", "\uDFFF"],
+  // A key hash is 64 lowercase hex characters on the wire.
+  pkHash: (k) => k.toString(16).padStart(64, "0"),
+};
 
 interface History {
   readonly segments: Segment<LogOperation>[];
@@ -83,13 +119,14 @@ interface History {
 function history(
   seed: number,
   shape: { keys: number; segments: number; opsPerSegment: number },
+  names: Names = ASCII,
 ): History {
   const r = rng(seed);
-  const streams = ["s0", "s1"];
+  const streams = names.streams;
   const refs = new Map<string, LogBodyRef>();
   const keyOf = (k: number) => ({
-    stream: streams[k % 2]!,
-    pkHash: `h${String(k).padStart(4, "0")}`,
+    stream: streams[k % streams.length]!,
+    pkHash: names.pkHash(k),
     key: [k] as const,
   });
   const segments: Segment<LogOperation>[] = [];
@@ -99,7 +136,7 @@ function history(
     const wireOps: WireOperation[] = [];
     for (let i = 0; i < shape.opsPerSegment; i += 1) {
       const k = keyOf(r.int(shape.keys));
-      const stamp = { o: 1 + r.int(4), r: r.pick(["a", "b", "c"]) };
+      const stamp = { o: 1 + r.int(4), r: r.pick(names.runs) };
       const roll = r.next();
       if (roll < 0.6) {
         const big = r.next() < 0.3;
@@ -209,51 +246,143 @@ async function fold(
   return { entries, streams };
 }
 
+/** The disk fold and `foldLog` on `count` random histories drawn from `names`. */
+async function agreeOnHistories(
+  db: SqlDriver,
+  names: Names,
+  count: number,
+  keys: number,
+) {
+  for (let seed = 1; seed <= count; seed += 1) {
+    const h = history(seed, { keys, segments: 8, opsPerSegment: 6 }, names);
+    // The first segments are an earlier compaction: their fold, in parts.
+    const cut = rng(seed + 9000).int(h.segments.length);
+    const earlier = foldLog({
+      snapshot: [],
+      segments: h.segments.slice(0, cut),
+    });
+    const parts = partitionFold(
+      earlier,
+      { ...CONTEXT, generation: 1, position: cut },
+      120,
+    ).map((p) => ({
+      ...p,
+      // The parts name their bodies the way a compaction did.
+      entries: asWire(p.entries as LogEntry[], h.refs),
+    }));
+    const tail = h.segments.slice(cut);
+    const oracle = foldLog({
+      snapshot: parts.map((p) => ({
+        ...p,
+        entries: p.entries.map((e) =>
+          e.kind === "upsert-ref"
+            ? ({
+                ...e,
+                kind: "upsert" as const,
+                value: valueOf(h, e.body),
+              } as never)
+            : e,
+        ),
+      })) as never,
+      segments: tail,
+    });
+    const mine = await fold(db, {
+      parts,
+      segments: h.wire.slice(cut),
+    });
+    expect(mine.entries, `seed ${seed}`).toEqual(
+      asWire(oracle.entries, h.refs),
+    );
+    expect(mine.streams, `seed ${seed}`).toEqual(oracle.streams);
+  }
+}
+
 describe("the disk fold is foldLog", () => {
   it("agrees on 300 random histories, with a previous snapshot and bodies by reference", async () => {
+    await agreeOnHistories(await database(), ASCII, 300, 8);
+  });
+
+  it("agrees on 300 random histories whose stream names and run ids sort differently by UTF-8 byte and by UTF-16 unit", async () => {
+    await agreeOnHistories(await database(), WIDE, 300, 14);
+  });
+
+  it("emits parts the wire accepts, in the key order a reader checks", async () => {
     const db = await database();
-    for (let seed = 1; seed <= 300; seed += 1) {
-      const h = history(seed, { keys: 8, segments: 8, opsPerSegment: 6 });
-      // The first segments are an earlier compaction: their fold, in parts.
-      const cut = rng(seed + 9000).int(h.segments.length);
-      const earlier = foldLog({
-        snapshot: [],
-        segments: h.segments.slice(0, cut),
-      });
-      const parts = partitionFold(
-        earlier,
-        { ...CONTEXT, generation: 1, position: cut },
-        120,
-      ).map((p) => ({
-        ...p,
-        // The parts name their bodies the way a compaction did.
-        entries: asWire(p.entries as LogEntry[], h.refs),
-      }));
-      const tail = h.segments.slice(cut);
-      const oracle = foldLog({
-        snapshot: parts.map((p) => ({
-          ...p,
-          entries: p.entries.map((e) =>
-            e.kind === "upsert-ref"
-              ? ({
-                  ...e,
-                  kind: "upsert" as const,
-                  value: valueOf(h, e.body),
-                } as never)
-              : e,
-          ),
-        })) as never,
-        segments: tail,
-      });
-      const mine = await fold(db, {
-        parts,
-        segments: h.wire.slice(cut),
-      });
-      expect(mine.entries, `seed ${seed}`).toEqual(
-        asWire(oracle.entries, h.refs),
+    for (let seed = 1; seed <= 100; seed += 1) {
+      const h = history(
+        seed,
+        { keys: 14, segments: 6, opsPerSegment: 8 },
+        WIDE,
       );
-      expect(mine.streams, `seed ${seed}`).toEqual(oracle.streams);
+      const mine = await fold(db, { parts: [], segments: h.wire });
+      const partitioner = createPartitioner(
+        mine.streams,
+        { ...CONTEXT, keyCheck: "0123456789abcdef", position: 6 },
+        400,
+      );
+      const parts = [];
+      for (const entry of mine.entries) {
+        const closed = partitioner.push(entry as LogEntry);
+        if (closed) parts.push(closed);
+      }
+      parts.push(partitioner.finish());
+      const entries: WireEntry[] = [];
+      for (const part of parts) {
+        // `encodeSnapshotPart` throws on entries out of key order.
+        const decoded = decodeSnapshotPart(encodeSnapshotPart(part as never));
+        expect(decoded.kind, `seed ${seed}`).toBe("ok");
+        entries.push(...(part.entries as WireEntry[]));
+      }
+      expect(entries, `seed ${seed}`).toEqual(mine.entries);
     }
+  });
+
+  it("orders by UTF-16 unit where UTF-8 byte order disagrees (U+E000 against U+10000)", async () => {
+    const db = await database();
+    const at = (stream: string, run: string, id: number): WireOperation => ({
+      kind: "upsert",
+      stream,
+      pkHash: "a".repeat(64),
+      stamp: { o: 1, r: run },
+      firstSeen: null,
+      value: { id },
+    });
+    const segment: Segment<LogOperation> = {
+      format: LOG_FORMAT,
+      ...CONTEXT,
+      position: 1,
+      observedAt: 1,
+      base: 0,
+      snapshot: null,
+      refs: [],
+      streams: [meta("s\uE000"), meta("s\u{10000}")],
+      operations: [
+        // Two streams: the order of their entries.
+        at("s\uE000", "r", 1) as LogOperation,
+        at("s\u{10000}", "r", 2) as LogOperation,
+        // One key at one stamp number from two runs: the greater run id wins.
+        {
+          ...at("s\uE000", "\uE000", 3),
+          pkHash: "b".repeat(64),
+        } as LogOperation,
+        {
+          ...at("s\uE000", "\u{10000}", 4),
+          pkHash: "b".repeat(64),
+        } as LogOperation,
+      ],
+    };
+    const oracle = foldLog({ snapshot: [], segments: [segment] });
+    const mine = await fold(db, {
+      parts: [],
+      segments: [segment as unknown as Segment<WireOperation>],
+    });
+    expect(mine.entries).toEqual(oracle.entries);
+    // The oracle's own order: U+10000 is two UTF-16 units, both below U+E000.
+    expect(oracle.entries.map((e) => e.stream)).toEqual([
+      "s\u{10000}",
+      "s\uE000",
+      "s\uE000",
+    ]);
   });
 
   it("agrees across many pages", async () => {
@@ -347,5 +476,97 @@ describe("the streaming partitioner is partitionFold", () => {
       streamed.push(partitioner.finish());
       expect(streamed, `seed ${seed}`).toEqual(whole);
     }
+  });
+});
+
+/** The bytes a query result holds: what crosses the driver, not how many rows. */
+function resultBytes(rows: readonly Record<string, unknown>[]): number {
+  let bytes = 0;
+  for (const row of rows)
+    for (const value of Object.values(row))
+      bytes +=
+        typeof value === "string"
+          ? Buffer.byteLength(value)
+          : value instanceof Uint8Array
+            ? value.byteLength
+            : value === null
+              ? 0
+              : 8;
+  return bytes;
+}
+
+describe("a page of the fold is cut by the bytes it holds", () => {
+  // The page budget (`PAGE_BYTES`, 2 MiB) and the largest single row below.
+  const BUDGET = 2 * 1024 * 1024;
+  const BODY = 150_000;
+
+  const wide = (small: number, large: number): Segment<WireOperation> => ({
+    format: LOG_FORMAT,
+    ...CONTEXT,
+    position: 1,
+    observedAt: 1,
+    base: 0,
+    snapshot: null,
+    refs: [],
+    streams: [meta("s0")],
+    operations: Array.from({ length: small + large }, (_, i) => ({
+      kind: "upsert" as const,
+      stream: "s0",
+      pkHash: `h${String(i).padStart(5, "0")}`,
+      stamp: { o: 1, r: "a" },
+      firstSeen: null,
+      // Small rows first, large ones after: what a size taken from the
+      // previous page does not see coming.
+      value: i < small ? { id: i } : { id: i, pad: "x".repeat(BODY) },
+    })),
+  });
+
+  /** Fold `segment` and read it back, measuring every query of the read-back. */
+  async function readBack(segment: Segment<WireOperation>) {
+    const db = await database();
+    let largest = 0;
+    let queries = 0;
+    const spy = {
+      batch: (statements: Parameters<SqlDriver["batch"]>[0]) =>
+        db.batch(statements),
+      query: async <R extends Record<string, never>>(
+        sql: string,
+        params?: Parameters<SqlDriver["query"]>[1],
+      ) => {
+        const rows = await db.query<R>(sql, params);
+        queries += 1;
+        largest = Math.max(largest, resultBytes(rows));
+        return rows;
+      },
+    } as unknown as Pick<SqlDriver, "batch" | "query">;
+    const workspace = await openFoldWorkspace(spy, "pdpp.c~", "test");
+    await workspace.addSegment(segment);
+    queries = 0;
+    const entries: WireEntry[] = [];
+    for await (const page of workspace.pages()) entries.push(...page);
+    await workspace.close();
+    return { entries, largest, queries };
+  }
+
+  it("small rows followed by large bodies stay inside the budget plus one row", async () => {
+    const segment = wide(60, 120);
+    const { entries, largest } = await readBack(segment);
+    const oracle = foldLog({
+      snapshot: [],
+      segments: [segment as unknown as Segment<LogOperation>],
+    });
+    expect(entries).toEqual(oracle.entries);
+    // 120 bodies of 150 KB are 18 MB; no query result may hold more than the
+    // budget and the one row that crosses it.
+    expect(largest).toBeLessThanOrEqual(BUDGET + BODY + 1000);
+  });
+
+  it("a row larger than the budget is a page of its own", async () => {
+    const segment = wide(0, 3);
+    const big = segment.operations[1] as { value: { pad: string } };
+    big.value.pad = "y".repeat(3 * 1024 * 1024);
+    const { entries, largest } = await readBack(segment);
+    expect(entries).toHaveLength(3);
+    expect(largest).toBeLessThanOrEqual(3 * 1024 * 1024 + BODY + 1000);
   });
 });

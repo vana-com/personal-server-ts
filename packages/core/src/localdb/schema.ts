@@ -742,22 +742,13 @@ END`,
     `ALTER TABLE delete_tombstones ADD COLUMN done_at INTEGER`,
   ],
   [
-    // Scratch for the operations that fold or build the log a whole at a
-    // time (`log-fold-workspace.ts`, `log-spool.ts`): the fold of a history
-    // too large to hold, and the sealed objects of a candidate waiting for
-    // upload. Both are device-local, never published, and emptied by the
-    // operation that fills them; a crash leaves rows the next operation on the
-    // connection deletes before it starts.
-    `CREATE TABLE log_fold_cells (
-  connection_id TEXT NOT NULL, workspace TEXT NOT NULL,
-  stream TEXT NOT NULL, pk_hash TEXT NOT NULL,
-  up_o INTEGER, up_r TEXT, up_ordinal INTEGER, up_hash TEXT,
-  up_first_seen INTEGER, up_ref INTEGER, up_body TEXT,
-  del_o INTEGER, del_r TEXT, del_explicit INTEGER, del_key TEXT,
-  PRIMARY KEY (connection_id, workspace, stream, pk_hash)) WITHOUT ROWID`,
-    `CREATE TABLE log_spool (
-  connection_id TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL,
-  bytes INTEGER NOT NULL, cipher BLOB NOT NULL,
-  PRIMARY KEY (connection_id, owner, name)) WITHOUT ROWID`,
+    // The explicit deletes made before typed keys were kept (`pk_values`
+    // null) are the only ones a publish round has to look for before it
+    // reads a replace (`untypedDeletePages`). They are few and old; the
+    // index holds them alone, so finding them does not read the changes still
+    // to publish. `IF NOT EXISTS` keeps the statement safe to run again.
+    `CREATE INDEX IF NOT EXISTS record_changes_untyped_deletes
+       ON record_changes(connection_id, stream, seq)
+       WHERE op = 'remove' AND explicit_delete = 1 AND pk_values IS NULL`,
   ],
 ];

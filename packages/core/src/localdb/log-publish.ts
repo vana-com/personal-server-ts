@@ -97,14 +97,14 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { tombstoneOmissions } from "./admit.js";
-import { changedKeyPages, hasChangedKeys } from "./log-changed-keys.js";
-import { planCompaction } from "./log-compact.js";
+import { PAGE_BYTES, rowsWithin, SIZE_ROWS } from "./byte-pages.js";
 import {
-  clearSpool,
-  openSpool,
-  type Spool,
-  type SpooledObject,
-} from "./log-spool.js";
+  changedKeyPages,
+  hasChangedKeys,
+  untypedDeletePages,
+} from "./log-changed-keys.js";
+import { planCompaction } from "./log-compact.js";
+import { openSpool, type Spool, type SpooledObject } from "./log-spool.js";
 import {
   logPublishPhases,
   openPhases,
@@ -156,11 +156,9 @@ import { unwriteRefusedRun } from "./unwrite.js";
 /**
  * A transfer page holds at most `PAGE_BYTES` of bodies when two or more rows
  * fit; a row larger than that is a page of its own (a body is encoded whole).
- * Row sizes are read `META_ROWS` at a time and cut into pages; a page also
- * holds at most `META_ROWS` rows.
+ * Every read of bodies is cut by the rows' real sizes (`byte-pages.ts`).
  */
-const META_ROWS = 2048;
-export const PAGE_BYTES = 2 * 1024 * 1024;
+export { PAGE_BYTES };
 
 const MAX_ATTEMPTS = 5;
 /** Keys a query binds: the delete lookup binds a connection, a stream and two positions beside them. */
@@ -1116,18 +1114,21 @@ async function snapshotRound(
       // time until they no longer fit one segment: a replace of a stream
       // larger than the segment never has more than a segment in memory.
       const untypedKeys: string[] = [];
-      for await (const page of pages()) {
-        const { untyped } = await operationsFor(
-          held,
-          connectionId,
-          stream,
-          page.map((g) => g.pk),
-          row.publish_watermark,
-          watermark,
-          false,
-        );
-        untypedKeys.push(...untyped);
-      }
+      for await (const page of untypedDeletePages(
+        held.db,
+        connectionId,
+        stream,
+        row.publish_watermark,
+        watermark,
+      ))
+        for (const d of page)
+          if (
+            (await declaredKey(held, connectionId, stream, {
+              pk_hash: d.pk,
+              record_key: d.recordKey,
+            })) === null
+          )
+            untypedKeys.push(d.pk);
       if (untypedKeys.length > 0) {
         stop(untypedKeys);
         continue;
@@ -1337,8 +1338,8 @@ async function snapshotRound(
 
   const scope = logScope(connection.connector, connection.ns);
   // The sealed objects this round uploads wait on disk, not in the candidate.
-  // Rows of a round that did not finish are gone before this one starts.
-  await clearSpool(held.db, connectionId);
+  // A process that ended mid-round left rows nothing refers to; they are gone
+  // when the file opens (`log-scratch.ts`).
   const spool = openSpool(held.db, connectionId, held.newOp());
   let handedOver = false;
   try {
@@ -1737,7 +1738,7 @@ async function commitControl(
  * the run deletes it: the row's data holds them with their types, and a
  * deletion's key is exactly what its hash was computed from.
  *
- * The bodies are read a page at a time (`PAGE_BYTES` of bodies, or one row), after reading the rows' sizes alone (`META_ROWS` at a
+ * The bodies are read a page at a time (`PAGE_BYTES` of bodies, or one row), after reading the rows' sizes alone (`SIZE_ROWS` at a
  * time): the shared SQL cannot return just the key fields of a body (a phone's
  * SQLite 3.22 has no JSON1), and a pass that drops many large records must not
  * hold them all at once. Only the small keys are kept.
@@ -1761,19 +1762,11 @@ async function omittedBy(
     const meta = await deps.db.query<{ pk_hash: string; n: number }>(
       `SELECT pk_hash, COALESCE(body_bytes, ${BODY_BYTES}) AS n FROM records
         WHERE ${scope}${after === undefined ? "" : " AND pk_hash > ?"}
-        ORDER BY pk_hash LIMIT ${META_ROWS}`,
+        ORDER BY pk_hash LIMIT ${SIZE_ROWS}`,
       after === undefined ? scopeParams : [...scopeParams, after],
     );
     for (let at = 0; at < meta.length;) {
-      let take = 0;
-      let bytes = 0;
-      while (
-        at + take < meta.length &&
-        (take === 0 || bytes + Number(meta[at + take]!.n) <= PAGE_BYTES)
-      ) {
-        bytes += Number(meta[at + take]!.n);
-        take += 1;
-      }
+      const take = rowsWithin(meta.slice(at).map((row) => Number(row.n)));
       const page = await deps.db.query<{ pk_hash: string; body: string }>(
         `SELECT pk_hash, body FROM records
           WHERE ${scope} AND pk_hash >= ? AND pk_hash <= ? ORDER BY pk_hash`,
@@ -1786,7 +1779,7 @@ async function omittedBy(
         });
       at += take;
     }
-    if (meta.length < META_ROWS) return omitted;
+    if (meta.length < SIZE_ROWS) return omitted;
     after = meta[meta.length - 1]!.pk_hash;
   }
 }
@@ -1850,20 +1843,13 @@ async function bodyBatches<T extends { readonly pk: string }>(
     [connectionId, stream, ...groups.map((g) => g.pk)],
   );
   const bytesOf = new Map(sizes.map((r) => [r.pk_hash, Number(r.n)]));
+  const weights = groups.map((g) => bytesOf.get(g.pk) ?? 0);
   const batches: T[][] = [];
-  let batch: T[] = [];
-  let bytes = 0;
-  for (const group of groups) {
-    const n = bytesOf.get(group.pk) ?? 0;
-    if (batch.length > 0 && bytes + n > PAGE_BYTES) {
-      batches.push(batch);
-      batch = [];
-      bytes = 0;
-    }
-    batch.push(group);
-    bytes += n;
+  for (let at = 0; at < groups.length;) {
+    const take = rowsWithin(weights.slice(at));
+    batches.push(groups.slice(at, at + take));
+    at += take;
   }
-  if (batch.length > 0) batches.push(batch);
   return batches;
 }
 
@@ -1921,8 +1907,6 @@ async function operationsFor(
   keys: readonly string[],
   from: number,
   to: number,
-  /** Without bodies, the rows that are held have no operation: a sweep for untyped deletes. */
-  withBodies = true,
 ): Promise<{
   readonly ops: Map<string, LogOperation>;
   /** Explicit deletes of these keys have no typed key and cannot be published. */
@@ -1943,14 +1927,12 @@ async function operationsFor(
       stamp_n: number;
       body: string;
     }>(
-      `SELECT pk_hash, stamp_o, stamp_r, stamp_n, first_o, ${
-        withBodies ? "body" : "'' AS body"
-      } FROM records
+      `SELECT pk_hash, stamp_o, stamp_r, stamp_n, first_o, body FROM records
         WHERE connection_id = ? AND stream = ? AND pk_hash IN (${marks})`,
       [connectionId, stream, ...group],
     );
     const held = new Set(rows.map((row) => row.pk_hash));
-    for (const row of withBodies ? rows : [])
+    for (const row of rows)
       ops.set(row.pk_hash, {
         kind: "upsert",
         stream,

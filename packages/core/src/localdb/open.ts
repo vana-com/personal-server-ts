@@ -1,4 +1,5 @@
 import type { SqlDriver } from "./driver.js";
+import { resetScratch } from "./log-scratch.js";
 import { migrate } from "./migrate.js";
 import { TEMP_TABLES } from "./merge.js";
 import type { ViewChangeRecorder, ViewLogger } from "./view-changes.js";
@@ -31,7 +32,8 @@ export class LocalDbIdentityMismatch extends Error {
 }
 
 /**
- * Sets the connection pragmas, migrates, creates the TEMP tables and checks
+ * Sets the connection pragmas, migrates, creates the TEMP tables, resets the
+ * scratch tables of the log (`log-scratch.ts`) and checks
  * (or, on a new file, records) the owner and network. Web uses TRUNCATE
  * journaling; the other hosts use WAL.
  *
@@ -50,6 +52,8 @@ export async function openLocalDb(
   await migrate(driver);
   await driver.batch([
     ...TEMP_TABLES.map((sql) => ({ sql })),
+    // The scratch of the log's whole-log operations starts empty on every open.
+    ...resetScratch(),
     {
       sql: "INSERT OR IGNORE INTO db_meta (id, owner, network, device_id, created_at) VALUES (1, ?, ?, ?, ?)",
       params: [

@@ -97,6 +97,7 @@ import {
 } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement, SqlValue } from "./driver.js";
+import { scratchDeletes } from "./log-scratch.js";
 import { withOrigin } from "./merge.js";
 import {
   applyInGroups,
@@ -347,6 +348,7 @@ export async function rebaselineKeyedLoad(
         params: [connectionId],
       },
       clearKeyedPending(connectionId),
+      ...scratchDeletes(connectionId),
       {
         sql: "DELETE FROM log_state WHERE connection_id = ?",
         params: [connectionId],
