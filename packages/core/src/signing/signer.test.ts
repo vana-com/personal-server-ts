@@ -229,3 +229,35 @@ describe("ServerSigner", () => {
     expect(sig1).toBe(sig2);
   });
 });
+
+describe("ServerSigner with an inert signing capability", () => {
+  const address = "0x1111111111111111111111111111111111111111" as const;
+
+  it("exposes its account address without requesting a signature", () => {
+    const account = {
+      address,
+      signTypedData: async () => {
+        throw new Error("unexpected signing call");
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    expect(createServerSigner(account, TEST_GATEWAY_CONFIG).address).toBe(
+      address,
+    );
+  });
+
+  it("forwards a signing capability failure without reporting success", async () => {
+    const refused = new Error("synthetic signer unavailable");
+    let calls = 0;
+    const account = {
+      address,
+      signTypedData: async () => {
+        calls += 1;
+        throw refused;
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    const signer = createServerSigner(account, TEST_GATEWAY_CONFIG);
+    const input = {} as Parameters<typeof signer.signAddData>[0];
+    await expect(signer.signAddData(input)).rejects.toBe(refused);
+    expect(calls).toBe(1);
+  });
+});
