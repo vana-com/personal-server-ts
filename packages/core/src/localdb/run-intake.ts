@@ -30,6 +30,7 @@ import {
   type BatchResponse,
   type BeginRequest,
   type BeginResponse,
+  type ConnectionCheckpoint,
   type IntakeDeclarations,
 } from "../stream-sync/intake.js";
 import { syncBeforeBegin } from "./bootstrap.js";
@@ -56,6 +57,100 @@ export interface RunIntakeStore {
     declarations: IntakeDeclarations,
   ): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
+  /** The connection's saved cursors (`ConnectionCheckpoint`), or null. */
+  checkpoint(connector: string): Promise<ConnectionCheckpoint | null>;
+}
+
+/**
+ * What `begin` reads as a connector's START state, without a run: the
+ * connection's checkpoint entry per stream, with the connector version that
+ * wrote it. It takes the same basis `begin` does: the registry is read and
+ * applied first (`syncBeforeBegin`, a foreign control row reported, not
+ * saved), so a connection deleted or reconnected on another device is not
+ * read from a stale local view, and the applied cursors are folded, as before
+ * every read of the checkpoint. A connection whose control row is not this
+ * owner's, is deleted, or cannot be read from the registry has none; so does
+ * one with a stream flagged `needs_full`, as `begin` would read the whole
+ * connection in full.
+ *
+ * `cursorVersion` is the version of the connector that wrote the stream's
+ * entry as this device knows it (`stream_state.cursor_version`); a fold stamps
+ * it with the published cursor's version, so it can be newer than the entry a
+ * reader holds in between. A reader that compares it with its own connector
+ * version therefore errs on the side of a full read.
+ */
+async function readConnectionCheckpoint(
+  deps: LocalSyncDeps,
+  connector: string,
+): Promise<ConnectionCheckpoint | null> {
+  const { db } = deps;
+  const id = controlScope(connector, "");
+  const synced = await syncBeforeBegin(deps, connector, { foreign: "report" });
+  if (
+    synced.unreachable ||
+    !synced.connection ||
+    synced.connection.controlState === "deleted" ||
+    synced.connection.controlState === "foreign" ||
+    synced.control?.kind === "foreign" ||
+    synced.control?.kind === "deleted"
+  )
+    return null;
+  await foldAppliedCursors(db, id);
+  // No cursors at all while a stream is flagged `needs_full`: `begin` reads
+  // the whole connection in full then.
+  const [row] = await db.query<{
+    checkpoint: string | null;
+    control_state: string;
+    needs_full: number;
+  }>(
+    `SELECT c.checkpoint, c.control_state,
+      EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id=c.connection_id AND s.needs_full=1) AS needs_full
+      FROM connections c WHERE c.connection_id=?`,
+    [id],
+  );
+  if (
+    !row ||
+    row.checkpoint === null ||
+    row.control_state === "deleted" ||
+    row.needs_full === 1
+  )
+    return null;
+  const stored: unknown = JSON.parse(row.checkpoint);
+  if (!isPlainObject(stored)) return null;
+  const heads = new Map(
+    (
+      await db.query<{
+        stream: string;
+        cursor_version: string | null;
+        complete: number;
+      }>(
+        "SELECT stream, cursor_version, complete FROM stream_state WHERE connection_id=?",
+        [id],
+      )
+    ).map((entry) => [entry.stream, entry]),
+  );
+  const streams: Record<
+    string,
+    { state: JsonValue; cursorVersion: string | null }
+  > = {};
+  for (const [stream, state] of Object.entries(
+    stored as Record<string, JsonValue>,
+  )) {
+    if (state === undefined) continue;
+    const head = heads.get(stream);
+    // A cursor is handed out only with a complete head here to resume onto.
+    // An incomplete head only a full read completes (a run resumed from the
+    // cursor takes `complete` from its base, which an incomplete or reset
+    // base cannot give), and a remote reader cannot choose one later, so it
+    // reads that stream in full now instead of resuming from the same place
+    // forever; a cursor for a stream this device holds no head of is read in
+    // full the same way. Other streams' cursors still go out. (`begin` keeps
+    // resuming such a stream: a retrying device run's progress cursor sits
+    // on a head not yet complete.)
+    if (head === undefined || head.complete !== 1) continue;
+    streams[stream] = { state, cursorVersion: head.cursor_version };
+  }
+  return Object.keys(streams).length ? { connectionId: id, streams } : null;
 }
 
 type Run = {
@@ -189,6 +284,7 @@ export function createRunIntakeStore(
     return run;
   }
   return {
+    checkpoint: (connector) => readConnectionCheckpoint(deps, connector),
     begin: (runId, req, declarations) =>
       serial(runId, async () => {
         if (
@@ -263,6 +359,8 @@ export function createRunIntakeStore(
             throw invalid("stream is not declared");
           if (entry.fields != null || entry.resources != null)
             throw new RunIntakeError("restricted_scope_unsupported");
+          if (entry.resumed !== undefined && typeof entry.resumed !== "boolean")
+            throw invalid("invalid run flag");
         }
         if (
           req.selectedStreams !== undefined &&
@@ -427,10 +525,30 @@ export function createRunIntakeStore(
             cached?.checkpoint == null ||
             cached.needs_full === 1);
         const collection = full ? "full_refresh" : "incremental";
+        const stored: unknown = cached?.checkpoint
+          ? JSON.parse(cached.checkpoint)
+          : null;
+        // A stream resumes only from a cursor of its own, on a stream this
+        // connection has state for. Any other declared stream is read whole,
+        // whatever the run's mode: a stream the connection holds no cursor
+        // for (a host that writes one stream per run left the others alone)
+        // would otherwise be read from nothing but labelled incremental, and
+        // its head would never complete. A stream with a cursor keeps its
+        // mode whatever its head: a retrying or not yet published run's
+        // progress cursor is resumed as before.
+        const resumable = new Set<string>();
+        if (!full && isPlainObject(stored)) {
+          const known = await db.query<{ stream: string }>(
+            "SELECT stream FROM stream_state WHERE connection_id=?",
+            [id],
+          );
+          for (const { stream } of known)
+            if (Object.hasOwn(stored, stream)) resumable.add(stream);
+        }
         const modes = new Map(
           declarations.streams.map((d) => [
             d.name,
-            full || d.incremental === false
+            full || d.incremental === false || !resumable.has(d.name)
               ? ("full_refresh" as const)
               : ("incremental" as const),
           ]),
@@ -462,9 +580,7 @@ export function createRunIntakeStore(
             if (order === null) modes.set(stream, "full_refresh");
           }
         }
-        let state: JsonValue | null = cached?.checkpoint
-          ? JSON.parse(cached.checkpoint)
-          : null;
+        let state: JsonValue | null = stored as JsonValue | null;
         if (isPlainObject(state)) {
           state = Object.fromEntries(
             Object.entries(state).filter(
@@ -561,9 +677,14 @@ export function createRunIntakeStore(
                   : (synced.connection?.generation ?? null),
                 JSON.stringify(d.primaryKey),
                 declarations.version,
+                // A full read is what the stream's rows prove, not what the
+                // run's mode asked for: a windowed read, or one resumed from
+                // a cursor handed out before the run, is not one.
                 modes.get(d.name) === "full_refresh" &&
                 !(req.streams ?? []).some(
-                  (s) => s.name === d.name && s.time_range != null,
+                  (s) =>
+                    s.name === d.name &&
+                    (s.time_range != null || s.resumed === true),
                 )
                   ? 1
                   : 0,

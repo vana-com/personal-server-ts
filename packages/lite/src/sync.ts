@@ -710,6 +710,8 @@ export async function createPsLiteSyncManager(
       abort: async (...args) => (await getLocalSync()).intake.abort(...args),
       publicationStatus: async (...args) =>
         (await getLocalSync()).intake.publicationStatus(...args),
+      checkpoint: async (connector) =>
+        (await (await getLocalSync()).intake.checkpoint?.(connector)) ?? null,
     };
     syncManager = createSyncManager(
       {
