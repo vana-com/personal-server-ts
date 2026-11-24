@@ -1260,6 +1260,31 @@ describe("waitForChange with since", () => {
     expect(answer).toEqual({ seq: "5", changed: true, epoch: next });
   });
 
+  it.each([
+    ["missing", undefined],
+    ["malformed", "garbage"],
+  ])(
+    "a first epoch for a held cursor with a %s delta still reaches the caller, which builds the reset (mutation: exception only when an epoch was sent)",
+    async (_name, delta) => {
+      const first = "22222222-2222-4222-8222-222222222222";
+      const registry = createGatewayStreamSyncRegistry({
+        gatewayUrl: "https://gateway.test/",
+        ownerAddress: owner,
+        fetch: (async () =>
+          new Response(
+            JSON.stringify({ seq: "5", changed: true, epoch: first, delta }),
+          )) as typeof fetch,
+      });
+      const answer = await registry.waitForChange!(
+        "3",
+        25_000,
+        new AbortController().signal,
+        "3",
+      );
+      expect(answer).toEqual({ seq: "5", changed: true, epoch: first });
+    },
+  );
+
   it("the same epoch with a malformed delta still fails the request", async () => {
     const held = "11111111-1111-4111-8111-111111111111";
     const registry = createGatewayStreamSyncRegistry({

@@ -230,8 +230,8 @@ export interface RegistryChangeAnswer {
    * Present on, and only on, a changed answer to a request that sent `since`
    * (a gateway that cannot read the delta answers `reset`). A changed answer
    * to such a request without a readable delta fails the request, with one
-   * exception: when `epoch` differs from the one the request carried, the
-   * answer may omit the delta. The cursor and `since` belong to another
+   * exception: when `epoch` differs from the one the request carried (or the
+   * request carried none), the answer may omit the delta. The cursor and `since` belong to another
    * database generation then, so the caller must treat that answer as a reset
    * (list in full) and not wait for a delta.
    */
