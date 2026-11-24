@@ -1339,7 +1339,9 @@ describe("erasure wired into the connection delete", () => {
               hold = true;
               return report;
             },
-            onUnfinished: () => {
+            onRetryStateChange: () => {
+              // What the host does: decide from the work owed now.
+              if (!deleter.retryOwed()) return;
               armed += 1;
               hold = false;
               // The retry timer firing at once.
@@ -1460,10 +1462,10 @@ describe("erasure wired into the connection delete", () => {
               resolve({ connections: [], pending: true, skipped: [] });
           }),
       );
-      const onUnfinished = vi.fn();
+      const onRetryStateChange = vi.fn();
       const deleter = createConnectionDeleter(a.deps, {
         eraseLogs,
-        onUnfinished,
+        onRetryStateChange,
       });
       deleter.noteSettled(CONNECTOR, TOMBSTONE);
       const first = deleter.resumeErasures();
@@ -1471,12 +1473,12 @@ describe("erasure wired into the connection delete", () => {
       // The running pass has taken the queue entry: the retry loop sees none,
       // answers at once, and asks for nothing more.
       expect(await deleter.resumeErasures()).toBe(false);
-      expect(onUnfinished).not.toHaveBeenCalled();
+      expect(onRetryStateChange).not.toHaveBeenCalled();
 
       release();
       // The pass ended pending: its caller is told, and the loop is armed.
       expect(await first).toBe(true);
-      expect(onUnfinished).toHaveBeenCalledTimes(1);
+      expect(onRetryStateChange).toHaveBeenCalledTimes(1);
       expect(eraseLogs).toHaveBeenCalledTimes(1);
     });
 

@@ -226,7 +226,7 @@ export function createLocalSync(
       );
       if (req.connect === true || unfinished.length > 0) {
         const stuck = await deletes().resumeDelete(req.connector);
-        if (stuck) armRetry();
+        syncRetryTimer();
         await checkBinding(binding);
         if (stuck)
           throw new RunIntakeError(
@@ -312,9 +312,9 @@ export function createLocalSync(
       // A request waits for the fence no longer than the loop waits to look
       // at a delete that has not landed.
       fenceWaitMs: retryFirst,
-      // A connector's erasure that is unfinished arms the retry when its own
-      // pass ends: a sibling still waiting on storage does not delay it.
-      onUnfinished: () => armRetry(),
+      // A connector's run or landing that ends re-decides the retry timer from
+      // the work owed then: a sibling still waiting on storage does not delay it.
+      onRetryStateChange: () => syncRetryTimer(),
     });
   let deleteStore: ReturnType<typeof createConnectionDeleter> | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());
@@ -323,13 +323,28 @@ export function createLocalSync(
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let retryDelay = retryFirst;
   let closed = false;
-  const armRetry = () => {
-    if (closed || retryTimer) return;
+  // The last resume failed (a database read, say): what it did not get to is
+  // not in memory, so the loop comes back until one resume succeeds.
+  let resumeFailed = false;
+  /**
+   * The one place the retry timer is armed or cleared, and always from the
+   * work owed at this moment: never from an answer computed before an await,
+   * which a run that ends meanwhile makes stale. Call it wherever that work
+   * may have changed.
+   */
+  const syncRetryTimer = () => {
+    if (closed || !(resumeFailed || deletes().retryOwed())) {
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = undefined;
+      retryDelay = retryFirst;
+      return;
+    }
+    if (retryTimer) return;
     const delay = retryDelay;
     retryDelay = Math.min(retryDelay * 2, retryMax);
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
-      void resume().catch(armRetry);
+      void resume().catch(() => undefined); // its failure is in `resumeFailed`
     }, delay);
     retryTimer.unref?.();
   };
@@ -347,7 +362,7 @@ export function createLocalSync(
                 ? { ns: purged.ns, version: purged.controlVersion }
                 : undefined,
             );
-          armRetry();
+          syncRetryTimer();
         })
       : () => {};
   const resumes = new Set<Promise<readonly PendingDelete[]>>();
@@ -361,16 +376,18 @@ export function createLocalSync(
     return work;
   };
   const resumeOnce = async () => {
-    const pending = await deletes().resumeDeletes();
-    // An erasure that is not finished is retried with the same backoff.
-    const erasing = await deletes().resumeErasures();
-    if (pending.length > 0 || erasing) armRetry();
-    else {
-      if (retryTimer) clearTimeout(retryTimer);
-      retryTimer = undefined;
-      retryDelay = retryFirst;
+    try {
+      const pending = await deletes().resumeDeletes();
+      // An erasure that is not finished is retried with the same backoff.
+      await deletes().resumeErasures();
+      resumeFailed = false;
+      return pending;
+    } catch (error) {
+      resumeFailed = true;
+      throw error;
+    } finally {
+      syncRetryTimer();
     }
-    return pending;
   };
   // Start recovery without holding unrelated connections. The apply and
   // publish paths check their own connector's durable intent before work.
@@ -378,7 +395,8 @@ export function createLocalSync(
     const rows = await deps.db.query<{ connector: string }>(
       "SELECT connector FROM delete_intents ORDER BY connector",
     );
-    if (rows.length || deletes().erasureOwed()) void resume().catch(armRetry);
+    if (rows.length || deletes().erasureOwed())
+      void resume().catch(() => undefined); // its failure is in `resumeFailed`
     return rows;
   };
   const deleter: ConnectionDeleter = {
@@ -390,7 +408,7 @@ export function createLocalSync(
         request,
       );
       // Its landing runs in the background; check back whether it landed.
-      armRetry();
+      syncRetryTimer();
       return result;
     },
     resumeDeletes: resume,
@@ -399,8 +417,8 @@ export function createLocalSync(
     async deleteStatus(connector) {
       const status = await deletes().deleteStatus(connector);
       // A status that found a newer delete owes its erasure: the retry loop
-      // is what runs it, so it is armed by the read that found the work.
-      if (deletes().erasureOwed()) armRetry();
+      // is what runs it, so the read that found the work re-decides the timer.
+      syncRetryTimer();
       return status;
     },
     erasureOwed: () => deletes().erasureOwed(),
@@ -552,8 +570,7 @@ export function createLocalSync(
     close: () => {
       closed = true;
       stopHearingPurges();
-      clearTimeout(retryTimer);
-      retryTimer = undefined;
+      syncRetryTimer(); // closed: clears it
       return (closing ??= (async () => {
         await deleteStore?.close();
         await Promise.allSettled([...resumes]);
