@@ -116,7 +116,12 @@ import {
   untypedDeletePages,
 } from "./log-changed-keys.js";
 import { planCompaction } from "./log-compact.js";
-import { openSpool, type Spool, type SpooledObject } from "./log-spool.js";
+import {
+  openSpool,
+  SpooledObjectGoneError,
+  type Spool,
+  type SpooledObject,
+} from "./log-spool.js";
 import {
   logPublishPhases,
   openPhases,
@@ -614,6 +619,22 @@ async function invalidateExpiredCandidate(
     transition(entry, "invalidated");
 }
 
+/** Whether the candidate's lifetime ended, judged under the connection queue. */
+async function expiredUnderQueue(
+  deps: LocalSyncDeps,
+  connectionId: string,
+  entry: PendingCommit,
+): Promise<boolean> {
+  return deps.queue.run(connectionId, "publish", async () => {
+    await invalidateExpiredCandidate(
+      insideQueue(deps, connectionId),
+      connectionId,
+      entry,
+    );
+    return isInvalidated(entry);
+  });
+}
+
 async function publishRounds(
   deps: LocalSyncDeps,
   connectionId: string,
@@ -725,6 +746,14 @@ async function publishRounds(
       // Storage kept refusing past its retry budget. Nothing is wrong with the
       // data: nothing was committed, so the changes stay queued and the next
       // cycle sends them again.
+      // A purge deletes the spool while uploads are blocked: the next read
+      // finds nothing. If the candidate's lifetime ended, it is stale and the
+      // next turn releases it; a spool missing under a live lifetime is a fault.
+      if (
+        error instanceof SpooledObjectGoneError &&
+        (await expiredUnderQueue(deps, connectionId, transfer))
+      )
+        continue;
       if (!(error instanceof StorageDeferredError)) throw error;
       deps.logger.info(
         { connectionId, error: error.message },
