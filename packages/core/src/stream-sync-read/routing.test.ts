@@ -154,6 +154,55 @@ describe("stream-sync read names", () => {
 });
 
 describe("live stream status projection", () => {
+  it("omits connections that have no known streams", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      listed: true,
+      issues: [],
+      connections: [{ connector: "fixture-empty", ns: "", streams: {} }],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+
+    expect(liveStreamCounts(status)).toEqual([]);
+  });
+
+  it("keeps separate rows and their counts for the same stream name", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      listed: true,
+      issues: [],
+      connections: [
+        {
+          connector: "fixture-a",
+          ns: "",
+          streams: {
+            items: {
+              live: true,
+              version: 1,
+              records: 2,
+              digest: "a".repeat(64),
+            },
+          },
+        },
+        {
+          connector: "fixture-b",
+          ns: "",
+          streams: { items: { live: true, version: 1, records: 7 } },
+        },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+
+    expect(liveStreamCounts(status)).toEqual([
+      {
+        connector: "fixture-a",
+        ns: "",
+        stream: "items",
+        records: 2,
+        digest: "a".repeat(64),
+      },
+      { connector: "fixture-b", ns: "", stream: "items", records: 7 },
+    ]);
+  });
+
   it("distinguishes a live empty stream from a non-live head's cached count", async () => {
     const { liveStreamCounts } = await import("./service.js");
     const status = {
