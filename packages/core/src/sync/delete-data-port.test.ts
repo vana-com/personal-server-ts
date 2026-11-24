@@ -197,6 +197,79 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     expect(outcome).toMatchObject({ replaced: null });
   });
 
+  describe("the answer to the re-signed post reads like the answer to the first", () => {
+    const staleVersion = () =>
+      jsonResponse(409, {
+        error: "Stale expectedVersion",
+        currentExpectedVersion: "7",
+        nextExpectedVersion: "8",
+      });
+    const afterConflict = async (second: Response) => {
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(staleVersion())
+        .mockResolvedValueOnce(second);
+      const made = makePort(liveRecord(), fetchImpl as unknown as typeof fetch);
+      return { ...made, fetchImpl, answer: made.port.tombstone(SCOPE) };
+    };
+
+    it("reads a coded already-deleted 409 as already deleted", async () => {
+      const { answer, fetchImpl } = await afterConflict(
+        jsonResponse(409, {
+          code: "owner_stream_head_already_deleted",
+          data: { expectedVersion: "9", deletedAt: "2026-08-25T10:00:00.000Z" },
+        }),
+      );
+
+      expect(await answer).toEqual({
+        status: "already-deleted",
+        dataPointId: computeDataPointId(OWNER, SCOPE),
+        version: "9",
+        deletedAt: "2026-08-25T10:00:00.000Z",
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    });
+
+    it("reads a coded head-absent 409 as not registered", async () => {
+      const { answer, fetchImpl } = await afterConflict(
+        jsonResponse(409, { code: "owner_stream_head_absent", scope: SCOPE }),
+      );
+
+      expect(await answer).toEqual({
+        status: "not-registered",
+        dataPointId: computeDataPointId(OWNER, SCOPE),
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    });
+
+    it("throws a terminal refusal the second answer carries", async () => {
+      const { answer } = await afterConflict(
+        jsonResponse(409, { code: "server_revoked" }),
+      );
+
+      await expect(answer).rejects.toMatchObject({ code: "server_revoked" });
+    });
+
+    it("reads a 404 and a 410 as it always did", async () => {
+      const gone = await afterConflict(jsonResponse(404, {}));
+      expect(await gone.answer).toMatchObject({ status: "not-registered" });
+      const deleted = await afterConflict(
+        jsonResponse(410, { data: { expectedVersion: "9" } }),
+      );
+      expect(await deleted.answer).toMatchObject({
+        status: "already-deleted",
+        version: "9",
+      });
+    });
+
+    it("throws on a second version conflict: it re-signs once, not forever", async () => {
+      const { answer, fetchImpl } = await afterConflict(staleVersion());
+
+      await expect(answer).rejects.toThrow(/Gateway error: 409/);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("with a fence, tombstones only the exact head it names and never re-signs on a 409", async () => {
     const head = {
       expectedVersion: "3",
