@@ -20,6 +20,7 @@ import { userPsId, type UserPsId } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { seal, unseal } from "../sealing/envelope.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
+import { drainWithTimeout } from "./lifecycle.js";
 import type { PrewarmRequestBody, SealRequestBody } from "./types.js";
 
 const SECRET = "agent-test-secret";
@@ -221,6 +222,38 @@ function jobsControl(
     prewarm: vi.fn(),
   };
 }
+
+describe("agent drain result", () => {
+  it("reports completion without logging a timeout for completed work", async () => {
+    const warnings: unknown[] = [];
+    const complete = await drainWithTimeout(() => Promise.resolve(), 50, {
+      warn: (...entry) => {
+        warnings.push(entry);
+      },
+    });
+    expect(complete).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  it("returns pending after the deadline and reports the timeout once", async () => {
+    const warnings: unknown[] = [];
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const complete = await drainWithTimeout(() => pending, 0, {
+      warn: (...entry) => {
+        warnings.push(entry);
+      },
+    });
+    expect(complete).toBe(false);
+    finish();
+    await pending;
+    expect(warnings).toEqual([
+      [{ timeoutMs: 0 }, "Timed out while draining agent jobs"],
+    ]);
+  });
+});
 
 describe("agent HTTP server", () => {
   it("requires operator bearer auth for sandbox prewarm", async () => {
