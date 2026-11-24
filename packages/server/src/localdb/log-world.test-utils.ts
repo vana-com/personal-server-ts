@@ -60,9 +60,18 @@ export interface WorldBlobStore {
 }
 
 const drivers: SqlDriver[] = [];
-/** Closes the databases of the devices a test opened; call it from `afterEach`. */
+/**
+ * Closes the databases of the devices a test opened; call it from `afterEach`.
+ * A database its test already closed is skipped.
+ */
 export async function closeWorldDrivers(): Promise<void> {
-  for (const db of drivers.splice(0)) await db.close();
+  for (const db of drivers.splice(0)) {
+    // A test may have closed its device's sync, which closes the database.
+    await db.close().catch((error: unknown) => {
+      if (!(error instanceof Error && error.message === "sqlite_driver_closed"))
+        throw error;
+    });
+  }
   for (const dir of tempDirs.splice(0))
     rmSync(dir, { recursive: true, force: true });
 }

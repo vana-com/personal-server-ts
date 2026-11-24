@@ -226,7 +226,7 @@ export function createLocalSync(
       );
       if (req.connect === true || unfinished.length > 0) {
         const stuck = await deletes().resumeDelete(req.connector);
-        if (stuck) armRetry();
+        kickRetryLoop();
         await checkBinding(binding);
         if (stuck)
           throw new RunIntakeError(
@@ -312,27 +312,149 @@ export function createLocalSync(
       // A request waits for the fence no longer than the loop waits to look
       // at a delete that has not landed.
       fenceWaitMs: retryFirst,
-      // A connector's erasure that is unfinished arms the retry when its own
-      // pass ends: a sibling still waiting on storage does not delay it.
-      onUnfinished: () => armRetry(),
+      // A connector's run or landing that ends asks the retry loop to look
+      // again: a sibling still waiting on storage does not delay it.
+      onRetryStateChange: () => kickRetryLoop(),
     });
   let deleteStore: ReturnType<typeof createConnectionDeleter> | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());
-  // A delete that cannot land is retried here, with backoff, until it lands:
-  // finishing it must not wait for a begin or a sync cycle to ask.
+  // A delete that cannot land, and an erasure that is not finished, are
+  // retried here, with backoff, until done: finishing them must not wait for a
+  // begin or a sync cycle to ask.
+  //
+  // One loop owns the retry timer and every marker that decides it
+  // (`resumeFailed`, `owed`); the deleter owns the erasure queue and the sweep
+  // flag. Nothing else writes them. An event (a request, a landing's or a run's
+  // end, a purge, a status read, a run intake, the timer, a resume) only sets
+  // `dirty` and kicks the loop, and never decides anything itself. A pass
+  // re-reads what is owed from its sources: the intent rows (the durable fact
+  // of an undelivered delete) and the deleter's queue. It ends, with no event
+  // since it began, by deciding the timer once. An event that arrives while it
+  // runs makes it run again, so no decision is ever made from a read that
+  // an event has overtaken, and two passes never run at once.
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let retryDelay = retryFirst;
   let closed = false;
-  const armRetry = () => {
-    if (closed || retryTimer) return;
+  // Pass state, written only by the loop.
+  // The last pass failed (a database read, say): what it did not get to is not
+  // in memory, so the loop comes back until a pass that runs the work succeeds.
+  let resumeFailed = false;
+  // Work is owed as of the last pass.
+  let owed = false;
+  // Set by every event; cleared when a pass starts.
+  let dirty = false;
+  // A tick or a resume asked for the work to run, not only for a fresh look.
+  let workDue = false;
+  interface Waiter {
+    readonly done: (pending: readonly PendingDelete[]) => void;
+    readonly fail: (error: unknown) => void;
+  }
+  let waiters: Waiter[] = [];
+  let looping: Promise<void> | undefined;
+  /**
+   * The only place the timer is armed or cleared: from the state the pass that
+   * just ended left, with nothing having changed since (`dirty` is false), or
+   * from `closed`, which only ever turns on.
+   */
+  const syncRetryTimer = () => {
+    if (closed || !(resumeFailed || owed)) {
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = undefined;
+      retryDelay = retryFirst;
+      return;
+    }
+    if (retryTimer) return;
     const delay = retryDelay;
     retryDelay = Math.min(retryDelay * 2, retryMax);
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
-      void resume().catch(armRetry);
+      kickRetryLoop(true);
     }, delay);
     retryTimer.unref?.();
   };
+  const handled = <T>(runs: readonly Promise<T>[]) => {
+    for (const run of runs) run.catch(() => undefined);
+    return runs;
+  };
+  /** Resolves once no loop is running: every pass has ended and decided the timer. */
+  const idle = async () => {
+    while (looping) await looping;
+  };
+  /**
+   * One pass: start the work if it is due, then read what is owed. The pass
+   * never waits for the work it starts: a landing stuck at the registry, or an
+   * erasure on slow storage, must not hold back a retry that is due. Each
+   * start's end is an event that kicks the loop. A resume (`takers`) answers
+   * once what it started has ended and the loop has gone idle, so the timer it
+   * reads is the one decided after that work ended.
+   */
+  const retryPass = async (due: boolean, takers: readonly Waiter[]) => {
+    let landings: readonly Promise<PendingDelete | null>[] = [];
+    let erasures: readonly Promise<void>[] = [];
+    try {
+      if (!closed) {
+        if (due) {
+          // A handler goes on each run the moment it is returned, before any
+          // later read is awaited: a run that fails while one is pending must
+          // not be reported unhandled.
+          landings = handled(await deletes().startDeletes());
+          erasures = handled(await deletes().startErasures());
+        }
+        owed = await deletes().retryOwed();
+        if (due) resumeFailed = false;
+      }
+    } catch (error) {
+      resumeFailed = true;
+      void idle().then(() => takers.forEach((taker) => taker.fail(error)));
+      return;
+    }
+    if (takers.length === 0) return;
+    void Promise.all([Promise.all(landings), Promise.all(erasures)])
+      .then(async ([results]) => {
+        await idle();
+        return results.filter((p): p is PendingDelete => p !== null);
+      })
+      .then(
+        (pending) => takers.forEach((taker) => taker.done(pending)),
+        (error) => takers.forEach((taker) => taker.fail(error)),
+      );
+  };
+  const kickRetryLoop = (due = false) => {
+    dirty = true;
+    if (due) workDue = true;
+    if (looping) return;
+    looping = (async () => {
+      try {
+        for (;;) {
+          dirty = false;
+          const takers = waiters;
+          waiters = [];
+          const run = workDue || takers.length > 0;
+          workDue = false;
+          await retryPass(run, takers);
+          if (!dirty) break;
+        }
+        syncRetryTimer();
+      } catch (error) {
+        // A pass catches its own failures; this is a bug. The loop must not
+        // die with the timer unarmed and the failure unhandled.
+        resumeFailed = true;
+        syncRetryTimer();
+        deps.logger.warn(
+          { error: String(error) },
+          "stream sync: the delete retry loop failed",
+        );
+      } finally {
+        looping = undefined;
+      }
+    })();
+  };
+  /** Run the owed work now; answers with the deletes still not landed. */
+  const resume = () =>
+    new Promise<readonly PendingDelete[]>((done, fail) => {
+      waiters.push({ done, fail });
+      kickRetryLoop(true);
+    });
   // A connection purged here, by a delete made here or one adopted from
   // another device, may be erased from storage once its delete has settled;
   // the retry loop runs the erasure (and decides whether it is time).
@@ -347,38 +469,16 @@ export function createLocalSync(
                 ? { ns: purged.ns, version: purged.controlVersion }
                 : undefined,
             );
-          armRetry();
+          kickRetryLoop();
         })
       : () => {};
-  const resumes = new Set<Promise<readonly PendingDelete[]>>();
-  const resume = () => {
-    const work = resumeOnce();
-    resumes.add(work);
-    void work.then(
-      () => resumes.delete(work),
-      () => resumes.delete(work),
-    );
-    return work;
-  };
-  const resumeOnce = async () => {
-    const pending = await deletes().resumeDeletes();
-    // An erasure that is not finished is retried with the same backoff.
-    const erasing = await deletes().resumeErasures();
-    if (pending.length > 0 || erasing) armRetry();
-    else {
-      if (retryTimer) clearTimeout(retryTimer);
-      retryTimer = undefined;
-      retryDelay = retryFirst;
-    }
-    return pending;
-  };
   // Start recovery without holding unrelated connections. The apply and
   // publish paths check their own connector's durable intent before work.
   const kickDeletes = async () => {
     const rows = await deps.db.query<{ connector: string }>(
       "SELECT connector FROM delete_intents ORDER BY connector",
     );
-    if (rows.length || deletes().erasureOwed()) void resume().catch(armRetry);
+    if (rows.length || deletes().erasureOwed()) kickRetryLoop(true);
     return rows;
   };
   const deleter: ConnectionDeleter = {
@@ -389,8 +489,8 @@ export function createLocalSync(
         connector,
         request,
       );
-      // Its landing runs in the background; check back whether it landed.
-      armRetry();
+      // Its landing runs in the background; look again whether it landed.
+      kickRetryLoop();
       return result;
     },
     resumeDeletes: resume,
@@ -399,8 +499,8 @@ export function createLocalSync(
     async deleteStatus(connector) {
       const status = await deletes().deleteStatus(connector);
       // A status that found a newer delete owes its erasure: the retry loop
-      // is what runs it, so it is armed by the read that found the work.
-      if (deletes().erasureOwed()) armRetry();
+      // is what runs it, so the read that found the work asks it to look.
+      kickRetryLoop();
       return status;
     },
     erasureOwed: () => deletes().erasureOwed(),
@@ -552,11 +652,10 @@ export function createLocalSync(
     close: () => {
       closed = true;
       stopHearingPurges();
-      clearTimeout(retryTimer);
-      retryTimer = undefined;
+      syncRetryTimer(); // closed (only ever turns on): clears the timer
       return (closing ??= (async () => {
         await deleteStore?.close();
-        await Promise.allSettled([...resumes]);
+        await looping;
         await deps.db.close();
       })());
     },
