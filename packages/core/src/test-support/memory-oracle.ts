@@ -48,6 +48,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 const TEMP_ROOT_OWNER = ".memory-oracle-owner";
@@ -297,14 +298,16 @@ function spawnChild(workload: Workload, gc: GcMode): Promise<ChildReport> {
     });
     let stdout = "";
     let stderr = "";
+    const stdoutDecoder = new StringDecoder("utf8");
     child.stdout.on("data", (d: Buffer) => {
-      stdout += d.toString("utf8");
+      stdout += stdoutDecoder.write(d);
     });
     child.stderr.on("data", (d: Buffer) => {
       stderr += d.toString("utf8");
     });
     child.on("error", reject);
     child.on("close", (code, signal) => {
+      stdout += stdoutDecoder.end();
       const line = stdout
         .split("\n")
         .filter((l) => l.startsWith(LINE_PREFIX))

@@ -102,6 +102,30 @@ describe("memory-oracle calibration", () => {
     });
     expect(r.peakBytes).toBeGreaterThanOrEqual(0.9 * HELD_MiB * MiB);
   }, 60_000);
+
+  // "€" is three bytes in UTF-8, and a ~300 KiB report line arrives in
+  // several stdout chunks. 65536 is not a multiple of 3, so a chunk boundary
+  // falls inside a character; decoding each chunk on its own replaces the
+  // split bytes with U+FFFD while JSON.parse still succeeds.
+  it("returns multi-byte characters intact across stdout chunks", async () => {
+    const temporary = join(homedir(), ".tmp");
+    mkdirSync(temporary, { recursive: true });
+    const root = mkdtempSync(join(temporary, "memory-oracle-unicode-"));
+    try {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        `export function unicode() { return "€".repeat(100_000); }`,
+      );
+      const measured = await run<string>({
+        module,
+        exportName: "unicode",
+      });
+      expect(measured.result).toBe("€".repeat(100_000));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe("memory-oracle temp roots", () => {
