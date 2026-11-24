@@ -8,6 +8,7 @@ import {
   utf8,
   utf8Length,
 } from "./bytes.js";
+import { canonicalJson, canonicalJsonChunks, JSON_CHUNK_UNITS } from "./json.js";
 
 const digits = "0123456789abcdefABCDEF".repeat(3).slice(0, 64);
 const lower = `0x${digits.toLowerCase()}`;
@@ -150,5 +151,34 @@ describe("hash port output formatting", () => {
       `0x${"00".repeat(32)}`,
     );
     expect(attempts).toBe(2);
+  });
+});
+
+describe("encoding JSON as bytes", () => {
+  it("refuses a Date object rather than silently encoding it as text", () => {
+    const value = "2026-06-01T00:00:00.000Z";
+    expect(() => utf8(canonicalJson({ label: new Date(value) }))).toThrow(
+      expect.objectContaining({
+        code: "non-canonical-value",
+        message: "only plain objects are allowed",
+      }),
+    );
+    expect(new TextDecoder().decode(utf8(canonicalJson({ label: value })))).toBe(
+      '{"label":"2026-06-01T00:00:00.000Z"}',
+    );
+  });
+
+  it("terminates a partial text iterator when a later value cannot be serialized", () => {
+    const chunks = canonicalJsonChunks(["a".repeat(JSON_CHUNK_UNITS), undefined]);
+    const first = chunks.next();
+    if (first.done) throw new Error("expected an initial text chunk");
+    expect(first.value.startsWith('["a')).toBe(true);
+    expect(() => chunks.next()).toThrow(
+      expect.objectContaining({
+        code: "non-canonical-value",
+        message: "unsupported value of type undefined",
+      }),
+    );
+    expect(chunks.next().done).toBe(true);
   });
 });
