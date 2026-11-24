@@ -8,6 +8,7 @@ import {
 } from "./bootstrap.js";
 import type { ConnectionRow, LocalSyncDeps } from "./deps.js";
 import { publishLog } from "./log-publish.js";
+import type { AttemptFailures } from "./partial-load.js";
 import type { PublishResult } from "./publish.js";
 import { insideQueue } from "./slot.js";
 import { UpdateRequiredError } from "./update-required.js";
@@ -25,8 +26,28 @@ export interface CycleReport {
      * before the unreadable segment was reached (a snapshot, earlier segments)
      * stay applied (see `UpdateRequiredError`).
      */
-    readonly status?: "update_required";
+    readonly status?: "update_required" | "degraded";
+    /**
+     * Set with `status: "degraded"`: the streams a load of this connection
+     * stopped on, each with the reason it stopped (`stream_partial`). The
+     * streams the load had not reached were not applied; the rest are as
+     * the last complete apply left them. Any acknowledged early publication
+     * remains in `published`.
+     */
+    readonly failedStreams?: readonly FailedStream[];
   }[];
+  /**
+   * A failure of the fallback pass that no connection owns (the registry
+   * listing, saving controls or purging). It never changes the result of a
+   * scoped caller whose connections settled in the early publish.
+   */
+  readonly cycleError?: string;
+}
+
+/** A stream a load of the connection stopped on, and why (`failureCode`). */
+export interface FailedStream {
+  readonly stream: string;
+  readonly reason: string;
 }
 
 /** The connections a retry owes while the registry position is unchanged. */
@@ -39,6 +60,8 @@ export interface EarlyPublish {
   readonly published: readonly PublishResult[];
   /** What the early publish threw, kept as thrown so its type survives. */
   readonly error: unknown;
+  /** A fresh connection's deferral, dropped from `published` (see `publishEarly`). */
+  readonly deferred?: boolean;
 }
 
 /**
@@ -58,21 +81,60 @@ export async function runCycle(
   if (scope) return runScoped(deps, scope);
   const early = made ?? (await publishEarly(deps, await earlyCandidates(deps)));
   // One listing after early publish, shared by bootstrap and all applies.
-  const listed = await deps.registry.listOwnerRows();
-  const connections = await bootstrapConnections(deps, listed);
+  return cycleOver(deps, await deps.registry.listOwnerRows(), early, onApply);
+}
+
+/** The cycle's pass over a listing already taken: bootstrap, then each connection. */
+async function cycleOver(
+  deps: LocalSyncDeps,
+  listed: OwnerRows,
+  early: Map<string, EarlyPublish>,
+  onApply?: (outcome: ApplyOutcome) => void,
+): Promise<CycleReport> {
+  const failures = new Map<string, unknown>();
+  const connections = await bootstrapConnections(deps, listed, failures);
   return {
-    connections: await Promise.all(
-      connections.map(({ connectionId }) =>
-        syncConnection(
-          deps,
-          connectionId,
-          early.get(connectionId),
-          listed,
-          onApply,
-        ),
-      ),
-    ),
+    connections: [
+      ...(await Promise.all(
+        connections
+          .filter(({ connectionId }) => !failures.has(connectionId))
+          .map(({ connectionId }) =>
+            syncConnection(
+              deps,
+              connectionId,
+              early.get(connectionId),
+              listed,
+              onApply,
+            ),
+          ),
+      )),
+      ...failedBootstraps(deps, failures, early),
+    ],
   };
+}
+
+/**
+ * A connection whose control save or purge failed is reported against itself,
+ * with what the early publish already did, and is not applied or published
+ * this pass. The other connections go on.
+ */
+function failedBootstraps(
+  deps: LocalSyncDeps,
+  failures: ReadonlyMap<string, unknown>,
+  early: ReadonlyMap<string, EarlyPublish>,
+): CycleReport["connections"] {
+  return [...failures].map(([connectionId, cause]) => {
+    const error = errorMessage(cause);
+    deps.logger.warn(
+      { connectionId, error },
+      "Stream sync cycle failed for a connection",
+    );
+    return {
+      connectionId,
+      published: early.get(connectionId)?.published ?? [],
+      error,
+    };
+  });
 }
 
 /** Retry only the named connections using one shared owner listing. */
@@ -118,38 +180,116 @@ async function runScoped(
  * the early publish does not take (deleted, foreign, or a reconnect), which
  * only the cycle's listing and apply can place.
  */
-export async function runPublish(deps: LocalSyncDeps): Promise<CycleReport> {
+export async function runPublish(
+  deps: LocalSyncDeps,
+  /**
+   * The connections the caller awaits. Once each has settled in the early
+   * publish, its result is final: the fallback pass that follows runs for the
+   * other connections only, and nothing it does changes that result (see
+   * `siblingPass`). Without it every connection is the caller's own.
+   */
+  awaited?: readonly string[],
+): Promise<CycleReport> {
   const candidates = await earlyCandidates(deps);
   const early = await publishEarly(deps, candidates);
   const fresh = new Set(candidates.fresh.map((c) => c.connectionId));
   // Every connection the early publish takes must have a result: a registry
   // without the batch route throws `RegistryBatchRouteMissingError`, which is
   // kept as the connection's error and leaves no result: nothing is published
-  // (the cycle reports it). A fresh
-  // connection has streams, so no published result means its deferral was
-  // dropped (`publishEarly`); a known connection with no streams has none.
-  const settled = [...candidates.active, ...candidates.fresh].every(
-    ({ connectionId }) => {
-      const e = early.get(connectionId);
-      return (
-        e !== undefined &&
-        e.error === null &&
-        (e.published.length > 0 || !fresh.has(connectionId)) &&
-        e.published.every(
-          (r) => r.outcome === "published" || r.outcome === "noop",
-        )
-      );
-    },
-  );
-  if (!settled || (await hasUnplacedConnections(deps, candidates)))
-    return runCycle(deps, undefined, early);
-  return {
-    connections: [...early].map(([connectionId, e]) => ({
-      connectionId,
-      published: e.published,
-      error: null,
-    })),
+  // (the cycle reports it). A fresh connection has streams, so no published
+  // result means its deferral was dropped (`publishEarly`), and one deferred
+  // stream leaves the connection unsettled whatever else it published; a
+  // known connection with no streams has none.
+  const isSettled = (connectionId: string): boolean => {
+    const e = early.get(connectionId);
+    return (
+      e !== undefined &&
+      e.error === null &&
+      e.deferred !== true &&
+      (e.published.length > 0 || !fresh.has(connectionId)) &&
+      e.published.every(
+        (r) => r.outcome === "published" || r.outcome === "noop",
+      )
+    );
   };
+  const earlyEntry = (
+    connectionId: string,
+    e: EarlyPublish,
+    unfinished?: string,
+  ): CycleReport["connections"][number] => ({
+    connectionId,
+    published: e.published,
+    error:
+      e.error !== null
+        ? errorMessage(e.error)
+        : unfinished !== undefined && !isSettled(connectionId)
+          ? unfinished
+          : null,
+  });
+  const settled = [...candidates.active, ...candidates.fresh].every(
+    ({ connectionId }) => isSettled(connectionId),
+  );
+  const unplaced = await unplacedConnections(deps, candidates);
+  if (settled && unplaced.length === 0)
+    return {
+      connections: [...early].map(([id, e]) => earlyEntry(id, e)),
+    };
+  const own = new Set(awaited ?? []);
+  if (own.size === 0 || ![...own].every(isSettled))
+    return runCycle(deps, undefined, early);
+
+  // The caller's connections settled: their result is the early publish's.
+  // The fallback runs for the rest and reports its failures, never throws.
+  const siblings = [...early].filter(([id]) => !own.has(id));
+  let cycle: CycleReport["connections"] = [];
+  let cycleError: string | undefined;
+  try {
+    const listed = await deps.registry.listOwnerRows();
+    const failures = new Map<string, unknown>();
+    const known = await bootstrapConnections(deps, listed, failures);
+    cycle = [
+      ...(await Promise.all(
+        known
+          .filter(
+            ({ connectionId }) =>
+              !own.has(connectionId) && !failures.has(connectionId),
+          )
+          .map(({ connectionId }) =>
+            syncConnection(deps, connectionId, early.get(connectionId), listed),
+          ),
+      )),
+      ...failedBootstraps(deps, failures, early).filter(
+        ({ connectionId }) => !own.has(connectionId),
+      ),
+    ];
+  } catch (cause) {
+    // Nothing of the pass ran for the siblings: each that did not settle
+    // failed with this, and a connection only the pass could place with it.
+    cycleError = errorMessage(cause);
+    cycle = [
+      ...siblings.map(([id, e]) => earlyEntry(id, e, cycleError)),
+      ...unplaced
+        .filter((id) => !own.has(id))
+        .map((connectionId) => ({
+          connectionId,
+          published: [],
+          error: cycleError!,
+        })),
+    ];
+  }
+  return {
+    connections: [
+      ...[...early]
+        .filter(([id]) => own.has(id))
+        .map(([id, e]) => earlyEntry(id, e)),
+      ...cycle,
+    ],
+    ...(cycleError !== undefined ? { cycleError } : {}),
+  };
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 /** The connections the early publish takes: known active, and new with streams. */
@@ -166,19 +306,19 @@ async function earlyCandidates(deps: LocalSyncDeps): Promise<EarlyCandidates> {
 }
 
 /**
- * A connection with streams that the early publish takes neither as active nor
- * as new: it waits for the cycle's listing.
+ * The connections with streams that the early publish takes neither as active
+ * nor as new: they wait for the cycle's listing.
  */
-async function hasUnplacedConnections(
+async function unplacedConnections(
   deps: LocalSyncDeps,
   { active, fresh }: EarlyCandidates,
-): Promise<boolean> {
+): Promise<readonly string[]> {
   const placed = new Set(
     [...active, ...fresh].map(({ connectionId }) => connectionId),
   );
-  return (await connectionsWithStreams(deps)).some(
-    ({ connectionId }) => !placed.has(connectionId),
-  );
+  return (await connectionsWithStreams(deps))
+    .map(({ connectionId }) => connectionId)
+    .filter((connectionId) => !placed.has(connectionId));
 }
 
 /**
@@ -220,6 +360,7 @@ async function publishEarly(
         early.set(connectionId, {
           published: published.filter((r) => r.outcome !== "deferred"),
           error: null,
+          deferred: published.some((r) => r.outcome === "deferred"),
         });
       } catch (cause) {
         early.set(connectionId, { published: [], error: cause });
@@ -249,17 +390,33 @@ export async function syncConnection(
 ): Promise<CycleReport["connections"][number]> {
   let published: readonly PublishResult[] = early?.published ?? [];
   let error: string | null = null;
-  let status: "update_required" | undefined;
+  let status: "update_required" | "degraded" | undefined;
+  let failedStreams: readonly FailedStream[] = [];
   try {
     // A pass includes publish, so it must not join an apply-only operation.
-    const outcome = await deps.queue.run(connectionId, "publish", () =>
-      applyConnection(
-        insideQueue(deps, connectionId),
-        connectionId,
-        listed,
-        listed?.find((row) => row.scope === connectionId)?.read,
-      ),
-    );
+    // The apply attempt's own record of the streams it marks failed.
+    const marked: AttemptFailures = new Map();
+    let outcome: ApplyOutcome;
+    try {
+      outcome = await deps.queue.run(connectionId, "publish", () =>
+        applyConnection(
+          insideQueue({ ...deps, attemptFailures: marked }, connectionId),
+          connectionId,
+          listed,
+          listed?.find((row) => row.scope === connectionId)?.read,
+        ),
+      );
+    } catch (cause) {
+      // Only an apply that threw has a failed load to report; an update that
+      // is required names no stream.
+      if (!(cause instanceof UpdateRequiredError))
+        failedStreams = [...marked]
+          .map(([stream, reason]) => ({ stream, reason }))
+          .sort((a, b) =>
+            a.stream < b.stream ? -1 : a.stream > b.stream ? 1 : 0,
+          );
+      throw cause;
+    }
     onApply?.(outcome);
     if (early && early.error !== null) throw early.error;
     // One segment and one commit per batch. A registry without the batch
@@ -269,7 +426,7 @@ export async function syncConnection(
     const through = await publishLog(deps, connectionId);
     published = [...published, ...through];
   } catch (cause) {
-    error = cause instanceof Error ? cause.message : String(cause);
+    error = errorMessage(cause);
     if (cause instanceof UpdateRequiredError) status = "update_required";
     // The timer and `/sync/trigger` drop the report. A connection whose
     // publish keeps failing would otherwise stay unpublished with no trace:
@@ -278,11 +435,16 @@ export async function syncConnection(
       { connectionId, error },
       "Stream sync cycle failed for a connection",
     );
+    // Say which streams this attempt's apply stopped on, so one bad object
+    // reads as that and not as a connection that failed whole. Rows of
+    // earlier attempts do not count.
+    if (status === undefined && failedStreams.length > 0) status = "degraded";
   }
   return {
     connectionId,
     published,
     error,
     ...(status ? { status } : {}),
+    ...(failedStreams.length > 0 ? { failedStreams } : {}),
   };
 }

@@ -1,5 +1,7 @@
 import {
   leavesUnconfirmed,
+  type CycleReport,
+  type FailedStream,
   type PublicationReceipt,
   type SeedIntake,
 } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -94,9 +96,37 @@ export interface StartPersonalServerLiteOptions extends Omit<
   onStatus?: (status: PersonalServerStatus) => void;
 }
 
+/** What one connection's publication did in a `publish()` pass. */
+export type PersonalServerLiteConnectionPublication = {
+  /** The connection's control scope (`controlScope(connector, ns)`). */
+  readonly connectionId: string;
+  readonly outcome: "published" | "noop" | "failed";
+  /** Why the connection failed; set with `outcome: "failed"`. */
+  readonly error?: string;
+  /** `update_required`: this build cannot read the connection's log. `degraded`: a load stopped on `failedStreams`. */
+  readonly status?: "update_required" | "degraded";
+  readonly failedStreams?: readonly FailedStream[];
+  readonly publications: readonly PublicationReceipt[];
+};
+
 export type PersonalServerLitePublicationResult = {
   readonly outcome: "published" | "noop";
+  /** The receipts of the connections the caller owns (every connection when it names none). */
   readonly publications: readonly PublicationReceipt[];
+  /** Every connection the pass took, the caller's own and the others. */
+  readonly connections: readonly PersonalServerLiteConnectionPublication[];
+  /** A failure of the pass that belongs to no connection (the listing, saving controls, a purge). It never rejects. */
+  readonly cycleError?: string;
+};
+
+export type PersonalServerLitePublishOptions = {
+  /**
+   * The connections (`controlScope(connector, ns)`) whose publication the
+   * caller awaits. `publish()` rejects only for these: another connection's
+   * failure is in `connections` and nothing more. Without it, or with an empty
+   * list, every connection is the caller's own.
+   */
+  readonly connections?: readonly string[];
 };
 
 /** The Lite handle: the shared handle plus the host's run-intake door. */
@@ -109,13 +139,18 @@ export type PersonalServerLiteHandle = PersonalServerHandle & {
   readonly streamSyncIntake: RunIntake | null;
   /** One-time retained-snapshot intake, with the runtime's Account admission. */
   readonly streamSyncSeed: SeedIntake | null;
-  /** Await a database publication cycle. Rejects if any stream cannot confirm publication.
+  /** Await a database publication cycle. Rejects if a stream of the caller's
+   * own connections (`options.connections`; all of them when none are named)
+   * cannot confirm publication. Another connection's failure does not reject:
+   * read it from `connections`.
    * A stream of a deleted connection (outcome `purged`) is settled, not
    * unconfirmed: it neither rejects nor appears in the receipts.
    * Receipts cover individual streams, not every stream of a connection.
    * A noop contains no new coverage. Unavailable or stopped runtimes reject.
    */
-  publish(): Promise<PersonalServerLitePublicationResult>;
+  publish(
+    options?: PersonalServerLitePublishOptions,
+  ): Promise<PersonalServerLitePublicationResult>;
   /** Whether an ended run is saved, from durable local state. Use it when a
    * `publish()` reply was lost; it does not collect or publish anything.
    * Errors as `streamSyncIntake.publicationStatus` does.
@@ -657,37 +692,47 @@ export async function startPersonalServer(
         },
       }
     : null;
-  function publish(): Promise<PersonalServerLitePublicationResult> {
+  function publish(
+    options: PersonalServerLitePublishOptions = {},
+  ): Promise<PersonalServerLitePublicationResult> {
     if (stopping)
       return Promise.reject(new Error("Stream publication is unavailable"));
-    const operation = publishCycle();
+    const operation = publishCycle(options);
     publishing.add(operation);
     void operation.finally(() => publishing.delete(operation)).catch(() => {});
     return operation;
   }
 
-  async function publishCycle(): Promise<PersonalServerLitePublicationResult> {
+  async function publishCycle(
+    options: PersonalServerLitePublishOptions,
+  ): Promise<PersonalServerLitePublicationResult> {
     if (
       (earlyOwnerReads && !registrationConfirmed) ||
       status === "stopped" ||
       !runtimeBundle?.getLocalSync
     )
       throw new Error("Stream publication is unavailable");
-    const report = await (await runtimeBundle.getLocalSync()).publish();
-    const publications: PublicationReceipt[] = [];
-    for (const connection of report.connections) {
-      if (connection.error) throw new Error(connection.error);
-      for (const result of connection.published) {
-        if (leavesUnconfirmed(result.outcome))
-          throw new Error(
-            `Stream publication ${result.outcome}: ${connection.connectionId}/${result.stream}`,
-          );
-        if (result.publication) publications.push(result.publication);
-      }
-    }
+    // An empty list names no connection: it is no scope, as when omitted.
+    const awaited = options.connections?.length
+      ? options.connections
+      : undefined;
+    const report = await (await runtimeBundle.getLocalSync()).publish(awaited);
+    const connections = report.connections.map(connectionPublication);
+    const own = awaited ? new Set(awaited) : null;
+    const mine = connections.filter(
+      (connection) => own === null || own.has(connection.connectionId),
+    );
+    // A connection the caller does not own never rejects its publication.
+    const failed = mine.find((connection) => connection.error !== undefined);
+    if (failed) throw new Error(failed.error);
+    const publications = mine.flatMap((connection) => connection.publications);
     return {
       outcome: publications.length ? "published" : "noop",
       publications,
+      connections,
+      ...(report.cycleError !== undefined
+        ? { cycleError: report.cycleError }
+        : {}),
     };
   }
 
@@ -749,6 +794,38 @@ export async function startPersonalServer(
     publish,
     publicationStatus,
     stop,
+  };
+}
+
+/** One connection's pass: its error, or the first stream it left unconfirmed, as a failure. */
+function connectionPublication(
+  connection: CycleReport["connections"][number],
+): PersonalServerLiteConnectionPublication {
+  const unconfirmed = connection.published.find((result) =>
+    leavesUnconfirmed(result.outcome),
+  );
+  const error =
+    connection.error ??
+    (unconfirmed
+      ? `Stream publication ${unconfirmed.outcome}: ${connection.connectionId}/${unconfirmed.stream}`
+      : undefined);
+  const publications = connection.published.flatMap((result) =>
+    result.publication ? [result.publication] : [],
+  );
+  return {
+    connectionId: connection.connectionId,
+    outcome:
+      error !== undefined
+        ? "failed"
+        : publications.length > 0
+          ? "published"
+          : "noop",
+    ...(error !== undefined ? { error } : {}),
+    ...(connection.status ? { status: connection.status } : {}),
+    ...(connection.failedStreams
+      ? { failedStreams: connection.failedStreams }
+      : {}),
+    publications,
   };
 }
 

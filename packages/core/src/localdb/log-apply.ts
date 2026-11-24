@@ -85,6 +85,7 @@ import { recommitApplied } from "./log-recommit.js";
 import { UpdateRequiredError } from "./update-required.js";
 import {
   failedRowStatement,
+  noteMarkedFailed,
   failureCode,
   hideStoredRows,
   partialRowStatement,
@@ -779,7 +780,14 @@ async function listKeyedLoad(
       await deps.db
         .batch(identities.map((identity) => failedRowStatement(identity, code)))
         .then(
-          () => announceApplied(deps, connectionId),
+          () => {
+            noteMarkedFailed(
+              deps.attemptFailures,
+              identities.map((identity) => identity.stream),
+              code,
+            );
+            announceApplied(deps, connectionId);
+          },
           () => undefined,
         );
     },
@@ -987,16 +995,20 @@ async function loadProgressively(
     partRefs.length > 0 ? partAt(0) : Promise.resolve(undefined),
     ...removing.map(segmentAt),
   ]).catch(async (error) => {
+    const code = failureCode(error);
     const stopped = [...new Set([...begun, ...resumed])].map(headOf);
     if (stopped.length)
       await deps.db
-        .batch(
-          stopped.map((identity) =>
-            failedRowStatement(identity, failureCode(error)),
-          ),
-        )
+        .batch(stopped.map((identity) => failedRowStatement(identity, code)))
         .then(
-          () => announceApplied(deps, connectionId),
+          () => {
+            noteMarkedFailed(
+              deps.attemptFailures,
+              stopped.map((identity) => identity.stream),
+              code,
+            );
+            announceApplied(deps, connectionId);
+          },
           () => undefined,
         );
     throw error;
@@ -1253,7 +1265,14 @@ async function loadProgressively(
           ]),
         )
         .then(
-          () => announceApplied(deps, connectionId),
+          () => {
+            noteMarkedFailed(
+              deps.attemptFailures,
+              stopped.map((identity) => identity.stream),
+              code,
+            );
+            announceApplied(deps, connectionId);
+          },
           () => undefined,
         );
     throw error;
