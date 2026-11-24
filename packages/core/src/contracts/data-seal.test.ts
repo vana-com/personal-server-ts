@@ -54,3 +54,25 @@ describe("ingest when the seal closes between the blob and its row", () => {
     expect(error).toBeInstanceOf(IngestPersistedError);
   });
 });
+
+describe("persisted-write diagnostic", () => {
+  it("preserves the exact error and the relative path for a repair caller", () => {
+    const rootCause = new Error("fixture index unavailable");
+    const error = new IngestPersistedError("fixtures/version.json", rootCause);
+    expect(error.name).toBe("IngestPersistedError");
+    expect(error.cause).toBe(rootCause);
+    expect(error.relativePath).toBe("fixtures/version.json");
+    expect(error.message).toContain(rootCause.message);
+  });
+
+  it("formats a non-Error cause without claiming the index was written", () => {
+    const error = new IngestPersistedError(
+      "fixtures/version.json",
+      "fixture refused",
+    );
+    expect(error.cause).toBe("fixture refused");
+    expect(error.message).toBe(
+      "Envelope persisted at fixtures/version.json but write did not complete: fixture refused",
+    );
+  });
+});
