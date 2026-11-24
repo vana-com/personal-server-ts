@@ -19,9 +19,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { measure, type StepReport } from "./measure.js";
 import { deriveKeyCheck } from "@opendatalabs/personal-server-ts-stream-sync";
 import { readLogState } from "../../../../core/src/localdb/log-state.js";
-import * as compact from "../../../../core/src/localdb/log-compact.js";
+import { compactLog } from "../../../../core/src/localdb/log-compact.js";
+import { openSpool } from "../../../../core/src/localdb/log-spool.js";
 import { endRequest } from "../../../../core/src/test-utils/run-end.js";
 import { openBetterSqlite3 } from "../better-sqlite3-driver.js";
 import {
@@ -56,33 +58,6 @@ export const STEPS = [
 ] as const;
 export type Step = (typeof STEPS)[number];
 const PREPARE: ReadonlySet<Step> = new Set(["intake1", "intake2"]);
-
-export interface StepReport {
-  readonly step: Step;
-  /** Resident size after a full collection, when the step began. */
-  readonly idleMiB: number;
-  /** Process high-water mark during the step (kernel `VmHWM`). */
-  readonly peakMiB: number;
-  readonly aboveIdleMiB: number;
-  readonly ms: number;
-  readonly notes: Record<string, unknown>;
-}
-
-const statusKiB = (field: string): number => {
-  const m = new RegExp(`^${field}:\\s+(\\d+) kB$`, "m").exec(
-    readFileSync("/proc/self/status", "utf8"),
-  );
-  if (!m) throw new Error(`${field} missing from /proc/self/status`);
-  return Number(m[1]);
-};
-
-async function settle(): Promise<void> {
-  const gc = globalThis.gc;
-  if (!gc) throw new Error("run with --expose-gc");
-  for (let i = 0; i < 3; i += 1) gc();
-  await new Promise((r) => setTimeout(r, 300));
-  for (let i = 0; i < 2; i += 1) gc();
-}
 
 /** A blob store of one file per blob: every `get` reads fresh bytes. */
 function diskBlobs(root: string): WorldBlobStore {
@@ -143,36 +118,11 @@ export async function runStep(args: StepArgs): Promise<StepReport | null> {
   let report: StepReport | null = null;
   const measured = async <T>(
     fn: () => Promise<T>,
-    notes: (result: T) => Record<string, unknown> = () => ({}),
+    notes?: (result: T) => Record<string, unknown>,
   ): Promise<T> => {
-    await settle();
-    const idle = statusKiB("VmRSS");
-    writeFileSync("/proc/self/clear_refs", "5");
-    const started = Date.now();
-    // Where the peak lives: sampled maxima of V8's heap and of the Buffers
-    // outside it (a lower bound; the kernel mark is the peak itself).
-    let heapMax = 0;
-    let externalMax = 0;
-    const sample = setInterval(() => {
-      const m = process.memoryUsage();
-      heapMax = Math.max(heapMax, m.heapUsed);
-      externalMax = Math.max(externalMax, m.external + m.arrayBuffers);
-    }, 20);
-    const result = await fn().finally(() => clearInterval(sample));
-    const peak = statusKiB("VmHWM");
-    report = {
-      step: args.step,
-      idleMiB: Math.round(idle / 1024),
-      peakMiB: Math.round(peak / 1024),
-      aboveIdleMiB: Math.max(0, Math.round((peak - idle) / 1024)),
-      ms: Date.now() - started,
-      notes: {
-        sampledHeapMiB: Math.round(heapMax / MiB),
-        sampledExternalMiB: Math.round(externalMax / MiB),
-        ...notes(result),
-      },
-    };
-    return result;
+    const done = await measure(args.step, fn, notes);
+    report = done.report;
+    return done.result;
   };
 
   const perBatch = Math.max(
@@ -260,24 +210,17 @@ export async function runStep(args: StepArgs): Promise<StepReport | null> {
       }
       case "compaction": {
         // The cost model compacts only a log with a long tail, so the step
-        // calls the compaction directly. Main's `planCompaction` has the gate
-        // in front of it: the baseline run strips it (see run.sh).
+        // calls `compactLog`, which has no gate. (Main's `planCompaction` has
+        // one: the baseline run strips it, see scripts/log-memory/README.md.)
         const a = await w.device("a");
-        type Plan = {
-          objects: readonly { name: string; cipher?: Uint8Array }[];
-        } | null;
-        const fn = ((compact as Record<string, unknown>).compactLog ??
-          compact.planCompaction) as (
-          deps: unknown,
-          input: unknown,
-        ) => Promise<Plan>;
         const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
         const log = await readLogState(a.deps, CONNECTION_ID);
         await measured(
           async () => {
-            const plan = await fn(
+            const plan = await compactLog(
               { ...a.deps, partTargetBytes: TARGET },
               {
+                connectionId: CONNECTION_ID,
                 connector: CONNECTOR,
                 ns: "",
                 generation: 1,
@@ -285,17 +228,17 @@ export async function runStep(args: StepArgs): Promise<StepReport | null> {
                 scope: LOG,
                 log,
               },
+              openSpool(a.deps.db, CONNECTION_ID, "bench"),
             );
             return {
-              objects: plan?.objects.length ?? 0,
-              bytes:
-                plan?.objects.reduce(
-                  (n, o) => n + (o.cipher?.length ?? 0),
-                  0,
-                ) ?? 0,
+              objects: plan.objects.length,
+              spooled: plan.objects.reduce((n, o) => n + o.bytes, 0),
             };
           },
-          (r) => ({ objects: r.objects, retainedCipherBytes: r.bytes }),
+          (r) => ({
+            objects: r.objects,
+            spooledCipherBytes: r.spooled,
+          }),
         );
         break;
       }
