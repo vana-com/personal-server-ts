@@ -54,6 +54,12 @@ const published = (id: string) => [
 // The mocked siblings only need the real queue, not database or network ports.
 // The cycle's one listing of the owner; the mocked siblings only pass it on.
 const LISTED: readonly never[] = [];
+// The registry's rows for the scoped table: a control row per connection, so a
+// test can see whether the cycle bootstrapped a connection it must leave alone.
+const OWNER_ROWS = ["own", "sibling", "A", "B", "C"].map((scope) => ({
+  scope,
+  read: { found: false },
+})) as never;
 const dependencies = () =>
   ({
     queue: connectionQueue(),
@@ -84,6 +90,7 @@ describe("a scoped caller's result is decided only by its own connections", () =
     step: (deps: LocalSyncDeps) => void,
   ) {
     const deps = dependencies();
+    deps.registry.listOwnerRows = async () => OWNER_ROWS;
     if (ownNeedsFallback)
       vi.mocked(newConnectionsWithStreams).mockResolvedValue([
         connection("own"),
@@ -124,6 +131,12 @@ describe("a scoped caller's result is decided only by its own connections", () =
           .spyOn(deps.registry, "listOwnerRows")
           .mockRejectedValue(fails("listing")),
       { sibling: "listing failed", cycleError: "listing failed" },
+    ],
+    [
+      "discovery of the connections only the listing could place",
+      () =>
+        vi.mocked(connectionsWithStreams).mockRejectedValue(fails("discovery")),
+      { sibling: "discovery failed", cycleError: "discovery failed" },
     ],
     [
       "control save or purge, not tied to one connection",
@@ -204,12 +217,60 @@ describe("a scoped caller's result is decided only by its own connections", () =
       expect(
         vi.mocked(applyConnection).mock.calls.filter(([, id]) => id === "own"),
       ).toHaveLength(needsFallback ? 1 : 0);
+      // A caller connection that settled early is not bootstrapped (no control
+      // save or purge, no queue slot) by the fallback either.
+      if (!needsFallback)
+        for (const [, listed] of vi.mocked(bootstrapConnections).mock.calls)
+          expect(listed?.map((row) => row.scope)).not.toContain("own");
       expect(
         report.connections.find((c) => c.connectionId === "sibling"),
       ).toMatchObject({ error: expected.sibling });
       expect(report.cycleError).toBe(expected.cycleError);
     },
   );
+
+  it("keeps a settled connection final when another requested connection has no early result", async () => {
+    // A commits early. B is requested but the early publish does not take it.
+    // C defers, which forces the fallback. A's apply would fail: the call must
+    // not touch A again, so that failure cannot reach the caller.
+    const deps = dependencies();
+    deps.registry.listOwnerRows = async () => OWNER_ROWS;
+    vi.mocked(knownActiveConnections).mockResolvedValue([connection("A")]);
+    vi.mocked(newConnectionsWithStreams).mockResolvedValue([connection("C")]);
+    const calls = new Map<string, number>();
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) => {
+      const n = (calls.get(id) ?? 0) + 1;
+      calls.set(id, n);
+      return id === "C" && n === 1 ? deferred(id) : published(id);
+    });
+    vi.mocked(bootstrapConnections).mockResolvedValue(
+      ["A", "B", "C"].map(connection),
+    );
+    vi.mocked(applyConnection).mockImplementation(async (_d, id) => {
+      if (id === "A") throw fails("apply");
+      return { kind: "applied" } as never;
+    });
+
+    const report = await runPublish(deps, ["A", "B"]);
+
+    expect(report.connections.find((c) => c.connectionId === "A")).toEqual({
+      connectionId: "A",
+      published: published("A"),
+      error: null,
+    });
+    expect(report.connections.find((c) => c.connectionId === "B")).toEqual({
+      connectionId: "B",
+      published: published("B"),
+      error: null,
+    });
+    expect(report.cycleError).toBeUndefined();
+    const touched = (mock: typeof publishLog | typeof applyConnection) =>
+      vi.mocked(mock).mock.calls.filter(([, id]) => id === "A");
+    expect(touched(publishLog)).toHaveLength(1);
+    expect(touched(applyConnection)).toHaveLength(0);
+    for (const [, listed] of vi.mocked(bootstrapConnections).mock.calls)
+      expect(listed?.map((row) => row.scope)).not.toContain("A");
+  });
 
   it("does not settle a connection that has one published and one deferred stream", async () => {
     const deps = dependencies();
