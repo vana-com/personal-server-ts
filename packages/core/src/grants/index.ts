@@ -28,6 +28,7 @@ export type {
 // §6 — the PDPP↔chain grant binding. Keyed by existing chain permission
 // identity; adds no field to any signed struct.
 export {
+  createFingerprintedPdppGrantBinding,
   createPdppGrantBinding,
   grantVersionStillAuthorizes,
   isValidGrantVersion,
@@ -35,6 +36,7 @@ export {
   verifyPdppGrantBinding,
   type ChainPermissionRef,
   type CreateBindingInput,
+  type CreateFingerprintedBindingInput,
   type PdppGrantBinding,
   type ResolvedBuilder,
   type VerifyBindingInput,

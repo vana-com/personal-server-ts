@@ -93,7 +93,8 @@ export function bindingsAgree(
     a.granteeAddress.toLowerCase() === b.granteeAddress.toLowerCase() &&
     a.granteeId.toLowerCase() === b.granteeId.toLowerCase() &&
     a.pdppClientId === b.pdppClientId &&
-    a.grantVersion === b.grantVersion
+    a.grantVersion === b.grantVersion &&
+    a.grantFingerprint === b.grantFingerprint
   );
 }
 

@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 
 import {
+  createFingerprintedPdppGrantBinding,
   createPdppGrantBinding,
   grantVersionStillAuthorizes,
   isValidGrantVersion,
@@ -19,6 +20,9 @@ import {
   type ResolvedBuilder,
 } from "./pdpp-binding.js";
 import { createInMemoryPdppGrantBindingStore } from "./pdpp-binding-store.js";
+import { grantFingerprint } from "./grant-fingerprint.js";
+import fingerprintVectors from "./__fixtures__/grant-fingerprint-vectors.json";
+import type { Grant } from "../pdpp/types.js";
 
 const OWNER = "0x00000000000000000000000000000000000000AA" as const;
 const OTHER_OWNER = "0x00000000000000000000000000000000000000BB" as const;
@@ -773,5 +777,177 @@ describe("in-memory grant list presentation", () => {
     store.getBindingsForPermission(PERMISSION).pop();
 
     expect(store.getBindingsForPermission(PERMISSION)).toEqual([row]);
+  });
+});
+
+describe("bindings recorded as grant fingerprints", () => {
+  const vector = fingerprintVectors.vectors[0]!;
+  const SALT_A = vector.salt;
+  const DATA_SCOPES = vector.data_scopes;
+  const SALT_B = "11".repeat(32);
+  const GRANT_A = vector.grant as Grant;
+  const GRANT_B = {
+    ...GRANT_A,
+    grant_id: "grt_01JZ8Q4V5R6S7T8U9V0W1X2Y9B",
+  } as Grant;
+
+  async function bindingFor(
+    grant: Grant,
+    salt: string,
+    pdppGrantId: string,
+    scopes: string[],
+    grantVersion = "1",
+  ) {
+    return createFingerprintedPdppGrantBinding({
+      pdppGrantId,
+      permission: PERMISSION,
+      serverOwner: OWNER,
+      granteeAddress: GRANTEE,
+      resolvedBuilder: RESOLVED_BUILDER,
+      pdppClientId: "client-app-1",
+      chainGrant: chainGrant({ scopes, grantVersion }),
+      fingerprint: { grant, dataScopes: DATA_SCOPES, salt },
+    });
+  }
+
+  function verify(
+    binding: Awaited<ReturnType<typeof bindingFor>>,
+    live: GatewayGrantResponse,
+  ) {
+    verifyPdppGrantBinding({
+      binding,
+      pdppGrantId: binding.pdppGrantId,
+      serverOwner: OWNER,
+      requestSigner: GRANTEE,
+      chainGrant: live,
+      deployment: DEPLOYMENT,
+    });
+  }
+
+  it("records the fingerprint and requires the slot to list it", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const binding = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA]);
+    expect(binding.grantFingerprint).toBe(fpA);
+    expect(binding.grantVersion).toBe("1");
+    expect(Object.isFrozen(binding)).toBe(true);
+
+    await expect(
+      bindingFor(GRANT_A, SALT_A, "pdpp-a", ["instagram.*"]),
+    ).rejects.toMatchObject({ errorCode: "INVALID_SIGNATURE" });
+    await expect(
+      bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA.toUpperCase()]),
+    ).rejects.toMatchObject({ errorCode: "INVALID_SIGNATURE" });
+  });
+
+  it("keeps grant A readable after grant B joins the list and the version rises", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const fpB = await grantFingerprint(GRANT_B, DATA_SCOPES, SALT_B);
+    const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
+    const b = await bindingFor(GRANT_B, SALT_B, "pdpp-b", [fpA, fpB], "2");
+    const live = chainGrant({ scopes: [fpA, fpB], grantVersion: "2" });
+    expect(() => verify(a, live)).not.toThrow();
+    expect(() => verify(b, live)).not.toThrow();
+  });
+
+  it("denies a removed grant as revoked while the other still reads", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const fpB = await grantFingerprint(GRANT_B, DATA_SCOPES, SALT_B);
+    const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
+    const b = await bindingFor(GRANT_B, SALT_B, "pdpp-b", [fpA, fpB], "2");
+    const live = chainGrant({ scopes: [fpB], grantVersion: "3" });
+    expectFailure(() => verify(a, live), "GRANT_REVOKED");
+    expect(() => verify(b, live)).not.toThrow();
+  });
+
+  it("denies a live version lower than the bound one", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "5");
+    expectFailure(
+      () => verify(a, chainGrant({ scopes: [fpA], grantVersion: "4" })),
+      "INVALID_SIGNATURE",
+    );
+    expectFailure(
+      () => verify(a, chainGrant({ scopes: [fpA], grantVersion: "x" })),
+      "INVALID_SIGNATURE",
+    );
+    expectFailure(
+      () =>
+        verify(a, {
+          ...chainGrant({ scopes: [fpA] }),
+          grantVersion: null,
+        } as unknown as GatewayGrantResponse),
+      "INVALID_SIGNATURE",
+    );
+  });
+
+  it("never matches a malformed or uppercase entry", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
+    const hex = fpA.slice(4);
+    for (const entry of [
+      fpA.toUpperCase(),
+      `gf1:${hex.toUpperCase()}`,
+      ` ${fpA}`,
+      `${fpA} `,
+      fpA.slice(0, -1),
+      `gf2:${hex}`,
+      hex,
+    ]) {
+      expectFailure(
+        () => verify(a, chainGrant({ scopes: [entry] })),
+        "GRANT_REVOKED",
+      );
+    }
+  });
+
+  it("denies a binding whose own recorded fingerprint is malformed", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
+    const bad = Object.freeze({ ...a, grantFingerprint: fpA.toUpperCase() });
+    expectFailure(
+      () => verify(bad, chainGrant({ scopes: [fpA.toUpperCase()] })),
+      "GRANT_REVOKED",
+    );
+  });
+
+  it("still enforces the other axes for a fingerprint binding", async () => {
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
+    expectFailure(
+      () =>
+        verify(
+          a,
+          chainGrant({ scopes: [fpA], revokedAt: "2026-10-01T00:00:00Z" }),
+        ),
+      "GRANT_REVOKED",
+    );
+    expectFailure(
+      () =>
+        verify(a, chainGrant({ scopes: [fpA], granteeId: OTHER_BUILDER_ID })),
+      "INVALID_SIGNATURE",
+    );
+    expectFailure(
+      () =>
+        verify(a, chainGrant({ scopes: [fpA], grantorAddress: OTHER_OWNER })),
+      "GRANT_OWNER_MISMATCH",
+    );
+  });
+
+  it("keeps the equality rule for a legacy binding without a fingerprint", () => {
+    const legacy = makeBinding();
+    expect(legacy.grantFingerprint).toBeUndefined();
+    const check = (grantVersion: string) =>
+      verifyPdppGrantBinding({
+        binding: legacy,
+        pdppGrantId: "pdpp-grant-1",
+        serverOwner: OWNER,
+        requestSigner: GRANTEE,
+        chainGrant: chainGrant({ grantVersion }),
+        deployment: DEPLOYMENT,
+      });
+    expect(() => check("1")).not.toThrow();
+    for (const grantVersion of ["2", "0.5"]) {
+      expectFailure(() => check(grantVersion), "INVALID_SIGNATURE");
+    }
   });
 });
