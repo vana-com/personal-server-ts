@@ -160,3 +160,95 @@ describe("AccessLogWriter", () => {
     expect(JSON.parse(content2.trim()).logId).toBe("day2");
   });
 });
+
+describe("AccessLogReader error paths", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "access-reader-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("read() on a missing logs directory returns an empty result", async () => {
+    const { createAccessLogReader } = await import("./access-reader.js");
+    const reader = createAccessLogReader(join(tempDir, "no-such-logs"));
+
+    await expect(reader.read()).resolves.toEqual({
+      logs: [],
+      total: 0,
+      limit: 50,
+      offset: 0,
+    });
+  });
+
+  it("skips a malformed (partially written) line and still returns the valid entries", async () => {
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    const { createAccessLogReader } = await import("./access-reader.js");
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+
+    const good1 = JSON.stringify(
+      makeEntry({ logId: "good-1", timestamp: "2026-01-28T10:00:00Z" }),
+    );
+    const good2 = JSON.stringify(
+      makeEntry({ logId: "good-2", timestamp: "2026-01-28T11:00:00Z" }),
+    );
+    // Torn final write: a truncated JSON line between two valid entries.
+    await writeFile(
+      join(logsDir, "access-2026-01-28.log"),
+      `${good1}\n{"logId": "torn-\n${good2}\n`,
+      "utf-8",
+    );
+
+    const reader = createAccessLogReader(logsDir);
+    const result = await reader.read();
+
+    expect(result.total).toBe(2);
+    expect(result.logs.map((entry) => entry.logId)).toEqual([
+      "good-2",
+      "good-1",
+    ]);
+  });
+
+  it("rejects the whole read when one log file cannot be read", async () => {
+    const { mkdir } = await import("node:fs/promises");
+    const { createAccessLogReader } = await import("./access-reader.js");
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+
+    const writer = createAccessLogWriter(logsDir);
+    await writer.write(makeEntry({ logId: "good-1" }));
+    // A directory sitting where a log file should be: readFile fails (EISDIR).
+    await mkdir(join(logsDir, "access-2026-01-29.log"));
+
+    const reader = createAccessLogReader(logsDir);
+    await expect(reader.read()).rejects.toThrow(/EISDIR/);
+  });
+});
+
+describe("AccessLogWriter error paths", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "access-log-error-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("write() rejects when the logs path exists as a regular file", async () => {
+    const { writeFile } = await import("node:fs/promises");
+    const filePath = join(tempDir, "not-a-dir");
+    await writeFile(filePath, "not a directory", "utf-8");
+
+    const writer = createAccessLogWriter(filePath);
+    await expect(writer.write(makeEntry())).rejects.toThrow();
+
+    // No partial log file was created alongside the failure.
+    await expect(readdir(tempDir)).resolves.toEqual(["not-a-dir"]);
+  });
+});
