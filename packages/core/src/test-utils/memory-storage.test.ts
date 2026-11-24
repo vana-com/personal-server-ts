@@ -150,3 +150,61 @@ describe("memory data storage index projections", () => {
     ]);
   });
 });
+
+describe("memory data storage guarded updates", () => {
+  it("does not publish or change the version for a stale index id", async () => {
+    const storage = createMemoryDataStorage();
+    const scope = "sample.records";
+    const path = "sample/guarded.json";
+    const row = await storage.insertEntry({
+      scope,
+      path,
+      fileId: "guarded",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 1,
+      version: 4,
+      casRevision: 2,
+    });
+    expect(storage.updateDataPointId(path, "published", row.id + 1)).toBe(false);
+    expect(storage.updateEntryVersion(path, 9, row.id + 1)).toBe(false);
+    expect(storage.findEntry({ scope })).toMatchObject({
+      dataPointId: null,
+      version: 4,
+      casRevision: 2,
+    });
+
+    expect(storage.updateDataPointId(path, "published", row.id)).toBe(true);
+    expect(storage.updateEntryVersion(path, 9, row.id)).toBe(true);
+    expect(storage.findEntry({ scope })).toMatchObject({
+      dataPointId: "published",
+      version: 9,
+      casRevision: 2,
+    });
+    expect(storage.countUnsynced()).toBe(0);
+  });
+});
+
+describe("memory data storage first-seen ledgers", () => {
+  it("isolates nested saved values from callers and from other scopes", async () => {
+    const storage = createMemoryDataStorage();
+    const scope = "sample.records";
+    const other = "sample.other";
+    const ledger = { records: [{ id: "first" }] };
+    await storage.writeFirstSeenLedger(scope, ledger);
+    await storage.writeFirstSeenLedger(other, { records: [{ id: "other" }] });
+
+    ledger.records[0]!.id = "changed after write";
+    const read = (await storage.readFirstSeenLedger(scope)) as typeof ledger;
+    expect(read).toEqual({ records: [{ id: "first" }] });
+    read.records[0]!.id = "changed after read";
+    expect(await storage.readFirstSeenLedger(scope)).toEqual({
+      records: [{ id: "first" }],
+    });
+
+    await storage.deleteFirstSeenLedger(scope);
+    expect(await storage.readFirstSeenLedger(scope)).toBeNull();
+    expect(await storage.readFirstSeenLedger(other)).toEqual({
+      records: [{ id: "other" }],
+    });
+  });
+});
