@@ -230,7 +230,9 @@ describe("declared-text projection diagnostics", () => {
       [invalid, valid, invalid],
       {
         fixture_notes: {
-          properties: { message: { x_pdpp_text_encoding: "pdpp-safe-escape-v1" } },
+          properties: {
+            message: { x_pdpp_text_encoding: "pdpp-safe-escape-v1" },
+          },
         },
       },
       "fixture.notes",
