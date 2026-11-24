@@ -185,10 +185,18 @@ describe("PDPP error response", () => {
   });
 
   it("distinguishes unavailable history from a missing result without adding an unset parameter", () => {
-    const unavailable = new PdppError("STREAM_HISTORY_UNAVAILABLE", "History unavailable");
+    const unavailable = new PdppError(
+      "STREAM_HISTORY_UNAVAILABLE",
+      "History unavailable",
+    );
     const missing = new PdppError("not_found", "Not found");
     expect([unavailable.status, missing.status]).toEqual([503, 404]);
-    expect([unavailable.type, missing.type]).toEqual(["api_error", "not_found_error"]);
-    expect(unavailable.toJSON("request-three").error).not.toHaveProperty("param");
+    expect([unavailable.type, missing.type]).toEqual([
+      "api_error",
+      "not_found_error",
+    ]);
+    expect(unavailable.toJSON("request-three").error).not.toHaveProperty(
+      "param",
+    );
   });
 });
