@@ -72,6 +72,34 @@ function makeGrant(
   };
 }
 
+describe("gateway payment diagnostic classification", () => {
+  it("uses one bounded fallback for missing and non-string reason values", async () => {
+    const { gatewayPaymentReasonCode } = await import("./x402.js");
+    for (const body of [
+      null,
+      [],
+      {},
+      { reasonCode: 42 },
+      { reasonCode: ["AMOUNT_INVALID"] },
+    ]) {
+      expect(gatewayPaymentReasonCode(body)).toBe("GATEWAY_REJECTED");
+    }
+  });
+
+  it("retains exact known classifications without guessing from similar text", async () => {
+    const { gatewayPaymentReasonCode } = await import("./x402.js");
+    expect(gatewayPaymentReasonCode({ reasonCode: "AMOUNT_OVERFLOW" })).toBe(
+      "AMOUNT_OVERFLOW",
+    );
+    expect(gatewayPaymentReasonCode({ reasonCode: "amount_overflow" })).toBe(
+      "GATEWAY_REJECTED",
+    );
+    expect(gatewayPaymentReasonCode({ reasonCode: "AMOUNT_OVERFLOW " })).toBe(
+      "GATEWAY_REJECTED",
+    );
+  });
+});
+
 describe("nextPaymentNonce", () => {
   it("produces strictly-monotonic-across-ms values", async () => {
     const a = nextPaymentNonce();
