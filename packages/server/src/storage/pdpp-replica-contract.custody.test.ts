@@ -1774,8 +1774,10 @@ describe("baseline checkpoint receipt", () => {
     const { db, exporter } = journal(0);
     try {
       exporter.acknowledgeBaselinePage(0, 2);
-      const resumed = createReplicationJournal(db, () => "synthetic-writer")
-        .exporter;
+      const resumed = createReplicationJournal(
+        db,
+        () => "synthetic-writer",
+      ).exporter;
       expect(resumed.getBaselineCheckpoint()).toBe(2);
       resumed.acknowledgeBaselinePage(2, 3);
       expect(exporter.getBaselineCheckpoint()).toBe(3);

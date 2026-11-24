@@ -38,7 +38,6 @@ describe("canonicalBytes32", () => {
   });
 });
 
-
 describe("utf8", () => {
   it("preserves byte-order mark, combining form and an embedded NUL", () => {
     expect(Array.from(utf8("\uFEFFe\u0301\u0000"))).toEqual([
