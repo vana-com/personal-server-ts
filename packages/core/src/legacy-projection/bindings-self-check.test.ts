@@ -69,6 +69,10 @@ import claudeConversationsSchema from "./legacy-schemas/claude.conversations.jso
 import claudeProjectsSchema from "./legacy-schemas/claude.projects.json";
 import stravaActivitiesSchema from "./legacy-schemas/strava.activities.json";
 import stravaCoverageDiagnosticsSchema from "./legacy-schemas/strava.coverage_diagnostics.json";
+import {
+  DeclaredTextError,
+  decodeDeclaredRecordsForProjection,
+} from "./declared-text.js";
 import type { PdppRecord } from "./types.js";
 
 interface CollectionProfileStream {
@@ -197,6 +201,54 @@ function declarationFor(binding: {
  * file actually declares — the mechanism the brief asked for: "when
  * canonical declarations land, swapping the inputs re-checks every mapping."
  */
+describe("declared-text projection diagnostics", () => {
+  it("keeps the scope, stream and field when formatting an error", () => {
+    const diagnostic = new DeclaredTextError(
+      "invalid_encoded_text",
+      "fixture_notes",
+      "message",
+    );
+
+    expect(diagnostic.projectionError("fixture.notes")).toEqual({
+      kind: "invalid_encoded_text",
+      scope: "fixture.notes",
+      stream: "fixture_notes",
+      field: "message",
+    });
+  });
+
+  it("groups repeated formatting errors while keeping a valid sibling row", () => {
+    const valid: PdppRecord = {
+      stream: "fixture_notes",
+      data: { message: "ordinary note" },
+    };
+    const invalid: PdppRecord = {
+      stream: "fixture_notes",
+      data: { message: "note\u0007" },
+    };
+    const result = decodeDeclaredRecordsForProjection(
+      [invalid, valid, invalid],
+      {
+        fixture_notes: {
+          properties: { message: { x_pdpp_text_encoding: "pdpp-safe-escape-v1" } },
+        },
+      },
+      "fixture.notes",
+    );
+
+    expect(result.records).toEqual([valid]);
+    expect(result.diagnostics).toEqual([
+      {
+        kind: "records_dropped",
+        scope: "fixture.notes",
+        stream: "fixture_notes",
+        count: 2,
+        reasons: ["invalid_encoded_text: message"],
+      },
+    ]);
+  });
+});
+
 describe("legacy scope binding self-check", () => {
   it("pins every GitHub projection to the verified 0.7.2 artifact and vendored profile bytes", () => {
     expect(githubDeclaration.version).toBe("0.7.2");
