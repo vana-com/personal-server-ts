@@ -605,7 +605,8 @@ describe("durable owner additions recovery", () => {
 
 describe("in-memory receipt diagnostics", () => {
   it("rejects malformed byte receipts without losing an outstanding reservation", async () => {
-    const { AdditionsBudget, AdditionsBudgetExceeded } = await import("./budget.js");
+    const { AdditionsBudget, AdditionsBudgetExceeded } =
+      await import("./budget.js");
     const budget = new AdditionsBudget(12);
     const pending = budget.reserve(4);
     for (const invalid of [-1, 0.5]) {
@@ -621,7 +622,9 @@ describe("in-memory receipt diagnostics", () => {
     const budget = new AdditionsBudget(12);
     const pending = budget.reserve(4);
     pending.settle(2);
-    expect(() => pending.settle(2)).toThrow("Additions reservation already settled");
+    expect(() => pending.settle(2)).toThrow(
+      "Additions reservation already settled",
+    );
     expect(budget.remaining).toBe(10);
   });
 });
