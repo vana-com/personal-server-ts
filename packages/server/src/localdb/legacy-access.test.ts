@@ -699,3 +699,65 @@ it("rechecks quiescence between native snapshot hash pages", async () => {
     }),
   ).rejects.toThrow("legacy_access_unavailable");
 });
+
+it("every paged native reader seeks past its cursor instead of rescanning", async () => {
+  const f = await fixture();
+  f.store.registerConnection({
+    instance: "newer",
+    sourceId: "urn:fixture",
+    method: "profile-source",
+    label: "Newer",
+  });
+  f.store.ingestBatch(
+    [
+      {
+        instance: "newer",
+        stream: "profile",
+        key: "account",
+        data: body,
+        emitted_at: "2026-02-01T00:00:00.000Z",
+        op: "upsert",
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "profile-source", generation: 1 },
+  );
+  const prepare = vi.spyOn(f.db, "prepare");
+  try {
+    const access = await openLegacyAccess(f.options);
+    const inventory = await collect(access.sources());
+    // The newer instance is imported; the older one is excluded and counted.
+    expect(inventory).toHaveLength(2);
+    await collect(
+      (inventory.find((s) => !("kind" in s)) as ImportSource).records(),
+    );
+    await access.close();
+    const planOf = (needle: string) => {
+      const sql = prepare.mock.calls
+        .map(([text]) => text)
+        .find((text) => text.includes(needle));
+      expect(sql, needle).toBeDefined();
+      return (
+        f.db
+          .prepare("EXPLAIN QUERY PLAN " + sql)
+          .all(...Array(sql!.match(/\?/g)?.length ?? 0).fill("x")) as {
+          detail: string;
+        }[]
+      ).map((row) => row.detail);
+    };
+    // Inventory groups and instance bindings: no `? IS NULL OR` cursor, and
+    // the continuation seeks on the cursor.
+    expect(planOf("(p.instance, p.stream) > (?, ?)")).toEqual([
+      expect.stringMatching(/SEARCH p .+\(instance,stream\)>\(\?,\?\)/),
+      expect.stringMatching(/SEARCH b /),
+    ]);
+    expect(planOf("FROM pdpp_instance_binding WHERE instance > ?")).toEqual([
+      expect.stringMatching(/SEARCH pdpp_instance_binding .+instance>\?/),
+    ]);
+    const sqls = prepare.mock.calls.map(([text]) => text);
+    expect(sqls.filter((text) => text.includes("? IS NULL OR"))).toEqual([]);
+  } finally {
+    prepare.mockRestore();
+  }
+});

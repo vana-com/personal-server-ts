@@ -306,7 +306,7 @@ export function keyedLoadBlocked(
  * End an unfinished key-ordered load that no load can finish (`keyedLoadBlocked`):
  * in ONE batch (a failing statement rolls all back, so the marker never
  * outlives the decision to drop its rows), delete the rows the load wrote, the
- * log's tombstones and the marker, as `purgeConnection` does for the rows of a
+ * log's tombstones (not a legacy import's) and the marker, as `purgeConnection` does for the rows of a
  * lifetime. The cursor is at 0 by the marker's invariant (the commit that
  * writes it also clears the marker), so its row is deleted as well.
  *
@@ -344,7 +344,12 @@ export async function rebaselineKeyedLoad(
         params: [connectionId],
       },
       {
-        sql: "DELETE FROM log_tombstones WHERE connection_id = ?",
+        // The log's tombstones: the retry reads them again. A legacy import's
+        // tombstone (stamp (0,'seed')) is not from the log and is never
+        // published, so this is the only place that holds it, and the import's
+        // receipt keeps the import from running again. It is kept: it only
+        // blocks a later seed's fill, and any real write outranks its stamp.
+        sql: "DELETE FROM log_tombstones WHERE connection_id = ? AND NOT (stamp_o = 0 AND stamp_r = 'seed')",
         params: [connectionId],
       },
       clearKeyedPending(connectionId),
