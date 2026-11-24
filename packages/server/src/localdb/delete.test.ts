@@ -687,6 +687,38 @@ it("a request with no answer is sent once more, then leaves its fences to the pe
   expect(controlWrites(f)).toEqual([1, 2]);
 });
 
+it.each(["owner_stream_head_already_deleted", "owner_stream_head_absent"])(
+  "a batch the gateway refuses with %s for the fence's row leaves the fence to the per-row pass, which lands it",
+  async (code) => {
+    const f = await world();
+    const singles = countSingles(f);
+    const postBatch = f.registry.postBatch.bind(f.registry);
+    const refused: string[] = [];
+    f.registry.postBatch = async (request) => {
+      // As the registry adapter reads `{ code, scope }` of such a 409.
+      if (refused.length === 0) {
+        refused.push(code);
+        return {
+          kind: "refused",
+          rows: request.rows.map((row) =>
+            row.scope === f.control
+              ? { kind: "conflict", latestVersion: null, latestDataHash: null }
+              : { kind: "not_written" },
+          ),
+        };
+      }
+      return postBatch(request);
+    };
+    const started = await f.a.deleter.requestConnectionDelete("fixture-source");
+    expect(started.fenced).toBe(true);
+    expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+    expect(refused).toEqual([code]);
+    expect(singles).toEqual([f.control]);
+    expect(controlWrites(f)).toEqual([1, 2]);
+    expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+  },
+);
+
 // ---------------------------------------------------------------------------
 // Lost replies, refusals and restarts.
 // ---------------------------------------------------------------------------

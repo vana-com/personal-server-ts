@@ -283,6 +283,44 @@ it("a 409 conflict wrote nothing: one answer per row in request order, the loser
   });
 });
 
+it.each(["owner_stream_head_already_deleted", "owner_stream_head_absent"])(
+  "a 409 %s names the first refused row by scope: that row lost, the rest were not written and go again",
+  async (code) => {
+    const { registry } = gatewayAnswering(
+      () =>
+        new Response(
+          JSON.stringify({ success: false, code, scope: "pdpp.x~.b" }),
+          { status: 409 },
+        ),
+    );
+    expect(await registry.postBatch!(batchRequest)).toEqual({
+      kind: "refused",
+      rows: [
+        { kind: "not_written" },
+        { kind: "conflict", latestVersion: null, latestDataHash: null },
+      ],
+    });
+  },
+);
+
+it("a 409 head answer that names no row of the request is a failed condition the caller reads", async () => {
+  const { registry } = gatewayAnswering(
+    () =>
+      new Response(
+        JSON.stringify({
+          success: false,
+          code: "owner_stream_head_already_deleted",
+          scope: "pdpp.other~.z",
+        }),
+        { status: 409 },
+      ),
+  );
+  expect(await registry.postBatch!(batchRequest)).toEqual({
+    kind: "precondition_failed",
+    failure: null,
+  });
+});
+
 it("sends each row's head fence and each condition's data hash as given, and omits them when absent", async () => {
   const { registry, sent } = gatewayAnswering(() =>
     results200({
@@ -500,6 +538,22 @@ describe("requires on the single write", () => {
     });
     expect("requires" in (sent[0]!.body as object)).toBe(false);
   });
+
+  it.each(["owner_stream_head_already_deleted", "owner_stream_head_absent"])(
+    "a tombstone's 409 %s stays a conflict the caller settles by reading the row",
+    async (code) => {
+      const { registry } = gatewayAnswering(
+        () =>
+          new Response(JSON.stringify({ success: false, code }), {
+            status: 409,
+          }),
+      );
+      expect(await registry.post(post)).toEqual({
+        kind: "conflict",
+        latestVersion: null,
+      });
+    },
+  );
 });
 
 describe("probeChange", () => {

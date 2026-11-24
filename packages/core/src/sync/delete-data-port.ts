@@ -9,7 +9,9 @@ import type {
 import type { ServerSigner } from "../signing/signer.js";
 import { computeDataPointId } from "./data-point-id.js";
 import {
+  isGatewayAlreadyDeletedCode,
   isGatewayAnswerCode,
+  isGatewayHeadAbsentCode,
   type GatewayAnswerCode,
 } from "./gateway-refusal.js";
 import { parseGatewayNextVersion } from "./workers/upload.js";
@@ -167,6 +169,38 @@ export function createGatewayDeleteDataPort(
     });
   }
 
+  /**
+   * The point is deleted already (a 410, or a 409 that says so). The winning
+   * tombstone may sit above the version we attempted (another replica
+   * advanced the scope first), and its version bounds the ciphertext to
+   * delete, so take the gateway's word: the echoed row, else a re-read of the
+   * deletion-aware feed, else unknown.
+   */
+  async function alreadyDeleted(
+    scope: string,
+    dataPointId: string,
+    body: unknown,
+  ): Promise<TombstoneOutcome> {
+    const echoed = unwrap(body);
+    let winning = normalizeVersionString(
+      stringField(echoed, "expectedVersion"),
+    );
+    let deletedAt = stringField(echoed, "deletedAt");
+    if (winning === null) {
+      const reread = await currentHead(scope).catch(() => null);
+      if (reread && reread.deletedAt !== null) {
+        winning = normalizeVersionString(reread.expectedVersion);
+        deletedAt = deletedAt ?? reread.deletedAt;
+      }
+    }
+    return {
+      status: "already-deleted",
+      dataPointId,
+      version: winning,
+      deletedAt,
+    };
+  }
+
   return {
     ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(
@@ -206,11 +240,18 @@ export function createGatewayDeleteDataPort(
       };
       let version = BigInt(current.expectedVersion) + 1n;
       let res = await sendTombstone(scope, dataPointId, version);
-      // A 409 is either a version conflict or the owner's cutover refusal;
-      // the body says which. The refusal is terminal, so it is read first.
+      // A 409 is a version conflict, the owner's cutover refusal, or the
+      // gateway's word on the head itself (already deleted, never registered);
+      // the body says which. The head answers are read first: they are the
+      // same facts as a 410 and a 404, and the refusal is terminal.
       const conflictBody =
         res.status === 409 ? await res.json().catch(() => null) : null;
       if (res.status === 409) {
+        const code = (conflictBody as Record<string, unknown> | null)?.code;
+        if (isGatewayAlreadyDeletedCode(code))
+          return alreadyDeleted(scope, dataPointId, conflictBody);
+        if (isGatewayHeadAbsentCode(code))
+          return { status: "not-registered", dataPointId };
         const refusal = refusalOf(409, conflictBody, res.statusText);
         if (refusal) throw refusal;
       }
@@ -265,30 +306,12 @@ export function createGatewayDeleteDataPort(
         return { status: "not-registered", dataPointId };
       }
       if (res.status === 410) {
-        // Raced with a concurrent deletion: the point is already gone. The
-        // winning tombstone may sit above the version we attempted (another
-        // replica advanced the scope first), and its version bounds the
-        // ciphertext to delete, so take the gateway's word: the echoed row,
-        // else a re-read of the deletion-aware feed, else unknown.
-        const body = await res.json().catch(() => null);
-        const echoed = unwrap(body);
-        let winning = normalizeVersionString(
-          stringField(echoed, "expectedVersion"),
-        );
-        let deletedAt = stringField(echoed, "deletedAt");
-        if (winning === null) {
-          const reread = await currentHead(scope).catch(() => null);
-          if (reread && reread.deletedAt !== null) {
-            winning = normalizeVersionString(reread.expectedVersion);
-            deletedAt = deletedAt ?? reread.deletedAt;
-          }
-        }
-        return {
-          status: "already-deleted",
+        // Raced with a concurrent deletion: the point is already gone.
+        return alreadyDeleted(
+          scope,
           dataPointId,
-          version: winning,
-          deletedAt,
-        };
+          await res.json().catch(() => null),
+        );
       }
       if (!res.ok) {
         const body = await res.json().catch(() => null);

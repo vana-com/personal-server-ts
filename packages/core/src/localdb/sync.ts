@@ -312,6 +312,9 @@ export function createLocalSync(
       // A request waits for the fence no longer than the loop waits to look
       // at a delete that has not landed.
       fenceWaitMs: retryFirst,
+      // A connector's erasure that is unfinished arms the retry when its own
+      // pass ends: a sibling still waiting on storage does not delay it.
+      onUnfinished: () => armRetry(),
     });
   let deleteStore: ReturnType<typeof createConnectionDeleter> | undefined;
   const deletes = () => (deleteStore ??= makeDeleter());

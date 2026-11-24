@@ -21,16 +21,16 @@ export const isGatewayRefusalCode = (
   (GATEWAY_REFUSAL_CODES as readonly string[]).includes(code);
 
 /**
- * PLACEHOLDER (data-gateway #212). The gateway will answer a tombstone aimed
- * at a head that is already deleted with a distinct code. That answer means
- * the scope is already retired: the legacy stage reads it as `done` (it reads
- * the head again, which is deleted, and confirms the blobs). The code name is
- * not fixed yet, so this list is empty and the answer maps nowhere. When the
- * gateway names the code, add it here and nowhere else: the parser and the
- * stage both read this list.
+ * The gateway answers a tombstone aimed at a head that is already deleted with
+ * HTTP 409 and one of these codes. The scope is retired already: it is no
+ * refusal, and no retry is blocked by it. The port reads it as the 410 it
+ * already knows (`delete-data-port.ts`), and the legacy stage reads the head
+ * again, which is deleted, and confirms the blobs. Add a code here and
+ * nowhere else: the port and the stage both read this list.
  */
-export const GATEWAY_ALREADY_DELETED_CODES =
-  [] as const satisfies readonly string[];
+export const GATEWAY_ALREADY_DELETED_CODES = [
+  "owner_stream_head_already_deleted",
+] as const satisfies readonly string[];
 export type GatewayAlreadyDeletedCode =
   (typeof GATEWAY_ALREADY_DELETED_CODES)[number];
 
@@ -39,6 +39,26 @@ export const isGatewayAlreadyDeletedCode = (
 ): code is GatewayAlreadyDeletedCode =>
   typeof code === "string" &&
   (GATEWAY_ALREADY_DELETED_CODES as readonly string[]).includes(code);
+
+/**
+ * The gateway answers a tombstone aimed at a head it never registered with
+ * HTTP 409 and one of these codes. It is not terminal: this device's head
+ * comes from the gateway's own deletion-aware feed (`legacyHeadFrom`), so the
+ * two views disagreeing is a lagging read, not a state no retry changes. The
+ * port reads it as the 404 it already knows (`not-registered`): the delete
+ * re-reads the registry, and the stage reads the head again (absent is done,
+ * live is waiting).
+ */
+export const GATEWAY_HEAD_ABSENT_CODES = [
+  "owner_stream_head_absent",
+] as const satisfies readonly string[];
+export type GatewayHeadAbsentCode = (typeof GATEWAY_HEAD_ABSENT_CODES)[number];
+
+export const isGatewayHeadAbsentCode = (
+  code: unknown,
+): code is GatewayHeadAbsentCode =>
+  typeof code === "string" &&
+  (GATEWAY_HEAD_ABSENT_CODES as readonly string[]).includes(code);
 
 /** Every code the parser turns into a `GatewayRefusalError`. */
 export type GatewayAnswerCode = GatewayRefusalCode | GatewayAlreadyDeletedCode;

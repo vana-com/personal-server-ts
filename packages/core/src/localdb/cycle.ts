@@ -84,20 +84,37 @@ export async function runCycle(
   return cycleOver(deps, await deps.registry.listOwnerRows(), early, onApply);
 }
 
-/** The cycle's pass over a listing already taken: bootstrap, then each connection. */
+/**
+ * The cycle's pass over a listing already taken: bootstrap, then each
+ * connection. A connection in `exclude` is left alone: its control row is not
+ * saved or purged, it takes no queue slot, and it is neither applied nor
+ * published (a caller's connection that its early publish already settled).
+ * The listing the applies read stays whole.
+ */
 async function cycleOver(
   deps: LocalSyncDeps,
   listed: OwnerRows,
   early: Map<string, EarlyPublish>,
   onApply?: (outcome: ApplyOutcome) => void,
+  exclude: ReadonlySet<string> = new Set(),
 ): Promise<CycleReport> {
   const failures = new Map<string, unknown>();
-  const connections = await bootstrapConnections(deps, listed, failures);
+  // A control row's scope is its connection's id (`controlScope`).
+  const connections = await bootstrapConnections(
+    deps,
+    exclude.size === 0
+      ? listed
+      : listed.filter(({ scope }) => !exclude.has(scope)),
+    failures,
+  );
   return {
     connections: [
       ...(await Promise.all(
         connections
-          .filter(({ connectionId }) => !failures.has(connectionId))
+          .filter(
+            ({ connectionId }) =>
+              !exclude.has(connectionId) && !failures.has(connectionId),
+          )
           .map(({ connectionId }) =>
             syncConnection(
               deps,
@@ -183,10 +200,13 @@ async function runScoped(
 export async function runPublish(
   deps: LocalSyncDeps,
   /**
-   * The connections the caller awaits. Once each has settled in the early
-   * publish, its result is final: the fallback pass that follows runs for the
-   * other connections only, and nothing it does changes that result (see
-   * `siblingPass`). Without it every connection is the caller's own.
+   * The connections the caller awaits. Each one that settled in the early
+   * publish is final for this call: the fallback pass that follows excludes it
+   * (no bootstrap, apply or publish), so nothing it does, and nothing another
+   * requested connection needs from it, changes that result. When every
+   * requested connection is final, the pass's failures (discovery, listing,
+   * a connection's own) are reported, never thrown. Without it every
+   * connection is the caller's own.
    */
   awaited?: readonly string[],
 ): Promise<CycleReport> {
@@ -229,39 +249,55 @@ export async function runPublish(
   const settled = [...candidates.active, ...candidates.fresh].every(
     ({ connectionId }) => isSettled(connectionId),
   );
-  const unplaced = await unplacedConnections(deps, candidates);
-  if (settled && unplaced.length === 0)
+  // What the caller awaits, split by what the early publish did for each: the
+  // settled ones are final. Nothing below touches them again, so nothing a
+  // sibling does (or another requested connection needs) can change them.
+  const final = new Set([...(awaited ?? [])].filter(isSettled));
+  const finalEntries = [...early]
+    .filter(([id]) => final.has(id))
+    .map(([id, e]) => earlyEntry(id, e));
+  // Every requested connection is final: the fallback is for siblings only,
+  // and its failures are reported, never thrown at this caller.
+  const isolated = final.size > 0 && final.size === new Set(awaited).size;
+
+  let unplaced: readonly string[] = [];
+  let discoveryError: { readonly cause: unknown } | undefined;
+  try {
+    unplaced = await unplacedConnections(deps, candidates);
+  } catch (cause) {
+    if (!isolated) throw cause;
+    discoveryError = { cause };
+  }
+  if (settled && unplaced.length === 0 && discoveryError === undefined)
     return {
       connections: [...early].map(([id, e]) => earlyEntry(id, e)),
     };
-  const own = new Set(awaited ?? []);
-  if (own.size === 0 || ![...own].every(isSettled))
-    return runCycle(deps, undefined, early);
+  if (!isolated) {
+    const cycle = await cycleOver(
+      deps,
+      await deps.registry.listOwnerRows(),
+      early,
+      undefined,
+      final,
+    );
+    return { connections: [...finalEntries, ...cycle.connections] };
+  }
 
-  // The caller's connections settled: their result is the early publish's.
   // The fallback runs for the rest and reports its failures, never throws.
-  const siblings = [...early].filter(([id]) => !own.has(id));
+  const siblings = [...early].filter(([id]) => !final.has(id));
   let cycle: CycleReport["connections"] = [];
   let cycleError: string | undefined;
   try {
-    const listed = await deps.registry.listOwnerRows();
-    const failures = new Map<string, unknown>();
-    const known = await bootstrapConnections(deps, listed, failures);
-    cycle = [
-      ...(await Promise.all(
-        known
-          .filter(
-            ({ connectionId }) =>
-              !own.has(connectionId) && !failures.has(connectionId),
-          )
-          .map(({ connectionId }) =>
-            syncConnection(deps, connectionId, early.get(connectionId), listed),
-          ),
-      )),
-      ...failedBootstraps(deps, failures, early).filter(
-        ({ connectionId }) => !own.has(connectionId),
-      ),
-    ];
+    if (discoveryError) throw discoveryError.cause;
+    cycle = (
+      await cycleOver(
+        deps,
+        await deps.registry.listOwnerRows(),
+        early,
+        undefined,
+        final,
+      )
+    ).connections;
   } catch (cause) {
     // Nothing of the pass ran for the siblings: each that did not settle
     // failed with this, and a connection only the pass could place with it.
@@ -269,7 +305,7 @@ export async function runPublish(
     cycle = [
       ...siblings.map(([id, e]) => earlyEntry(id, e, cycleError)),
       ...unplaced
-        .filter((id) => !own.has(id))
+        .filter((id) => !final.has(id))
         .map((connectionId) => ({
           connectionId,
           published: [],
@@ -278,12 +314,7 @@ export async function runPublish(
     ];
   }
   return {
-    connections: [
-      ...[...early]
-        .filter(([id]) => own.has(id))
-        .map(([id, e]) => earlyEntry(id, e)),
-      ...cycle,
-    ],
+    connections: [...finalEntries, ...cycle],
     ...(cycleError !== undefined ? { cycleError } : {}),
   };
 }
