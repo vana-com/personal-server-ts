@@ -170,6 +170,7 @@ describe("required legacy stream planning", () => {
       "synthetic-extra",
       "synthetic-child",
     ]);
+    expect(optionalStreams).toEqual(["synthetic-extra"]);
   });
 
   it("returns independent required lists when no optional streams are declared", () => {

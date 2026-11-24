@@ -37,6 +37,15 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 }
 
 describe("loadConfig", () => {
+  it("loads an on-disk config that starts with a UTF-8 BOM", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      await writeFile(configPath, "\uFEFF{}", "utf-8");
+      const config = await loadConfig({ configPath });
+      expect(config.server.port).toBe(DEFAULTS.server.port);
+    });
+  });
+
   it("returns defaults when file is missing", async () => {
     const config = await loadConfig({
       configPath: "/tmp/nonexistent-config-path/config.json",
