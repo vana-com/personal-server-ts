@@ -20,6 +20,7 @@ import { userPsId, type UserPsId } from "../identity/paths.js";
 import { deriveEnclaveIdentity } from "../identity/wallet.js";
 import { seal, unseal } from "../sealing/envelope.js";
 import { createAgentServer, type AgentJobsControl } from "./http.js";
+import { drainWithTimeout } from "./lifecycle.js";
 import type { PrewarmRequestBody, SealRequestBody } from "./types.js";
 
 const SECRET = "agent-test-secret";
@@ -221,6 +222,38 @@ function jobsControl(
     prewarm: vi.fn(),
   };
 }
+
+describe("agent drain result", () => {
+  it("reports completion without logging a timeout for completed work", async () => {
+    const warnings: unknown[] = [];
+    const complete = await drainWithTimeout(() => Promise.resolve(), 50, {
+      warn: (...entry) => {
+        warnings.push(entry);
+      },
+    });
+    expect(complete).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  it("returns pending after the deadline and reports the timeout once", async () => {
+    const warnings: unknown[] = [];
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const complete = await drainWithTimeout(() => pending, 0, {
+      warn: (...entry) => {
+        warnings.push(entry);
+      },
+    });
+    expect(complete).toBe(false);
+    finish();
+    await pending;
+    expect(warnings).toEqual([
+      [{ timeoutMs: 0 }, "Timed out while draining agent jobs"],
+    ]);
+  });
+});
 
 describe("agent HTTP server", () => {
   it("requires operator bearer auth for sandbox prewarm", async () => {
@@ -797,6 +830,34 @@ describe("agent HTTP server", () => {
     expect(response.status).toBe(200);
     expect(`0x${Buffer.from(recovered).toString("hex")}`).toBe(signature);
     expect(body.secretHash).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("classifies stale delivery as a stable bad-request diagnostic", async () => {
+    const { StaleDelivery } = await import("./errors.js");
+    const error = new StaleDelivery();
+    expect({
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    }).toEqual({
+      status: 400,
+      code: "STALE_DELIVERY",
+      message: "Delivery timestamp is stale",
+    });
+  });
+
+  it("distinguishes invalid delivery from a stale timestamp", async () => {
+    const { DeliveryInvalid } = await import("./errors.js");
+    const error = new DeliveryInvalid();
+    expect({
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    }).toEqual({
+      status: 400,
+      code: "DELIVERY_INVALID",
+      message: "Delivery is invalid",
+    });
   });
 
   it("maps a retired epoch to 409", async () => {

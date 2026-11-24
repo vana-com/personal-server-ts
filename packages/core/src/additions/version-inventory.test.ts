@@ -1,8 +1,35 @@
 import { describe, expect, it, vi } from "vitest";
+import { AdditionsBudget, AdditionsBudgetExceeded } from "./budget.js";
 import { createVersionInventoryClient } from "./version-inventory.js";
 
 const owner = "0x1111111111111111111111111111111111111111";
 const id = "0xc4514b17500f374e6ba098810bfeb0855719335bc2de26fa3038d0a0e5ffc2ce";
+
+describe("version inventory byte allowance receipts", () => {
+  it("records actual cost and closes the budget after an oversized receipt", () => {
+    const budget = new AdditionsBudget(10);
+    const reservation = budget.reserve(3);
+
+    expect(() => reservation.settle(4)).toThrow(AdditionsBudgetExceeded);
+    expect(budget.remaining).toBe(6);
+    expect(() => budget.charge(1)).toThrow(AdditionsBudgetExceeded);
+  });
+
+  it("keeps the reservation when a malformed receipt can be corrected", () => {
+    const budget = new AdditionsBudget(10);
+    const reservation = budget.reserve(5);
+
+    for (const invalid of [-1, 1.5, Number.NaN]) {
+      expect(() => reservation.settle(invalid)).toThrow(
+        AdditionsBudgetExceeded,
+      );
+      expect(budget.remaining).toBe(5);
+    }
+
+    reservation.settle(2);
+    expect(budget.remaining).toBe(8);
+  });
+});
 
 describe("owner version inventory", () => {
   it("signs the canonical owner URI with defaults, preserving scope whitespace", async () => {
@@ -303,7 +330,7 @@ it("rejects foreign-owner discovery and cyclic scope cursors", async () => {
 });
 
 describe("version inventory head", () => {
-  function client(head: unknown) {
+  function client(head: unknown, bounded = false) {
     const fetcher = vi.fn().mockImplementation(
       async () =>
         new Response(
@@ -320,13 +347,16 @@ describe("version inventory head", () => {
         ),
     );
     const signRequest = vi.fn().mockResolvedValue("Web3Signed server-proof");
+    const boundedOwnerSigner = vi.fn().mockResolvedValue("fixture");
     return {
       fetcher,
       signRequest,
+      boundedOwnerSigner,
       inventory: createVersionInventoryClient({
         gatewayUrl: "https://gateway.example",
         ownerAddress: owner,
         ownerSigner: { signRequest },
+        ...(bounded ? { boundedOwnerSigner } : {}),
         fetch: fetcher,
       }),
     };
@@ -348,6 +378,40 @@ describe("version inventory head", () => {
     });
     expect(signRequest).toHaveBeenCalledTimes(1);
     expect(String(fetcher.mock.calls[0]![0])).toContain("limit=1");
+  });
+
+  it("forwards an optional head budget for an ordinary signed page", async () => {
+    const { inventory, fetcher, signRequest, boundedOwnerSigner } = client(
+      {
+        expectedVersion: "23",
+        dataHash: hashA,
+        metadataHash: hashB,
+        status: "finalized",
+        deletedAt: null,
+      },
+      true,
+    );
+    const budget = new AdditionsBudget(8192);
+
+    await expect(
+      inventory.head(" scope ", undefined, budget),
+    ).resolves.toMatchObject({ expectedVersion: "23", deletedAt: null });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(boundedOwnerSigner).toHaveBeenCalledTimes(1);
+    expect(signRequest).not.toHaveBeenCalled();
+    expect(budget.remaining).toBeLessThan(8192);
+  });
+
+  it("requires the bounded signer when a head budget is supplied", async () => {
+    const { inventory, fetcher, signRequest } = client(null);
+
+    await expect(
+      inventory.head(" scope ", undefined, new AdditionsBudget(8192)),
+    ).rejects.toThrow("Bounded inventory signing capability unavailable");
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(signRequest).not.toHaveBeenCalled();
   });
 
   it("returns null for a point the gateway never registered", async () => {

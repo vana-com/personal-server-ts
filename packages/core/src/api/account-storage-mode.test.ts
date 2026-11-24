@@ -13,6 +13,7 @@ import {
   type AccountStorageModeValue,
   type PersonalServerDataApiDeps,
 } from "./index.js";
+import { accountModeUnknownResponse } from "./account-storage-mode.js";
 import { accountStorageModeOf } from "../sync/account-mode/index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import {
@@ -47,6 +48,38 @@ const post = () =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ records: [{ id: 1 }] }),
   });
+
+describe("account mode helper contracts", () => {
+  it("reads the current mode once per selection rather than caching a prior answer", () => {
+    let current: AccountStorageModeValue = "unknown";
+    let reads = 0;
+    const view = accountStorageModeFor(
+      {
+        read: () => {
+          reads += 1;
+          return current;
+        },
+      },
+      OWNER_A,
+    );
+
+    expect(selectAccountStorageMode({ accountStorageMode: view })).toEqual({
+      kind: "unknown",
+    });
+    current = "switched";
+    expect(selectAccountStorageMode({ accountStorageMode: view })).toEqual({
+      kind: "streams",
+    });
+    expect(reads).toBe(2);
+  });
+
+  it("makes a temporary storage-mode response retryable and non-cacheable", () => {
+    const response = accountModeUnknownResponse();
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+});
 
 describe("accountStorageModeFor", () => {
   // DROP_REQUEST_OWNER

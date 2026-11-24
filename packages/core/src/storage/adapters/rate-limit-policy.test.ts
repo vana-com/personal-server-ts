@@ -176,6 +176,14 @@ describe("parseRateLimitPolicy", () => {
     expect(pacing("put;q=240;w=60").put).toBe(4);
   });
 
+  it("requires whole request counts without narrowing the window duration", () => {
+    expect(parseRateLimitPolicy('"example";q=12.5;w=10')).toBeUndefined();
+    expect(parseRateLimitPolicy("q=12.5;w=10")).toBeUndefined();
+    expect(parseRateLimitPolicy('"example";q=12;w=10.5')).toEqual({
+      named: { example: { limit: 12, windowMs: 10_500 } },
+    });
+  });
+
   it("takes no quota that is zero, not finite or outside the bounds", () => {
     const huge = "9".repeat(400);
     for (const bad of [
@@ -215,4 +223,36 @@ describe("parseRateLimitPolicy", () => {
       unnamed: { limit: 5, windowMs: 10_000 },
     });
   });
+});
+
+it("unsubscribing removes a listener without suppressing future policy changes", async () => {
+  const headers = ["5;w=10", "8;w=10"];
+  const feed = createRateLimitPolicyFeed(
+    async () =>
+      new Response(null, { headers: { "ratelimit-policy": headers.shift()! } }),
+  );
+  const removed: unknown[] = [];
+  const retained: unknown[] = [];
+  const unsubscribe = feed.subscribe((policy) => removed.push(policy));
+  feed.subscribe((policy) => retained.push(policy));
+  await feed.fetch("https://fixture.invalid");
+  unsubscribe();
+  await feed.fetch("https://fixture.invalid");
+  expect(removed).toHaveLength(1);
+  expect(retained).toHaveLength(2);
+});
+
+it("a late subscriber receives the last valid policy after unreadable advice", async () => {
+  const headers = ["5;w=10", "nonsense"];
+  const feed = createRateLimitPolicyFeed(
+    async () =>
+      new Response(null, { headers: { "ratelimit-policy": headers.shift()! } }),
+  );
+  await feed.fetch("https://fixture.invalid");
+  await feed.fetch("https://fixture.invalid");
+  const observed: unknown[] = [];
+  feed.subscribe((policy) => observed.push(policy));
+  expect(observed).toEqual([
+    { named: {}, unnamed: { limit: 5, windowMs: 10_000 } },
+  ]);
 });

@@ -28,6 +28,7 @@ import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import type { ServerContext } from "../bootstrap.js";
 import { createUnswitchedServer as createServer } from "../account-mode/unswitched-server.test-utils.js";
 import { initializeDatabase } from "../storage/index-schema.js";
+import { methodManifestRejectionDiagnostic } from "./bootstrap.js";
 import { registerTestConnection } from "./test-connections.js";
 
 /**
@@ -132,6 +133,24 @@ afterEach(async () => {
   ctx = undefined;
   await rm(tempDir, { recursive: true, force: true });
   vi.unstubAllEnvs();
+});
+
+describe("PDPP method manifest rejection diagnostics", () => {
+  it("describes an absent parse result without claiming a connector mismatch", () => {
+    expect(methodManifestRejectionDiagnostic(undefined)).toEqual({
+      reason: "manifest_invalid",
+      message:
+        "PDPP method manifest could not be parsed — its runs stay legacy-only",
+    });
+  });
+
+  it("retains the mismatch warning when a connector key was parsed", () => {
+    expect(methodManifestRejectionDiagnostic("fixture-connector")).toEqual({
+      reason: "manifest_key_mismatch",
+      message:
+        "PDPP method manifest names a different connector key — its runs stay legacy-only",
+    });
+  });
 });
 
 describe("mounting is conditional on the deployment being able to serve PDPP", () => {

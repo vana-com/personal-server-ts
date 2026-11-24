@@ -34,6 +34,28 @@ describe("renderAccountPage", () => {
     expect(html).toContain("<script>void 0;</script>");
   });
 
+  it("includes a visible keyboard focus outline for the account action", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html).toMatch(
+      /\.unity-button:focus-visible\s*\{[^}]*outline:\s*2px solid/,
+    );
+  });
+
+  it("suppresses account-action transitions when reduced motion is requested", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html).toMatch(
+      /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.unity-button\s*\{\s*transition:\s*none/,
+    );
+  });
+
   it("follows the system colour scheme like Vana Account", () => {
     const html = renderAccountPage({
       title: "t",
@@ -60,6 +82,29 @@ describe("renderAccountPage", () => {
 
     expect(slim).toContain('class="unity-panel unity-panel--slim"');
     expect(full).not.toContain('class="unity-panel unity-panel--slim"');
+  });
+
+  it("keeps the section label linked to its visible heading", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html.match(/<section[^>]+aria-labelledby="([^"]+)"/)?.[1]).toBe(
+      "page-heading",
+    );
+    expect(html.match(/<h1[^>]+id="([^"]+)"/)?.[1]).toBe("page-heading");
+  });
+
+  it("omits empty optional content instead of emitting empty landmarks", () => {
+    const html = renderAccountPage({
+      title: "t",
+      headingAccent: "a",
+      heading: "h",
+    });
+    expect(html).not.toContain('id="page-description"');
+    expect(html).not.toContain('<div class="unity-content">');
+    expect(html).not.toContain("<script>");
   });
 });
 

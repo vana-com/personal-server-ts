@@ -50,6 +50,37 @@ describe("createBodyLimit", () => {
     expect(json.message).toContain(`${maxSize} bytes`);
   });
 
+  it("accepts a JSON body exactly at the UTF-8 byte limit", async () => {
+    const body = JSON.stringify({ label: "caf\u00e9" });
+    const bytes = new TextEncoder().encode(body).byteLength;
+    expect(bytes).toBeGreaterThan(body.length);
+    const app = createApp(bytes);
+    const response = await app.request("/upload", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(bytes),
+      },
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+  });
+
+  it("leaves a JSON request without Content-Length readable to the handler", async () => {
+    const app = new Hono();
+    app.post("/upload", createBodyLimit(64), async (c) => {
+      return c.json(await c.req.json<{ label: string }>());
+    });
+    const response = await app.request("/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: "demo" }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ label: "demo" });
+  });
+
   it("constants have correct values", () => {
     expect(DATA_INGEST_MAX_SIZE).toBe(536870912);
     expect(DEFAULT_MAX_SIZE).toBe(1048576);

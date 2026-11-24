@@ -302,6 +302,44 @@ describe("createReplicationDriver", () => {
     expect(await driver.trigger()).toBeUndefined();
   });
 
+  it("stop drains a rejected step while trigger retains its rejection", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const stepFailure = new Error("step failed");
+    const hookFailure = new Error("error hook failed");
+    const errors: unknown[] = [];
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      deadlineMs: 30_000,
+      timers: clock.timers,
+      onError(error) {
+        errors.push(error);
+        throw hookFailure;
+      },
+    });
+    driver.start();
+    const joined = driver.trigger();
+    const stopping = driver.stop(5_000);
+    expect(steps[0]!.signal.aborted).toBe(true);
+    expect(driver.status().state).toBe("stopping");
+
+    const results = Promise.allSettled([joined, stopping]);
+    steps[0]!.done.reject(stepFailure);
+    expect(await results).toEqual([
+      { status: "rejected", reason: hookFailure },
+      { status: "fulfilled", value: true },
+    ]);
+    expect(errors).toEqual([stepFailure]);
+    expect(steps).toHaveLength(1);
+    expect(clock.armed()).toEqual([]);
+    expect(driver.status()).toMatchObject({
+      state: "stopped",
+      stepping: false,
+      lastError: "step failed",
+    });
+  });
+
   it("stop gives up after the grace period when a step ignores its abort", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();

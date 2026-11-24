@@ -14,6 +14,8 @@ import {
   PsUnavailableError,
   ServerNotConfiguredError,
   ContentTooLargeError,
+  DerivativeCycleError,
+  DerivativeComputeUnavailableError,
 } from "./catalog.js";
 
 describe("ProtocolError", () => {
@@ -136,5 +138,29 @@ describe("ProtocolError", () => {
       "ServerNotConfiguredError",
     );
     expect(new ContentTooLargeError().name).toBe("ContentTooLargeError");
+  });
+});
+
+describe("derivative question diagnostics", () => {
+  it("includes the ordered cycle path in the conflict response", () => {
+    const details = {
+      derivedScope: "synthetic.summary",
+      path: ["synthetic.summary", "synthetic.input", "synthetic.summary"],
+    };
+    const error = new DerivativeCycleError(details);
+    expect(error.toJSON().error).toMatchObject({
+      code: 409,
+      errorCode: "DERIVATIVE_CYCLE",
+      details,
+    });
+  });
+
+  it("reports an unconfigured derivative engine instead of a missing question", () => {
+    const error = new DerivativeComputeUnavailableError();
+    expect(error.toJSON().error).toEqual({
+      code: 503,
+      errorCode: "DERIVATIVE_COMPUTE_UNAVAILABLE",
+      message: "This server has no derivative compute configured",
+    });
   });
 });

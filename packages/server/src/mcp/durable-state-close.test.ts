@@ -344,6 +344,34 @@ describe("MCP durable state close", () => {
     await outside;
   });
 
+  it("drains a later inert operation even if an earlier operation failed", async () => {
+    const { state } = await emptyTarget();
+    const calls: string[] = [];
+    const failed = state.exclusive(async () => {
+      calls.push("failed");
+      throw new Error("fixture failure");
+    });
+    const rejected = expect(failed).rejects.toThrow("fixture failure");
+    const following = state.exclusive(async () => {
+      calls.push("finished");
+      return "fixture result";
+    });
+
+    await state.close();
+    expect(calls).toEqual(["failed", "finished"]);
+    await rejected;
+    await expect(following).resolves.toBe("fixture result");
+  });
+
+  it("closes an idle fixture without adding filesystem entries", async () => {
+    const { state, directory } = await emptyTarget();
+    const before = (await readdir(directory)).sort();
+
+    await state.close();
+
+    expect((await readdir(directory)).sort()).toEqual(before);
+  });
+
   it("returns one promise for repeated closes", async () => {
     const s = await seeded();
     const first = s.state.close();

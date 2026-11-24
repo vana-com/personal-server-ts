@@ -15,6 +15,7 @@ import {
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpScopeAccessRequest,
+  buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   buildMcpUrl,
   createMcpConnection,
@@ -32,6 +33,7 @@ import {
   readMcpScopeRequestWithToken,
   requestMcpScopeAccess,
   revokeMcpConnection,
+  toMcpScopeAccessRequestView,
   toMcpConnectionView,
   DEFAULT_MCP_GRANT_TTL_SECONDS,
   mcpGrantDefaultExpiry,
@@ -325,6 +327,27 @@ describe("mcp/connection-api", () => {
     expect(buildMcpUrl("https://x.relay.test/", "abc")).toBe(
       "https://x.relay.test/mcp/abc",
     );
+  });
+
+  it("builds one resource metadata URL for either trailing-slash form", () => {
+    const origin = "https://example.invalid";
+    const expected = origin + "/.well-known/oauth-protected-resource/mcp";
+    expect(buildMcpProtectedResourceMetadataUrl(origin)).toBe(expected);
+    expect(buildMcpProtectedResourceMetadataUrl(origin + "/")).toBe(expected);
+  });
+
+  it("omits an absent scope request reason but retains a supplied one", () => {
+    const request = {
+      scopes: ["sample.records"],
+      requestedAt: "2026-01-02T00:00:00Z",
+    };
+    expect(toMcpScopeAccessRequestView(request)).toStrictEqual(request);
+    expect(
+      toMcpScopeAccessRequestView({ ...request, reason: "Example task" }),
+    ).toStrictEqual({
+      ...request,
+      reason: "Example task",
+    });
   });
 
   it("buildStableMcpUrl trims trailing slash on origin", () => {

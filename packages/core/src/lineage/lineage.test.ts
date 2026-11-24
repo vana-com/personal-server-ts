@@ -399,3 +399,29 @@ describe("stored lineage helpers", () => {
     expect(extractLineageField([SOURCE_ID])).toBeUndefined();
   });
 });
+
+describe("synthetic lineage projection ownership", () => {
+  it("stamps a new record without modifying a frozen source record", () => {
+    const data = Object.freeze({ note: "invented" });
+    const stamped = stampLineage(data, {
+      sources: [],
+      writtenAt: "2026-01-01T00:00:00Z",
+    });
+    expect(stamped).not.toBe(data);
+    expect(stamped.note).toBe("invented");
+    expect(hasReservedLineageKey(data)).toBe(false);
+    expect(hasReservedLineageKey(stamped)).toBe(true);
+  });
+
+  it("returns a fresh source list on each read of the same stamped record", () => {
+    const value = stampLineage(
+      {},
+      { sources: [], writtenAt: "2026-01-01T00:00:00Z" },
+    );
+    const first = readStoredLineage(value);
+    const second = readStoredLineage(value);
+    expect(first?.sources).toEqual([]);
+    expect(second?.sources).toEqual([]);
+    expect(first?.sources).not.toBe(second?.sources);
+  });
+});

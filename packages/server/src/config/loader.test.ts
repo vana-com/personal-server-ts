@@ -2,11 +2,30 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import { access, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { loadConfig } from "./loader.js";
+import { loadConfig, parseConfigJson } from "./loader.js";
 import {
   DEFAULTS,
+  ServerConfigSchema,
   SUPERSEDED_INFERENCE_MODELS,
 } from "@opendatalabs/personal-server-ts-core/schemas";
+
+describe("parseConfigJson", () => {
+  it("accepts one leading UTF-8 BOM without changing JSON strings", () => {
+    expect(parseConfigJson("\uFEFF{}")).toEqual({});
+    expect(parseConfigJson("{}")).toEqual({});
+    expect(parseConfigJson('\uFEFF{"note":"\uFEFFinside"}')).toEqual({
+      note: "\uFEFFinside",
+    });
+  });
+
+  it("still rejects malformed JSON and leaves schema validation intact", () => {
+    for (const raw of ["\uFEFF{", "\uFEFF\uFEFF{}", " \uFEFF{}"]) {
+      expect(() => parseConfigJson(raw)).toThrow(SyntaxError);
+    }
+    const parsed = parseConfigJson('\uFEFF{"server":{"port":-1}}');
+    expect(ServerConfigSchema.safeParse(parsed).success).toBe(false);
+  });
+});
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "config-test-"));
@@ -18,6 +37,15 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 }
 
 describe("loadConfig", () => {
+  it("loads an on-disk config that starts with a UTF-8 BOM", async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, "config.json");
+      await writeFile(configPath, "\uFEFF{}", "utf-8");
+      const config = await loadConfig({ configPath });
+      expect(config.server.port).toBe(DEFAULTS.server.port);
+    });
+  });
+
   it("returns defaults when file is missing", async () => {
     const config = await loadConfig({
       configPath: "/tmp/nonexistent-config-path/config.json",
@@ -372,5 +400,33 @@ describe("loadConfig", () => {
       await expect(access(configPath)).resolves.toBeUndefined();
       await expect(access(join(rootPath, "config.json"))).rejects.toThrow();
     });
+  });
+});
+
+describe("config storage and path formatting", () => {
+  it("saves pretty JSON to a new nested config path and reloads the edited value", async () => {
+    const { saveConfig } = await import("./loader.js");
+    await withTempDir(async (dir) => {
+      const original = await loadConfig({
+        configPath: join(dir, "original.json"),
+      });
+      const edited = {
+        ...original,
+        logging: { ...original.logging, level: "debug" as const },
+      };
+      const configPath = join(dir, "nested", "config.json");
+      await saveConfig(edited, { configPath });
+      expect(await readFile(configPath, "utf8")).toBe(
+        JSON.stringify(edited, null, 2) + "\n",
+      );
+      expect((await loadConfig({ configPath })).logging.level).toBe("debug");
+    });
+  });
+
+  it("expands bare home shorthand but leaves a tilde in an ordinary label alone", async () => {
+    const { homedir } = await import("node:os");
+    const { expandHomePath } = await import("./paths.js");
+    expect(expandHomePath("~")).toBe(homedir());
+    expect(expandHomePath("fixture~backup")).toBe("fixture~backup");
   });
 });

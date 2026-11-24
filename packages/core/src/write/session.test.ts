@@ -245,6 +245,44 @@ describe("createWriteSession", () => {
     ).resolves.toMatchObject({ grantId: "grant_w1" });
   });
 
+  it("keeps distinct in-memory rows addressable by their own test keys", async () => {
+    const store = createInMemoryWriteSessionStore();
+    const fixture = {
+      builderAddress: BUILDER,
+      writeScopes: ["synthetic.entries"],
+      createdAt: "2026-01-01T00:00:00Z",
+      expiresAtMs: Number.MAX_SAFE_INTEGER,
+    };
+    const one = {
+      ...fixture,
+      tokenHash: "fixture-one",
+      grantId: "fixture-grant-one",
+    };
+    const two = {
+      ...fixture,
+      tokenHash: "fixture-two",
+      grantId: "fixture-grant-two",
+    };
+    await store.create(one);
+    await store.create(two);
+    expect(await store.getByTokenHash("fixture-one")).toEqual(one);
+    expect(await store.getByTokenHash("fixture-two")).toEqual(two);
+  });
+
+  it("does not share in-memory rows between store instances", async () => {
+    const first = createInMemoryWriteSessionStore();
+    const second = createInMemoryWriteSessionStore();
+    await first.create({
+      tokenHash: "fixture-key",
+      builderAddress: BUILDER,
+      grantId: "fixture-grant",
+      writeScopes: ["synthetic.entries"],
+      createdAt: "2026-01-01T00:00:00Z",
+      expiresAtMs: Number.MAX_SAFE_INTEGER,
+    });
+    expect(await second.getByTokenHash("fixture-key")).toBeNull();
+  });
+
   it("expires stored sessions", async () => {
     const store = createInMemoryWriteSessionStore();
     const gw = fakeGateway(grant());
@@ -264,5 +302,34 @@ describe("createWriteSession", () => {
     expect(
       await store.getByTokenHash(await hashWriteSessionToken("tok_exp")),
     ).toBeNull();
+  });
+});
+
+describe("in-memory write session storage errors", () => {
+  const storedRecord = (tokenHash: string, expiresAtMs: number) => ({
+    tokenHash,
+    builderAddress: BUILDER,
+    grantId: "synthetic-grant",
+    writeScopes: ["synthetic.entries"],
+    createdAt: "2026-06-01T00:00:00.000Z",
+    expiresAtMs,
+  });
+
+  it("reports a missing entry without interfering with a stored sibling", async () => {
+    const store = createInMemoryWriteSessionStore();
+    const sibling = storedRecord("synthetic-live", Number.MAX_SAFE_INTEGER);
+    await store.create(sibling);
+    expect(await store.getByTokenHash("synthetic-missing")).toBeNull();
+    expect(await store.getByTokenHash(sibling.tokenHash)).toEqual(sibling);
+  });
+
+  it("does not carry stale lookups or live entries to a new in-memory store", async () => {
+    const first = createInMemoryWriteSessionStore();
+    const second = createInMemoryWriteSessionStore();
+    const record = storedRecord("synthetic-live", Number.MAX_SAFE_INTEGER);
+    await first.create(record);
+    expect(await second.getByTokenHash(record.tokenHash)).toBeNull();
+    await second.create(record);
+    expect(await second.getByTokenHash(record.tokenHash)).toEqual(record);
   });
 });
