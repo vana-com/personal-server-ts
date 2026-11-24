@@ -54,10 +54,15 @@ export function isGrantFingerprint(value: unknown): value is string {
 /**
  * The fingerprint of `grant` under `salt`.
  *
- * The grant is hashed as its JSON form: members whose value is `undefined`
- * are left out, exactly as `JSON.stringify` leaves them out, so an optional
- * member that is absent and one that is `undefined` give the same
- * fingerprint. Any other non-JSON value throws.
+ * The grant is hashed as its JSON form, after a `JSON.stringify` round trip:
+ * members whose value is `undefined` are left out, so an optional member that
+ * is absent and one that is `undefined` give the same fingerprint. The input
+ * must be plain Grant JSON. The round trip does not reject other values; it
+ * converts them as `JSON.stringify` does (a Date becomes its ISO string).
+ *
+ * Recompute against the grant document exactly as it was issued, not one
+ * rebuilt from current data: a changed display name, timestamp spelling or
+ * array order gives a different fingerprint. Text is not Unicode-normalized.
  */
 export async function grantFingerprint(
   grant: Grant,

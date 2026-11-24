@@ -47,7 +47,23 @@ describe("grant fingerprint", () => {
     );
   });
 
-  it("changes with any change to the terms", async () => {
+  it("does not depend on member order at any depth", async () => {
+    const reorder = (value: unknown): unknown =>
+      Array.isArray(value)
+        ? value.map(reorder)
+        : value !== null && typeof value === "object"
+          ? Object.fromEntries(
+              Object.entries(value)
+                .reverse()
+                .map(([k, v]) => [k, reorder(v)]),
+            )
+          : value;
+    expect(await grantFingerprint(reorder(grant) as Grant, first.salt)).toBe(
+      first.fingerprint,
+    );
+  });
+
+  it("changes when a stream's field list changes", async () => {
     const narrowed: Grant = {
       ...grant,
       streams: [{ ...grant.streams[0]!, fields: ["id", "title"] }],
