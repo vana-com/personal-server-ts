@@ -165,7 +165,9 @@ describe("memory data storage guarded updates", () => {
       version: 4,
       casRevision: 2,
     });
-    expect(storage.updateDataPointId(path, "published", row.id + 1)).toBe(false);
+    expect(storage.updateDataPointId(path, "published", row.id + 1)).toBe(
+      false,
+    );
     expect(storage.updateEntryVersion(path, 9, row.id + 1)).toBe(false);
     expect(storage.findEntry({ scope })).toMatchObject({
       dataPointId: null,

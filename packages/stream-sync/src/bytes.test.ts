@@ -71,13 +71,20 @@ describe("utf8Length", () => {
 
   it("counts exactly at the one-, two-, three-, and four-byte boundaries", () => {
     const cases = [
-      [0x7f, 1], [0x80, 2], [0x7ff, 2], [0x800, 3],
-      [0xffff, 3], [0x10000, 4], [0x10ffff, 4],
+      [0x7f, 1],
+      [0x80, 2],
+      [0x7ff, 2],
+      [0x800, 3],
+      [0xffff, 3],
+      [0x10000, 4],
+      [0x10ffff, 4],
     ] as const;
     for (const [point, width] of cases) {
       expect(utf8Length(String.fromCodePoint(point))).toBe(width);
     }
-    expect(utf8Length(String.fromCodePoint(...cases.map(([point]) => point)))).toBe(19);
+    expect(
+      utf8Length(String.fromCodePoint(...cases.map(([point]) => point))),
+    ).toBe(19);
   });
 });
 

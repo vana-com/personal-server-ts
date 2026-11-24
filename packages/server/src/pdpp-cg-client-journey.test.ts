@@ -312,14 +312,30 @@ describe("vendored client diagnostic values", () => {
     expect(bare).toMatchObject({ name: "PdppClientError", ...input });
     expect(bare.requestId).toBeUndefined();
     expect(bare.param).toBeUndefined();
-    expect(new PdppClientError({ ...input, param: "cursor", requestId: "fixture-request" }))
-      .toMatchObject({ ...input, param: "cursor", requestId: "fixture-request" });
+    expect(
+      new PdppClientError({
+        ...input,
+        param: "cursor",
+        requestId: "fixture-request",
+      }),
+    ).toMatchObject({
+      ...input,
+      param: "cursor",
+      requestId: "fixture-request",
+    });
   });
 
   it("keeps transport diagnostics distinct from typed request failures", () => {
-    const error = new PdppTransportError({ httpStatus: 502, message: "Unrecognized response" });
+    const error = new PdppTransportError({
+      httpStatus: 502,
+      message: "Unrecognized response",
+    });
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(PdppClientError);
-    expect(error).toMatchObject({ name: "PdppTransportError", httpStatus: 502, message: "Unrecognized response" });
+    expect(error).toMatchObject({
+      name: "PdppTransportError",
+      httpStatus: 502,
+      message: "Unrecognized response",
+    });
   });
 });
