@@ -2259,3 +2259,33 @@ describe("coordinator settle", () => {
     expect(world.settles).toHaveLength(1);
   });
 });
+
+describe("replica timer eligibility", () => {
+  it("keeps ordinary retry timing independent of the finalized-head refresh", () => {
+    const timing = {
+      finalityWait: false,
+      nextEligible: 120,
+      waitSince: 50,
+      checkedBlock: "10",
+    };
+    expect(
+      replicaEligibleAt(timing, { now: 100, head: 10n, hintRefreshAt: 250 }),
+    ).toBe(120);
+  });
+
+  it("does not advertise a timer wake for terminal work", () => {
+    const timing = {
+      finalityWait: false,
+      nextEligible: Number.MAX_SAFE_INTEGER,
+      waitSince: null,
+      checkedBlock: null,
+    };
+    expect(
+      replicaEligibleAt(timing, {
+        now: 100,
+        head: undefined,
+        hintRefreshAt: undefined,
+      }),
+    ).toBeUndefined();
+  });
+});
