@@ -2,6 +2,7 @@ import { expect, it, vi } from "vitest";
 import { streamReadScope } from "../stream-sync-read/routing.js";
 import {
   isMemoryScope,
+  isReservedSystemConnector,
   isReservedSystemScope,
   isSystemScope,
 } from "./reserved-scopes.js";
@@ -34,6 +35,7 @@ it("#574 keeps physical scopes private and normalizes read aliases before policy
 });
 
 it("recognizes a private memory snapshot only when its stream name is present", () => {
+  expect(isMemoryScope("memory")).toBe(false);
   expect(isMemoryScope("memory.synthetic")).toBe(true);
   expect(isMemoryScope("memory.")).toBe(false);
   expect(isMemoryScope("synthetic.memory")).toBe(false);
@@ -44,4 +46,10 @@ it("recognizes platform-owned scopes in both namespace spellings", () => {
   expect(isReservedSystemScope("pdpp.vana-system-synthetic.records")).toBe(
     true,
   );
+});
+
+it("distinguishes ordinary catalog labels from the platform namespace", () => {
+  expect(isReservedSystemConnector("vana-system-catalog")).toBe(true);
+  expect(isReservedSystemConnector("catalog")).toBe(false);
+  expect(isReservedSystemScope("pdpp.catalog.records")).toBe(false);
 });
