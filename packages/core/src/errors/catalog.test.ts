@@ -17,6 +17,7 @@ import {
   DerivativeCycleError,
   DerivativeComputeUnavailableError,
 } from "./catalog.js";
+import { PdppError } from "./pdpp-catalog.js";
 
 describe("ProtocolError", () => {
   it("has correct code, errorCode, message, and details", () => {
@@ -162,5 +163,32 @@ describe("derivative question diagnostics", () => {
       errorCode: "DERIVATIVE_COMPUTE_UNAVAILABLE",
       message: "This server has no derivative compute configured",
     });
+  });
+});
+
+describe("PDPP error response", () => {
+  it("includes a provided field name and correlates each serialization to its request", () => {
+    const error = new PdppError("invalid_expand", "Unknown expansion", {
+      param: "expand",
+    });
+    expect(error.status).toBe(400);
+    expect(error.toJSON("request-one")).toEqual({
+      error: {
+        type: "invalid_request_error",
+        code: "invalid_expand",
+        message: "Unknown expansion",
+        param: "expand",
+        request_id: "request-one",
+      },
+    });
+    expect(error.toJSON("request-two").error.request_id).toBe("request-two");
+  });
+
+  it("distinguishes unavailable history from a missing result without adding an unset parameter", () => {
+    const unavailable = new PdppError("STREAM_HISTORY_UNAVAILABLE", "History unavailable");
+    const missing = new PdppError("not_found", "Not found");
+    expect([unavailable.status, missing.status]).toEqual([503, 404]);
+    expect([unavailable.type, missing.type]).toEqual(["api_error", "not_found_error"]);
+    expect(unavailable.toJSON("request-three").error).not.toHaveProperty("param");
   });
 });
