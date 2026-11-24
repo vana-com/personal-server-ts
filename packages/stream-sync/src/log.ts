@@ -210,11 +210,11 @@ export function upsertAfter(a: LogUpsert, b: LogUpsert): boolean {
   const an = a.ordinal ?? 0;
   const bn = b.ordinal ?? 0;
   if (an !== bn) return an > bn;
-  return bodyHash(a.value) > bodyHash(b.value);
+  return upsertBodyHash(a.value) > upsertBodyHash(b.value);
 }
 
 /** The hash `records.body_sha256` holds for the same body: SHA-256 of its canonical JSON. */
-function bodyHash(value: JsonObject): string {
+export function upsertBodyHash(value: JsonObject): string {
   let hex = "";
   for (const byte of sha256Sync(utf8(canonicalJson(value))))
     hex += byte.toString(16).padStart(2, "0");
@@ -555,6 +555,49 @@ export async function firstDeletionKeyMismatch(
   return null;
 }
 
+/** A key's greatest deletion in a fold: an explicit delete, or a completion's omission. */
+export interface FoldDeletion {
+  readonly stamp: LogStamp;
+  readonly explicit: boolean;
+  readonly key: LogKey;
+}
+
+/**
+ * What a key contributes to the fold once every operation on it has been
+ * seen: `upsert`, its greatest upsert, and `deletion`, its greatest deletion
+ * (`foldLog` says how each is chosen). An upsert is above a deletion when it
+ * is later, or tied with an omission. A deletion the upsert is strictly after
+ * has erased something and stays, in front of the upsert; one it only ties
+ * erased nothing and is left out. `U` is the upsert as the caller holds it
+ * (with its body, or by reference).
+ */
+export function foldCellEntries<U extends { readonly stamp: LogStamp }>(
+  stream: string,
+  pkHash: string,
+  upsert: U | null,
+  d: FoldDeletion | null,
+): (LogDelete | LogOmitted | (U & { stream: string; pkHash: string }))[] {
+  const tombstone = (): LogDelete | LogOmitted => {
+    const { stamp, key } = d!;
+    return d!.explicit
+      ? { kind: "delete", stream, pkHash, key, stamp }
+      : { kind: "omitted", stream, pkHash, key, stamp };
+  };
+  const outlives =
+    upsert !== null &&
+    (!d ||
+      stampAfter(upsert.stamp, d.stamp) ||
+      (!d.explicit && !stampAfter(d.stamp, upsert.stamp)));
+  if (upsert && outlives) {
+    // Only a deletion the winner is strictly after has erased anything.
+    const winner = { ...upsert, stream, pkHash };
+    return d && stampAfter(upsert.stamp, d.stamp)
+      ? [tombstone(), winner]
+      : [winner];
+  }
+  return d ? [tombstone()] : [];
+}
+
 export interface LogFold {
   readonly streams: readonly LogStreamMeta[];
   readonly entries: readonly LogEntry[];
@@ -593,10 +636,9 @@ export function foldLog(input: {
   readonly snapshot: readonly SnapshotPart[];
   readonly segments: readonly Segment[];
 }): LogFold {
-  type Deletion = { stamp: LogStamp; explicit: boolean; key: LogKey };
   type Cell = {
     upsert: LogUpsert | null;
-    deletion: Deletion | null;
+    deletion: FoldDeletion | null;
   };
   const cells = new Map<string, Cell>();
   const cell = (stream: string, pk: string): Cell => {
@@ -625,11 +667,6 @@ export function foldLog(input: {
     )
       c.deletion = { stamp, explicit, key };
   };
-  /** An upsert is above a deletion: later, or tied with an omission. */
-  const outlives = (stamp: LogStamp, d: Deletion | null) =>
-    !d ||
-    stampAfter(stamp, d.stamp) ||
-    (!d.explicit && !stampAfter(d.stamp, stamp));
   const metas = new Map<string, LogStreamMeta>();
   const follow = (meta: LogStreamMeta) =>
     metas.set(meta.stream, followMeta(metas.get(meta.stream), meta));
@@ -660,20 +697,7 @@ export function foldLog(input: {
   const entries: LogEntry[] = [];
   for (const [key, c] of cells) {
     const [stream, pkHash] = key.split("\u0000") as [string, string];
-    const d = c.deletion;
-    const tombstone = (): LogEntry => {
-      const { stamp, key } = d!;
-      return d!.explicit
-        ? { kind: "delete", stream, pkHash, key, stamp }
-        : { kind: "omitted", stream, pkHash, key, stamp };
-    };
-    if (c.upsert && outlives(c.upsert.stamp, d)) {
-      // Only a deletion the winner is strictly after has erased anything.
-      if (d && stampAfter(c.upsert.stamp, d.stamp)) entries.push(tombstone());
-      entries.push({ ...c.upsert, stream, pkHash });
-    } else if (d) {
-      entries.push(tombstone());
-    }
+    entries.push(...foldCellEntries(stream, pkHash, c.upsert, c.deletion));
   }
   entries.sort(
     (a, b) =>
@@ -691,9 +715,60 @@ export function foldLog(input: {
 }
 
 /**
- * Split a fold into parts of about `targetBytes` each, in key order. A part
- * holds at least one entry, and a fold with none still yields one part, which
- * carries the stream metas. The size of an entry is its wire size.
+ * Splits entries, given in key order, into parts of about `targetBytes` each.
+ * `push` returns the part an entry closed, if it did; `finish` returns the
+ * last. A part holds at least one entry, and a fold with none still yields one
+ * part, which carries the stream metas. The size of an entry is its wire size.
+ * `partitionFold` is the same split over a whole array; a caller that cannot
+ * hold the fold feeds this one entry at a time.
+ */
+export function createPartitioner(
+  streams: readonly LogStreamMeta[],
+  context: {
+    readonly connector: string;
+    readonly ns: string;
+    readonly generation: number;
+    readonly keyCheck: string;
+    readonly position: number;
+  },
+  targetBytes: number = DEFAULT_PART_TARGET_BYTES,
+): {
+  push(entry: WireEntry): WireSnapshotPart | null;
+  finish(): WireSnapshotPart;
+} {
+  const metaBytes =
+    JSON.stringify(streams.map((m) => m.stream)).length + 200 * streams.length;
+  let index = 0;
+  let current: WireEntry[] = [];
+  let size = metaBytes;
+  const close = (): WireSnapshotPart => {
+    const part: WireSnapshotPart = {
+      format: LOG_FORMAT,
+      ...context,
+      index: index++,
+      streams,
+      entries: current,
+    };
+    current = [];
+    size = metaBytes;
+    return part;
+  };
+  return {
+    push(entry) {
+      const bytes = JSON.stringify(opToWire(entry)).length + 1;
+      const closed =
+        current.length > 0 && size + bytes > targetBytes ? close() : null;
+      current.push(entry);
+      size += bytes;
+      return closed;
+    },
+    finish: close,
+  };
+}
+
+/**
+ * Split a fold into parts of about `targetBytes` each, in key order
+ * (`createPartitioner`).
  */
 export function partitionFold(
   fold: {
@@ -709,30 +784,13 @@ export function partitionFold(
   },
   targetBytes: number = DEFAULT_PART_TARGET_BYTES,
 ): WireSnapshotPart[] {
-  const base = (index: number, entries: WireEntry[]): WireSnapshotPart => ({
-    format: LOG_FORMAT,
-    ...context,
-    index,
-    streams: fold.streams,
-    entries,
-  });
-  const metaBytes =
-    JSON.stringify(fold.streams.map((m) => m.stream)).length +
-    200 * fold.streams.length;
+  const partitioner = createPartitioner(fold.streams, context, targetBytes);
   const parts: WireSnapshotPart[] = [];
-  let current: WireEntry[] = [];
-  let size = metaBytes;
   for (const entry of fold.entries) {
-    const bytes = JSON.stringify(opToWire(entry)).length + 1;
-    if (current.length > 0 && size + bytes > targetBytes) {
-      parts.push(base(parts.length, current));
-      current = [];
-      size = metaBytes;
-    }
-    current.push(entry);
-    size += bytes;
+    const closed = partitioner.push(entry);
+    if (closed) parts.push(closed);
   }
-  parts.push(base(parts.length, current));
+  parts.push(partitioner.finish());
   return parts;
 }
 
