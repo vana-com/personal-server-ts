@@ -64,22 +64,28 @@ describe("checkpoint registration matching", () => {
   const snapshot = { head, versions: [slot] };
 
   it("matches the same recorded commitments regardless of hex letter case", () => {
-    expect(findCheckpointRegistration(snapshot, "1", {
-      dataHash: "0x" + "AB".repeat(32),
-      metadataHash: "0x" + "CD".repeat(32),
-    })).toBe(slot);
+    expect(
+      findCheckpointRegistration(snapshot, "1", {
+        dataHash: "0x" + "AB".repeat(32),
+        metadataHash: "0x" + "CD".repeat(32),
+      }),
+    ).toBe(slot);
   });
 
   it("does not treat one matching commitment as a match for the pair", () => {
     const unrelated = "0x" + "ef".repeat(32);
-    expect(findCheckpointRegistration(snapshot, "1", {
-      dataHash: slot.dataHash,
-      metadataHash: unrelated,
-    })).toBeUndefined();
-    expect(findCheckpointRegistration(snapshot, "1", {
-      dataHash: unrelated,
-      metadataHash: slot.metadataHash,
-    })).toBeUndefined();
+    expect(
+      findCheckpointRegistration(snapshot, "1", {
+        dataHash: slot.dataHash,
+        metadataHash: unrelated,
+      }),
+    ).toBeUndefined();
+    expect(
+      findCheckpointRegistration(snapshot, "1", {
+        dataHash: unrelated,
+        metadataHash: slot.metadataHash,
+      }),
+    ).toBeUndefined();
   });
 });
 const slotSchema = z.object({
