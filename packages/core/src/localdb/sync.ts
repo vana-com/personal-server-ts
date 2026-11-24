@@ -372,39 +372,50 @@ export function createLocalSync(
     }, delay);
     retryTimer.unref?.();
   };
+  const handled = <T>(runs: readonly Promise<T>[]) => {
+    for (const run of runs) run.catch(() => undefined);
+    return runs;
+  };
+  /** Resolves once no loop is running: every pass has ended and decided the timer. */
+  const idle = async () => {
+    while (looping) await looping;
+  };
   /**
-   * One pass: run the work if it is due, then read what is owed. A resume
-   * (`takers`) answers once the erasures it started have ended and the loop
-   * has decided the timer (`quiet`), so the timer it reads is the one the
-   * work it ran left.
+   * One pass: start the work if it is due, then read what is owed. The pass
+   * never waits for the work it starts: a landing stuck at the registry, or an
+   * erasure on slow storage, must not hold back a retry that is due. Each
+   * start's end is an event that kicks the loop. A resume (`takers`) answers
+   * once what it started has ended and the loop has gone idle, so the timer it
+   * reads is the one decided after that work ended.
    */
-  const retryPass = async (
-    due: boolean,
-    takers: readonly Waiter[],
-    quiet: Promise<void>,
-  ) => {
-    let pending: readonly PendingDelete[] = [];
-    let runs: readonly Promise<void>[] = [];
+  const retryPass = async (due: boolean, takers: readonly Waiter[]) => {
+    let landings: readonly Promise<PendingDelete | null>[] = [];
+    let erasures: readonly Promise<void>[] = [];
     try {
       if (!closed) {
         if (due) {
-          pending = await deletes().resumeDeletes();
-          // Started, not awaited: a connector's slow erasure must not hold
-          // back the loop. Its end is an event.
-          runs = await deletes().startErasures();
+          // A handler goes on each run the moment it is returned, before any
+          // later read is awaited: a run that fails while one is pending must
+          // not be reported unhandled.
+          landings = handled(await deletes().startDeletes());
+          erasures = handled(await deletes().startErasures());
         }
         owed = await deletes().retryOwed();
         if (due) resumeFailed = false;
       }
     } catch (error) {
       resumeFailed = true;
-      void quiet.then(() => takers.forEach((taker) => taker.fail(error)));
+      void idle().then(() => takers.forEach((taker) => taker.fail(error)));
       return;
     }
-    void Promise.all(runs)
-      .then(() => quiet)
+    if (takers.length === 0) return;
+    void Promise.all([Promise.all(landings), Promise.all(erasures)])
+      .then(async ([results]) => {
+        await idle();
+        return results.filter((p): p is PendingDelete => p !== null);
+      })
       .then(
-        () => takers.forEach((taker) => taker.done(pending)),
+        (pending) => takers.forEach((taker) => taker.done(pending)),
         (error) => takers.forEach((taker) => taker.fail(error)),
       );
   };
@@ -413,8 +424,6 @@ export function createLocalSync(
     if (due) workDue = true;
     if (looping) return;
     looping = (async () => {
-      let end!: () => void;
-      const quiet = new Promise<void>((resolve) => (end = resolve));
       try {
         for (;;) {
           dirty = false;
@@ -422,13 +431,21 @@ export function createLocalSync(
           waiters = [];
           const run = workDue || takers.length > 0;
           workDue = false;
-          await retryPass(run, takers, quiet);
+          await retryPass(run, takers);
           if (!dirty) break;
         }
         syncRetryTimer();
+      } catch (error) {
+        // A pass catches its own failures; this is a bug. The loop must not
+        // die with the timer unarmed and the failure unhandled.
+        resumeFailed = true;
+        syncRetryTimer();
+        deps.logger.warn(
+          { error: String(error) },
+          "stream sync: the delete retry loop failed",
+        );
       } finally {
         looping = undefined;
-        end();
       }
     })();
   };
