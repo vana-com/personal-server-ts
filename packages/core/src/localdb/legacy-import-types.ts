@@ -23,10 +23,19 @@ export interface ImportSource {
   /** Replayable data objects, NOT PDPP envelopes. Use computeRecordKeyFromData
    * (storage/pdpp-records) for record_key, stream-sync pkHash for typed pk_hash,
    * and SHA-256(UTF-8 canonicalJson(record)) for body_sha256. Never stringify
-   * key values before pkHash. Invalid/missing keys refuse, not skip.
+   * key values before pkHash. A row with no full identity (a missing or
+   * invalid key, not an object) is left out and counted per reason in the
+   * receipt (`legacy-quarantine.ts`); it does not refuse the stream. A
+   * conflicting duplicate key still refuses it.
    * Each pass validates the sealed revision before its first and after its last
    * row; mutation throws source_changed, including an empty pass. */
-  records(): AsyncIterable<Record<string, unknown>>;
+  records(): AsyncIterable<unknown>;
+  /** Keys the source records as deleted, each as an object holding the typed
+   * primary-key fields (a whole row is fine). The import writes each as a
+   * tombstone at the seed stamp, only for a key the stream does not hold: it
+   * stops a later seed from another copy bringing the key back, and a real
+   * write still overrides it. Same pass rules as `records`. */
+  deletions?(): AsyncIterable<unknown>;
 }
 
 /** Count and SHA-256 over unique rows in binary pk_hash order. Each pair is

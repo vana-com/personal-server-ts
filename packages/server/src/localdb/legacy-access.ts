@@ -155,9 +155,16 @@ export async function openLegacyAccess(
   };
   let bindingAfter: string | null = null;
   for (;;) {
-    const row = prepare(
-      "SELECT * FROM pdpp_instance_binding WHERE (? IS NULL OR instance > ?) ORDER BY instance LIMIT 1",
-    ).get(bindingAfter, bindingAfter) as Record<string, unknown> | undefined;
+    // A first and a continuation query: a nullable cursor predicate cannot seek.
+    const row = (
+      bindingAfter === null
+        ? prepare(
+            "SELECT * FROM pdpp_instance_binding ORDER BY instance LIMIT 1",
+          ).get()
+        : prepare(
+            "SELECT * FROM pdpp_instance_binding WHERE instance > ? ORDER BY instance LIMIT 1",
+          ).get(bindingAfter)
+    ) as Record<string, unknown> | undefined;
     if (!row) break;
     frame(row);
     bindingAfter = row.instance as string;
@@ -213,12 +220,20 @@ export async function openLegacyAccess(
       let stream = "";
       for (;;) {
         await reader.assertRevision(expected);
-        const row = prepare(
-          `SELECT p.instance, p.stream, b.source_id AS sourceId, count(*) AS rows
+        // A first and a continuation query: a nullable cursor predicate keeps
+        // the planner from seeking, so each group would rescan the table.
+        const groups = `SELECT p.instance, p.stream, b.source_id AS sourceId, count(*) AS rows
           FROM pdpp_records p LEFT JOIN pdpp_instance_binding b ON b.instance = p.instance
-          WHERE p.deleted = 0 AND (? IS NULL OR p.instance > ? OR (p.instance = ? AND p.stream > ?))
-          GROUP BY p.instance,p.stream ORDER BY p.instance,p.stream LIMIT 1`,
-        ).get(instance, instance, instance, stream) as
+          WHERE p.deleted = 0`;
+        const order =
+          "GROUP BY p.instance,p.stream ORDER BY p.instance,p.stream LIMIT 1";
+        const row = (
+          instance === null
+            ? prepare(`${groups} ${order}`).get()
+            : prepare(
+                `${groups} AND (p.instance, p.stream) > (?, ?) ${order}`,
+              ).get(instance, stream)
+        ) as
           | {
               instance: string;
               stream: string;
@@ -264,7 +279,7 @@ export async function openLegacyAccess(
     },
     async page(instance, stream, after, limit, maxBytes, expected) {
       await reader.assertRevision(expected);
-      const rows: Record<string, unknown>[] = [];
+      const rows: unknown[] = [];
       let cursor = after;
       let bytes = 0;
       // The decoded page owns these rows now. Source pages have no reuse until
@@ -292,14 +307,13 @@ export async function openLegacyAccess(
         const row = prepare(
           "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0",
         ).get(instance, stream, next.record_key) as { data: string };
-        let value: Record<string, unknown>;
+        // Stored text that is not a JSON object is one row the import counts
+        // out (`not_an_object`); it does not refuse the stream.
+        let value: unknown;
         try {
-          const parsed: unknown = JSON.parse(row.data);
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-            throw new Error();
-          value = parsed as Record<string, unknown>;
+          value = JSON.parse(row.data);
         } catch {
-          throw new Error("invalid_record");
+          value = null;
         }
         rows.push(value);
         bytes += next.bytes + next.keyBytes;

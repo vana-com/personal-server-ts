@@ -1,4 +1,3 @@
-import { computeRecordKeyFromData } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   ImportInventoryEntry,
@@ -36,7 +35,9 @@ export interface CanonicalImportPageReader {
     maxBytes: number,
     revision: string,
   ): Promise<{
-    readonly rows: readonly Record<string, unknown>[];
+    /** Stored rows as parsed. A row that is not a JSON object (or not JSON) is
+     * `null`: the import counts it out (`not_an_object`), it does not stop. */
+    readonly rows: readonly unknown[];
     readonly next: string | null;
   }>;
 }
@@ -50,6 +51,11 @@ export interface CanonicalImportPageReader {
  * incremental defaults true as in IntakeStreamDeclaration; it is not inferred
  * from semantics or a new declaration field. Most recently active live instance wins (stable instance tie break).
  * Unknown inventory yields ImportExclusion; never invent declaration/key/target.
+ *
+ * Only the newest live instance of a source id is read. An older live instance,
+ * or one of a deleted connection, is excluded and counted (`older_instance`,
+ * `deleted_instance`). A row that cannot become a record (no full key, not an
+ * object) is not refused here: the import counts it out per row.
  */
 export async function* createCanonicalImportSource(options: {
   readonly owner: string;
@@ -175,14 +181,9 @@ export async function* createCanonicalImportSource(options: {
           ) {
             throw new Error("invalid_page_cursor");
           }
-          for (const record of page.rows) {
-            try {
-              computeRecordKeyFromData(record, [...target.primaryKey]);
-            } catch {
-              throw new Error("invalid_record");
-            }
-            yield record;
-          }
+          // A row with no full key is the import's to count, not this reader's
+          // to refuse: one bad row must not hide the rest of its stream.
+          for (const record of page.rows) yield record;
           cursor = page.next;
           // A suspended generator keeps locals rooted. Drop the consumed page
           // before the host handoff and the next decoded page allocation.

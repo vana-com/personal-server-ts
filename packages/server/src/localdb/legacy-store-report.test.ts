@@ -102,6 +102,11 @@ describe("legacy store import report", () => {
       alreadyImported: 0,
       refused: [],
     });
+    // Every row of the newest instance is imported; the older instance's rows
+    // are excluded whole and counted, never merged.
+    expect(first.rows.imported).toBeGreaterThan(0);
+    expect(first.rows.legacy).toBe(first.rows.imported);
+    expect(first.rows.quarantined).toEqual({});
     expect(first.excluded).toEqual([
       { reason: "older_instance", streams: 1, rows: 2 },
       { reason: "undeclared_source", streams: 1, rows: 3 },
@@ -129,6 +134,77 @@ describe("legacy store import report", () => {
     });
     expect(second.excluded).toEqual(first.excluded);
     expect(second.files).toEqual(first.files);
+  }, 120_000);
+
+  it("accounts for the rows of a refused stream: every old row is imported, left out, or refused", async () => {
+    const base = await scratch("legacy-report-");
+    directories.push(base);
+    const root = join(base, "root");
+    writeLegacyStore(root);
+    addOtherInstances(root);
+    const h = await direct(base, root);
+    closers.push(h.close);
+    await h.run();
+    // The stream's declaration changed under the receipt: the next run
+    // refuses it whole, and its rows are neither imported nor quarantined.
+    await h.local.batch([
+      {
+        sql: "UPDATE stream_state SET primary_key = '[\"other\"]' WHERE connection_id = 'pdpp.github~' AND stream = 'repositories'",
+      },
+      { sql: "DELETE FROM import_ledger WHERE stream = 'repositories'" },
+    ]);
+    await h.run();
+    const report = h.runner.report()!;
+    expect(report.refused).toEqual([
+      { reason: "invalid_record", streams: 1, rows: 3 },
+    ]);
+    const left = Object.values(report.rows.quarantined).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(report.rows.refused).toBe(3);
+    expect(report.rows.legacy).toBe(
+      report.rows.imported + left + report.rows.refused!,
+    );
+  }, 120_000);
+
+  it("reports a row the fill-only rules keep out as blocked, not imported, and keeps the count across a restart", async () => {
+    const base = await scratch("legacy-report-");
+    directories.push(base);
+    const root = join(base, "root");
+    writeLegacyStore(root);
+    addOtherInstances(root);
+    const h = await direct(base, root);
+    closers.push(h.close);
+    await h.run();
+    // One key is now deleted on this device (a tombstone, no row), and the
+    // stream's receipt is gone: the next run stages it again, and the rules
+    // keep it out.
+    await h.local.batch([
+      {
+        sql: `INSERT INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
+              SELECT connection_id, stream, pk_hash, record_key, 1, 'z', 2 FROM records
+               WHERE connection_id = 'pdpp.github~' AND stream = 'repositories' LIMIT 1`,
+      },
+      {
+        sql: `DELETE FROM records WHERE rowid IN (SELECT rowid FROM records
+               WHERE connection_id = 'pdpp.github~' AND stream = 'repositories' LIMIT 1)`,
+      },
+      { sql: "DELETE FROM import_ledger WHERE stream = 'repositories'" },
+    ]);
+    await h.run();
+    const report = h.runner.report()!;
+    const left = Object.values(report.rows.quarantined).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(report.rows.blocked).toBe(1);
+    expect(report.rows.legacy).toBe(
+      report.rows.imported + report.rows.blocked + left + report.rows.refused!,
+    );
+    // The receipt carries the count: a run that imports nothing new says the same.
+    await h.run();
+    expect(h.runner.report()!.rows).toEqual(report.rows);
   }, 120_000);
 
   it("publishes one report per run, after retirement: files are never null beside a finished report", async () => {

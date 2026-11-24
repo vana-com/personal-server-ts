@@ -25,8 +25,8 @@ import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-c
  * `seedExclusions`: `ledger`, the seeds the database refused for good
  * (`[{reason, streams}]`, from its import ledger; `null` without a local
  * database), and `legacyStore`, what the last finished run of this process
- * left out of the server's own legacy store (`excluded`, `refused`, `files`;
- * `null` until one has finished). Counts only: no record, key or path.
+ * left out of the server's own legacy store (`excluded`, `refused`, `rows`,
+ * `files`; `null` until one has finished). Counts only: no record, key or path.
  *
  * Only the owner may call it. Without a stream-sync read port the route answers 404.
  */

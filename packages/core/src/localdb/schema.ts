@@ -741,4 +741,13 @@ END`,
     // `done_at` is unfinished work the start sweep queues.
     `ALTER TABLE delete_tombstones ADD COLUMN done_at INTEGER`,
   ],
+  [
+    // The legacy import identifies a row by its record key, the key `records`
+    // is unique by (`records_by_key`), not by the typed key hash. It asks, for
+    // each old row, whether a tombstone or a removal waiting to be published
+    // holds that record key; these two indexes answer by key. Before them the
+    // only access path to either table was the hash.
+    `CREATE INDEX log_tombstones_by_record_key ON log_tombstones(connection_id, stream, record_key)`,
+    `CREATE INDEX record_changes_by_record_key ON record_changes(connection_id, stream, record_key, seq)`,
+  ],
 ];
