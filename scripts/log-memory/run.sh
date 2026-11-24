@@ -19,8 +19,11 @@ out=${OUT:-$HOME/.tmp/log-memory-out}
 mkdir -p "$out" "$work"
 trap 'rm -rf "$work"' EXIT
 : > "$out/$label.jsonl"
-exec 9>"$HOME/.tmp/heavy-run.lock"
-flock 9
+# A caller that already holds the lock for several cases sets HEAVY_LOCK_HELD.
+if [ -z "${HEAVY_LOCK_HELD:-}" ]; then
+  exec 9>"$HOME/.tmp/heavy-run.lock"
+  flock 9
+fi
 cd "$root"
 for step in "${steps[@]}"; do
   # Wait (up to 30 minutes) for the host to have the memory a step needs.
