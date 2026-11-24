@@ -228,7 +228,7 @@ export async function runStep(args: StepArgs): Promise<StepReport | null> {
                 scope: LOG,
                 log,
               },
-              openSpool(a.deps.db, CONNECTION_ID, "bench"),
+              openSpool(a.deps.db, CONNECTION_ID),
             );
             return {
               objects: plan.objects.length,

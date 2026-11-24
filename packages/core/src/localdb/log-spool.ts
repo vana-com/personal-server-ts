@@ -7,18 +7,21 @@
 // them as rows of the local database, and an object is read back when its
 // upload starts and dropped when it ends.
 //
-// The spool belongs to one candidate. It lives while that candidate can still
-// be sent: the candidate is retained until the registry's answer is known, and
-// a retry sends the same objects again. `discard` deletes its rows when the
-// candidate is released. Nothing of a spool outlives its process: the table is
-// created again on every open, and a purge deletes the connection's rows
-// (`log-scratch.ts`).
+// The spool belongs to one candidate, as one session of the scratch
+// (`log-scratch.ts`). It lives while that candidate can still be sent: the
+// candidate is retained until the registry's answer is known, and a retry
+// sends the same objects again. `discard` deletes its rows when the candidate
+// is released. Nothing of a spool outlives its process: the next open of the
+// file deletes what another process left, and a purge deletes the connection's
+// rows. A second handle on the same file opens its own spool and touches no
+// one else's.
 //
 // An object is stored in chunks of at most `SPOOL_CHUNK` bytes, one row each:
 // a sealed object can be 4 MiB, and a phone's SQL bridge refuses a request or
 // a reply frame over 4 MiB (a blob travels as base64, a third larger still).
 
 import type { SqlDriver } from "./driver.js";
+import { deleteSession, newSession, PROCESS, SPOOL } from "./log-scratch.js";
 
 /** One sealed object waiting for upload, by its blob name in the log scope. */
 export interface SpooledObject {
@@ -29,6 +32,9 @@ export interface SpooledObject {
   read(): Promise<Uint8Array>;
 }
 
+/** Names deleted in one request: a name is a short key, so a count is a bound here. */
+const DELETES_PER_BATCH = 200;
+
 /** The most one row holds. */
 export const SPOOL_CHUNK = 1024 * 1024;
 
@@ -36,6 +42,8 @@ export interface Spool {
   add(name: string, cipher: Uint8Array): Promise<void>;
   /** What was added, in order of addition, one entry per name. */
   objects(): readonly SpooledObject[];
+  /** Delete the objects whose names are not in `names`. */
+  keepOnly(names: ReadonlySet<string>): Promise<void>;
   /** Delete the spool's rows. */
   discard(): Promise<void>;
 }
@@ -43,15 +51,15 @@ export interface Spool {
 export function openSpool(
   db: Pick<SqlDriver, "batch" | "query">,
   connectionId: string,
-  owner: string,
 ): Spool {
   const added = new Map<string, SpooledObject>();
-  const mine = [connectionId, owner] as const;
+  const session = newSession();
+  const mine = [connectionId, session] as const;
   return {
     async add(name, cipher) {
       await db.batch([
         {
-          sql: "DELETE FROM log_spool WHERE connection_id = ? AND owner = ? AND name = ?",
+          sql: `DELETE FROM ${SPOOL} WHERE connection_id = ? AND session = ? AND name = ?`,
           params: [...mine, name],
         },
       ]);
@@ -64,9 +72,9 @@ export function openSpool(
         );
         await db.batch([
           {
-            sql: `INSERT INTO log_spool(connection_id, owner, name, chunk, bytes, cipher)
-                  VALUES (?, ?, ?, ?, ?, ?)`,
-            params: [...mine, name, chunk, part.length, part],
+            sql: `INSERT INTO ${SPOOL}(connection_id, session, process, name, chunk, bytes, cipher)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            params: [...mine, PROCESS, name, chunk, part.length, part],
           },
         ]);
       }
@@ -81,8 +89,8 @@ export function openSpool(
           let at = 0;
           for (let chunk = 0; chunk < chunks; chunk++) {
             const [row] = await db.query<{ cipher: Uint8Array }>(
-              `SELECT cipher FROM log_spool
-                WHERE connection_id = ? AND owner = ? AND name = ? AND chunk = ?`,
+              `SELECT cipher FROM ${SPOOL}
+                WHERE connection_id = ? AND session = ? AND name = ? AND chunk = ?`,
               [...mine, name, chunk],
             );
             if (!row)
@@ -97,14 +105,21 @@ export function openSpool(
       });
     },
     objects: () => [...added.values()],
+    async keepOnly(names) {
+      const drop = [...added.keys()].filter((name) => !names.has(name));
+      for (let at = 0; at < drop.length; at += DELETES_PER_BATCH) {
+        await db.batch(
+          drop.slice(at, at + DELETES_PER_BATCH).map((name) => ({
+            sql: `DELETE FROM ${SPOOL} WHERE connection_id = ? AND session = ? AND name = ?`,
+            params: [...mine, name],
+          })),
+        );
+      }
+      for (const name of drop) added.delete(name);
+    },
     async discard() {
       added.clear();
-      await db.batch([
-        {
-          sql: "DELETE FROM log_spool WHERE connection_id = ? AND owner = ?",
-          params: [...mine],
-        },
-      ]);
+      await db.batch([deleteSession(SPOOL, connectionId, session)]);
     },
   };
 }

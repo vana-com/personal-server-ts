@@ -5,8 +5,6 @@
 // it may stay behind in the workspace object. Each test spills objects, drops
 // the caller's references, forces a collection and asks a `WeakRef` for the
 // object: a handle or a closure that still holds the bytes keeps it alive.
-import vm from "node:vm";
-import v8 from "node:v8";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   LOG_FORMAT,
@@ -19,21 +17,15 @@ import {
 } from "../../../core/src/localdb/index.js";
 import { openFoldWorkspace } from "../../../core/src/localdb/log-fold-workspace.js";
 import { openSpool, type Spool } from "../../../core/src/localdb/log-spool.js";
+import { publishLog } from "../../../core/src/localdb/log-publish.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
-
-v8.setFlagsFromString("--expose-gc");
-const collect = vm.runInNewContext("gc") as () => void;
-
-/** True once every object behind `refs` is collected: a macrotask, then a collection, until it is or 10 rounds pass. */
-async function collected(refs: readonly WeakRef<object>[]): Promise<boolean> {
-  for (let round = 0; round < 10; round++) {
-    // A WeakRef target stays alive to the end of the job that made it.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    collect();
-    if (refs.every((ref) => ref.deref() === undefined)) return true;
-  }
-  return false;
-}
+import { collected, liveBytes } from "./gc.test-utils.js";
+import {
+  CONNECTION_ID,
+  closeWorldDrivers,
+  sName,
+  world,
+} from "./log-world.test-utils.js";
 
 const ID = { owner: "0xAbC", network: "moksha", deviceId: "dev-1" };
 
@@ -61,7 +53,7 @@ describe("spilled bytes are not reachable from memory", () => {
 
   it("a spool's handles do not keep the sealed objects", async () => {
     const db = await database();
-    const spool = openSpool(db, "c1", "op-1");
+    const spool = openSpool(db, "c1");
     const refs = await spill(spool, 6, 1_500_000);
     expect(await collected(refs)).toBe(true);
     // The handles are alive and read the bytes back from the rows.
@@ -78,7 +70,7 @@ describe("spilled bytes are not reachable from memory", () => {
 
   it("a workspace does not keep the history folded into it", async () => {
     const db = await database();
-    const workspace = await openFoldWorkspace(db, "c1", "compact");
+    const workspace = await openFoldWorkspace(db, "c1");
     const fold = async () => {
       const refs: WeakRef<object>[] = [];
       const operations: WireOperation[] = [];
@@ -126,4 +118,58 @@ describe("spilled bytes are not reachable from memory", () => {
     expect(entries).toBe(4);
     await workspace.close();
   });
+});
+
+describe("a publish round retains the references of the bodies it selects, not the bodies", () => {
+  afterEach(closeWorldDrivers);
+
+  // 60 records of 400 KB against a part target of 100 KB. Each counts as a few
+  // hundred bytes of the round (`opSize`: its pieces are named, not carried),
+  // so the round takes all 60: 24 MB of bodies. A planner that keeps the
+  // bodies until the segment is built holds all of them at once; one that
+  // seals the pieces into the spool as it selects a record holds one.
+  const TARGET = 100_000;
+  const RECORDS = 60;
+  const PAD = 400_000;
+
+  /** A database that measures what the process holds each time a sealed piece is written to the spool. */
+  const sampling = (inner: SqlDriver, peak: { bytes: number }) =>
+    ({
+      ...inner,
+      batch: async (statements: Parameters<SqlDriver["batch"]>[0]) => {
+        const result = await inner.batch(statements);
+        if (statements.some((s) => s.sql.includes("INSERT INTO log_spool")))
+          peak.bytes = Math.max(peak.bytes, liveBytes());
+        return result;
+      },
+    }) as SqlDriver;
+
+  for (const full of [false, true])
+    it(`${full ? "a replacing run (the whole stream is read at once)" : "an ordinary run"} of ${RECORDS} bodies above the part target stays well under their size`, async () => {
+      const peak = { bytes: 0 };
+      const w = await world({
+        streams: 1,
+        partTargetBytes: TARGET,
+        database: (deviceId) =>
+          deviceId === "a"
+            ? sampling(openBetterSqlite3(":memory:"), peak)
+            : openBetterSqlite3(":memory:"),
+      });
+      const a = await w.device("a");
+      await a.run(
+        "r1",
+        Array.from({ length: RECORDS }, (_, i) => ({
+          stream: sName(0),
+          id: `k${i}`,
+          pad: PAD,
+        })),
+        { full },
+      );
+      const before = liveBytes();
+      await publishLog(a.deps, CONNECTION_ID);
+      const retained = peak.bytes - before;
+      expect(peak.bytes).toBeGreaterThan(0);
+      // The bodies are 24 MB; one body and one batch of reads are a few MB (about 2 MB measured).
+      expect(retained).toBeLessThan(8 * 1024 * 1024);
+    }, 120_000);
 });

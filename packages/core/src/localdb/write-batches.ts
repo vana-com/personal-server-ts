@@ -14,10 +14,11 @@
 // escaping of quotes in a body (a quote costs two bytes in the stored body and
 // four in the request).
 
+import { PAGE_BYTES } from "./byte-pages.js";
 import type { SqlDriver, SqlStatement, SqlValue } from "./driver.js";
 
 /** What one write batch carries, at most, when two or more groups fit. */
-export const WRITE_BATCH_BYTES = 1024 * 1024;
+export const WRITE_BATCH_BYTES = PAGE_BYTES;
 
 /** The bytes `value` takes as UTF-8, the unit SQLite's `LENGTH(CAST(x AS BLOB))` counts. */
 export function utf8Length(value: string): number {

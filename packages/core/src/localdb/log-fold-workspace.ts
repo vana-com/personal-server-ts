@@ -31,9 +31,14 @@
 // TEXT. `foldLog` and the workspace are tested against each other on names
 // where the two orders differ.
 //
-// The rows are scratch of one operation, keyed by connection and purpose
-// (`log-scratch.ts`). The operation empties them when it is done; the table
-// is created again on every open, and a purge deletes the connection's rows.
+// The rows are scratch of one session, one fold (`log-scratch.ts`): the
+// session deletes its own rows when it ends, the next open of the file
+// deletes those another process left, and a purge deletes the connection's.
+// A second handle on the same file opens its own session and touches no one
+// else's rows.
+//
+// Reads are cut by what the reply holds (`byte-pages.ts`): a body is read as
+// a blob, a cell too large for a page is read alone in chunks.
 
 import {
   followMeta,
@@ -48,9 +53,21 @@ import {
   type WireOperation,
   type WireSnapshotPart,
 } from "@opendatalabs/personal-server-ts-stream-sync";
-import { rowsWithin, SIZE_ROWS } from "./byte-pages.js";
+import {
+  fitsPage,
+  readChunked,
+  replyBytes,
+  rowsWithin,
+  SIZE_ROWS,
+  textOf,
+} from "./byte-pages.js";
 import type { SqlDriver, SqlStatement } from "./driver.js";
-import { FOLD_CELLS } from "./log-scratch.js";
+import {
+  deleteSession,
+  FOLD_CELLS,
+  newSession,
+  PROCESS,
+} from "./log-scratch.js";
 import { utf8Length, writeInBatches } from "./write-batches.js";
 
 export interface FoldWorkspace {
@@ -78,11 +95,11 @@ type CellRow = {
   up_ordinal: number | null;
   up_first_seen: number | null;
   up_ref: number | null;
-  up_body: string | null;
+  up_body: Uint8Array | null;
   del_o: number | null;
   del_r: Uint8Array | null;
   del_explicit: number | null;
-  del_key: string | null;
+  del_key: Uint8Array | null;
 };
 
 /** A string as the bytes of its UTF-16BE code units, lone surrogates kept: byte order is code-unit order. */
@@ -106,28 +123,20 @@ function fromUtf16Key(bytes: Uint8Array): string {
 export async function openFoldWorkspace(
   db: Pick<SqlDriver, "batch" | "query">,
   connectionId: string,
-  purpose: string,
 ): Promise<FoldWorkspace> {
-  const mine = [connectionId, purpose] as const;
-  const clear = () =>
-    db.batch([
-      {
-        sql: `DELETE FROM ${FOLD_CELLS} WHERE connection_id = ? AND workspace = ?`,
-        params: mine,
-      },
-    ]);
-  await clear();
+  const session = newSession();
+  const mine = [connectionId, session] as const;
   const metas = new Map<string, LogStreamMeta>();
   const follow = (meta: LogStreamMeta) =>
     metas.set(meta.stream, followMeta(metas.get(meta.stream), meta));
 
   const cell = (stream: string, pk: string): SqlStatement => ({
-    sql: `INSERT OR IGNORE INTO ${FOLD_CELLS}(connection_id, workspace, stream, pk_hash)
-          VALUES (?, ?, ?, ?)`,
-    params: [...mine, utf16Key(stream), pk],
+    sql: `INSERT OR IGNORE INTO ${FOLD_CELLS}(connection_id, session, process, stream, pk_hash)
+          VALUES (?, ?, ?, ?, ?)`,
+    params: [...mine, PROCESS, utf16Key(stream), pk],
   });
   const where =
-    "connection_id = ? AND workspace = ? AND stream = ? AND pk_hash = ?";
+    "connection_id = ? AND session = ? AND stream = ? AND pk_hash = ?";
   const upsert = (
     op: Extract<WireOperation, { kind: "upsert" | "upsert-ref" }>,
   ): SqlStatement[] => {
@@ -200,6 +209,65 @@ export async function openFoldWorkspace(
     ];
   };
 
+  /**
+   * The cells after `after`, in key order, that one reply holds: from their
+   * sizes alone (small columns, kept before the bodies in a row) the cost of
+   * each is what its blobs take in base64, then the longest run that fits a
+   * page. A cell whose values alone overflow a page is read by itself, its
+   * values in chunks. Nothing for no cells left.
+   */
+  const nextCells = async (
+    after: readonly [Uint8Array, string] | null,
+  ): Promise<CellRow[]> => {
+    const range = `connection_id = ? AND session = ?${
+      after ? " AND (stream, pk_hash) > (?, ?)" : ""
+    }`;
+    const params = after ? [...mine, ...after] : [...mine];
+    const sizes: { up: number; del: number; keys: number }[] = await db.query(
+      `SELECT COALESCE(up_bytes, 0) AS up, COALESCE(del_bytes, 0) AS del,
+              LENGTH(stream) + LENGTH(pk_hash) + COALESCE(LENGTH(up_r), 0)
+                + COALESCE(LENGTH(del_r), 0) AS keys
+         FROM ${FOLD_CELLS} WHERE ${range}
+        ORDER BY stream, pk_hash LIMIT ${SIZE_ROWS}`,
+      params,
+    );
+    if (sizes.length === 0) return [];
+    const costs = sizes.map(
+      (row) =>
+        replyBytes(Number(row.up)) +
+        replyBytes(Number(row.del)) +
+        replyBytes(Number(row.keys)),
+    );
+    const take = rowsWithin(costs);
+    if (take > 1 || fitsPage(costs[0]!))
+      return db.query<CellRow>(
+        `SELECT stream, pk_hash, up_o, up_r, up_ordinal, up_first_seen, up_ref,
+                del_o, del_r, del_explicit,
+                CAST(up_body AS BLOB) AS up_body, CAST(del_key AS BLOB) AS del_key
+           FROM ${FOLD_CELLS} WHERE ${range}
+          ORDER BY stream, pk_hash LIMIT ${take}`,
+        params,
+      );
+    const [cell] = await db.query<CellRow>(
+      `SELECT stream, pk_hash, up_o, up_r, up_ordinal, up_first_seen, up_ref,
+              del_o, del_r, del_explicit, NULL AS up_body, NULL AS del_key
+         FROM ${FOLD_CELLS} WHERE ${range}
+        ORDER BY stream, pk_hash LIMIT 1`,
+      params,
+    );
+    const value = (column: "up_body" | "del_key", bytes: number) =>
+      readChunked(db, bytes, (offset, length) => ({
+        sql: `SELECT substr(CAST(${column} AS BLOB), ?, ?) AS c FROM ${FOLD_CELLS}
+               WHERE connection_id = ? AND session = ? AND stream = ? AND pk_hash = ?`,
+        params: [offset, length, ...mine, cell!.stream, cell!.pk_hash],
+      }));
+    if (Number(sizes[0]!.up) > 0)
+      cell!.up_body = await value("up_body", Number(sizes[0]!.up));
+    if (Number(sizes[0]!.del) > 0)
+      cell!.del_key = await value("del_key", Number(sizes[0]!.del));
+    return [cell!];
+  };
+
   return {
     async addPart(part) {
       for (const meta of part.streams) follow(meta);
@@ -242,41 +310,16 @@ export async function openFoldWorkspace(
       ),
     async *pages() {
       let after: readonly [Uint8Array, string] | null = null;
-      const range = () =>
-        `connection_id = ? AND workspace = ?${
-          after ? " AND (stream, pk_hash) > (?, ?)" : ""
-        }`;
       for (;;) {
-        const params = after ? [...mine, ...after] : [...mine];
-        // The sizes of the next cells first (small rows: they come before the
-        // bodies in a row), then the longest run of them that fits the budget.
-        const sizes: { n: number }[] = await db.query<{ n: number }>(
-          `SELECT COALESCE(up_bytes, 0) + COALESCE(del_bytes, 0) AS n
-             FROM ${FOLD_CELLS} WHERE ${range()}
-            ORDER BY stream, pk_hash LIMIT ${SIZE_ROWS}`,
-          params,
-        );
-        if (sizes.length === 0) return;
-        const take = rowsWithin(sizes.map((row) => Number(row.n)));
-        const page: CellRow[] = await db.query<CellRow>(
-          `SELECT stream, pk_hash, up_o, up_r, up_ordinal, up_first_seen, up_ref,
-                  del_o, del_r, del_explicit, up_body, del_key
-             FROM ${FOLD_CELLS} WHERE ${range()}
-            ORDER BY stream, pk_hash LIMIT ${take}`,
-          params,
-        );
-        yield page.flatMap(entriesOf);
-        if (
-          page.length < take ||
-          (take === sizes.length && sizes.length < SIZE_ROWS)
-        )
-          return;
-        const last = page[page.length - 1]!;
+        const cells: CellRow[] = await nextCells(after);
+        if (cells.length === 0) return;
+        yield cells.flatMap(entriesOf);
+        const last: CellRow = cells[cells.length - 1]!;
         after = [last.stream, last.pk_hash];
       }
     },
     close: async () => {
-      await clear();
+      await db.batch([deleteSession(FOLD_CELLS, connectionId, session)]);
     },
   };
 }
@@ -293,11 +336,11 @@ function entriesOf(row: CellRow): WireEntry[] {
           ...(row.up_ref === 1
             ? {
                 kind: "upsert-ref" as const,
-                body: JSON.parse(row.up_body!) as LogBodyRef,
+                body: JSON.parse(textOf(row.up_body!)) as LogBodyRef,
               }
             : {
                 kind: "upsert" as const,
-                value: JSON.parse(row.up_body!),
+                value: JSON.parse(textOf(row.up_body!)),
               }),
         };
   const deletion: FoldDeletion | null =
@@ -306,7 +349,7 @@ function entriesOf(row: CellRow): WireEntry[] {
       : {
           stamp: { o: row.del_o, r: fromUtf16Key(row.del_r!) },
           explicit: row.del_explicit === 1,
-          key: JSON.parse(row.del_key!) as LogKey,
+          key: JSON.parse(textOf(row.del_key!)) as LogKey,
         };
   return foldCellEntries(stream, row.pk_hash, upsert, deletion) as WireEntry[];
 }

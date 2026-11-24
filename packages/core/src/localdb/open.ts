@@ -1,5 +1,5 @@
 import type { SqlDriver } from "./driver.js";
-import { resetScratch } from "./log-scratch.js";
+import { abandonedScratch, ensureScratch } from "./log-scratch.js";
 import { migrate } from "./migrate.js";
 import { TEMP_TABLES } from "./merge.js";
 import type { ViewChangeRecorder, ViewLogger } from "./view-changes.js";
@@ -32,9 +32,10 @@ export class LocalDbIdentityMismatch extends Error {
 }
 
 /**
- * Sets the connection pragmas, migrates, creates the TEMP tables, resets the
- * scratch tables of the log (`log-scratch.ts`) and checks
- * (or, on a new file, records) the owner and network. Web uses TRUNCATE
+ * Sets the connection pragmas, migrates, creates the TEMP tables and the
+ * scratch tables of the log (`log-scratch.ts`), checks (or, on a new file,
+ * records) the owner and network, and only then deletes the scratch rows
+ * another process left. Web uses TRUNCATE
  * journaling; the other hosts use WAL.
  *
  * With `options.viewChanges` the returned driver is the recorder's: the host
@@ -52,8 +53,7 @@ export async function openLocalDb(
   await migrate(driver);
   await driver.batch([
     ...TEMP_TABLES.map((sql) => ({ sql })),
-    // The scratch of the log's whole-log operations starts empty on every open.
-    ...resetScratch(),
+    ...ensureScratch(),
     {
       sql: "INSERT OR IGNORE INTO db_meta (id, owner, network, device_id, created_at) VALUES (1, ?, ?, ?, ?)",
       params: [
@@ -73,6 +73,9 @@ export async function openLocalDb(
   if (meta.network !== identity.network) {
     throw new LocalDbIdentityMismatch("network");
   }
+  // The file is this device's: what another process left in the scratch of the
+  // log's whole-log operations is abandoned (`log-scratch.ts`).
+  await driver.batch(abandonedScratch());
   const views = options.viewChanges;
   return views ? views.recorder.attach(driver, views.logger) : driver;
 }

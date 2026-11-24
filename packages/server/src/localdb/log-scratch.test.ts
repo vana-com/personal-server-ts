@@ -100,9 +100,9 @@ describe("scratch tables of the log", () => {
 
   /** What a process that ended mid-operation leaves for a connection. */
   const leave = async (db: SqlDriver, connectionId: string) => {
-    const workspace = await openFoldWorkspace(db, connectionId, "compact");
+    const workspace = await openFoldWorkspace(db, connectionId);
     await workspace.addSegment(segment);
-    const spool = openSpool(db, connectionId, "op-1");
+    const spool = openSpool(db, connectionId);
     await spool.add("q-0", new Uint8Array([1, 2, 3, 4]));
     await spool.add("v-0", new Uint8Array(3_000_000).fill(7));
   };
@@ -122,6 +122,24 @@ describe("scratch tables of the log", () => {
     };
   };
 
+  /**
+   * A second handle on the file `db` has open. The server's driver refuses one
+   * (a process lock, `better-sqlite3-worker.cjs`) and the phone bridge has one
+   * connection per process, so the open must hold for a driver that allows
+   * it: the handle shares the connection and keeps it open on close.
+   */
+  const beside = (db: SqlDriver): SqlDriver => ({
+    ...db,
+    close: async () => undefined,
+  });
+
+  /** The rows say another process wrote them: the way a file looks after the process that held it ended. */
+  const asIfAnotherProcess = (db: SqlDriver) =>
+    db.batch([
+      { sql: "UPDATE log_fold_cells SET process = 'ended-process'" },
+      { sql: "UPDATE log_spool SET process = 'ended-process'" },
+    ]);
+
   it("a database that opens after a crash has none of the crashed operation's rows", async () => {
     const path = file();
     const first = await database(path);
@@ -130,9 +148,53 @@ describe("scratch tables of the log", () => {
     expect((await rows(first)).cells).toBe(4);
     expect((await rows(first)).spool).toBeGreaterThanOrEqual(4);
     // The process ends. Nothing closed the workspace or discarded the spool.
+    await asIfAnotherProcess(first);
     await first.close();
     open.splice(open.indexOf(first), 1);
     const second = await database(path);
+    expect(await rows(second)).toEqual({ cells: 0, spool: 0 });
+  });
+
+  it("a file whose identity is refused is not touched by the open", async () => {
+    const path = file();
+    const first = await database(path);
+    await leave(first, "c1");
+    const before = await rows(first);
+    await asIfAnotherProcess(first);
+    // A second handle on the file, of another owner: its open throws before it
+    // deletes anything.
+    await expect(
+      openLocalDb(beside(first), { ...ID, owner: "0xOther" }),
+    ).rejects.toThrow();
+    expect(await rows(first)).toEqual(before);
+  });
+
+  it("a second handle on the same file does not delete the first one's rows, and neither fold reads the other's", async () => {
+    const first = await database(file());
+    const workspace = await openFoldWorkspace(first, "c1");
+    await workspace.addSegment(segment);
+    const spool = openSpool(first, "c1");
+    await spool.add("q-0", new Uint8Array([1, 2, 3, 4]));
+    const before = await rows(first);
+    expect(before.cells).toBe(2);
+    // A second handle on the file opens while the first is mid-fold and
+    // mid-spool: its open deletes what other processes left, and these rows
+    // are this process's.
+    const second = await openLocalDb(beside(first), ID);
+    expect(await rows(second)).toEqual(before);
+    const other = await openFoldWorkspace(second, "c1");
+    await other.addSegment(segment);
+    await other.close();
+    expect(await rows(second)).toEqual(before);
+    // The first fold still has its cells, and its spool its object.
+    const entries: unknown[] = [];
+    for await (const page of workspace.pages()) entries.push(...page);
+    expect(entries).toHaveLength(2);
+    expect(await spool.objects()[0]!.read()).toEqual(
+      new Uint8Array([1, 2, 3, 4]),
+    );
+    await workspace.close();
+    await spool.discard();
     expect(await rows(second)).toEqual({ cells: 0, spool: 0 });
   });
 
@@ -153,13 +215,12 @@ describe("scratch tables of the log", () => {
     expect(await rows(db, "c2")).toEqual(other);
   });
 
-  it("a workspace that is closed leaves none, and one that is reopened starts empty", async () => {
+  it("a workspace that is closed leaves none", async () => {
     const db = await database(file());
-    await leave(db, "c1");
-    const again = await openFoldWorkspace(db, "c1", "compact");
-    expect((await rows(db, "c1")).cells).toBe(0);
-    await again.addSegment(segment);
-    await again.close();
+    const workspace = await openFoldWorkspace(db, "c1");
+    await workspace.addSegment(segment);
+    expect((await rows(db, "c1")).cells).toBe(2);
+    await workspace.close();
     expect((await rows(db, "c1")).cells).toBe(0);
   });
 });

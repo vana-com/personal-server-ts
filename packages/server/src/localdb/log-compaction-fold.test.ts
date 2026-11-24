@@ -67,7 +67,7 @@ describe("a compaction is the fold of its history", () => {
 
       const log = await readLogState(a.deps, CONNECTION_ID);
       const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
-      const spool = openSpool(a.db, CONNECTION_ID, "test");
+      const spool = openSpool(a.db, CONNECTION_ID);
       const plan = await compactLog(
         { ...a.deps, partTargetBytes: 600 },
         {
@@ -124,7 +124,7 @@ describe("a compaction of large bodies writes inside the phone bridge's frame", 
     }
     const log = await readLogState(a.deps, CONNECTION_ID);
     const framed = frameLimited(a.db);
-    const spool = openSpool(framed, CONNECTION_ID, "test");
+    const spool = openSpool(framed, CONNECTION_ID);
     const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
     const plan = await compactLog(
       { ...a.deps, db: framed, partTargetBytes: 400_000 },

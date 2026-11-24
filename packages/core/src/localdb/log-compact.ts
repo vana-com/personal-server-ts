@@ -132,11 +132,7 @@ export async function compactLog(
       .sort((a, b) => a.position - b.position)
       .map((ref) => ({ ref, bytes: ref.bytes })),
   ];
-  const workspace = await openFoldWorkspace(
-    deps.db,
-    input.connectionId,
-    "compaction",
-  );
+  const workspace = await openFoldWorkspace(deps.db, input.connectionId);
   try {
     const reader = readPartsAhead<Source, WireSnapshotPart | WireSegment>(
       deps.blobs,

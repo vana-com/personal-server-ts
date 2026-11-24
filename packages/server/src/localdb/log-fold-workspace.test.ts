@@ -241,7 +241,7 @@ async function fold(
     segments: readonly Segment<WireOperation>[];
   },
 ) {
-  const workspace = await openFoldWorkspace(db, "pdpp.c~", "test");
+  const workspace = await openFoldWorkspace(db, "pdpp.c~");
   for (const part of input.parts) await workspace.addPart(part);
   for (const segment of input.segments) await workspace.addSegment(segment);
   const entries: WireEntry[] = [];
@@ -432,26 +432,33 @@ describe("the disk fold is foldLog", () => {
     expect((mine.entries[0] as { firstSeen: number | null }).firstSeen).toBe(5);
   });
 
-  it("leaves no rows behind, and clears a crashed operation's", async () => {
+  it("leaves no rows behind, and a workspace never reads another's rows", async () => {
     const db = await database();
-    const stale = await openFoldWorkspace(db, "pdpp.c~", "test");
-    await stale.addSegment(
+    const other = await openFoldWorkspace(db, "pdpp.c~");
+    await other.addSegment(
       history(3, { keys: 4, segments: 1, opsPerSegment: 4 }).wire[0]!,
     );
-    // Not closed: a crash. The next workspace of the connection and purpose starts empty.
-    const next = await openFoldWorkspace(db, "pdpp.c~", "test");
+    // `other` is open: a second workspace of the same connection folds beside
+    // it. Its entries are its own history's, not a mix with `other`'s keys.
+    const mine = history(4, { keys: 4, segments: 1, opsPerSegment: 4 });
+    const next = await openFoldWorkspace(db, "pdpp.c~");
+    await next.addSegment(mine.wire[0]!);
+    const entries: WireEntry[] = [];
+    for await (const page of next.pages()) entries.push(...page);
+    const alone = await fold(await database(), {
+      parts: [],
+      segments: mine.wire,
+    });
+    expect(entries).toEqual(alone.entries);
     const count = async () =>
       (
         await db.query<{ n: number }>(
           "SELECT COUNT(*) AS n FROM log_fold_cells",
         )
       )[0]!.n;
-    expect(await count()).toBe(0);
-    await next.addSegment(
-      history(4, { keys: 4, segments: 1, opsPerSegment: 4 }).wire[0]!,
-    );
-    expect(await count()).toBeGreaterThan(0);
     await next.close();
+    expect(await count()).toBeGreaterThan(0); // `other`'s rows stay
+    await other.close();
     expect(await count()).toBe(0);
   });
 });
@@ -797,7 +804,7 @@ describe("a page of the fold is cut by the bytes it holds", () => {
         return rows;
       },
     } as unknown as Pick<SqlDriver, "batch" | "query">;
-    const workspace = await openFoldWorkspace(spy, "pdpp.c~", "test");
+    const workspace = await openFoldWorkspace(spy, "pdpp.c~");
     await workspace.addSegment(segment);
     queries = 0;
     const entries: WireEntry[] = [];
@@ -855,7 +862,7 @@ describe("every write of the workspace and the spool fits the phone bridge's fra
   /** Fold `segment` through a driver with the bridge's limits and read the winners back. */
   async function foldFramed(segment: Segment<WireOperation>) {
     const db = frameLimited(await database());
-    const workspace = await openFoldWorkspace(db, "pdpp.c~", "test");
+    const workspace = await openFoldWorkspace(db, "pdpp.c~");
     await workspace.addSegment(segment);
     const entries: WireEntry[] = [];
     for await (const page of workspace.pages()) entries.push(...page);
@@ -893,6 +900,29 @@ describe("every write of the workspace and the spool fits the phone bridge's fra
     expect(frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
   });
 
+  // A body is read as a blob, so a reply holds its stored bytes in base64
+  // whatever the characters are. Read as text, a stored body of backslashes is
+  // escaped a second time in the reply: 1.5 MiB of them are 3 MiB stored and 6
+  // MiB in the reply.
+  const heavy: ReadonlyArray<readonly [string, string, number, number]> = [
+    ["backslashes, one body of 3 MiB stored", "\\", 1_500_000, 1],
+    ["backslashes, bodies of 800 KB stored", "\\", 400_000, 6],
+    ["backslashes, bodies of 300 KB stored", "\\", 150_000, 30],
+    ["quotes, bodies of 800 KB stored", '"', 400_000, 6],
+    ["control characters, bodies of 600 KB stored", "\u0001", 100_000, 6],
+    ["two-byte characters, bodies of 1.2 MB", "é", 600_000, 4],
+    ["three-byte characters, bodies of 1.2 MB", "€", 400_000, 4],
+    ["four-byte characters, bodies of 1.2 MB", "😀", 150_000, 4],
+  ];
+  for (const [label, char, length, count] of heavy)
+    it(`reads ${label} in replies under 4 MiB`, async () => {
+      const frames = await foldFramed(
+        values(count, (i) => ({ id: i, pad: char.repeat(length) })),
+      );
+      expect(frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+      expect(frames.largestReply).toBeLessThan(SQL_FRAME_BYTES);
+    });
+
   it("deletes with large keys are written in requests under 4 MiB", async () => {
     const segment = values(0, () => ({}));
     segment.operations = Array.from({ length: 60 }, (_, i) => ({
@@ -908,7 +938,7 @@ describe("every write of the workspace and the spool fits the phone bridge's fra
 
   it("a spool holds objects of any size in requests and replies under 4 MiB", async () => {
     const db = frameLimited(await database());
-    const spool = openSpool(db, "pdpp.c~", "op-1");
+    const spool = openSpool(db, "pdpp.c~");
     const sizes = [0, 1, 1_048_576, 1_048_577, 4 * 1024 * 1024, 3_000_001];
     for (const [i, size] of sizes.entries())
       await spool.add(`v-${i}`, new Uint8Array(size).fill(i + 1));

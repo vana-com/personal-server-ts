@@ -369,6 +369,8 @@ export async function world(options: {
         id: string | number;
         v?: number;
         pad?: number;
+        /** The character `pad` repeats (default "p"): a quote or a backslash is escaped in JSON, a euro sign is three bytes. */
+        padWith?: string;
         blobId?: string;
         remove?: boolean;
       }[],
@@ -404,16 +406,22 @@ export async function world(options: {
       const begun = await begin(runId, opts);
       await sync.intake.batch(runId, {
         batch: 0,
-        records: records.map(({ stream, id, v, pad, blobId, remove }) => ({
-          stream,
-          ...(remove ? { op: "delete" as const } : {}),
-          data: {
-            id,
-            ...(v === undefined ? {} : { v }),
-            ...(pad === undefined ? {} : { pad: "p".repeat(pad) }),
-            ...(blobId === undefined ? {} : { blob_ref: { blob_id: blobId } }),
-          },
-        })),
+        records: records.map(
+          ({ stream, id, v, pad, padWith, blobId, remove }) => ({
+            stream,
+            ...(remove ? { op: "delete" as const } : {}),
+            data: {
+              id,
+              ...(v === undefined ? {} : { v }),
+              ...(pad === undefined
+                ? {}
+                : { pad: (padWith ?? "p").repeat(pad) }),
+              ...(blobId === undefined
+                ? {}
+                : { blob_ref: { blob_id: blobId } }),
+            },
+          }),
+        ),
       });
       if (opts.blob)
         await sync.blobs.put({

@@ -72,7 +72,7 @@ export async function rebaseOnLog(
   // is as large as what the device holds. Parts and segments are read one at
   // a time. No body is read: a seed names a key and reads the record this
   // device holds of it, so the bodies the history names are of no use here.
-  const workspace = await openFoldWorkspace(deps.db, connectionId, "rebase");
+  const workspace = await openFoldWorkspace(deps.db, connectionId);
   try {
     for (const part of snapshot?.parts ?? [])
       await workspace.addPart(
