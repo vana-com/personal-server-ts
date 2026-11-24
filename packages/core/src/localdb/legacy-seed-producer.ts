@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex } from "@noble/hashes/utils";
 import { classifyImportRow } from "./import-snapshot.js";
 import { foldLayers, type FoldLayer } from "./legacy-fold.js";
 import { quarantineTally, type QuarantineCounts } from "./legacy-quarantine.js";
@@ -19,7 +21,7 @@ import type { SeedIntake } from "./seed.js";
  *
  * Limit: the seed upload has no deletion line. A deletion a layer records
  * keeps that key's older versions out of this stream's upload, and writes no
- * tombstone. A tombstone needs the server runner's source (`deletions`).
+ * tombstone.
  */
 export interface LegacySeedStream {
   readonly connector: string;
@@ -47,11 +49,13 @@ export interface LegacySeedStreamReport {
    * `staged`: the rows went through the importer (`rows` of them).
    * `empty`: the store had nothing importable, so no upload was made.
    * `refused`: the stream holds a fault that makes it untrustworthy (a key
-   * repeated with different bodies, `reason`); nothing of it was uploaded and
+   * repeated with different bodies, a store that changed under the read,
+   * `reason`); nothing of it was imported and
    * the next stream goes on, as the server's import refuses one stream only. */
   readonly outcome: "merged" | "staged" | "empty" | "refused";
-  /** Why the stream was refused. */
-  readonly reason?: "invalid_record";
+  /** Why the stream was refused: `invalid_record`, or `source_changed` when
+   * the store's content changed between the counting pass and the upload. */
+  readonly reason?: "invalid_record" | "source_changed";
   /** Rows put to the intake. */
   readonly rows: number;
   /** Rows left out for want of a full identity, by reason. */
@@ -72,6 +76,26 @@ export interface LegacySeedReport {
 const CHUNK_BYTES = 256 * 1024;
 
 const encoder = new TextEncoder();
+
+/** The store's content changed between the two passes. */
+class SourceChanged extends Error {
+  constructor() {
+    super("source_changed");
+  }
+}
+
+/** What a pass saw: a digest of the upload lines, and the rows left out. The
+ * upload's own count check only compares line counts, so a row that changed
+ * between the passes would pass it. The digest compares content. */
+function fingerprint(
+  digest: ReturnType<typeof sha256.create>,
+  quarantine: QuarantineCounts,
+): string {
+  return JSON.stringify([
+    bytesToHex(digest.digest()),
+    Object.entries(quarantine).sort(([a], [b]) => (a < b ? -1 : 1)),
+  ]);
+}
 
 /** The importable rows of a stream, and what was left out, in one traversal.
  * The signal is checked at every stored record, the ones the fold leaves out
@@ -141,12 +165,18 @@ export async function seedLegacyStore(
     const quarantine = quarantineTally();
     const read = importable(stream, options.signal);
     // The descriptor leads the upload and states the line count, so one pass
-    // counts. The second pass writes the lines. A store that changes between
-    // the two fails the upload's count check, and nothing is imported.
+    // counts. The second pass writes the lines. Both passes fingerprint what
+    // they read (the lines, and the rows left out); the second checks its own
+    // before the upload ends, so a store that changed between the passes, even
+    // with the same count, stages nothing and imports nothing.
     let count = 0;
+    const counted = sha256.create();
     // `for await` closes the readers when the pass ends early, by abort or fault.
     try {
-      for await (const _row of read(quarantine)) count++;
+      for await (const row of read(quarantine)) {
+        count++;
+        counted.update(encoder.encode(JSON.stringify(row) + "\n"));
+      }
     } catch (error) {
       // A conflict the fold found refuses this stream only. Anything else,
       // an abort included, stops the seed.
@@ -176,6 +206,7 @@ export async function seedLegacyStore(
         total.add(reason, n);
       continue;
     }
+    const expected = fingerprint(counted, quarantine.counts());
     const descriptor = JSON.stringify({
       primaryKey: stream.primaryKey,
       profile: { key: null, version: stream.version },
@@ -195,18 +226,43 @@ export async function seedLegacyStore(
         bytes = 0;
         return chunk;
       };
-      for await (const row of read(quarantineTally())) {
+      const written = sha256.create();
+      const writtenQuarantine = quarantineTally();
+      for await (const row of read(writtenQuarantine)) {
         const line = encoder.encode(JSON.stringify(row) + "\n");
+        written.update(line);
         // Flush before the line that would pass the bound, so a chunk holds
         // whole lines within it; a line over the bound alone travels alone.
         if (bytes > 0 && bytes + line.byteLength > CHUNK_BYTES) yield flush();
         pending.push(line);
         bytes += line.byteLength;
       }
+      // Before the last chunk leaves, so the staging never sees a complete
+      // upload of changed content.
+      if (fingerprint(written, writtenQuarantine.counts()) !== expected)
+        throw new SourceChanged();
       if (bytes > 0) yield flush();
     }
     options.signal?.throwIfAborted();
-    const put = await intake.put(connector, name, body());
+    let put: Awaited<ReturnType<SeedIntake["put"]>>;
+    try {
+      put = await intake.put(connector, name, body());
+    } catch (error) {
+      if (!(error instanceof SourceChanged)) throw error;
+      // Refuses this stream only; no receipt was written, so a later run reads
+      // the store again.
+      statusOf.delete(connector);
+      reports.push({
+        connector,
+        stream: name,
+        outcome: "refused",
+        reason: "source_changed",
+        rows: 0,
+        quarantine: {},
+        invalid: 0,
+      });
+      continue;
+    }
     statusOf.delete(connector);
     if (put.state === "merged") {
       // A final receipt appeared after `status()`: the body was not consumed

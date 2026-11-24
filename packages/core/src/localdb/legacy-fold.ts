@@ -10,7 +10,7 @@ import {
  * Several stored versions of one stream as one `ImportSource`.
  *
  * Old stores keep a stream as many layers: the `{records}` files each
- * collection left, an older instance of the same source. A key can sit in
+ * collection left. A key can sit in
  * many layers. The import takes the newest layer's version of each key, so the
  * result follows layer rank, not the order anything is read or submitted in.
  *
@@ -21,19 +21,22 @@ import {
  *   for it are left out (`deleted_in_newer_layer`), and the fold reports the
  *   deletion (once) so the import can tombstone it. A newer layer that holds
  *   the key live restores it: that layer decided first.
- *   A layer names its deletions by typed key (`deletions`) or, for stores
- *   that keep only the canonical record key of a deleted row, by
- *   `deletedRecordKeys`; the older row's own fields give the typed key then.
+ *   A layer names its deletions by typed key (`deletions`).
  * - A layer may carry `$pdpp.sourceId` on its rows. With `sourceId` set, a
  *   row must carry exactly that source (`untagged` and `source_mismatch`
  *   rows are counted out, never guessed into a stream). The envelope is not
  *   part of the record: it is dropped.
  * - A v1-full envelope names its operation in `$pdpp.record.op` and the key
  *   in `$pdpp.record.key` (the shape `sync/pdpp-import.ts` reads). `delete`
- *   makes the row a deletion of that layer, handled like `deletions()`: its
- *   claim must be a key object and must agree with the payload's key fields
- *   when the payload has them. `upsert` or no op is a row. Any other op is
- *   counted out as `unknown_op`.
+ *   makes the row a deletion of that layer, handled like `deletions()`, and
+ *   applies only when the envelope is complete (version 1, source, declaration,
+ *   stream name, scope and primary key, a record key object), names this
+ *   stream and its primary key, and claims a full key that agrees with the
+ *   payload's key fields when the payload has them. Otherwise it is counted
+ *   out (`deletion_envelope_incomplete`, `deletion_stream_mismatch`,
+ *   `deletion_<key fault>`) and deletes nothing. `upsert` or no op is a row,
+ *   unless its envelope names another stream (`stream_mismatch`). Any other
+ *   op is counted out as `unknown_op`.
  * - A row whose body has no JSON form (a cycle, a BigInt) is counted out
  *   before it claims its key, so an older readable copy still stands.
  * - A row with no full identity passes through for the import to count. A
@@ -51,10 +54,10 @@ import {
  * delete envelope as `delete_envelope` (also when a live row shadows it), a
  * malformed one as `deletion_<reason>`. So a host that reads only `records()`
  * loses no count, and stored records = rows + markers. Keys a layer lists
- * apart from its records (`deletions`, `deletedRecordKeys`) are not stored
- * records; only a malformed `deletions()` key is counted.
+ * apart from its records (`deletions`) are not stored records; only a
+ * malformed `deletions()` key is counted.
  *
- * Memory: the record keys (and deleted record keys) of the layers read so far,
+ * Memory: the record keys of the layers read so far,
  * a body digest per key of the layer being read, and the key fields of
  * the layer's delete envelopes. No body or payload is kept; each traversal
  * reads the layers again.
@@ -63,8 +66,6 @@ export interface FoldLayer {
   records(): AsyncIterable<unknown>;
   /** Keys this layer deleted, each an object holding the typed key fields. */
   deletions?(): AsyncIterable<unknown>;
-  /** Canonical record keys this layer deleted. */
-  deletedRecordKeys?(): AsyncIterable<string>;
 }
 
 export interface FoldOptions {
@@ -83,14 +84,68 @@ type Decoded =
   | { readonly row: unknown }
   | { readonly deletion: unknown; readonly claim: unknown };
 
+/** An own property of an envelope object: an envelope field never comes from a
+ * prototype. */
+const field = (object: Record<string, unknown>, name: string): unknown =>
+  Object.hasOwn(object, name) ? object[name] : undefined;
+
+const text = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0;
+
+/** Why a delete envelope cannot be applied to `target`, or null. A delete is
+ * destructive, so it must be complete: every field `sync/pdpp-import.ts`
+ * requires of a v1-full envelope (the declaration digest cannot be checked
+ * here: the fold holds no declaration). It must belong to this stream, and
+ * declare the stream's own primary key. Its key is checked apart, by
+ * `deletedKey`. */
+function deleteFault(
+  meta: Record<string, unknown>,
+  target: { readonly stream: string; readonly primaryKey: readonly string[] },
+): "envelope_incomplete" | "stream_mismatch" | null {
+  const declaration = field(meta, "declaration");
+  const stream = field(meta, "stream");
+  const record = field(meta, "record");
+  if (
+    field(meta, "version") !== 1 ||
+    !text(field(meta, "sourceId")) ||
+    !isObject(declaration) ||
+    !text(field(declaration, "digest")) ||
+    typeof field(declaration, "version") !== "string" ||
+    !isObject(stream) ||
+    !text(field(stream, "name")) ||
+    !text(field(stream, "scope")) ||
+    !isObject(record) ||
+    !isObject(field(record, "key"))
+  )
+    return "envelope_incomplete";
+  const primaryKey = field(stream, "primaryKey");
+  if (
+    !Array.isArray(primaryKey) ||
+    primaryKey.length === 0 ||
+    !primaryKey.every((name) => typeof name === "string")
+  )
+    return "envelope_incomplete";
+  if (
+    field(stream, "name") !== target.stream ||
+    primaryKey.length !== target.primaryKey.length ||
+    !primaryKey.every((name, index) => name === target.primaryKey[index])
+  )
+    return "stream_mismatch";
+  return null;
+}
+
 /** The row without its `$pdpp` envelope, the marker that counts it out, or the
  * deletion the envelope declares (`claim` is its `record.key`). */
-function decode(record: unknown, sourceId: string | undefined): Decoded {
+function decode(
+  record: unknown,
+  sourceId: string | undefined,
+  target: { readonly stream: string; readonly primaryKey: readonly string[] },
+): Decoded {
   if (!isObject(record)) return { row: record };
   const has = Object.hasOwn(record, "$pdpp");
   const meta = has ? record["$pdpp"] : undefined;
   if (sourceId !== undefined) {
-    const claimed = isObject(meta) ? meta["sourceId"] : undefined;
+    const claimed = isObject(meta) ? field(meta, "sourceId") : undefined;
     if (typeof claimed !== "string" || claimed === "")
       return { row: new QuarantinedRow("untagged") };
     if (claimed !== sourceId)
@@ -99,10 +154,22 @@ function decode(record: unknown, sourceId: string | undefined): Decoded {
   if (!has) return { row: record };
   const data = { ...record };
   delete data["$pdpp"];
-  const op = isObject(meta) && isObject(meta["record"]) ? meta["record"] : null;
-  if (op?.["op"] === "delete") return { deletion: data, claim: op["key"] };
-  if (op && op["op"] !== undefined && op["op"] !== "upsert")
+  const op = isObject(meta) ? field(meta, "record") : undefined;
+  const name = isObject(op) ? field(op, "op") : undefined;
+  if (name === "delete") {
+    const fault = deleteFault(meta as Record<string, unknown>, target);
+    if (fault) return { row: new QuarantinedRow(`deletion_${fault}`) };
+    return {
+      deletion: data,
+      claim: field(op as Record<string, unknown>, "key"),
+    };
+  }
+  if (isObject(op) && name !== undefined && name !== "upsert")
     return { row: new QuarantinedRow("unknown_op") };
+  // A row an envelope assigns to another stream is not a row of this one.
+  const stream = isObject(meta) ? field(meta, "stream") : undefined;
+  if (isObject(stream) && field(stream, "name") !== target.stream)
+    return { row: new QuarantinedRow("stream_mismatch") };
   return { row: data };
 }
 
@@ -168,8 +235,6 @@ export function foldLayers(
   async function* walk(): AsyncIterable<Event> {
     // Keys a newer layer decided: live (`true`) or deleted (`false`).
     const taken = new Map<string, boolean>();
-    // Record keys a newer layer deleted that no row has named yet.
-    const deletedByKey = new Set<string>();
     for (const layer of layers) {
       // Every record key this layer holds, with the digest of its body: a
       // repeat is checked against the first, whatever became of the first.
@@ -181,7 +246,7 @@ export function foldLayers(
       // applied after its rows, so a live row of the layer outranks them.
       const declared = new Map<string, Record<string, unknown>>();
       for await (const record of layer.records()) {
-        const decoded = decode(record, options.sourceId);
+        const decoded = decode(record, options.sourceId, base.target);
         if ("deletion" in decoded) {
           const named = await deletedKey(
             decoded.deletion,
@@ -233,17 +298,6 @@ export function foldLayers(
           };
           continue;
         }
-        if (deletedByKey.has(id)) {
-          // A newer layer deleted this key and holds no version of it: leave
-          // the row out, and tombstone the key so another copy cannot return it.
-          taken.set(id, false);
-          deleted.add(id);
-          yield { row: new QuarantinedRow("deleted_in_newer_layer") };
-          yield {
-            deletion: keyFields(primaryKey, row as Record<string, unknown>),
-          };
-          continue;
-        }
         own.add(id);
         yield { row };
       }
@@ -268,9 +322,6 @@ export function foldLayers(
             deletion: keyFields(primaryKey, record as Record<string, unknown>),
           };
         }
-      if (layer.deletedRecordKeys)
-        for await (const recordKey of layer.deletedRecordKeys())
-          deletedByKey.add(recordKey);
       for (const id of own) taken.set(id, true);
       for (const id of deleted) taken.set(id, false);
     }

@@ -37,9 +37,10 @@ const STREAM = "repositories";
  * Damages the `repositories` stream of the fixture, one way per row:
  * - `-0` is stored text that is not a JSON object;
  * - `-1` has no `id` in its body, so no identity;
- * - `-2` is deleted, and an older live instance still holds a copy of it;
+ * - `-2` is deleted;
  * and an older live instance of the same source holds `-1`, `-2` and a key
- * (`-9`) the newer instance never had.
+ * (`-9`) the newer instance never had. Only the newest live instance is
+ * imported: the older one is excluded and counted, never merged.
  */
 function damage(root: string) {
   const db = initializeDatabase(join(root, "index.db"));
@@ -80,8 +81,8 @@ function damage(root: string) {
   }
 }
 
-/** What the old store holds, read straight from its rows: per stream, every
- * live row, newest instance first. */
+/** What the old store holds, read straight from its rows: every live row, and
+ * the keys deleted. */
 function legacyRows(root: string) {
   const db = initializeDatabase(join(root, "index.db"));
   try {
@@ -107,27 +108,18 @@ function legacyRows(root: string) {
 }
 
 /** The bodies the database should hold: per stream and id, the body of the
- * newest instance that holds the key with a full identity and did not delete
- * it. A row with no `id`, or that is not an object, has no identity. */
+ * newest instance's live row. A row with no `id`, or that is not an object, has
+ * no identity. */
 function expectedBodies(root: string) {
-  const { live, deleted } = legacyRows(root);
-  const rank = (instance: string) => (instance === INSTANCE ? 0 : 1);
+  const { live } = legacyRows(root);
   const out = new Map<string, Record<string, unknown>>();
-  const sorted = [...live].sort((a, b) => rank(a.instance) - rank(b.instance));
-  for (const row of sorted) {
+  for (const row of live) {
+    if (row.instance !== INSTANCE) continue;
     const body: unknown = JSON.parse(row.data);
     if (!body || typeof body !== "object" || Array.isArray(body)) continue;
     const id = (body as Record<string, unknown>)["id"];
     if (typeof id !== "string") continue;
-    const name = `${row.stream}/${id}`;
-    const newerDeleted = deleted.some(
-      (d) =>
-        d.stream === row.stream &&
-        d.record_key === row.record_key &&
-        rank(d.instance) < rank(row.instance),
-    );
-    if (newerDeleted || out.has(name)) continue;
-    out.set(name, body as Record<string, unknown>);
+    out.set(`${row.stream}/${id}`, body as Record<string, unknown>);
   }
   return out;
 }
@@ -157,6 +149,8 @@ it("oracle: every difference between the old store and the database is in the re
   damage(root);
   const expected = expectedBodies(root);
   const { live } = legacyRows(root);
+  const newest = live.filter((row) => row.instance === INSTANCE);
+  const older = live.filter((row) => row.instance === ARCHIVE);
 
   const h = await direct(base, root);
   closers.push(h.close);
@@ -167,29 +161,33 @@ it("oracle: every difference between the old store and the database is in the re
   expect([...got.keys()].sort()).toEqual([...expected.keys()].sort());
   for (const [name, body] of expected) expect(got.get(name)).toEqual(body);
 
-  // Every old row is imported or reported under a reason.
+  // Every row of the newest instance is imported or reported under a reason;
+  // the older instance is excluded whole, and counted.
   const report = h.runner.report()!;
   expect(report.refused).toEqual([]);
-  expect(report.rows.legacy).toBe(live.length);
+  expect(report.excluded).toContainEqual({
+    reason: "older_instance",
+    streams: 1,
+    rows: older.length,
+  });
+  expect(report.rows.legacy).toBe(newest.length);
   const quarantined = Object.values(report.rows.quarantined).reduce(
     (a, b) => a + b,
     0,
   );
   expect(report.rows.imported + report.rows.blocked + quarantined).toBe(
-    live.length,
+    newest.length,
   );
   expect(report.rows.imported).toBe(expected.size);
   expect(report.rows.quarantined).toEqual({
     not_an_object: 1,
     missing_key_field: 1,
-    deleted_in_newer_layer: 1,
   });
-  // A key deleted in the newest instance stays out, though an older copy holds it.
+  // A key deleted in the newest instance stays out, and nothing of the older
+  // instance fills it, or the key its damaged row could not claim.
   expect(got.has(`${STREAM}/${STREAM}-2`)).toBe(false);
-  // The older copy fills a key the newest instance's damaged row could not claim.
-  expect(got.get(`${STREAM}/${STREAM}-1`)).toMatchObject({
-    text: "older repositories 1",
-  });
+  expect(got.has(`${STREAM}/${STREAM}-1`)).toBe(false);
+  expect(got.has(`${STREAM}/${STREAM}-9`)).toBe(false);
   // The streams nothing damaged import whole.
   for (const stream of STREAMS.filter((s) => s !== STREAM))
     expect(

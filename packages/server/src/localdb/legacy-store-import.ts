@@ -117,8 +117,6 @@ export interface LegacyStoreImportOptions {
   readonly methods: () => readonly { sourceId: string; methodId: string }[];
   /** Verified manifest documents, read at each run. */
   readonly manifests: () => Iterable<string>;
-  /** See `LegacyAccessOptions.olderInstances`. Default `"merge"`. */
-  readonly olderInstances?: "merge" | "exclude";
   /** Read at each run, so it follows `streamSync.retireLegacy`. */
   readonly streamSync: () => { readonly retireLegacy?: boolean };
   readonly logger: LocalSyncDeps["logger"];
@@ -170,9 +168,6 @@ export function createLegacyStoreRunner(
         root,
         dataDir: options.dataDir,
         declarations: options.declarations(),
-        ...(options.olderInstances
-          ? { olderInstances: options.olderInstances }
-          : {}),
         eraseLedger: createLegacyEraseLedger(deps.db, () => deps.now()),
         legacyWriteSeal: options.legacyWriteSeal,
         // The server opened this handle at this root for this owner. The old

@@ -11,9 +11,4 @@ MutNoReceipt-all: No error has been found. | 30351465 states generated, 8227927 
 Good: No error has been found. | 30351465 states generated, 8227927 distinct states found, depth 19
 MutUpgradedNoRecover-NoResurrection: Error: Invariant NoResurrection is violated. | 6079 states generated, 2827 distinct states found, 2191 states left on queue. | trace depth 6
 Upgraded: No error has been found. | 31740157 states generated, 8638953 distinct states found, 0 states left on queue. | depth 21
-SeedRank-ranked-same: No error has been found. | 45 states generated, 24 distinct states found, depth 7
-SeedRank-ranked-split: No error has been found. | 78 states generated, 42 distinct states found, depth 9
-SeedRank-ranked-split-GlobalRank: Error: Invariant GlobalRank is violated. | 74 states generated, 42 distinct states found, 5 states left on queue | trace depth 9
-SeedRank-arrival-same-LocalRank: Error: Invariant LocalRank is violated. | 12 states generated, 11 distinct states found, 5 states left on queue | trace depth 3
-SeedRank-arrival-Convergence: No error has been found. | 136 states generated, 68 distinct states found, depth 10
 ALLDONE

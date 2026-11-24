@@ -131,37 +131,6 @@ it("fold-delete-in-a-newer-layer-keeps-older-copies-out-and-leaves-a-seed-tombst
   expect(await a.keys()).toEqual(["a", "b", "c", "d"]);
 });
 
-it("fold-a-layer-that-names-deleted-record-keys-keeps-older-rows-out-and-tombstones-them", async () => {
-  const w = await world();
-  const a = await w.device("a");
-  const newest: FoldLayer = {
-    ...layer([{ id: "x", v: "kept" }]),
-    async *deletedRecordKeys() {
-      yield "b";
-      yield "never-held";
-    },
-  };
-  const result = await a.importSource("files", (base) =>
-    foldLayers(base, [
-      newest,
-      layer([
-        { id: "a", v: 1 },
-        { id: "b", v: 1 },
-      ]),
-      layer([{ id: "b", v: 0 }]),
-    ]),
-  );
-  expect(result).toMatchObject({
-    kind: "imported",
-    tombstoned: 1,
-    quarantine: { deleted_in_newer_layer: 2 },
-  });
-  expect(await a.keys()).toEqual(["a", "x"]);
-  expect(
-    await a.db.query("SELECT record_key, stamp_r FROM log_tombstones"),
-  ).toEqual([{ record_key: "b", stamp_r: "seed" }]);
-});
-
 it("fold-a-newer-layer-that-holds-the-key-live-outranks-an-older-delete", async () => {
   const w = await world();
   const a = await w.device("a");
@@ -279,20 +248,33 @@ it("fold-an-unreadable-newer-row-leaves-the-older-copy-standing", async () => {
 });
 
 // A v1-full row names its operation in `$pdpp.record`. A delete holds the
-// key (`record.key`) and its payload still carries the key fields.
+// key (`record.key`) and its payload still carries the key fields. The
+// envelope is complete (`sync/pdpp-import.ts` reads the same fields) and names
+// the stream it belongs to.
+const meta = (
+  record: { key: unknown; op: string },
+  over: Record<string, unknown> = {},
+  primaryKey: readonly string[] = ["id"],
+) => ({
+  version: 1,
+  sourceId: SOURCE,
+  declaration: { digest: "digest", version: "1" },
+  stream: { name: "items", scope: "items", primaryKey },
+  record,
+  ...over,
+});
 const deleteEnvelope = (
   id: string,
   extra: { sourceId?: string; claim?: unknown; op?: string } = {},
 ) => ({
   id,
-  $pdpp: {
-    version: 1,
-    sourceId: extra.sourceId ?? SOURCE,
-    record: {
+  $pdpp: meta(
+    {
       key: "claim" in extra ? extra.claim : { id },
       op: extra.op ?? "delete",
     },
-  },
+    extra.sourceId === undefined ? {} : { sourceId: extra.sourceId },
+  ),
 });
 
 it("fold-a-v1-full-delete-envelope-hides-older-rows-and-writes-a-seed-tombstone", async () => {
@@ -369,7 +351,8 @@ it("fold-a-delete-envelope-of-another-source-or-with-a-wrong-key-claim-deletes-n
     quarantine: {
       source_mismatch: 1,
       deletion_record_key_mismatch: 1,
-      deletion_not_an_object: 1,
+      // A claim that is no key object leaves the envelope incomplete.
+      deletion_envelope_incomplete: 1,
     },
   });
   expect(await a.keys()).toEqual(["x", "y", "z"]);
@@ -559,17 +542,17 @@ it("fold-a-delete-whose-payload-disagrees-with-its-claim-on-any-key-field-delete
   // pass for a claim it contradicts.
   const forged = {
     tenant: "B",
-    $pdpp: {
-      sourceId: SOURCE,
-      record: { key: { tenant: "A", id: 1 }, op: "delete" },
-    },
+    $pdpp: meta({ key: { tenant: "A", id: 1 }, op: "delete" }, {}, [
+      "tenant",
+      "id",
+    ]),
   };
   const honest = {
     tenant: "A",
-    $pdpp: {
-      sourceId: SOURCE,
-      record: { key: { tenant: "A", id: 2 }, op: "delete" },
-    },
+    $pdpp: meta({ key: { tenant: "A", id: 2 }, op: "delete" }, {}, [
+      "tenant",
+      "id",
+    ]),
   };
   const result = await a.importSource("files", (base) =>
     foldLayers(
@@ -615,10 +598,7 @@ it("fold-a-delete-yields-only-its-key-fields", async () => {
         {
           id: "a",
           big: "x".repeat(1000),
-          $pdpp: {
-            sourceId: SOURCE,
-            record: { key: { id: "a" }, op: "delete" },
-          },
+          $pdpp: meta({ key: { id: "a" }, op: "delete" }),
         },
       ]),
       layer([tagged("b", "older")], undefined),
@@ -761,7 +741,7 @@ it("a primary-key field named __proto__ still writes its tombstone", async () =>
       [
         layer([
           own(
-            `{"__proto__":"a","$pdpp":{"sourceId":"${SOURCE}","record":{"key":{"__proto__":"a"},"op":"delete"}}}`,
+            `{"__proto__":"a","$pdpp":{"version":1,"sourceId":"${SOURCE}","declaration":{"digest":"d","version":"1"},"stream":{"name":"items","scope":"items","primaryKey":["__proto__"]},"record":{"key":{"__proto__":"a"},"op":"delete"}}}`,
           ),
         ]),
         layer([
@@ -818,4 +798,81 @@ it("a key object keeps a field named __proto__ as its own property", async () =>
     '{"__proto__":"t","id":1}',
     '{"__proto__":"u","id":2}',
   ]);
+});
+
+// A delete envelope is destructive, so it applies only when it is complete (the
+// fields `sync/pdpp-import.ts` requires), names this stream, and names the full
+// key. Anything else is counted out by reason and deletes nothing.
+const olderLayers = (envelope: unknown) => [
+  layer([envelope, tagged("n", "new")]),
+  layer([tagged("b", "kept"), tagged("c", "kept")]),
+];
+
+it.each([
+  ["no stream", { stream: undefined }, { deletion_envelope_incomplete: 1 }],
+  [
+    "no declaration",
+    { declaration: undefined },
+    { deletion_envelope_incomplete: 1 },
+  ],
+  ["version 2", { version: 2 }, { deletion_envelope_incomplete: 1 }],
+  [
+    "no stream scope",
+    { stream: { name: "items", primaryKey: ["id"] } },
+    { deletion_envelope_incomplete: 1 },
+  ],
+  [
+    "another stream",
+    { stream: { name: "other", scope: "other", primaryKey: ["id"] } },
+    { deletion_stream_mismatch: 1 },
+  ],
+  [
+    "another primary key",
+    { stream: { name: "items", scope: "items", primaryKey: ["uuid"] } },
+    { deletion_stream_mismatch: 1 },
+  ],
+])(
+  "fold-a-delete-envelope-with-%s-deletes-nothing",
+  async (_name, over, counted) => {
+    const w = await world();
+    const a = await w.device("a");
+    const envelope = {
+      id: "b",
+      $pdpp: meta({ key: { id: "b" }, op: "delete" }, over),
+    };
+    const result = await a.importSource("files", (base) =>
+      foldLayers(base, olderLayers(envelope), { sourceId: SOURCE }),
+    );
+    expect(result).toMatchObject({
+      kind: "imported",
+      tombstoned: 0,
+      quarantine: counted,
+    });
+    // The older copy of `b` stands: the envelope did not delete it.
+    expect(await a.keys()).toEqual(["b", "c", "n"]);
+    expect(await a.db.query("SELECT * FROM log_tombstones")).toEqual([]);
+  },
+);
+
+it("fold-an-upsert-envelope-for-another-stream-is-counted-not-imported-here", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const stray = {
+    id: "x",
+    v: "other stream",
+    $pdpp: meta(
+      { key: { id: "x" }, op: "upsert" },
+      { stream: { name: "other", scope: "other", primaryKey: ["id"] } },
+    ),
+  };
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, [layer([stray, tagged("n", "new")])], {
+      sourceId: SOURCE,
+    }),
+  );
+  expect(result).toMatchObject({
+    kind: "imported",
+    quarantine: { stream_mismatch: 1 },
+  });
+  expect(await a.keys()).toEqual(["n"]);
 });

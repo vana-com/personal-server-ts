@@ -53,10 +53,6 @@ export interface LegacyAccessOptions {
   /** Canonical data directory bound to the server's index; defaults to root/data. */
   readonly dataDir?: string;
   readonly declarations: readonly DeclarationSnapshot[];
-  /** What becomes of live instances older than the newest of their source id:
-   * `"merge"` (default) imports them as lower layers of one stream, `"exclude"`
-   * leaves them out. See `createCanonicalImportSource`. */
-  readonly olderInstances?: "merge" | "exclude";
   /** Existing storage removal authority; no new parallel lock/seal. */
   readonly legacyWriteSeal: LegacyWriteSeal;
   /** All legacy writers must be quiescent for the lifetime of this access.
@@ -205,35 +201,8 @@ export async function openLegacyAccess(
       releaseReadPages();
     }
   }
-  // Deletion keys are content too: a tombstone in a newer instance changes
-  // what the merge imports while the live rows stay the same. A store with no
-  // tombstone hashes as before.
-  const firstDeletedKey = prepare(
-    `SELECT instance,stream,record_key FROM ${recordKeyScan} WHERE deleted = 1 ORDER BY instance,stream,record_key LIMIT 1`,
-  );
-  const nextDeletedKey = prepare(
-    `SELECT instance,stream,record_key FROM ${recordKeyScan} WHERE deleted = 1 AND (instance,stream,record_key) > (?,?,?) ORDER BY instance,stream,record_key LIMIT 1`,
-  );
-  let priorDeleted: [string, string, string] | null = null;
-  let hashedDeleted = 0;
-  for (;;) {
-    const row = (
-      priorDeleted ? nextDeletedKey.get(...priorDeleted) : firstDeletedKey.get()
-    ) as { instance: string; stream: string; record_key: string } | undefined;
-    if (!row) break;
-    if (!priorDeleted) frame("deleted-keys");
-    frame([row.instance, row.stream, row.record_key]);
-    priorDeleted = [row.instance, row.stream, row.record_key];
-    if (++hashedDeleted % 128 === 0) {
-      await authorized();
-      releaseReadPages();
-    }
-  }
   releaseReadPages();
   const revision = hash.digest("hex");
-  // The newest deletion of each instance, read once: the source is fenced by
-  // `revision`, so it cannot change under this reader.
-  const deletedAt = new Map<string, number>();
   const reader: CanonicalImportPageReader = {
     declarations: options.declarations,
     async assertRevision(expected) {
@@ -297,58 +266,16 @@ export async function openLegacyAccess(
     },
     async connections(sourceId) {
       await authorized();
-      // An instance's activity is its newest write, a deletion included: the
-      // instance whose last live row was deleted is still the newest, and its
-      // tombstone must outrank an older copy of the row. A tombstone's
-      // `emitted_at` is the time of the deletion.
-      const lastDeleted = (instance: string) => {
-        const known = deletedAt.get(instance);
-        if (known !== undefined) return known;
-        const row = prepare(
-          "SELECT emitted_at, MAX(emitted_key) AS newest FROM pdpp_records WHERE instance = ? AND deleted = 1",
-        ).get(instance) as { emitted_at: string | null; newest: string | null };
-        const at =
-          row.newest && row.emitted_at ? Date.parse(row.emitted_at) : 0;
-        deletedAt.set(instance, at);
-        return at;
-      };
       return store.listConnections(sourceId).map((c) => ({
         instance: c.instance,
         deleted: c.deletedAt !== null,
         lastActive: Math.max(
           0,
-          lastDeleted(c.instance),
           ...store
             .listStreams([c.instance])
             .map((s) => (s.lastUpdated ? Date.parse(s.lastUpdated) : 0)),
         ),
       }));
-    },
-    async rows(instance, stream, expected) {
-      await reader.assertRevision(expected);
-      const row = prepare(
-        "SELECT count(*) AS n FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-      ).get(instance, stream) as { n: number };
-      return row.n;
-    },
-    async deletedKeys(instance, stream, after, limit, expected) {
-      await reader.assertRevision(expected);
-      // A first-page and a continuation query, as `page` has: a nullable
-      // cursor predicate (`? IS NULL OR record_key > ?`) keeps the planner from
-      // seeking to the cursor, so each page would rescan the stream.
-      const found =
-        after === null
-          ? prepare(
-              `SELECT record_key FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 1 ORDER BY record_key LIMIT ?`,
-            ).all(instance, stream, limit + 1)
-          : prepare(
-              `SELECT record_key FROM ${recordKeyScan} WHERE instance = ? AND stream = ? AND deleted = 1 AND record_key > ? ORDER BY record_key LIMIT ?`,
-            ).all(instance, stream, after, limit + 1);
-      const keys = (found as { record_key: string }[]).map((r) => r.record_key);
-      const more = keys.length > limit;
-      if (more) keys.pop();
-      releaseReadPages();
-      return { keys, next: more ? keys[keys.length - 1]! : null };
     },
     async page(instance, stream, after, limit, maxBytes, expected) {
       await reader.assertRevision(expected);
@@ -405,9 +332,6 @@ export async function openLegacyAccess(
       bindings: options.importProjection.bindings,
       reader,
       resolveTarget: options.resolveTarget,
-      ...(options.olderInstances
-        ? { olderInstances: options.olderInstances }
-        : {}),
     });
   async function safePath(path: string, missing = false) {
     const absolute = resolve(path);

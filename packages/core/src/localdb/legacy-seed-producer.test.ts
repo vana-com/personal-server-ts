@@ -12,6 +12,19 @@ import type { SeedIntake } from "./seed.js";
 
 const CHUNK_BYTES = 256 * 1024;
 
+/** A complete v1-full envelope of the `items` stream (what a delete needs). */
+const envelopeOf = (
+  sourceId: string,
+  record: { key: unknown; op: string },
+  stream = "items",
+) => ({
+  version: 1,
+  sourceId,
+  declaration: { digest: "digest", version: "1" },
+  stream: { name: stream, scope: stream, primaryKey: ["id"] },
+  record,
+});
+
 /** An intake that drains the body as the real one does, and keeps what it saw. */
 function intake() {
   const chunks: Uint8Array[] = [];
@@ -143,7 +156,7 @@ describe("seedLegacyStore counts", () => {
     const SOURCE = "urn:fixture";
     const envelope = (id: unknown, claim: unknown, op = "delete") => ({
       id,
-      $pdpp: { sourceId: SOURCE, record: { key: claim, op } },
+      $pdpp: envelopeOf(SOURCE, { key: claim, op }),
     });
     const layer: FoldLayer = {
       async *records() {
@@ -161,7 +174,7 @@ describe("seedLegacyStore counts", () => {
     );
     expect(report.rows).toBe(1);
     expect(report.quarantine).toEqual({
-      deletion_not_an_object: 1,
+      deletion_envelope_incomplete: 1,
       deletion_record_key_mismatch: 1,
       deletion_missing_key_field: 1,
       unknown_op: 1,
@@ -207,9 +220,9 @@ describe("seedLegacyStore counts", () => {
 
 describe("seedLegacyStore deletes", () => {
   const tag = { sourceId: "urn:fixture" };
-  const del = (id: string) => ({
+  const del = (id: string, stream = "items") => ({
     id,
-    $pdpp: { ...tag, record: { key: { id }, op: "delete" } },
+    $pdpp: envelopeOf(tag.sourceId, { key: { id }, op: "delete" }, stream),
   });
   const row = (id: string) => ({ id, $pdpp: tag });
   const layer = (...records: unknown[]): FoldLayer => ({
@@ -227,7 +240,7 @@ describe("seedLegacyStore deletes", () => {
           sourceId: tag.sourceId,
         };
         yield {
-          ...stream([layer(row("k"), del("k"))]),
+          ...stream([layer(row("k"), del("k", "shadowed"))]),
           stream: "shadowed",
           sourceId: tag.sourceId,
         };
@@ -277,5 +290,78 @@ describe("seedLegacyStore conflicts", () => {
     });
     expect(report.streams[1]).toMatchObject({ outcome: "staged", rows: 1 });
     expect(puts).toEqual(["other"]);
+  });
+});
+
+describe("seedLegacyStore drift", () => {
+  /** A layer whose Nth read yields `passes[N]`. */
+  const drifting = (...passes: unknown[][]): FoldLayer => {
+    let read = 0;
+    return {
+      async *records() {
+        yield* passes[Math.min(read++, passes.length - 1)]!;
+      },
+    };
+  };
+
+  it("refuses a stream whose rows changed between the passes with the same count, and carries on", async () => {
+    const { port, puts } = intake();
+    const steady = { ...stream([drifting([{ id: "z" }])]), stream: "steady" };
+    const report = await seedLegacyStore(
+      port,
+      store(
+        stream([
+          drifting(
+            [
+              { id: "a", v: 1 },
+              { id: "b", v: 1 },
+            ],
+            [
+              { id: "a", v: 1 },
+              { id: "b", v: 2 },
+            ],
+          ),
+        ]),
+        steady,
+      ),
+    );
+    expect(report.streams).toMatchObject([
+      { stream: "items", outcome: "refused", reason: "source_changed" },
+      { stream: "steady", outcome: "staged" },
+    ]);
+    // The drifting stream's body never ended cleanly, so nothing was imported
+    // for it, and its rows are not counted.
+    expect(puts).toEqual(["steady"]);
+    expect(report.rows).toBe(1);
+  });
+
+  it("refuses a stream whose left-out rows changed between the passes", async () => {
+    const { port, puts } = intake();
+    const report = await seedLegacyStore(
+      port,
+      store(
+        stream([
+          // The same importable row; a different row is left out each time.
+          drifting([{ id: "a" }, { nope: 1 }], [{ id: "a" }, 5]),
+        ]),
+      ),
+    );
+    expect(report.streams).toMatchObject([
+      { outcome: "refused", reason: "source_changed" },
+    ]);
+    expect(puts).toEqual([]);
+  });
+
+  it("stages a stream that did not change", async () => {
+    const { port, puts } = intake();
+    const same = [{ id: "a", v: 1 }, { nope: 1 }];
+    const report = await seedLegacyStore(
+      port,
+      store(stream([drifting(same, same)])),
+    );
+    expect(report.streams).toMatchObject([
+      { outcome: "staged", rows: 1, quarantine: { missing_key_field: 1 } },
+    ]);
+    expect(puts).toEqual(["items"]);
   });
 });

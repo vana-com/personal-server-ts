@@ -106,37 +106,5 @@ published omission, a delete folded into a snapshot), and turn red without
 - A full refresh drops seed rows that upstream does not list (stamp 0 is below
   every real stamp). A record that exists only in an archive can be dropped this
   way. This is existing behaviour and the model keeps it.
-- Older instances of the same upstream source are seed sources: the server
-  runner folds a source's live instances newest first into one ranked import per
-  `(source, stream)`, so on one device the newest instance's body wins whatever
-  the order of arrival (`SeedRank.tla`, below). Archive and deleted instances
-  are never merged.
-- Across devices the body is not ranked. Devices exchange seed bodies at equal
-  stamp `(0, seed)` and the greater `body_sha256` wins (accepted ruling Q11). If
-  two devices hold different instance sets, the devices still agree, but the body
-  they agree on may come from an older instance (`SeedRank-ranked-split-GlobalRank`).
-
-## Which body wins when instances overlap (`SeedRank.tla`)
-
-`LateSeed.tla` has no bodies, so it cannot say which of two seed bodies a key
-ends with. `SeedRank.tla` adds one key, two instances (one newer than the other)
-and two devices. The hash order is the reverse of the rank order, so "follows the
-rank" and "follows the hash" give different answers. Two import modes: `arrival`
-(one import per instance, any order) and `ranked` (one folded import per device).
-Two layouts: `same` (each device holds both instances) and `split` (`d1` holds
-both, `d2` only the older one). Run with `MODULE=SeedRank ./run.sh <Config>`.
-
-| Config                             | Result                                                                                                                                                             |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `SeedRank-ranked-same`             | No error. `TypeOK`, `LocalRank`, `Convergence`, `GlobalRank` hold. 45 states generated, 24 distinct, depth 7.                                                      |
-| `SeedRank-ranked-split`            | No error. `TypeOK`, `LocalRank`, `Convergence` hold. 78 states generated, 42 distinct, depth 9.                                                                    |
-| `SeedRank-ranked-split-GlobalRank` | `GlobalRank` violated, depth 9 (74 states generated). The devices agree, on the older instance's body: the cross-device tie-break is the hash (Q11), not the rank. |
-| `SeedRank-arrival-same-LocalRank`  | `LocalRank` violated, depth 3 (12 states generated): the instance that arrives first stays, so the body follows arrival order.                                     |
-| `SeedRank-arrival-Convergence`     | No error. 136 states generated, 68 distinct, depth 10: arrival order costs rank, not agreement.                                                                    |
-
-T2 answer: newest-first submission does not give "newest body wins" by itself,
-because an import never replaces a held row. It does when the instances are
-folded into one ranked import per device, as the runner now does. A negative
-control in `canonical-instance-merge.test.ts` shows two separate imports let the
-arrival order decide. These are bounded results for one key; they are not a
-proof of the SQL.
+- Older instances of the same upstream identity (O2) are not seed sources yet.
+  The legacy store keeps no upstream account identity, only a label.

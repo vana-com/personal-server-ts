@@ -57,17 +57,22 @@ export function isQuarantinedRow(value: unknown): value is QuarantinedRow {
 /** Rows left out of an import, by reason. Zero counts are absent. */
 export type QuarantineCounts = Readonly<Record<string, number>>;
 
-/** Counts rows by reason. */
+/** Counts rows by reason. A reason is a host's string, so it is held in a
+ * `Map`: as a plain-object key, `__proto__` would be dropped and `constructor`
+ * would find `Object`'s own function. The counts come out as own properties
+ * (`Object.fromEntries`), which `Object.entries` and JSON read back faithfully. */
 export function quarantineTally() {
-  const counts: Record<string, number> = {};
+  const counts = new Map<string, number>();
   return {
     add(reason: string, rows = 1) {
-      if (rows > 0) counts[reason] = (counts[reason] ?? 0) + rows;
+      if (rows > 0) counts.set(reason, (counts.get(reason) ?? 0) + rows);
     },
     get total() {
-      return Object.values(counts).reduce((a, b) => a + b, 0);
+      let sum = 0;
+      for (const rows of counts.values()) sum += rows;
+      return sum;
     },
-    counts: (): QuarantineCounts => ({ ...counts }),
+    counts: (): QuarantineCounts => Object.fromEntries(counts),
   };
 }
 
@@ -90,10 +95,10 @@ const positive = (value: unknown): value is number =>
 
 function countsOf(value: unknown): QuarantineCounts {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const out: Record<string, number> = {};
-  for (const [name, rows] of Object.entries(value))
-    if (positive(rows)) out[name] = rows;
-  return out;
+  // Own properties, so a reason named `__proto__` survives the round trip.
+  return Object.fromEntries(
+    Object.entries(value).filter(([, rows]) => positive(rows)),
+  ) as QuarantineCounts;
 }
 
 /** The receipt's `reason`: null for a clean import, else the outcomes. */
