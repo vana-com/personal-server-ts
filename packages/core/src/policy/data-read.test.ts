@@ -3,7 +3,10 @@ import type {
   Builder,
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/browser";
-import { verifyDataReadPolicy } from "./data-read.js";
+import {
+  resolveDataListGrantScopes,
+  verifyDataReadPolicy,
+} from "./data-read.js";
 
 const BUILDER_ADDRESS = "0x0000000000000000000000000000000000000001";
 const BUILDER_ID = "0xbuilder1";
@@ -550,4 +553,25 @@ describe("reserved system scopes", () => {
       ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
     },
   );
+});
+
+describe("resolveDataListGrantScopes", () => {
+  const input = { signer: BUILDER_ADDRESS, serverOwner: "0xOwner" } as const;
+  const portsWith = (response: unknown) => ({
+    authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+    grantVerifier: { getGrant: vi.fn() },
+    grantLister: { listGrantsByUser: vi.fn().mockResolvedValue(response) },
+  });
+
+  it("classifies an invalid dependency response as a bad gateway", async () => {
+    await expect(
+      resolveDataListGrantScopes(input, portsWith({ items: [] })),
+    ).rejects.toMatchObject({ errorCode: "BAD_GATEWAY" });
+  });
+
+  it("keeps a valid empty dependency response distinct from failure", async () => {
+    await expect(
+      resolveDataListGrantScopes(input, portsWith([])),
+    ).resolves.toEqual([]);
+  });
 });

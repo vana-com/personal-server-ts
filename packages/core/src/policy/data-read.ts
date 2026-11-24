@@ -383,6 +383,13 @@ export async function resolveDataListGrantScopes(
   // A lookup failure (gateway outage, malformed envelope) propagates: the
   // listing fails closed rather than silently coming back empty.
   const grants = await ports.grantLister.listGrantsByUser(input.serverOwner);
+  if (!Array.isArray(grants)) {
+    throw new ProtocolError(
+      502,
+      "BAD_GATEWAY",
+      "Grant lookup returned an invalid response",
+    );
+  }
   const scopes = new Set<string>();
   for (const grant of grants) {
     // Gateway rows are untrusted runtime data. One that lacks the fields the
