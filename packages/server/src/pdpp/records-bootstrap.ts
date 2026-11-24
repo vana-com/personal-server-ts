@@ -432,8 +432,7 @@ export function createPdppRecordsDeps(
       // The bound method is the connector_key of a verified retained manifest;
       // a source URL's basename is not authority to select its local database.
       const connector = binding.method;
-      return connector &&
-        configuredMethods.get(source.sourceId)?.includes(connector)
+      return connector && sourceIdForConnector(connector) === source.sourceId
         ? { connector, namespace: "" }
         : null;
     },

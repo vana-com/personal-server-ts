@@ -124,6 +124,37 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     expect(deps.connectionLink!(instance, "unselected")).toBeNull();
   });
 
+  it("refuses qualified record links when a collector method is ambiguous across sources", () => {
+    const sources = ["source-a", "source-b"].map((name) => ({
+      ...DECLARATION,
+      source_id: `https://registry.pdpp.dev/sources/${name}`,
+    }));
+    const auth = fakePdppAuth();
+    const deps = createPdppRecordsDeps({
+      pdppAuth: auth,
+      declarations: sources,
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      replication: false,
+      logger: pino({ level: "silent" }),
+      configuredMethods: sources.map((source) => ({
+        sourceId: source.source_id,
+        methodId: "github-browser",
+      })),
+    })!;
+    expect(deps.sourceIdForConnector!("github-browser")).toBeUndefined();
+    expect(auth.resolveConnectionSourceId?.("github-browser")).toBeUndefined();
+    for (const source of sources) {
+      const instances = deps.instancesForSource!(
+        SERVER_OWNER,
+        source.source_id,
+      );
+      expect(instances).toHaveLength(1);
+      expect(deps.connectionLink!(instances[0]!, "top_artists")).toBeNull();
+    }
+  });
+
   it("normalizes the server owner's address casing the same way subjectId is derived", () => {
     const deps = createPdppRecordsDeps({
       pdppAuth: fakePdppAuth(),
