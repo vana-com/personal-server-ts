@@ -692,6 +692,77 @@ describe("the legacy stage of a connection delete after the switch", () => {
       expect(tries.get("one.s1")).toBe(1);
     });
 
+    it("records the blobs storage removed before it reports pending, so a steady 429 on some slots cannot stall the rest", async () => {
+      // One deleted scope with six blob slots. Storage takes the first two
+      // names of each request and answers 429 for the others, so a pass that
+      // starts over at slot 1 spends its whole budget on the same two slots.
+      const slotCount = 6;
+      const blobs = new Set(
+        Array.from({ length: slotCount }, (_, i) => String(i + 1)),
+      );
+      const tombstone = String(slotCount + 1);
+      const ports: LegacyDeletePorts = {
+        scopesOf: (connector) => (connector === GH ? ["one.s1"] : []),
+        mode: () => "switched",
+        head: async () => ({ state: "deleted", version: tombstone }),
+        retire: async () => {
+          throw new Error("a deleted head is not retired again");
+        },
+        pendingBlobs: async () => 0,
+        finality: {
+          tombstoneState: async () => ({
+            finalized: "99",
+            settling: false,
+            rolledBack: null,
+          }),
+        },
+        versions: {
+          list: async () => ({
+            complete: true,
+            versions: [
+              ...Array.from({ length: slotCount }, (_, i) => ({
+                expectedVersion: String(i + 1),
+                dataHash: `0x0${i + 1}`,
+                isTombstone: false,
+              })),
+              {
+                expectedVersion: tombstone,
+                dataHash: "0xff",
+                isTombstone: true,
+              },
+            ],
+          }),
+        },
+        objects: {
+          deleteBlobVersions: async (_scope, names) => ({
+            deleted: names.slice(0, 2).filter((n) => blobs.delete(n)),
+            missing: names.slice(0, 2).filter((n) => !blobs.has(n)),
+            failed: names
+              .slice(2)
+              .map((version) => ({ version, error: "429" })),
+          }),
+        },
+      };
+      const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+      const a = await w.device("a", {
+        erasure: () => erasurePorts(w),
+        legacyDelete: () => ports,
+        deleteRetryMs: RETRY,
+      });
+      await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
+        connector: GH,
+        observedAt: 1100,
+      });
+      await a.cycle();
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(DONE),
+      );
+      expect(blobs.size).toBe(0);
+    });
+
     it("does not send a refused tombstone again while log erasure is still pending", async () => {
       const unfinalized = (w: World): LogErasurePorts => ({
         ...erasurePorts(w),

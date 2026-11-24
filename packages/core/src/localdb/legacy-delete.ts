@@ -386,9 +386,13 @@ async function confirmErased(
     const outcome = await ports.objects
       .deleteBlobVersions(scope, batch)
       .catch(() => null);
-    if (outcome === null || outcome.failed.length > 0) return waiting;
+    if (outcome === null) return waiting;
+    // Record what storage answered before reporting pending: a retry then
+    // starts at the slots still left, so a steady 429 on some slots cannot
+    // spend every pass on the ones already gone.
     const acknowledged = new Set([...outcome.deleted, ...outcome.missing]);
     for (const slot of acknowledged) answered.add(slot);
+    if (outcome.failed.length > 0) return waiting;
     if (batch.some((slot) => !acknowledged.has(slot))) return waiting;
   }
   return settled(PART_DONE);
