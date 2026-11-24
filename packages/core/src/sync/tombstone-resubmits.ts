@@ -33,7 +33,9 @@ export type TombstoneResubmitFailure =
   | "attempts-exhausted"
   | "head-changed"
   /** The pass that saw the rollback has no way to send a new tombstone. */
-  | "no-reissue-path";
+  | "no-reissue-path"
+  /** The gateway refused the re-submitted delete with a terminal code. */
+  | "gateway-refused";
 
 export interface TombstoneResubmitSnapshot {
   /** Scopes with a re-submission in progress or due. */
