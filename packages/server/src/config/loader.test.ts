@@ -393,3 +393,31 @@ describe("loadConfig", () => {
     });
   });
 });
+
+describe("config storage and path formatting", () => {
+  it("saves pretty JSON to a new nested config path and reloads the edited value", async () => {
+    const { saveConfig } = await import("./loader.js");
+    await withTempDir(async (dir) => {
+      const original = await loadConfig({
+        configPath: join(dir, "original.json"),
+      });
+      const edited = {
+        ...original,
+        logging: { ...original.logging, level: "debug" as const },
+      };
+      const configPath = join(dir, "nested", "config.json");
+      await saveConfig(edited, { configPath });
+      expect(await readFile(configPath, "utf8")).toBe(
+        JSON.stringify(edited, null, 2) + "\n",
+      );
+      expect((await loadConfig({ configPath })).logging.level).toBe("debug");
+    });
+  });
+
+  it("expands bare home shorthand but leaves a tilde in an ordinary label alone", async () => {
+    const { homedir } = await import("node:os");
+    const { expandHomePath } = await import("./paths.js");
+    expect(expandHomePath("~")).toBe(homedir());
+    expect(expandHomePath("fixture~backup")).toBe("fixture~backup");
+  });
+});
