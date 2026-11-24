@@ -68,6 +68,17 @@ describe("utf8Length", () => {
       expect(utf8Length(text)).toBe(utf8(text).length);
     }
   });
+
+  it("counts exactly at the one-, two-, three-, and four-byte boundaries", () => {
+    const cases = [
+      [0x7f, 1], [0x80, 2], [0x7ff, 2], [0x800, 3],
+      [0xffff, 3], [0x10000, 4], [0x10ffff, 4],
+    ] as const;
+    for (const [point, width] of cases) {
+      expect(utf8Length(String.fromCodePoint(point))).toBe(width);
+    }
+    expect(utf8Length(String.fromCodePoint(...cases.map(([point]) => point)))).toBe(19);
+  });
 });
 
 describe("toHex", () => {
@@ -75,6 +86,13 @@ describe("toHex", () => {
     const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
     expect(toHex(bytes)).toBe(Buffer.from(bytes).toString("hex"));
     expect(toHex(new Uint8Array())).toBe("");
+  });
+
+  it("formats only a subview, leaving its neighboring bytes unchanged", () => {
+    const backing = Uint8Array.of(0xf1, 0, 0xab, 0xff, 0xf2);
+    expect(toHex(backing.subarray(1, 4))).toBe("00abff");
+    expect(toHex(backing.subarray(2, 2))).toBe("");
+    expect(Array.from(backing)).toEqual([0xf1, 0, 0xab, 0xff, 0xf2]);
   });
 });
 
