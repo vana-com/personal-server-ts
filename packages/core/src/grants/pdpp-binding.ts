@@ -253,8 +253,11 @@ export function createPdppGrantBinding(
 }
 
 export interface CreateFingerprintedBindingInput extends CreateBindingInput {
-  /** The PDPP grant document and the salt that its on-chain fingerprint used. */
-  fingerprint: { grant: Grant; salt: string };
+  /**
+   * The PDPP grant document, the data scopes it pays for, and the salt that
+   * its on-chain fingerprint used.
+   */
+  fingerprint: { grant: Grant; dataScopes: readonly string[]; salt: string };
 }
 
 /** True when the slot's list holds `entry` as an exact, well-formed fingerprint. */
@@ -278,6 +281,7 @@ export async function createFingerprintedPdppGrantBinding(
   const base = createPdppGrantBinding(input);
   const fingerprint = await grantFingerprint(
     input.fingerprint.grant,
+    input.fingerprint.dataScopes,
     input.fingerprint.salt,
   );
   if (!slotListsFingerprint(input.chainGrant.scopes, fingerprint)) {

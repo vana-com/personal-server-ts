@@ -783,6 +783,7 @@ describe("in-memory grant list presentation", () => {
 describe("bindings recorded as grant fingerprints", () => {
   const vector = fingerprintVectors.vectors[0]!;
   const SALT_A = vector.salt;
+  const DATA_SCOPES = vector.data_scopes;
   const SALT_B = "11".repeat(32);
   const GRANT_A = vector.grant as Grant;
   const GRANT_B = {
@@ -805,7 +806,7 @@ describe("bindings recorded as grant fingerprints", () => {
       resolvedBuilder: RESOLVED_BUILDER,
       pdppClientId: "client-app-1",
       chainGrant: chainGrant({ scopes, grantVersion }),
-      fingerprint: { grant, salt },
+      fingerprint: { grant, dataScopes: DATA_SCOPES, salt },
     });
   }
 
@@ -824,7 +825,7 @@ describe("bindings recorded as grant fingerprints", () => {
   }
 
   it("records the fingerprint and requires the slot to list it", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
     const binding = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA]);
     expect(binding.grantFingerprint).toBe(fpA);
     expect(binding.grantVersion).toBe("1");
@@ -839,8 +840,8 @@ describe("bindings recorded as grant fingerprints", () => {
   });
 
   it("keeps grant A readable after grant B joins the list and the version rises", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
-    const fpB = await grantFingerprint(GRANT_B, SALT_B);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const fpB = await grantFingerprint(GRANT_B, DATA_SCOPES, SALT_B);
     const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
     const b = await bindingFor(GRANT_B, SALT_B, "pdpp-b", [fpA, fpB], "2");
     const live = chainGrant({ scopes: [fpA, fpB], grantVersion: "2" });
@@ -849,8 +850,8 @@ describe("bindings recorded as grant fingerprints", () => {
   });
 
   it("denies a removed grant as revoked while the other still reads", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
-    const fpB = await grantFingerprint(GRANT_B, SALT_B);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
+    const fpB = await grantFingerprint(GRANT_B, DATA_SCOPES, SALT_B);
     const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
     const b = await bindingFor(GRANT_B, SALT_B, "pdpp-b", [fpA, fpB], "2");
     const live = chainGrant({ scopes: [fpB], grantVersion: "3" });
@@ -859,7 +860,7 @@ describe("bindings recorded as grant fingerprints", () => {
   });
 
   it("denies a live version lower than the bound one", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
     const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "5");
     expectFailure(
       () => verify(a, chainGrant({ scopes: [fpA], grantVersion: "4" })),
@@ -880,7 +881,7 @@ describe("bindings recorded as grant fingerprints", () => {
   });
 
   it("never matches a malformed or uppercase entry", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
     const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
     const hex = fpA.slice(4);
     for (const entry of [
@@ -900,7 +901,7 @@ describe("bindings recorded as grant fingerprints", () => {
   });
 
   it("denies a binding whose own recorded fingerprint is malformed", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
     const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
     const bad = Object.freeze({ ...a, grantFingerprint: fpA.toUpperCase() });
     expectFailure(
@@ -910,7 +911,7 @@ describe("bindings recorded as grant fingerprints", () => {
   });
 
   it("still enforces the other axes for a fingerprint binding", async () => {
-    const fpA = await grantFingerprint(GRANT_A, SALT_A);
+    const fpA = await grantFingerprint(GRANT_A, DATA_SCOPES, SALT_A);
     const a = await bindingFor(GRANT_A, SALT_A, "pdpp-a", [fpA], "1");
     expectFailure(
       () =>
