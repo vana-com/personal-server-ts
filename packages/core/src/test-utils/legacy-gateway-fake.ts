@@ -76,6 +76,13 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
     storageRateLimited: 0,
     /** The gateway answers 503 for the next N tombstones. */
     gatewayDown: 0,
+    /**
+     * The feed a device read is behind the gateway: the head it saw live is
+     * already deleted by another writer (`already-deleted`), or the gateway
+     * has no such head (`absent`). The next tombstone of a scope is refused
+     * with the gateway's code for it, 409.
+     */
+    race: undefined as undefined | "already-deleted" | "absent",
   };
   const idOf = (scope: string) => computeDataPointId(options.owner, scope);
   const iso = () => "2026-11-23T00:00:00.000Z";
@@ -142,6 +149,26 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
           deletedAt: head.deletedAt,
         },
       });
+    if (state.race === "already-deleted" && head.deletedAt === null) {
+      head.version += 1;
+      head.dataHash = TOMBSTONE_DATA_HASH;
+      head.metadataHash = TOMBSTONE_METADATA_HASH;
+      head.deletedAt = iso();
+      record(request.scope, head.version, head.dataHash, true);
+      return json(409, {
+        success: false,
+        code: "owner_stream_head_already_deleted",
+        scope: request.scope,
+      });
+    }
+    if (state.race === "absent") {
+      heads.delete(request.scope);
+      return json(409, {
+        success: false,
+        code: "owner_stream_head_absent",
+        scope: request.scope,
+      });
+    }
     if (state.cutover === "v1")
       return json(409, {
         success: false,

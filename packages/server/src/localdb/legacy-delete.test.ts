@@ -294,6 +294,77 @@ describe("the legacy stage of a connection delete after the switch", () => {
     );
   });
 
+  describe("a gateway that disagrees with the feed this device read the head from", () => {
+    it.each([
+      ["already-deleted", { status: "ok", reason: "already-deleted" }],
+      ["absent", { status: "skipped", reason: "not-registered" }],
+    ] as const)(
+      "the scope delete reads the gateway's %s answer as a step that did not fail, so the stage needs no second pass",
+      async (race, step) => {
+        const { fake, legacy } = await collected();
+        fake.state.race = race;
+        const scope = SCOPES[0]!;
+        const head = await legacy.ports.head(scope);
+        if (head.state !== "live") throw new Error("expected a live head");
+
+        const result = await legacy.ports.retire(scope, head.fence);
+
+        expect(result.steps.gateway).toMatchObject(step);
+      },
+    );
+
+    it("reads done when the gateway answers 409 owner_stream_head_already_deleted: the head is deleted already, its blobs are confirmed gone", async () => {
+      const { a, fake } = await collected();
+      fake.state.race = "already-deleted";
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(DONE),
+      );
+      expect(SCOPES.every((s) => !fake.isLive(s))).toBe(true);
+      // Asked once per point: the answer is no reason to send it again.
+      expect(gatewayDeletes(fake)).toHaveLength(SCOPES.length);
+    });
+
+    it("reads done, never blocked, when the gateway answers 409 owner_stream_head_absent and the feed then agrees", async () => {
+      const { a, fake } = await collected();
+      fake.state.race = "absent";
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(DONE),
+      );
+      expect(SCOPES.every((s) => fake.head(s) === null)).toBe(true);
+    });
+
+    it("keeps waiting, never blocked, while the gateway says absent and the feed still shows the head", async () => {
+      const { a, fake } = await collected();
+      // The gateway refuses, but the head stays in the feed this device reads.
+      fake.state.race = "absent";
+      const feedRead = fake.feed.getDataPoint.bind(fake.feed);
+      fake.feed.getDataPoint = async (query) =>
+        (await feedRead(query)) ?? {
+          id: "x",
+          ownerAddress: OWNER,
+          scope: query.scope,
+          dataHash: `0x${"aa".repeat(32)}`,
+          metadataHash: `0x${"bb".repeat(32)}`,
+          expectedVersion: "2",
+          addedAt: "2026-11-23T00:00:00.000Z",
+          deletedAt: null,
+        };
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(() =>
+        expect(gatewayDeletes(fake).length).toBeGreaterThan(SCOPES.length),
+      );
+      expect((await statusOf(a)).legacy).toEqual(PENDING);
+    });
+  });
+
   it("retries a gateway that is down, and sends one tombstone per point", async () => {
     const { a, fake } = await collected();
     fake.state.gatewayDown = 3;
