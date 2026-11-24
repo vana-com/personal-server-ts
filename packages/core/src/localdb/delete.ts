@@ -323,9 +323,11 @@ export function createConnectionDeleter(
   const keccak = keccakOf(deps.streamCrypto);
   const flights = new Map<string, Landing>();
   /**
-   * Connectors whose delete failed to land and is retried by the loop: their
-   * intent row is still there. Cleared when a landing succeeds or the intent
-   * is gone.
+   * Connectors whose delete failed to land and is retried by the loop. A
+   * mirror of a durable fact: the connector's intent row is still there. It
+   * is cleared when a landing succeeds, when a failed landing finds its
+   * intent gone (a landing superseded by a newer delete clears the intent
+   * itself), and when the retry scan finds no intent row for it.
    */
   const unlanded = new Set<string>();
   const requests = new Set<Promise<ConnectionDeleteRequest>>();
@@ -1256,8 +1258,12 @@ export function createConnectionDeleter(
         () => {
           unlanded.delete(connector);
         },
-        (error) => {
-          unlanded.add(connector);
+        async (error) => {
+          // A landing that cleared its own intent (it was superseded) has
+          // nothing left to retry. A failed read keeps the retry.
+          const kept = await readIntent(connector).then(Boolean, () => true);
+          if (kept) unlanded.add(connector);
+          else unlanded.delete(connector);
           throw error;
         },
       )
@@ -1412,9 +1418,15 @@ export function createConnectionDeleter(
     },
     readConnectionLifetime,
     async resumeDeletes() {
+      // Marked before the scan: one marked after it may have been made by a
+      // landing that began after the rows were read.
+      const marked = [...unlanded];
       const rows = await deps.db.query<{ connector: string }>(
         "SELECT connector FROM delete_intents ORDER BY connector",
       );
+      const held = new Set(rows.map((row) => row.connector));
+      for (const connector of marked)
+        if (!held.has(connector)) unlanded.delete(connector);
       return (
         await Promise.all(rows.map(({ connector }) => resumeDelete(connector)))
       ).filter((p): p is PendingDelete => p !== null);

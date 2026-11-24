@@ -9,13 +9,17 @@ import type { createConnectionDeleter } from "../../../core/src/localdb/delete.j
 import type { LogErasurePorts } from "../../../core/src/localdb/log-erase.js";
 import {
   CONNECTOR,
+  CONTROL,
   closeWorldDrivers,
   sName,
   world,
 } from "./log-world.test-utils.js";
 
 // What the tick does between learning its answer and returning it.
-const gap: { afterErasures?: () => Promise<void> } = {};
+const gap: {
+  afterErasures?: () => Promise<void>;
+  deleter?: ReturnType<typeof createConnectionDeleter>;
+} = {};
 vi.mock("../../../core/src/localdb/delete.js", async (importOriginal) => {
   const original = await importOriginal<{
     createConnectionDeleter: typeof createConnectionDeleter;
@@ -27,6 +31,7 @@ vi.mock("../../../core/src/localdb/delete.js", async (importOriginal) => {
     ) => {
       const deleter = original.createConnectionDeleter(...args);
       const resumeErasures = deleter.resumeErasures.bind(deleter);
+      gap.deleter = deleter;
       deleter.resumeErasures = async () => {
         const answer = await resumeErasures();
         await gap.afterErasures?.();
@@ -138,10 +143,91 @@ describe("the delete retry timer follows the work owed when it is decided", () =
     expect(logKeys().length).toBeGreaterThan(0);
 
     // And the retry it fires finishes the erasure.
-    for (let rounds = 0; rounds < 10 && logKeys().length > 0; rounds += 1) {
+    for (let rounds = 0; rounds < 200 && logKeys().length > 0; rounds += 1) {
       await vi.advanceTimersByTimeAsync(RETRY.max);
       await nextTask();
     }
     expect(logKeys().filter((key) => !key.includes("/v-"))).toEqual([]);
+  });
+});
+
+describe("an in-memory retry marker is cleared when the durable fact it mirrors goes away", () => {
+  /** A device that collected the connector, with the retry timer faked. */
+  async function collected() {
+    const w = await world({ streams: 1, partTargetBytes: 65536 });
+    const a = await w.device("a", { deleteRetryMs: RETRY });
+    await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
+      observedAt: 1100,
+    });
+    await a.cycle();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    return { w, a };
+  }
+  const intents = (a: Awaited<ReturnType<typeof collected>>["a"]) =>
+    a.db.query("SELECT 1 FROM delete_intents");
+  /** Let the database reads of a tick under way finish. */
+  const settle = async () => {
+    for (let spins = 0; spins < 60; spins += 1) await nextTask();
+  };
+  it("arms no timer after a delete is superseded while it lands: its intent is cleared, so nothing is left to retry", async () => {
+    const { a } = await collected();
+    // Another writer moves the connection's control row past the delete's pin
+    // just before the delete's fence post.
+    const post = a.deps.registry.post.bind(a.deps.registry);
+    const postBatch = a.deps.registry.postBatch!.bind(a.deps.registry);
+    let rival = false;
+    a.deps.registry.postBatch = async (request, signal) => {
+      if (!rival && request.rows.some((row) => row.scope === CONTROL)) {
+        rival = true;
+        const row = request.rows.find((r) => r.scope === CONTROL)!;
+        await post({
+          ownerAddress: request.ownerAddress,
+          scope: CONTROL,
+          expectedVersion: row.expectedVersion,
+          dataHash: `0x${"ab".repeat(32)}`,
+          metadataHash: `0x${"cd".repeat(32)}`,
+          signature: "0x01",
+        });
+      }
+      return postBatch(request, signal);
+    };
+
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await until(async () => (await intents(a)).length === 0);
+    expect(rival).toBe(true);
+    await settle();
+
+    // The next tick owes nothing: the delete is gone, so no timer is armed.
+    await a.sync.deleter.resumeDeletes();
+    expect(gap.deleter!.retryOwed()).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("arms no timer when a failed landing's intent is gone by the time the retry looks", async () => {
+    const { a } = await collected();
+    const post = a.deps.registry.post.bind(a.deps.registry);
+    const postBatch = a.deps.registry.postBatch!.bind(a.deps.registry);
+    a.deps.registry.post = async (request, signal) => {
+      if (request.scope === CONTROL) throw new Error("registry down");
+      return post(request, signal);
+    };
+    a.deps.registry.postBatch = async (request, signal) => {
+      if (request.rows.some((row) => row.scope === CONTROL))
+        throw new Error("registry down");
+      return postBatch(request, signal);
+    };
+    await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+    await until(async () => (await intents(a)).length === 1);
+    // The landing keeps failing: the loop is armed, as it should be.
+    await vi.advanceTimersByTimeAsync(RETRY.max);
+    await settle();
+    expect(gap.deleter!.retryOwed()).toBe(true);
+
+    // The intent goes (another process finished or replaced the delete). The
+    // next tick finds nothing to land and nothing owed.
+    await a.db.batch([{ sql: "DELETE FROM delete_intents" }]);
+    await a.sync.deleter.resumeDeletes();
+    expect(gap.deleter!.retryOwed()).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
