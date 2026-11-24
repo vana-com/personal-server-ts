@@ -1040,6 +1040,9 @@ async function serveStreamSyncView(
         : {}),
       // Present only while a first load is still applying parts: the body is
       // the rows applied so far, `<parts applied>/<parts>`. Owner reads only.
+      ...(decision.complete === false
+        ? { "X-Stream-Sync-Complete": "false" }
+        : {}),
       ...(decision.partial
         ? {
             "X-Stream-Sync-Partial": `${decision.partial.partsApplied}/${decision.partial.partsTotal}`,
@@ -2728,7 +2731,7 @@ function historyInteger(
 export interface OwnerScopeSummary {
   scope: string;
   latestCollectedAt?: string;
-  dataStatus?: "ready" | "indexing";
+  dataStatus?: "ready" | "indexing" | "incomplete";
 }
 
 /** The account's storage mode as one request freezes it before any read. */
@@ -2767,6 +2770,7 @@ export async function listOwnerVisibleScopes(
     const listed = await listScopes({
       canRead: (scope) => !isSystemScope(scope),
       includeLoading: true,
+      includeIncomplete: true,
     });
     return {
       // The stream listing applies the resolver's own selection rule, so a
@@ -2850,6 +2854,7 @@ export async function handlePersonalServerDataRequest(
             (!listAuth || listAuthCovers(listAuth, scope)),
           // No grant on the request: the owner's view, which serves loads in progress.
           includeLoading: !listAuth,
+          includeIncomplete: !listAuth,
         });
         const prefix = url.searchParams.get("scopePrefix") ?? "";
         const filtered = scopes.filter((row) => row.scope.startsWith(prefix));
@@ -3426,6 +3431,7 @@ export async function handlePersonalServerDataRequest(
           cursor: url.searchParams.get("cursor"),
           legacyFile: false,
           isOwnerView: isOwnerView(authResult),
+          includeIncomplete: !inProcess && isOwnerView(authResult),
           requireRegistered: charge !== null,
           signal: request.signal,
         };

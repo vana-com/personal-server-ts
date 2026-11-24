@@ -84,6 +84,46 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     ).toEqual({ connector: "spotify", namespace: "" });
   });
 
+  it("links a registered browser method to its actual connector key instead of the source URL basename", () => {
+    const declaration = {
+      ...DECLARATION,
+      source_id: "https://registry.pdpp.dev/sources/github",
+    };
+    const auth = fakePdppAuth();
+    const deps = createPdppRecordsDeps({
+      pdppAuth: auth,
+      declarations: [declaration],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      replication: false,
+      logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: declaration.source_id, methodId: "github-browser" },
+      ],
+    })!;
+    const instance = "conn_123e4567-e89b-42d3-a456-426614174000";
+    deps.bindingStore.registerConnection({
+      instance,
+      sourceId: declaration.source_id,
+      method: "github-browser",
+      label: "Personal",
+    });
+    expect(deps.connectionLink!(instance, "top_artists")).toEqual({
+      connector: "github-browser",
+      namespace: "",
+    });
+    expect(deps.sourceIdForConnector!("github-browser")).toBe(
+      declaration.source_id,
+    );
+    expect(auth.resolveConnectionSourceId?.("github-browser")).toBe(
+      declaration.source_id,
+    );
+    expect(auth.resolveConnectionSourceId?.("not-a-method")).toBeUndefined();
+    expect(deps.sourceIdForConnector!("github")).toBeUndefined();
+    expect(deps.connectionLink!(instance, "unselected")).toBeNull();
+  });
+
   it("normalizes the server owner's address casing the same way subjectId is derived", () => {
     const deps = createPdppRecordsDeps({
       pdppAuth: fakePdppAuth(),
