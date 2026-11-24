@@ -384,4 +384,90 @@ describe("createSqlitePdppGrantBindingStore", () => {
       /newer than this build supports/,
     );
   });
+
+  it("round-trips a grant fingerprint, and a binding without one stays without", () => {
+    const db = new Database(":memory:");
+    const store = createSqlitePdppGrantBindingStore(db);
+    const fingerprint = `gf1:${"ab".repeat(32)}`;
+    const withFp = makeBinding({
+      pdppGrantId: "pdpp-grant-fp",
+      grantFingerprint: fingerprint,
+    });
+    const without = makeBinding({ pdppGrantId: "pdpp-grant-plain" });
+    store.putBinding(withFp);
+    store.putBinding(without);
+
+    expect(store.getByPdppGrantId("pdpp-grant-fp")).toEqual(withFp);
+    expect(store.getByPdppGrantId("pdpp-grant-fp")?.grantFingerprint).toBe(
+      fingerprint,
+    );
+    expect(
+      store.getByPdppGrantId("pdpp-grant-plain")?.grantFingerprint,
+    ).toBeUndefined();
+    expect(store.getBindingsForPermission(PERMISSION)).toHaveLength(2);
+  });
+
+  it("rejects a re-put of the same grant id with a different fingerprint", () => {
+    const db = new Database(":memory:");
+    const store = createSqlitePdppGrantBindingStore(db);
+    store.putBinding(
+      makeBinding({ grantFingerprint: `gf1:${"ab".repeat(32)}` }),
+    );
+    expectFailure(
+      () =>
+        store.putBinding(
+          makeBinding({ grantFingerprint: `gf1:${"cd".repeat(32)}` }),
+        ),
+      /different binding already exists for this PDPP grant/i,
+    );
+    expectFailure(
+      () => store.putBinding(makeBinding()),
+      /different binding already exists for this PDPP grant/i,
+    );
+  });
+
+  it("migrates a database at the previous schema version and reads old rows with no fingerprint", () => {
+    const db = new Database(":memory:");
+    // The store as it was before the fingerprint column: v2 table, version 2.
+    db.exec(`
+      CREATE TABLE pdpp_grant_bindings (
+        pdpp_grant_id TEXT PRIMARY KEY,
+        permission_key TEXT NOT NULL,
+        chain_id INTEGER NOT NULL,
+        contract_address TEXT NOT NULL,
+        permission_id TEXT NOT NULL,
+        owner_address TEXT NOT NULL,
+        grantee_address TEXT NOT NULL,
+        pdpp_client_id TEXT NOT NULL,
+        grantee_id TEXT NOT NULL,
+        bound_at TEXT NOT NULL,
+        grant_version TEXT
+      );
+      CREATE TABLE pdpp_grant_bindings_schema_version (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL
+      );
+      INSERT INTO pdpp_grant_bindings_schema_version (id, version) VALUES (1, 2);
+      INSERT INTO pdpp_grant_bindings VALUES
+        ('pdpp-grant-old', '14800:0xd54523048add05b4d734afae7c68324ebb7373ef:42', 14800,
+         '0xD54523048AdD05b4d734aFaE7C68324Ebb7373eF', '42',
+         '0x00000000000000000000000000000000000000AA',
+         '0x00000000000000000000000000000000000000C1', 'client-app-1',
+         '0x00000000000000000000000000000000000000C1',
+         '2026-09-17T10:00:00.000Z', '3');
+    `);
+    const store = createSqlitePdppGrantBindingStore(db);
+    const old = store.getByPdppGrantId("pdpp-grant-old");
+    expect(old?.grantVersion).toBe("3");
+    expect(old?.grantFingerprint).toBeUndefined();
+    store.putBinding(
+      makeBinding({
+        pdppGrantId: "pdpp-grant-new",
+        grantFingerprint: `gf1:${"ab".repeat(32)}`,
+      }),
+    );
+    expect(store.getByPdppGrantId("pdpp-grant-new")?.grantFingerprint).toMatch(
+      /^gf1:/,
+    );
+  });
 });

@@ -14,6 +14,9 @@ import {
   ScopeMismatchError,
 } from "../errors/catalog.js";
 
+import type { Grant } from "../pdpp/types.js";
+import { grantFingerprint, isGrantFingerprint } from "./grant-fingerprint.js";
+
 import type {
   Builder,
   GatewayGrantResponse,
@@ -83,6 +86,13 @@ export interface PdppGrantBinding {
    * `null` denotes a preserved legacy row and always denies access.
    */
   grantVersion: string | null;
+  /**
+   * The `gf1:` fingerprint of this PDPP grant, when the chain slot lists one
+   * entry per grant. The live slot must still list it exactly; removing it
+   * revokes this grant alone. Absent for a binding recorded the older way
+   * (scope names in the slot), which keeps the equal-version rule.
+   */
+  grantFingerprint?: string;
   /** When the binding was recorded (ISO 8601). Provenance, not status. */
   boundAt: string;
 }
@@ -242,6 +252,44 @@ export function createPdppGrantBinding(
   });
 }
 
+export interface CreateFingerprintedBindingInput extends CreateBindingInput {
+  /** The PDPP grant document and the salt that its on-chain fingerprint used. */
+  fingerprint: { grant: Grant; salt: string };
+}
+
+/** True when the slot's list holds `entry` as an exact, well-formed fingerprint. */
+function slotListsFingerprint(scopes: unknown, entry: unknown): boolean {
+  return (
+    isGrantFingerprint(entry) && Array.isArray(scopes) && scopes.includes(entry)
+  );
+}
+
+/**
+ * Create a binding for a grant that the chain slot records as a fingerprint.
+ *
+ * Does every check `createPdppGrantBinding` does, then computes the grant's
+ * fingerprint and requires the chain grant's `scopes` to list it exactly. This
+ * is async because the fingerprint uses SHA-256 through WebCrypto; it is a
+ * separate function so the sync creator and its callers do not change.
+ */
+export async function createFingerprintedPdppGrantBinding(
+  input: CreateFingerprintedBindingInput,
+): Promise<PdppGrantBinding> {
+  const base = createPdppGrantBinding(input);
+  const fingerprint = await grantFingerprint(
+    input.fingerprint.grant,
+    input.fingerprint.salt,
+  );
+  if (!slotListsFingerprint(input.chainGrant.scopes, fingerprint)) {
+    throw new InvalidSignatureError({
+      reason: "Chain grant does not list this grant's fingerprint",
+      grantId: input.chainGrant.id,
+      expected: fingerprint,
+    });
+  }
+  return Object.freeze({ ...base, grantFingerprint: fingerprint });
+}
+
 export interface VerifyBindingInput {
   /** The retained, immutable binding record. */
   binding: PdppGrantBinding;
@@ -279,6 +327,8 @@ export interface VerifyBindingInput {
  *    checks are deliberately against different fields, because a wallet and
  *    a builder id are different values,
  *  - **revocation**: the live chain grant must exist and be unrevoked.
+ *  - **version**: equal to the bound version; for a fingerprint binding, the
+ *    slot must list the fingerprint and the version must not be lower.
  *
  * No chain I/O happens in this function — the caller supplies the already-read
  * `chainGrant`. That keeps this usable on the hot read path without adding a
@@ -357,7 +407,28 @@ export function verifyPdppGrantBinding(input: VerifyBindingInput): void {
     throw new GrantRevokedError({ grantId: chainGrant.id });
   }
 
-  if (
+  if (binding.grantFingerprint !== undefined) {
+    // One fingerprint per grant: other grants may join the slot and raise the
+    // version, so authority is the entry itself, not the version number.
+    // Absent or malformed entry = this grant was removed.
+    if (!slotListsFingerprint(chainGrant.scopes, binding.grantFingerprint)) {
+      throw new GrantRevokedError({
+        grantId: binding.pdppGrantId,
+        reason: "Grant fingerprint is no longer listed on the chain permission",
+      });
+    }
+    if (
+      !isValidGrantVersion(binding.grantVersion) ||
+      !isValidGrantVersion(chainGrant.grantVersion) ||
+      BigInt(chainGrant.grantVersion) < BigInt(binding.grantVersion)
+    ) {
+      throw new InvalidSignatureError({
+        reason: "Chain grant version is lower than the bound grantVersion",
+        expected: binding.grantVersion,
+        actual: chainGrant.grantVersion,
+      });
+    }
+  } else if (
     !grantVersionStillAuthorizes(binding.grantVersion, chainGrant.grantVersion)
   ) {
     throw new InvalidSignatureError({

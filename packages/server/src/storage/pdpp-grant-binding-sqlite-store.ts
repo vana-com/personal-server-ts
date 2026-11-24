@@ -54,6 +54,11 @@ ALTER TABLE pdpp_grant_bindings_v2 RENAME TO pdpp_grant_bindings;
 CREATE INDEX IF NOT EXISTS pdpp_grant_bindings_permission_key
   ON pdpp_grant_bindings (permission_key);
 `,
+  // Adds the nullable grant_fingerprint column. Existing rows keep NULL and
+  // read back with no fingerprint, so they keep the equal-version rule.
+  `
+ALTER TABLE pdpp_grant_bindings ADD COLUMN grant_fingerprint TEXT;
+`,
 ];
 
 function migrate(db: Database): void {
@@ -100,6 +105,7 @@ interface BindingRowDb {
   grantee_id: string;
   bound_at: string;
   grant_version: string | null;
+  grant_fingerprint: string | null;
 }
 
 function toBinding(row: BindingRowDb): PdppGrantBinding {
@@ -115,6 +121,9 @@ function toBinding(row: BindingRowDb): PdppGrantBinding {
     pdppClientId: row.pdpp_client_id,
     granteeId: row.grantee_id,
     grantVersion: row.grant_version,
+    ...(row.grant_fingerprint === null
+      ? {}
+      : { grantFingerprint: row.grant_fingerprint }),
     boundAt: row.bound_at,
   });
 }
@@ -147,10 +156,10 @@ export function createSqlitePdppGrantBindingStore(
   const insertStmt = db.prepare(`
     INSERT INTO pdpp_grant_bindings
       (pdpp_grant_id, permission_key, chain_id, contract_address, permission_id,
-       owner_address, grantee_address, pdpp_client_id, grantee_id, bound_at, grant_version)
+       owner_address, grantee_address, pdpp_client_id, grantee_id, bound_at, grant_version, grant_fingerprint)
     VALUES
       (@pdpp_grant_id, @permission_key, @chain_id, @contract_address, @permission_id,
-       @owner_address, @grantee_address, @pdpp_client_id, @grantee_id, @bound_at, @grant_version)
+       @owner_address, @grantee_address, @pdpp_client_id, @grantee_id, @bound_at, @grant_version, @grant_fingerprint)
   `);
 
   function putBinding(binding: PdppGrantBinding): void {
@@ -185,6 +194,7 @@ export function createSqlitePdppGrantBindingStore(
         grantee_id: binding.granteeId,
         bound_at: binding.boundAt,
         grant_version: binding.grantVersion,
+        grant_fingerprint: binding.grantFingerprint ?? null,
       });
     });
 
