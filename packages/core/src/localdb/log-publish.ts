@@ -97,6 +97,7 @@ import {
 import type { LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { tombstoneOmissions } from "./admit.js";
+import { changedKeyPages, hasChangedKeys } from "./log-changed-keys.js";
 import { planCompaction } from "./log-compact.js";
 import {
   clearSpool,
@@ -1004,18 +1005,28 @@ async function snapshotRound(
           replace,
         )
       : [];
-    const groups = await changedKeys(
-      held,
+    const hasChanges = await hasChangedKeys(
+      held.db,
       connectionId,
       stream,
       row.publish_watermark,
       watermark,
     );
+    // The changed keys are read a page at a time, in the order they changed:
+    // a round takes a segment's worth and stops.
+    const pages = () =>
+      changedKeyPages(
+        held.db,
+        connectionId,
+        stream,
+        row.publish_watermark,
+        watermark,
+      );
     // A stream with no head yet (a first collection that publishes while it
     // collects) is described by its local state.
     const head: PlanHead | null =
       plan.finalHead ??
-      (groups.length > 0
+      (hasChanges
         ? {
             generation: row.head_generation ?? connection.generation,
             primaryKey: JSON.parse(row.primary_key),
@@ -1043,7 +1054,7 @@ async function snapshotRound(
         }));
     const metaPublishes =
       metaChanged && plan.steps.some((s) => s.decision.kind === "publish");
-    const hasWork = groups.length > 0 || replace !== null || metaPublishes;
+    const hasWork = hasChanges || replace !== null || metaPublishes;
     if (!hasWork || head === null) {
       planned.push({ ...base, runIds: base.runIds });
       continue;
@@ -1067,7 +1078,9 @@ async function snapshotRound(
     // interleave as they would with any other changes.
     const room = (size: number) => first || budget + size <= target;
     const sizeOf = (op: LogOperation) => opSize(op, target);
-    const selected: { pk: string; seq: number }[] = [];
+    // What the round takes: how many keys, the last one's change, and their operations.
+    let selectedCount = 0;
+    let lastSelectedSeq = 0;
     const taken: LogOperation[] = [];
     let bytes = 100;
     let rest = false;
@@ -1102,35 +1115,47 @@ async function snapshotRound(
       // any row goes, with no bodies read. Then bodies are read a batch at a
       // time until they no longer fit one segment: a replace of a stream
       // larger than the segment never has more than a segment in memory.
-      const keys = groups.map((g) => g.pk);
-      const { untyped } = await operationsFor(
-        held,
-        connectionId,
-        stream,
-        keys,
-        row.publish_watermark,
-        watermark,
-        false,
-      );
-      if (untyped.length > 0) {
-        stop(untyped);
+      const untypedKeys: string[] = [];
+      for await (const page of pages()) {
+        const { untyped } = await operationsFor(
+          held,
+          connectionId,
+          stream,
+          page.map((g) => g.pk),
+          row.publish_watermark,
+          watermark,
+          false,
+        );
+        untypedKeys.push(...untyped);
+      }
+      if (untypedKeys.length > 0) {
+        stop(untypedKeys);
         continue;
       }
       let size = bytes + 100 + omittedSize(omitted);
       const found = new Map<string, LogOperation>();
-      for (const batch of chunked(keys, KEYS_PER_QUERY)) {
-        if (size > target) break;
-        const read = await operationsFor(
+      let count = 0;
+      probe: for await (const page of pages()) {
+        for (const batch of await bodyBatches(
           held,
           connectionId,
           stream,
-          batch,
-          row.publish_watermark,
-          watermark,
-        );
-        for (const [pk, op] of read.ops) {
-          size += sizeOf(op);
-          found.set(pk, op);
+          page,
+        )) {
+          if (size > target) break probe;
+          const read = await operationsFor(
+            held,
+            connectionId,
+            stream,
+            batch.map((g) => g.pk),
+            row.publish_watermark,
+            watermark,
+          );
+          for (const [pk, op] of read.ops) {
+            size += sizeOf(op);
+            found.set(pk, op);
+          }
+          count += batch.length;
         }
       }
       if (size > target) found.clear();
@@ -1139,42 +1164,48 @@ async function snapshotRound(
           planned.push({ ...base, ack: row.publish_watermark, rest: true });
           continue;
         }
-        // A stream can hold more keys than a call takes as arguments (a
-        // spread of ~125k overflows the stack), so these go one by one.
-        for (const group of groups) selected.push(group);
+        selectedCount = count;
         for (const op of found.values()) taken.push(op);
         bytes = size;
         whole = true;
       }
     }
     if (!whole)
-      scan: for (const batch of chunked(groups, KEYS_PER_QUERY)) {
-        const { ops: found, untyped } = await operationsFor(
+      scan: for await (const page of pages()) {
+        for (const batch of await bodyBatches(
           held,
           connectionId,
           stream,
-          batch.map((g) => g.pk),
-          row.publish_watermark,
-          watermark,
-        );
-        if (untyped.length > 0) {
-          stop(untyped);
-          continue eachStream;
-        }
-        for (const group of batch) {
-          const op = found.get(group.pk);
-          const size = op ? sizeOf(op) : 0;
-          if (!room(bytes + size)) {
-            rest = true;
-            break scan;
+          page,
+        )) {
+          const { ops: found, untyped } = await operationsFor(
+            held,
+            connectionId,
+            stream,
+            batch.map((g) => g.pk),
+            row.publish_watermark,
+            watermark,
+          );
+          if (untyped.length > 0) {
+            stop(untyped);
+            continue eachStream;
           }
-          selected.push(group);
-          if (op) taken.push(op);
-          bytes += size;
-          first = false;
+          for (const group of batch) {
+            const op = found.get(group.pk);
+            const size = op ? sizeOf(op) : 0;
+            if (!room(bytes + size)) {
+              rest = true;
+              break scan;
+            }
+            selectedCount += 1;
+            lastSelectedSeq = group.seq;
+            if (op) taken.push(op);
+            bytes += size;
+            first = false;
+          }
         }
       }
-    if (selected.length === 0 && groups.length > 0) {
+    if (selectedCount === 0 && hasChanges) {
       planned.push({ ...base, ack: row.publish_watermark, rest: true });
       continue;
     }
@@ -1216,7 +1247,7 @@ async function snapshotRound(
     }
     budget += bytes;
     first = false;
-    const ack = rowsRest ? selected.at(-1)!.seq : watermark;
+    const ack = rowsRest ? lastSelectedSeq : watermark;
     planned.push({
       ...base,
       included: true,
@@ -1800,22 +1831,40 @@ async function omittedDigest(
 }
 const DIGEST_PAGE = 4096;
 
-/** Changed keys since the watermark, oldest change first. */
-async function changedKeys(
+/**
+ * The groups of a page cut into batches whose bodies hold about `PAGE_BYTES`
+ * (a group alone if its body is larger), by the sizes the rows keep: a batch is
+ * read whole, so the keys of a query are not the bound on what it holds.
+ * Groups with no row (a delete) weigh nothing.
+ */
+async function bodyBatches<T extends { readonly pk: string }>(
   deps: Pick<LocalSyncDeps, "db">,
   connectionId: string,
   stream: string,
-  from: number,
-  to: number,
-): Promise<{ pk: string; seq: number }[]> {
-  const rows = await deps.db.query<{ pk_hash: string; seq: number }>(
-    `SELECT pk_hash, MAX(seq) AS seq FROM record_changes
-      WHERE connection_id = ? AND stream = ? AND seq > ? AND seq <= ?
-        AND ${ELIGIBLE_CHANGE}
-      GROUP BY pk_hash ORDER BY MAX(seq)`,
-    [connectionId, stream, from, to],
+  groups: readonly T[],
+): Promise<T[][]> {
+  const sizes = await deps.db.query<{ pk_hash: string; n: number }>(
+    `SELECT pk_hash, COALESCE(body_bytes, ${BODY_BYTES}) AS n FROM records
+      WHERE connection_id = ? AND stream = ?
+        AND pk_hash IN (${groups.map(() => "?").join(",")})`,
+    [connectionId, stream, ...groups.map((g) => g.pk)],
   );
-  return rows.map((row) => ({ pk: row.pk_hash, seq: row.seq }));
+  const bytesOf = new Map(sizes.map((r) => [r.pk_hash, Number(r.n)]));
+  const batches: T[][] = [];
+  let batch: T[] = [];
+  let bytes = 0;
+  for (const group of groups) {
+    const n = bytesOf.get(group.pk) ?? 0;
+    if (batch.length > 0 && bytes + n > PAGE_BYTES) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(group);
+    bytes += n;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
 }
 
 /**
@@ -1844,15 +1893,13 @@ export async function hasPendingLogPublication(
       if ((await retainedRuns(deps, connectionId, row.stream)).length > 0)
         return true;
       if (
-        (
-          await changedKeys(
-            deps,
-            connectionId,
-            row.stream,
-            row.publish_watermark,
-            last?.seq ?? row.publish_watermark,
-          )
-        ).length > 0
+        await hasChangedKeys(
+          deps.db,
+          connectionId,
+          row.stream,
+          row.publish_watermark,
+          last?.seq ?? row.publish_watermark,
+        )
       )
         return true;
     }
