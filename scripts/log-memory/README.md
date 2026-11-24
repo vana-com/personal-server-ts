@@ -37,8 +37,14 @@ harness (`git log -- scripts/log-memory`, its first commit: it holds the
 harness and no change to the code under test) in a worktree on top of main's
 sources, and run the same cases there. Main's `planCompaction` has the
 cost-model gate in front of it, which a log of a few segments never passes: in
-that worktree make the gate false (`false && !required && ...`) so the
-`compaction` step compacts.
+that worktree let an environment variable open the gate for the `compaction`
+step only (`process.env.FORCE_COMPACT !== "1" && !required && ...`, with the
+step setting `FORCE_COMPACT`). Do not open it for every step: a gate that is
+always open compacts the whole log in every publish round, and the other steps
+then measure a different log.
+
+Several cases can run under one hold of the heavy-run lock: the caller takes the
+lock and sets `HEAVY_LOCK_HELD=1`, which makes `run.sh` skip its own.
 
 ## The legacy path
 
