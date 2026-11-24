@@ -87,6 +87,59 @@ function createApp(
   return app;
 }
 
+function createSuccessfulAuditFixture() {
+  const entries: AccessLogEntry[] = [];
+  const audit = createAccessLogMiddleware({
+    write: (entry) => {
+      entries.push(entry);
+      return Promise.resolve();
+    },
+  });
+
+  return {
+    entries,
+    record: async (scope: string) => {
+      // Stand in for an already authorized, successful request. No router or
+      // upstream middleware is involved in these record-format assertions.
+      const context = {
+        get(name: string) {
+          if (name === "auth") return { signer: "fixture-reader" };
+          if (name === "grant") return { id: "fixture-grant" };
+          return undefined;
+        },
+        req: { param: () => scope, header: () => undefined },
+        res: { status: 200 },
+      } as unknown as Parameters<
+        ReturnType<typeof createAccessLogMiddleware>
+      >[0];
+      await audit(context, () => Promise.resolve());
+    },
+  };
+}
+
+describe("successful access audit records", () => {
+  it("keeps the scope label with the corresponding record", async () => {
+    const { entries, record } = createSuccessfulAuditFixture();
+    await record("synthetic.first");
+    await record("synthetic.second");
+
+    expect(entries.map(({ scope }) => scope)).toEqual([
+      "synthetic.first",
+      "synthetic.second",
+    ]);
+  });
+
+  it("gives consecutive reads on the same scope distinct IDs", async () => {
+    const { entries, record } = createSuccessfulAuditFixture();
+    await record("synthetic.records");
+    await record("synthetic.records");
+
+    const ids = entries.map(({ logId }) => logId);
+    expect(ids).toEqual([expect.any(String), expect.any(String)]);
+    expect(new Set(ids).size).toBe(2);
+  });
+});
+
 describe("createAccessLogMiddleware", () => {
   it("200 response writes entry with correct fields", async () => {
     const writer = createMockWriter();

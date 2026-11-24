@@ -1,9 +1,21 @@
 import { describe, it, expect } from "vitest";
 import {
   findStreamGrant,
+  grantIsV02,
   withinTimeConstraint,
   type Grant,
 } from "./pdpp-auth.js";
+
+describe("grantIsV02", () => {
+  it("distinguishes the two published grant versions", () => {
+    expect(grantIsV02({ version: "0.2.0" } as Grant)).toBe(true);
+    expect(grantIsV02({ version: "0.1.0" } as Grant)).toBe(false);
+  });
+
+  it("does not describe a missing grant as version 0.2", () => {
+    expect(grantIsV02(undefined)).toBe(false);
+  });
+});
 
 describe("findStreamGrant", () => {
   it("finds the StreamGrant entry matching a stream name", () => {

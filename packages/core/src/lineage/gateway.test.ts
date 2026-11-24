@@ -405,3 +405,33 @@ describe("createGatewayLineageClient", () => {
     ).rejects.toThrow(/^Gateway error: 409 Gap in version sequence/);
   });
 });
+
+describe("stored lineage presentation", () => {
+  it("stamps lineage on a new record without changing caller fields", async () => {
+    const { stampLineage } = await import("./lineage.js");
+    const original = { label: "synthetic row", count: 2 };
+    const lineage = {
+      sources: [`0x${"ab".repeat(32)}` as const],
+      writtenAt: "2026-01-02T03:04:05.000Z",
+    };
+    const stamped = stampLineage(original, lineage);
+    expect(stamped).not.toBe(original);
+    expect(stamped).toEqual({ ...original, $lineage: lineage });
+    expect(original).toEqual({ label: "synthetic row", count: 2 });
+  });
+
+  it("normalizes displayed source hex while preserving source order", async () => {
+    const { readStoredLineage } = await import("./lineage.js");
+    const sources = [`0x${"CD".repeat(32)}`, `0x${"AB".repeat(32)}`];
+    const writtenAt = "2026-01-02T03:04:05.000Z";
+    const record = { $lineage: { sources, writtenAt } };
+    expect(readStoredLineage(record)).toEqual({
+      sources: [`0x${"cd".repeat(32)}`, `0x${"ab".repeat(32)}`],
+      writtenAt,
+    });
+    expect(record.$lineage.sources).toEqual([
+      `0x${"CD".repeat(32)}`,
+      `0x${"AB".repeat(32)}`,
+    ]);
+  });
+});

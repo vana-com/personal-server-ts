@@ -147,6 +147,19 @@ export function createScopeUploadRegistry(
 ): ScopeUploadRegistry {
   const idleTimeoutMs = options.idleTimeoutMs ?? SCOPE_UPLOAD_IDLE_TIMEOUT_MS;
   const maxBatchBytes = options.maxBatchBytes ?? SCOPE_UPLOAD_MAX_BATCH_BYTES;
+  // Timers cannot represent a larger positive delay reliably.
+  if (
+    !Number.isInteger(idleTimeoutMs) ||
+    idleTimeoutMs < 1 ||
+    idleTimeoutMs > 2_147_483_647
+  ) {
+    throw new RangeError(
+      "idleTimeoutMs must be an integer from 1 to 2147483647",
+    );
+  }
+  if (!Number.isSafeInteger(maxBatchBytes) || maxBatchBytes < 1) {
+    throw new RangeError("maxBatchBytes must be a positive safe integer");
+  }
   const createId = options.createId ?? (() => crypto.randomUUID());
   let open: OpenUpload | null = null;
   const ended = new Map<string, "committed" | "aborted" | "expired">();

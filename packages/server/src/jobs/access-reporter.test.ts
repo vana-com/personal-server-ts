@@ -147,6 +147,39 @@ describe("access reporter batching", () => {
     );
   });
 
+  it("continues sending after a refused batch's warning sink throws", async () => {
+    const send = okFetch().mockResolvedValueOnce(
+      new Response(null, { status: 400 }),
+    );
+    const warn = vi.fn(() => {
+      throw new Error("warning sink unavailable");
+    });
+    const fallback = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    try {
+      const { instance } = reporter(send as unknown as typeof fetch, warn);
+      await instance.report(event(1));
+      await expect(instance.flush()).resolves.toBeUndefined();
+
+      await instance.report(event(2));
+      await expect(instance.stop()).resolves.toBeUndefined();
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(logIdsOf(send.mock.calls[1])).toEqual(["log-2"]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(fallback).toHaveBeenCalledWith(
+        ACCESS_RECORDS_DROPPED,
+        expect.objectContaining({
+          count: 1,
+          droppedTotal: 1,
+          reason: "refused_400",
+        }),
+      );
+    } finally {
+      fallback.mockRestore();
+    }
+  });
+
   it("drops only the record a 400 names and resends the rest", async () => {
     const send = vi.fn(async () =>
       send.mock.calls.length === 1
@@ -358,5 +391,27 @@ describe("access reporter payload", () => {
     expect(record).not.toHaveProperty("tool");
     expect(record).not.toHaveProperty("denyReason");
     expect(record.outcome).toBe("served");
+  });
+
+  it("keeps enqueue order when a flush and shutdown overlap", async () => {
+    const send = okFetch();
+    const { instance } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    const flushing = instance.flush();
+    await instance.report(event(2));
+    await Promise.all([flushing, instance.stop()]);
+
+    expect(send.mock.calls.flatMap(logIdsOf)).toEqual(["log-1", "log-2"]);
+  });
+
+  it("does not resend an already drained queue on repeated shutdown", async () => {
+    const send = okFetch();
+    const { instance } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+
+    await instance.stop();
+    await instance.stop();
+
+    expect(send.mock.calls.flatMap(logIdsOf)).toEqual(["log-1"]);
   });
 });

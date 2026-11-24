@@ -81,7 +81,7 @@ export function parseRateLimitPolicy(
     if (
       !quota ||
       !seconds ||
-      !Number.isFinite(quota) ||
+      !Number.isInteger(quota) ||
       !Number.isFinite(seconds) ||
       quota < 1 ||
       seconds < 1 ||

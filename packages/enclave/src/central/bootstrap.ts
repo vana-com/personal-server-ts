@@ -76,6 +76,18 @@ function port(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
     throw new Error(`${key} is invalid`);
   return value;
 }
+export async function closeFleetListeners(
+  closeMcp: () => Promise<void>,
+  closeServers: () => Promise<void>,
+): Promise<void> {
+  const [mcp] = await Promise.allSettled([Promise.resolve().then(closeMcp)]);
+  const [servers] = await Promise.allSettled([
+    Promise.resolve().then(closeServers),
+  ]);
+  if (mcp?.status === "rejected") throw mcp.reason;
+  if (servers?.status === "rejected") throw servers.reason;
+}
+
 /** Separate central entrypoint: no Docker/owner-root/worker-key initialization. */
 export async function startFleetCentral(
   env: NodeJS.ProcessEnv,
@@ -584,14 +596,22 @@ export async function startFleetCentral(
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       await Promise.allSettled(inFlight);
-      await mcp.close();
-      await Promise.all(
-        servers.map(
-          (server) =>
-            new Promise<void>((resolve, reject) =>
-              server.close((error) => (error ? reject(error) : resolve())),
+      await closeFleetListeners(
+        () => mcp.close(),
+        async () => {
+          const results = await Promise.allSettled(
+            servers.map(
+              (server) =>
+                new Promise<void>((resolve, reject) =>
+                  server.close((error) => (error ? reject(error) : resolve())),
+                ),
             ),
-        ),
+          );
+          const failure = results.find(
+            (result) => result.status === "rejected",
+          );
+          if (failure?.status === "rejected") throw failure.reason;
+        },
       );
     },
   };

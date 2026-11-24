@@ -442,10 +442,20 @@ export async function startPersonalServer(
       { data: uploadOptions.data, arrayKey: uploadOptions.arrayKey },
       "scope upload begin",
     )) as { uploadId: string; collectedAt: string; maxBatchBytes: number };
+    const maxBatchBytes = begun?.maxBatchBytes;
+    if (
+      typeof maxBatchBytes !== "number" ||
+      !Number.isFinite(maxBatchBytes) ||
+      maxBatchBytes <= 0
+    ) {
+      throw new Error(
+        "Invalid scope upload begin response: expected a positive maxBatchBytes",
+      );
+    }
     const path = `${base}/${encodeURIComponent(begun.uploadId)}`;
     // Batches stay at the size Web3Signed owner auth accepts as a body; only
     // a single larger record goes up alone, up to the server's limit.
-    const batchBytes = Math.min(begun.maxBatchBytes, SCOPE_UPLOAD_BATCH_BYTES);
+    const batchBytes = Math.min(maxBatchBytes, SCOPE_UPLOAD_BATCH_BYTES);
     let seq = 0;
     // Set when an append fails: the server may hold some of its batches, and
     // the handle does not know which, so it takes no more appends or commits.

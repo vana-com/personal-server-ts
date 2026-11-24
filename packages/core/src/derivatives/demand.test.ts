@@ -16,6 +16,11 @@ import {
 import { ingestDataContract } from "../contracts/data.js";
 import { NotOwnerError, ScopeMismatchError } from "../errors/catalog.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
+import {
+  cloneAnswerShape,
+  parseAnswerShapeInput,
+  renderShapedAnswer,
+} from "./answer-shape.js";
 import { createRecomputeScheduler } from "./scheduler.js";
 import { createInMemoryQuestionStore } from "./store.js";
 import type { QuestionRegistration } from "./types.js";
@@ -269,5 +274,42 @@ describe("an authorized read is the demand that recomputes a derivative", () => 
     await settle();
     expect(h.compute).not.toHaveBeenCalled();
     h.scheduler.stop();
+  });
+});
+
+describe("answers displayed by a derivative read", () => {
+  it("renders in declaration order and keeps present false, zero and empty text", () => {
+    const shape = parseAnswerShapeInput({
+      fields: [
+        { name: "count", type: "integer" },
+        { name: "omitted", type: "string", required: false },
+        { name: "ready", type: "boolean" },
+        { name: "note", type: "string" },
+      ],
+    })!;
+    const result = renderShapedAnswer(shape, {
+      note: "",
+      ready: false,
+      count: 0,
+    });
+    expect(result).toBe("count: 0\nready: false\nnote: ");
+  });
+
+  it("copies a displayed shape without sharing its field or choice arrays", () => {
+    const shape = parseAnswerShapeInput({
+      fields: [{ name: "status", type: "enum", values: ["draft", "ready"] }],
+    })!;
+    const copy = cloneAnswerShape(shape)!;
+    copy.fields[0]!.name = "changed";
+    copy.fields[0]!.values!.push("extra");
+    expect(shape.fields).toEqual([
+      {
+        name: "status",
+        type: "enum",
+        required: true,
+        values: ["draft", "ready"],
+      },
+    ]);
+    expect(cloneAnswerShape(null)).toBeNull();
   });
 });

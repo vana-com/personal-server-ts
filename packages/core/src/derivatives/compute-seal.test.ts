@@ -7,7 +7,10 @@ import { describe, expect, it } from "vitest";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { computeQuestion, type QuestionComputeDeps } from "./compute.js";
-import { createFakeInferenceProvider } from "./inference.js";
+import {
+  createFakeInferenceProvider,
+  InferenceRequestError,
+} from "./inference.js";
 import { createInMemoryQuestionStore } from "./store.js";
 import { createLegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import { authorityHearing } from "../test-utils/account-mode.js";
@@ -131,4 +134,32 @@ describe("computeQuestion when legacy storage is closed", () => {
     expect((await computeQuestion("q-1", f.deps)).status).toBe("ready");
     expect(f.storage.findEntry({ scope: "coach.weekly" })).toBeDefined();
   });
+});
+
+describe("computeQuestion when inference is unavailable", () => {
+  for (const { status, tries, code } of [
+    { status: 503, tries: 3, code: "inference_unavailable" },
+    { status: 400, tries: 1, code: "internal" },
+  ] as const) {
+    it(`classifies a synthetic provider ${status} after ${tries} attempt(s) without storing an answer`, async () => {
+      const f = await build(fixedLegacyWriteSeal("unswitched"));
+      const provider = createFakeInferenceProvider({
+        respond: () => {
+          throw new InferenceRequestError("synthetic provider refusal", status);
+        },
+      });
+      const outcome = await computeQuestion("q-1", {
+        ...f.deps,
+        provider,
+        sleep: async () => {},
+      });
+      expect(outcome.status).toBe("failed");
+      expect(provider.calls).toHaveLength(tries);
+      expect(f.storage.findEntry({ scope: "coach.weekly" })).toBeUndefined();
+      expect(await f.deps.store.get("q-1")).toMatchObject({
+        status: "failed",
+        errorCode: code,
+      });
+    });
+  }
 });

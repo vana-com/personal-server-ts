@@ -28,6 +28,23 @@ describe("the lifetime token", () => {
     expect(parseLifetime(C, `v2:${C}:`)).toEqual(new Map());
   });
 
+  it("orders encoded entries without changing the caller's map", () => {
+    const input = new Map([
+      [WORK, 3],
+      ["", 1],
+    ]);
+    const before = [...input];
+    expect(formatLifetime(C, input)).toBe(`v2:${C}:@1,${WORK}@3`);
+    expect([...input]).toEqual(before);
+  });
+
+  it("returns an independent map on each parse", () => {
+    const token = formatLifetime(C, new Map([["", 1]]));
+    const first = parseLifetime(C, token) as Map<string, number>;
+    first.clear();
+    expect(parseLifetime(C, token)).toEqual(new Map([["", 1]]));
+  });
+
   it("refuses what the server did not write", () => {
     for (const token of [
       "",
@@ -57,6 +74,19 @@ describe("the lifetime token", () => {
     expect(() =>
       parseLifetime(`${C}-2`, formatLifetime(C, new Map([["", 1]]))),
     ).toThrow(InvalidConnectionLifetime);
+  });
+
+  it("rejects a generation that cannot be represented exactly", () => {
+    expect(() => parseLifetime(C, `v2:${C}:@9007199254740992`)).toThrow(
+      "lifetime is not one this server names",
+    );
+  });
+
+  it("rejects accidental trailing whitespace instead of silently normalizing it", () => {
+    const token = formatLifetime(C, new Map([["", 2]]));
+    expect(() => parseLifetime(C, token + "\n")).toThrow(
+      InvalidConnectionLifetime,
+    );
   });
 
   it("round-trips a connector id with separators in it", () => {

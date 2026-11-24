@@ -177,3 +177,43 @@ describe("Oura takeover selection policy", () => {
     expect(isOuraTakeoverSelection(value)).toBe(expected !== null);
   });
 });
+
+describe("Oura history selection portability", () => {
+  it("recognizes unique mixed naming forms regardless of stream order", () => {
+    const value = {
+      streams: [
+        { name: "oura.activity" },
+        { name: "sleep" },
+        { name: "oura.readiness" },
+      ],
+    };
+    expect(ouraTakeoverSelectionSince(value)).toEqual({ since: null });
+    expect(isOuraTakeoverSelection(value)).toBe(true);
+  });
+
+  it("accepts a read-only checkpoint selection without rewriting its names or ranges", () => {
+    const since = "2026-06-15";
+    const value = Object.freeze({
+      streams: Object.freeze([
+        Object.freeze({
+          name: "oura.sleep",
+          time_range: Object.freeze({ since }),
+        }),
+        Object.freeze({
+          name: "oura.readiness",
+          time_range: Object.freeze({ since }),
+        }),
+        Object.freeze({
+          name: "oura.activity",
+          time_range: Object.freeze({ since }),
+        }),
+      ]),
+    });
+    expect(ouraTakeoverSelectionSince(value)).toEqual({ since });
+    expect(value.streams.map(({ name }) => name)).toEqual([
+      "oura.sleep",
+      "oura.readiness",
+      "oura.activity",
+    ]);
+  });
+});

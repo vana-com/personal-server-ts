@@ -88,6 +88,24 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(dec.decode((await files.read("a/0"))!)).toBe("123");
   });
 
+  it("distinguishes a written empty file from one that does not exist", async () => {
+    const files = createFsStreamSyncFiles(root);
+    const existing = "samples/empty.bin";
+    const absent = "samples/absent.bin";
+    await files.write(existing, Uint8Array.of(0, 255, 128));
+    await files.write(existing, new Uint8Array());
+
+    expect(await files.read(existing)).toEqual(new Uint8Array());
+    expect(await files.read(absent)).toBeNull();
+    expect(await files.size(existing)).toBe(0);
+    expect(await files.size(absent)).toBe(0);
+    expect(await files.list("samples")).toEqual([existing]);
+
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of files.readChunks(existing)) chunks.push(chunk);
+    expect(chunks).toEqual([]);
+  });
+
   it("write replaces a file that has an open append handle", async () => {
     const files = createFsStreamSyncFiles(root);
     await files.appendMany([{ path: "s/0", bytes: enc.encode("old") }]);

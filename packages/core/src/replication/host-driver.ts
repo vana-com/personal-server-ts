@@ -273,7 +273,11 @@ export function createReplicationDriver(input: {
       if (current) {
         let grace: unknown;
         settled = await Promise.race([
-          current.then(() => true),
+          // Stop waits for settlement; trigger still returns the original promise.
+          current.then(
+            () => true,
+            () => true,
+          ),
           new Promise<boolean>((resolve) => {
             grace = timers.setTimeout(() => resolve(false), graceMs);
           }),

@@ -26,6 +26,35 @@ function storageWhoseCommit(commit: () => Promise<never>) {
   return { storage, abort };
 }
 
+describe("scope upload registry limits", () => {
+  it.each([NaN, Infinity, 0, -1, 1.5, 2_147_483_648])(
+    "rejects invalid idle timeout configuration (%s) at initialization",
+    (idleTimeoutMs) => {
+      expect(() => createScopeUploadRegistry({ idleTimeoutMs })).toThrow(
+        new RangeError("idleTimeoutMs must be an integer from 1 to 2147483647"),
+      );
+    },
+  );
+
+  it.each([NaN, Infinity, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid batch ceiling configuration (%s) at initialization",
+    (maxBatchBytes) => {
+      expect(() => createScopeUploadRegistry({ maxBatchBytes })).toThrow(
+        new RangeError("maxBatchBytes must be a positive safe integer"),
+      );
+    },
+  );
+
+  it("accepts valid explicit initialization limits", () => {
+    expect(
+      createScopeUploadRegistry({
+        idleTimeoutMs: 2_147_483_647,
+        maxBatchBytes: 1,
+      }).maxBatchBytes,
+    ).toBe(1);
+  });
+});
+
 describe("scope upload commit under the legacy-write seal", () => {
   it.each(["switched", "unknown"] as const)(
     "aborts the staged upload and rethrows a %s refusal as it is",

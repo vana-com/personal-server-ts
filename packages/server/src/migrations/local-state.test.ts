@@ -85,6 +85,30 @@ describe("migrateLocalState", () => {
     );
   });
 
+  it.each(["", " \t "])(
+    "does not create a cursor for a blank legacy timestamp (%j)",
+    async (timestamp) => {
+      await writeFile(
+        configPath,
+        JSON.stringify({ sync: { lastProcessedTimestamp: timestamp } }),
+        "utf-8",
+      );
+
+      const result = await migrateLocalState({
+        storageRoot,
+        dataDir,
+        configPath,
+        syncCursorPath,
+        tokensPath,
+      });
+
+      expect(result.syncCursorCreated).toBe(false);
+      await expect(readFile(syncCursorPath, "utf-8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
   it("is idempotent and does not overwrite an existing sync cursor", async () => {
     await writeFile(
       configPath,
