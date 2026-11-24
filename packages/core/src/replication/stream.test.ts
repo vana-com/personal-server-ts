@@ -16,6 +16,16 @@ import {
 import { DEFAULT_REPLICA_STREAMED_LIMITS } from "./stream.js";
 import { ReplicaByteBudget, admit } from "./limits.js";
 
+
+it("rejects a producer failure without returning a partial digest", async () => {
+  const failure = new Error("synthetic producer interrupted");
+  await expect(
+    hashReplicaBytes(async function* () {
+      yield Uint8Array.of(1, 2);
+      throw failure;
+    }),
+  ).rejects.toBe(failure);
+});
 it("streams the existing canonical wire bytes and fragments, including metadata above the Lite envelope limit", async () => {
   for (const size of [0, 1, 2, 3, 65537]) {
     const blob = new Uint8Array(size).fill(31);
