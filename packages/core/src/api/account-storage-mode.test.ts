@@ -79,6 +79,27 @@ describe("account mode helper contracts", () => {
     expect(response.headers.get("retry-after")).toBe("5");
     expect(response.headers.get("cache-control")).toBe("no-store");
   });
+
+  it("returns a machine-readable temporary storage-mode explanation", async () => {
+    const response = accountModeUnknownResponse();
+    expect(response.headers.get("content-type")).toBe("application/json");
+    expect(await response.json()).toEqual({
+      error: {
+        code: 503,
+        errorCode: "ACCOUNT_MODE_UNKNOWN",
+        message: expect.stringMatching(/legacy writes are paused\. Retry shortly\.$/),
+      },
+    });
+  });
+
+  it("returns a fresh diagnostic body for each response", async () => {
+    const first = accountModeUnknownResponse();
+    const second = accountModeUnknownResponse();
+    const firstBody = await first.text();
+    expect(first.bodyUsed).toBe(true);
+    expect(second.bodyUsed).toBe(false);
+    expect(await second.text()).toBe(firstBody);
+  });
 });
 
 describe("accountStorageModeFor", () => {
