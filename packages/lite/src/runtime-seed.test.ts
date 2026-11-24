@@ -231,7 +231,16 @@ it("fills a late seed into a stream a real collection owns, without overwriting 
     await f
       .driver()
       .query("SELECT stream, state, reason, rows FROM import_ledger"),
-  ).toEqual([{ stream: "items", state: "imported", reason: null, rows: 2 }]);
+  ).toEqual([
+    // Two staged rows; the real "a" blocks the seed's old "a": a counted
+    // outcome, not an import.
+    {
+      stream: "items",
+      state: "imported",
+      reason: 'outcomes:{"blocked":1}',
+      rows: 2,
+    },
+  ]);
   expect(
     await context.runtime.streamSyncSeed!.status("fixture-source"),
   ).toEqual({ targetKnown: true, streams: { items: { state: "merged" } } });

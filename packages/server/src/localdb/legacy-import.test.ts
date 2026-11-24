@@ -9,7 +9,7 @@ import {
   importLegacySource,
 } from "../../../core/src/localdb/legacy-import.js";
 import { createImportLedger } from "../../../core/src/localdb/import-ledger.js";
-import { quarantineFromReceipt } from "../../../core/src/localdb/legacy-quarantine.js";
+import { receiptOutcomes } from "../../../core/src/localdb/legacy-quarantine.js";
 import { openLocalDb } from "../../../core/src/localdb/open.js";
 import { connectionQueue } from "../../../core/src/localdb/queue.js";
 import type { LocalSyncDeps } from "../../../core/src/localdb/deps.js";
@@ -411,10 +411,13 @@ it("import-quarantines-bad-keys-per-row-and-imports-the-rest", async () => {
     "SELECT rows, reason FROM import_ledger",
   );
   expect(ledger.rows).toBe(99);
-  expect(quarantineFromReceipt(ledger.reason)).toEqual({
-    bad_key_value: 3,
-    missing_key_field: 1,
-    not_an_object: 1,
+  expect(receiptOutcomes(ledger.reason)).toEqual({
+    blocked: 0,
+    quarantined: {
+      bad_key_value: 3,
+      missing_key_field: 1,
+      not_an_object: 1,
+    },
   });
   // The same rows again add nothing and still report what was left out.
   expect(await f.run()).toMatchObject({
