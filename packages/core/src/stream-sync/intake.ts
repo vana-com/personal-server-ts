@@ -142,14 +142,28 @@ export interface BeginRequest {
   readonly expectedControlVersion?: number;
   readonly observedAt?: number;
   /**
-   * The scope the producer will put in START, per stream. Used only to
-   * refuse `fields` and `resources` (R17).
+   * The scope the producer will put in START, per stream. Used to refuse
+   * `fields` and `resources` (R17), and to tell a read that is not a full one.
+   * (Per stream, `begin` resumes only a stream with a saved cursor of its
+   * own; any other declared stream is read whole, whatever the run's mode.)
    */
   readonly streams?: readonly {
     readonly name: string;
     readonly fields?: unknown;
     readonly resources?: unknown;
     readonly time_range?: unknown;
+    /**
+     * True when the producer resumes this stream from a cursor it was handed
+     * outside this run (the connection's checkpoint read by `checkpoint()`
+     * before a remote run). Its rows are then only those after that cursor,
+     * whatever the run's mode asks for: the stream is not read in full, even
+     * when `connect` or `wantFull` makes the run a full collection. The
+     * publication treats it as an incremental read: over a changed or reset
+     * connection, or a stream flagged for a full read since the cursor was
+     * read, the head stays incomplete and the run's checkpoint is not saved;
+     * over the unchanged connection it publishes and saves as usual.
+     */
+    readonly resumed?: boolean;
   }[];
 }
 
@@ -330,11 +344,56 @@ export interface RunPublicationStatus {
 /** The observation request is retained until every host has migrated to V1. */
 export type RunEndRequest = EndRequest | RawEndV1;
 
+/**
+ * The connection's saved cursors, as the last run (on this device or another)
+ * left them: what `begin` would hand a connector as its START state, before
+ * any run exists and without a verified artifact. A host that runs the
+ * connector elsewhere (a remote run) reads it to resume from the same place,
+ * and ends the run it opens here with the cursors that run returns.
+ */
+export interface ConnectionCheckpoint {
+  readonly connectionId: string;
+  /**
+   * Per stream with a saved cursor: the connector's STATE for it and the
+   * version of the connector that wrote it (here or on another device), or
+   * null when no run has stamped one yet. `cursorVersion` may be newer than
+   * the state beside it (a fold stamps the published cursor's version), so a
+   * reader comparing it with its own connector version errs towards a full
+   * read. A connection with a stream flagged for a full read has no cursors
+   * at all (`begin` reads the whole connection in full then). A stream has
+   * an entry only with a complete head here to resume onto: one whose head
+   * is incomplete, or that has no head here, is left out whatever is stored
+   * for it. A remote reader cannot complete a head except by choosing a full
+   * read up front, and a run resumed from the cursor takes `complete` from
+   * its base, so over a reset base (a changed primary key) or an unpublished
+   * one it would be handed the same cursor forever; `begin` itself keeps
+   * resuming such a stream, as a retrying device run must. A stream the
+   * connection never wrote (a run that selected the streams it writes leaves
+   * the others alone) simply has no entry.
+   */
+  readonly streams: Readonly<
+    Record<
+      string,
+      { readonly state: JsonValue; readonly cursorVersion: string | null }
+    >
+  >;
+}
+
 export interface RunIntake {
   begin(runId: string, req: BeginRequest): Promise<BeginResponse>;
   batch(runId: string, req: BatchRequest): Promise<BatchResponse>;
   end(runId: string, req: RunEndRequest): Promise<EndResponse>;
   abort(runId: string, reason: "failed" | "cancelled"): Promise<void>;
+  /**
+   * The connection's saved cursors for `connector`, or null when it has none
+   * (no connection, no checkpoint, a deleted or foreign connection, a
+   * registry that cannot be read, a stream flagged for a full read, or no
+   * stream with both a cursor and a complete head). It
+   * reads the registry first, as `begin` does, so another device's delete or
+   * reconnect is seen. A read: it opens no run and needs no artifact.
+   * Optional: a host over an older writer has none, and reads in full.
+   */
+  checkpoint?(connector: string): Promise<ConnectionCheckpoint | null>;
   /**
    * Whether an ended run is saved, from durable local state. An unknown run
    * answers `gone`. With `binding`, another owner answers `owner_mismatch` and
