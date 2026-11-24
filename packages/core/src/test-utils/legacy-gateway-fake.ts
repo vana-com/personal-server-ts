@@ -47,6 +47,21 @@ export interface LegacyGatewayFakeOptions {
 export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
   const heads = new Map<string, Head>();
   const blobs = new Set<string>();
+  /** The registry's kept history of each scope: every slot, tombstones included. */
+  const slots = new Map<
+    string,
+    { version: number; dataHash: string; isTombstone: boolean }[]
+  >();
+  const record = (
+    scope: string,
+    version: number,
+    dataHash: string,
+    isTombstone = false,
+  ) =>
+    slots.set(scope, [
+      ...(slots.get(scope) ?? []),
+      { version, dataHash, isTombstone },
+    ]);
   /** Every request that reached the fake, in order. */
   const requests: { method: string; url: string; scope?: string }[] = [];
   /** Tombstone versions the gateway stored, by scope (a repeat would show twice). */
@@ -145,6 +160,7 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
     head.dataHash = TOMBSTONE_DATA_HASH;
     head.metadataHash = TOMBSTONE_METADATA_HASH;
     head.deletedAt = iso();
+    record(request.scope, head.version, head.dataHash, true);
     tombstones.set(request.scope, [
       ...(tombstones.get(request.scope) ?? []),
       head.version,
@@ -195,8 +211,23 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
     throw new Error(`fake gateway: unexpected ${method} ${url}`);
   }) as unknown as typeof fetch;
 
+  /** The gateway's version inventory (`GET /v1/data/:id/versions`), read in full. */
+  const inventory = {
+    async list(scope: string) {
+      return {
+        complete: true as const,
+        versions: (slots.get(scope) ?? []).map((slot) => ({
+          expectedVersion: String(slot.version),
+          dataHash: slot.dataHash,
+          isTombstone: slot.isTombstone,
+        })),
+      };
+    },
+  };
+
   return {
     feed,
+    inventory,
     fetch: fetchImpl,
     state,
     requests,
@@ -210,7 +241,10 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
         metadataHash: `0x${"bb".repeat(32)}`,
         deletedAt: null,
       });
-      for (let v = 1; v <= version; v++) blobs.add(blobKey(scope, v));
+      for (let v = 1; v <= version; v++) {
+        blobs.add(blobKey(scope, v));
+        record(scope, v, `0x${v.toString(16).padStart(64, "0")}`);
+      }
     },
     /** A write to the legacy scope that moved its head (a new lifetime's write). */
     moveHead(scope: string) {
@@ -218,6 +252,7 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
       head.version += 1;
       head.dataHash = `0x${"cc".repeat(32)}`;
       blobs.add(blobKey(scope, head.version));
+      record(scope, head.version, head.dataHash);
     },
     head: (scope: string) => heads.get(scope) ?? null,
     isLive: (scope: string) => {

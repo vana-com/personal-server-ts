@@ -139,6 +139,12 @@ export type LogObjectEraser = Pick<DeleteDataPort, "deleteBlobVersions">;
  */
 export interface RetainedPieces {
   keep(scope: string, names: readonly string[]): Promise<void>;
+  /**
+   * How many piece names the record holds for `scope`: every name any pass
+   * wrote down, so a repeat pass that finds the log gone still answers for
+   * what an earlier pass left in storage.
+   */
+  count(scope: string): Promise<number>;
 }
 
 /** Rows per batch: a large body can name many pieces. */
@@ -149,8 +155,17 @@ const KEEP_BATCH = 500;
  * keyed by scope and name and survives a connection's purge: it is the
  * record of what a delete left in storage, which nothing else names.
  */
-export function retainedPiecesIn(db: Pick<SqlDriver, "batch">): RetainedPieces {
+export function retainedPiecesIn(
+  db: Pick<SqlDriver, "batch" | "query">,
+): RetainedPieces {
   return {
+    async count(scope) {
+      const [row] = await db.query<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM retained_log_pieces WHERE scope = ?",
+        [scope],
+      );
+      return Number(row?.n ?? 0);
+    },
     async keep(scope, names) {
       for (let at = 0; at < names.length; at += KEEP_BATCH)
         await db.batch(
@@ -406,7 +421,13 @@ async function eraseOne(
             detail: "log head is missing with listed segments still present",
           };
       }
-      return { kind: "erased", deleted: 0, retained: 0, unenumerated: 0 };
+      // The pieces an earlier pass left are still in storage: say so.
+      return {
+        kind: "erased",
+        deleted: 0,
+        retained: await deps.retained.count(scope),
+        unenumerated: 0,
+      };
     }
     if (opened === "unreadable")
       return { kind: "stopped", why: "head-unreadable" };
@@ -517,7 +538,12 @@ async function eraseOne(
           };
       }
     }
-    return { kind: "erased", deleted, retained: pieces.size, unenumerated };
+    return {
+      kind: "erased",
+      deleted,
+      retained: await deps.retained.count(scope),
+      unenumerated,
+    };
   } catch (error) {
     if (error instanceof Moved) return { kind: "stopped", why: "re-added" };
     return {

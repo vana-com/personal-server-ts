@@ -165,6 +165,32 @@ describe("erasing a log the real publisher wrote", () => {
     expect(order).not.toContain("v");
   });
 
+  it("reports the body pieces it left on a later pass, after the log objects are gone", async () => {
+    const { pieces, deps } = await deletedCompactedLog();
+    const bodyPieces = pieces(LOG);
+    expect(bodyPieces.length).toBeGreaterThan(0);
+
+    const first = await eraseDeletedConnectionLogs(deps(), {
+      connector: CONNECTOR,
+    });
+    expect(first.connections[0]!.outcome).toMatchObject({
+      kind: "erased",
+      retained: bodyPieces.length,
+    });
+
+    // A later pass, or one after a restart, finds the head gone. The pieces
+    // are still in storage and the record of them is still in the database.
+    const again = await eraseDeletedConnectionLogs(deps(), {
+      connector: CONNECTOR,
+    });
+    expect(again.connections[0]!.outcome).toEqual({
+      kind: "erased",
+      deleted: 0,
+      retained: bodyPieces.length,
+      unenumerated: 0,
+    });
+  });
+
   it("finishes after a storage failure part-way, with nothing remembered between the passes", async () => {
     const { w, keys, pieces, before, deps } = await deletedCompactedLog();
     let failures = 0;
@@ -514,6 +540,73 @@ describe("erasure wired into the connection delete", () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
     expect(deleted).toEqual([]);
     expect(logKeys(w, LOG).length).toBeGreaterThan(0);
+  });
+
+  describe("what the storage part of a delete says", () => {
+    /** A deleter over a settled delete, whose eraser is the real one over `erasure`. */
+    async function restarted(
+      a: Awaited<ReturnType<World["device"]>>,
+      erasure: LogErasurePorts,
+      registry = a.deps.registry,
+    ) {
+      return createConnectionDeleter(a.deps, {
+        eraseLogs: (connector, signal, gate) =>
+          eraseDeletedConnectionLogs(
+            {
+              registry,
+              blobs: a.deps.blobs,
+              keys: a.deps.keys,
+              logger: { info() {}, warn() {} },
+              retained: retainedPiecesIn(a.db),
+              ...erasure,
+            },
+            {
+              connector,
+              signal,
+              ...(gate && { skipNamespaces: gate.skipNamespaces }),
+            },
+          ),
+      });
+    }
+    const settledDelete = async () => {
+      const c = await collected({ finalized: "99" });
+      await c.a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(c.a)).toEqual([]));
+      await vi.waitFor(() => expect(erasable(c.w, LOG)).toEqual([]));
+      return c;
+    };
+
+    it("still reads blocked(body_pieces_retained) on a second sweep after the log was erased", async () => {
+      const { a, erasure } = await settledDelete();
+
+      const deleter = await restarted(a, erasure);
+      deleter.noteSettled(CONNECTOR);
+      await deleter.resumeErasures();
+
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "blocked",
+        reason: "body_pieces_retained",
+      });
+    });
+
+    it("reads storage as pending while the registry cannot list the deleted connections", async () => {
+      const { a, erasure } = await settledDelete();
+      const down = {
+        ...a.deps.registry,
+        listControlRows: async () => {
+          throw new Error("registry unavailable");
+        },
+      };
+
+      const deleter = await restarted(a, erasure, down);
+      deleter.noteSettled(CONNECTOR);
+      await deleter.resumeErasures();
+
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "pending",
+      });
+      expect(deleter.erasureOwed()).toBe(true);
+    });
   });
 
   describe("the erasure's own bookkeeping", () => {

@@ -8,6 +8,7 @@ import { LegacyWriteRefusedError } from "../../../core/src/api/legacy-write-gate
 import type {
   ConnectionDeleteStatus,
   DeleteBlockReason,
+  LegacyDeletePorts,
   LogErasurePorts,
 } from "../../../core/src/localdb/index.js";
 import { legacyScopesOfConnector } from "../../../core/src/legacy-projection/erase-connector.js";
@@ -84,6 +85,8 @@ async function collected(
     cutover?: FakeCutover;
     signer?: FakeSignerRole;
     big?: boolean;
+    /** This device's erasure ports (default: storage as the world holds it). */
+    erasure?: (w: World) => LogErasurePorts;
   } & NonNullable<Parameters<typeof legacyPortsOver>[1]> = {},
 ) {
   const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
@@ -95,7 +98,7 @@ async function collected(
   for (const scope of SCOPES) fake.seed(scope, 2);
   const legacy = await legacyPortsOver(fake, options);
   const a = await w.device("a", {
-    erasure: () => erasurePorts(w),
+    erasure: () => (options.erasure ?? erasurePorts)(w),
     legacyDelete: () => legacy.ports,
     deleteRetryMs: RETRY,
   });
@@ -302,10 +305,15 @@ describe("the legacy stage of a connection delete after the switch", () => {
       0,
     );
 
-    // The sync manager's drain finishes them; here the store is emptied.
+    // The sync manager's drain finishes them; here the store is emptied and
+    // storage takes the deletes again. An empty queue alone is not enough:
+    // the stage confirms the blobs are gone.
     await legacy.pendingBlobDeletions.remove(
       await legacy.pendingBlobDeletions.list(),
     );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect((await statusOf(a)).legacy).toEqual(PENDING);
+    fake.state.storageRateLimited = 0;
     await vi.waitFor(async () =>
       expect((await statusOf(a)).legacy).toEqual(DONE),
     );
@@ -473,5 +481,247 @@ describe("the legacy stage of a connection delete after the switch", () => {
     );
     expect((await statusOf(a)).legacy).toEqual(DONE);
     expect((await statusOf(a)).fence).toEqual(DONE);
+  });
+
+  describe("a legacy part reads done only on evidence any device can re-check", () => {
+    const bothGone = (fake: ReturnType<typeof createLegacyGatewayFake>) =>
+      SCOPES.map((scope) => fake.blobCount(scope));
+
+    it("does not read done on a device with an empty queue while the deleting device's blobs are still in storage, and finishes them itself", async () => {
+      const { w, fake, a } = await collected();
+      // Device b has the connection too, and has not seen the delete.
+      const other = await legacyPortsOver(fake);
+      const b = await w.device("b", {
+        erasure: () => erasurePorts(w),
+        legacyDelete: () => other.ports,
+        deleteRetryMs: RETRY,
+      });
+      await b.cycle();
+      // Device a tombstones every point, then storage refuses its blob deletes.
+      fake.state.storageRateLimited = 1000;
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(() =>
+        expect(SCOPES.every((s) => !fake.isLive(s))).toBe(true),
+      );
+      expect(bothGone(fake).every((n) => n > 0)).toBe(true);
+
+      // Device b adopts the delete. Its own queue is empty; the gateway shows
+      // every head deleted. That is not proof of erasure.
+      await b.cycle();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect((await statusOf(b)).legacy).toEqual(PENDING);
+      expect(bothGone(fake).every((n) => n > 0)).toBe(true);
+
+      // Storage recovers: b re-derives what is left from the gateway's history
+      // and removes it, then says done.
+      fake.state.storageRateLimited = 0;
+      await vi.waitFor(async () =>
+        expect((await statusOf(b)).legacy).toEqual(DONE),
+      );
+      expect(bothGone(fake)).toEqual(SCOPES.map(() => 0));
+    });
+
+    it("finishes the blobs after a crash between the gateway tombstone and the queue write", async () => {
+      // The queue write is lost and storage refuses the blob deletes: what is
+      // left is a deleted head, an empty queue and blobs in storage, which is
+      // also what a restart finds after a process crash at that point.
+      const { a, fake } = await collected({ queueWritesLost: 1000 });
+      fake.state.storageRateLimited = 1000;
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(() =>
+        expect(SCOPES.every((s) => !fake.isLive(s))).toBe(true),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect((await statusOf(a)).legacy).toEqual(PENDING);
+      expect(bothGone(fake).every((n) => n > 0)).toBe(true);
+
+      fake.state.storageRateLimited = 0;
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(DONE),
+      );
+      expect(bothGone(fake)).toEqual(SCOPES.map(() => 0));
+    });
+  });
+
+  describe("a deleted head whose tombstone is not final", () => {
+    it("reads pending until the registry finalizes the legacy tombstone, then done", async () => {
+      const legacyFinal = { value: false };
+      const { a, fake } = await collected({
+        // The control tombstone is final; a legacy scope's is not yet.
+        finality: (scope) =>
+          scope.startsWith("pdpp.") || legacyFinal.value
+            ? { finalized: "99", settling: false, rolledBack: null }
+            : { finalized: null, settling: true, rolledBack: null },
+      });
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(() =>
+        expect(SCOPES.every((s) => !fake.isLive(s))).toBe(true),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect((await statusOf(a)).legacy).toEqual(PENDING);
+
+      legacyFinal.value = true;
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(DONE),
+      );
+    });
+  });
+
+  describe("retries by scope and by stage, apart from what is shown", () => {
+    /** Two bound scopes: one refused for good, one that fails twice, then lands. */
+    function mixed() {
+      const scopes = ["one.s1", "two.s2"] as const;
+      const heads = new Map<string, "live" | "deleted">(
+        scopes.map((s) => [s, "live"]),
+      );
+      const tries = new Map<string, number>(scopes.map((s) => [s, 0]));
+      const blobs = new Set(["two.s2/1"]);
+      const failure = (code?: "server_revoked") => ({
+        scope: "",
+        dataPointId: null,
+        durable: false,
+        pendingBlobDeletion: false,
+        steps: {
+          gateway: {
+            status: "failed" as const,
+            error: "x",
+            ...(code && { code }),
+          },
+          storage: { status: "skipped" as const },
+          local: { status: "skipped" as const },
+        },
+      });
+      const ports: LegacyDeletePorts = {
+        scopesOf: (connector) => (connector === GH ? [...scopes] : []),
+        mode: () => "switched",
+        head: async (scope) =>
+          heads.get(scope) === "deleted"
+            ? { state: "deleted", version: "2" }
+            : {
+                state: "live",
+                fence: {
+                  expectedVersion: "1",
+                  dataHash: "0x01",
+                  metadataHash: "0x02",
+                },
+              },
+        retire: async (scope) => {
+          const n = (tries.get(scope) ?? 0) + 1;
+          tries.set(scope, n);
+          if (scope === "one.s1") return failure("server_revoked");
+          if (n <= 2) return failure();
+          heads.set(scope, "deleted");
+          return {
+            ...failure(),
+            durable: true,
+            steps: {
+              gateway: { status: "ok" as const },
+              storage: { status: "ok" as const },
+              local: { status: "ok" as const },
+            },
+          };
+        },
+        pendingBlobs: async () => 0,
+        finality: {
+          tombstoneState: async () => ({
+            finalized: "99",
+            settling: false,
+            rolledBack: null,
+          }),
+        },
+        versions: {
+          list: async (scope) => ({
+            complete: true,
+            versions:
+              heads.get(scope) === "deleted"
+                ? [
+                    {
+                      expectedVersion: "1",
+                      dataHash: "0x01",
+                      isTombstone: false,
+                    },
+                    {
+                      expectedVersion: "2",
+                      dataHash: "0x03",
+                      isTombstone: true,
+                    },
+                  ]
+                : [],
+          }),
+        },
+        objects: {
+          deleteBlobVersions: async (scope, names) => ({
+            deleted: names.filter((n) => blobs.delete(`${scope}/${n}`)),
+            missing: names.filter((n) => !n),
+            failed: [],
+          }),
+        },
+      };
+      return { ports, tries, blobs };
+    }
+
+    it("keeps retrying a pending scope beside one the gateway refused for good, and asks the refused one once", async () => {
+      const { ports, tries } = mixed();
+      const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+      const a = await w.device("a", {
+        erasure: () => erasurePorts(w),
+        legacyDelete: () => ports,
+        deleteRetryMs: RETRY,
+      });
+      await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
+        connector: GH,
+        observedAt: 1100,
+      });
+      await a.cycle();
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      // The pending scope's work continues to its end ...
+      await vi.waitFor(() =>
+        expect(tries.get("two.s2")).toBeGreaterThanOrEqual(3),
+      );
+      // ... and what is shown is the refusal, which no retry changes.
+      await vi.waitFor(async () =>
+        expect((await statusOf(a)).legacy).toEqual(blockedBy("server_revoked")),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(tries.get("one.s1")).toBe(1);
+    });
+
+    it("does not send a refused tombstone again while log erasure is still pending", async () => {
+      const unfinalized = (w: World): LogErasurePorts => ({
+        ...erasurePorts(w),
+        finality: {
+          tombstoneState: async () => ({
+            finalized: null,
+            settling: true,
+            rolledBack: null,
+          }),
+        },
+      });
+      const { a, fake } = await collected({
+        cutover: "v1",
+        erasure: unfinalized,
+      });
+
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      await vi.waitFor(async () => {
+        expect((await statusOf(a)).legacy).toEqual(
+          blockedBy("owner_stream_sync_required"),
+        );
+      });
+      const tries = gatewayDeletes(fake).length;
+      // Erasure keeps retrying (its tombstone is not final) ...
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect((await statusOf(a)).storage).toEqual(PENDING);
+      // ... and the legacy scopes are not asked again.
+      expect(gatewayDeletes(fake)).toHaveLength(tries);
+      expect(tries).toBeLessThanOrEqual(SCOPES.length);
+    });
   });
 });

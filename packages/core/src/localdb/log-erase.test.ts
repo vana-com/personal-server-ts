@@ -220,6 +220,9 @@ function world() {
         if (keepFails) throw new Error("database is locked");
         kept.push({ scope, names: [...names], callsBefore: calls.length });
       },
+      count: async (scope) =>
+        new Set(kept.filter((k) => k.scope === scope).flatMap((k) => k.names))
+          .size,
     },
     objects: {
       deleteBlobVersions: async (scope, names) => {
@@ -616,7 +619,8 @@ describe("eraseDeletedConnectionLogs", () => {
       expect(again.connections[0]!.outcome).toEqual({
         kind: "erased",
         deleted: 0,
-        retained: 0,
+        // The pieces the first pass left are still in storage.
+        retained: 4,
         unenumerated: 0,
       });
       expect(w.calls).toEqual([]);

@@ -128,7 +128,21 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   fenced to the head the stage read.
 - The tombstone leaves through the seal's `remove`. A gateway refusal that a
   retry cannot change (`owner_stream_sync_required`, `server_revoked`,
-  `server_unregistered`) ends the stage as `blocked`, with no retry loop.
+  `server_unregistered`) shows that scope as `blocked`, is asked once, and
+  never holds back a scope that is only waiting: retry is decided per scope,
+  and per stage (legacy, storage), apart from what is shown.
+- A legacy scope is `done` only on evidence any device can re-check, never on
+  this device's queue being empty. With the head deleted and the tombstone
+  final, the stage reads the scope's gateway history (the version inventory,
+  which keeps every slot after a tombstone) and confirms each slot with
+  storage's idempotent delete: deleted or missing. A crash between the
+  tombstone and the queue write, or another device's unfinished drain, leaves
+  work that the next device to look re-derives this way. A restart confirms
+  again; that costs delete requests, not state.
+- Storage reads `body_pieces_retained` on every pass that follows the first,
+  from the persisted record of pieces left (`retained_log_pieces`). That record
+  is per device: a device that did not run the erasure cannot learn the names
+  from storage, because the segments that named them are gone.
 - `deleter.deleteStatus(connector)` answers `{ fence, legacy, storage }`, each
   `done`, `pending` or `blocked(reason)` (`localdb/delete-status.ts`). The owner
   connector routes carry it as `deleteStatus` (202 body and `GET`). An app says

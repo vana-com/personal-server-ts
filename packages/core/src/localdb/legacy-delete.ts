@@ -17,6 +17,20 @@
 // admitted after the switch; the seal's `commit` stays closed to every legacy
 // write that adds data. Blob deletes ride the pending-blob-deletion store.
 //
+// WHEN A SCOPE IS DONE
+//
+// A scope is `done` only on evidence that survives a crash and that any device
+// of the account can re-check: a deleted head at the gateway, a finalized
+// tombstone, and every slot of the scope's gateway history answered "deleted"
+// or "missing" by storage's own idempotent delete. This device's queue being
+// empty is not evidence: another device may hold the work, or a crash may have
+// come between the tombstone and the queue write. So a device that finds a
+// deleted head with nothing queued re-derives the work from the gateway's
+// kept history (`GET /v1/data/:id/versions` lists every registered slot after
+// a tombstone) and confirms each slot against storage. The only memory is
+// in-process progress, so a rate-limited pass resumes where it stopped; a
+// restart confirms again, and that costs nothing but delete requests.
+//
 // Why a connection added again cannot lose data to this stage: a legacy scope
 // accepts no write after the switch (the seal refuses it on the device, the
 // gateway's cutover policy refuses it everywhere), so a new connection's data
@@ -34,6 +48,7 @@ import {
 import { keccakOf, type StreamCryptoPort } from "../stream-sync/crypto-port.js";
 import type { LegacyWriteVerdict } from "../api/legacy-write-gate.js";
 import type { DeleteScopeResult } from "../sync/workers/delete.js";
+import type { LogObjectEraser, LogVersionLister } from "./log-erase.js";
 import type {
   DataPointFeedPort,
   PendingBlobDeletionStore,
@@ -46,6 +61,7 @@ import {
   LEGACY_REFUSALS,
   PART_DONE,
   PART_PENDING,
+  type DeleteBlockReason,
   type DeletePart,
   type LegacyRefusal,
 } from "./delete-status.js";
@@ -54,7 +70,11 @@ import type { LocalSyncDeps } from "./deps.js";
 /** A legacy scope's gateway head, as the stage needs it. */
 export type LegacyHead =
   | { readonly state: "absent" }
-  | { readonly state: "deleted" }
+  | {
+      readonly state: "deleted";
+      /** The tombstone's registry version: it bounds every slot with a blob. */
+      readonly version: string;
+    }
   | { readonly state: "live"; readonly fence: TombstoneFence };
 
 /** What the stage needs from the host: the legacy side of this device. */
@@ -66,9 +86,25 @@ export interface LegacyDeletePorts {
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;
   /** The durable scope delete, fenced to `fence`: tombstone, blobs, local erase. */
   retire(scope: string, fence: TombstoneFence): Promise<DeleteScopeResult>;
-  /** Blob deletions of `scope` still queued behind its tombstone. */
+  /** Blob deletions of `scope` still queued on this device behind its tombstone. */
   pendingBlobs(scope: string): Promise<number>;
   finality: Pick<TombstoneFinalityPort, "tombstoneState">;
+  /** The gateway's kept history of a scope, which outlives its tombstone. */
+  versions: LogVersionLister;
+  /** Storage's idempotent per-object delete: "missing" is a confirmed absence. */
+  objects: LogObjectEraser;
+}
+
+/**
+ * What a pass keeps between passes of one device. Nothing here is evidence of
+ * a finished delete (a restart starts empty): it only spares the gateway and
+ * storage requests a pass already made.
+ */
+export interface LegacyMemory {
+  /** Scopes whose tombstone the gateway refused for good, or this device cannot send. */
+  readonly refused: Map<string, DeleteBlockReason>;
+  /** Slots storage answered for, by `<scope>@<tombstone version>`. */
+  readonly erased: Map<string, Set<string>>;
 }
 
 /** What one pass learned about a connector's legacy copy. */
@@ -76,9 +112,21 @@ export interface LegacyOutcome {
   readonly part: DeletePart;
   /** The control tombstone failed to settle: the connection is live again. */
   readonly rolledBack: boolean;
-  /** A later pass can make progress. */
+  /**
+   * A later pass can make progress on some scope. Decided per scope, apart
+   * from `part`: a refused scope shows `blocked` and asks for no retry, and it
+   * does not hide a scope that is only waiting.
+   */
   readonly pending: boolean;
 }
+
+/** One scope: what to show, and whether a later pass can change it. */
+interface ScopeOutcome {
+  readonly part: DeletePart;
+  readonly retry: boolean;
+}
+const settled = (part: DeletePart): ScopeOutcome => ({ part, retry: false });
+const waiting: ScopeOutcome = { part: PART_PENDING, retry: true };
 
 const worst = (a: DeletePart, b: DeletePart): DeletePart => {
   const rank = (p: DeletePart) =>
@@ -101,7 +149,8 @@ export function legacyHeadFrom(
       ...(signal && { signal }),
     });
     if (record === null) return { state: "absent" };
-    if (record.deletedAt !== null) return { state: "deleted" };
+    if (record.deletedAt !== null)
+      return { state: "deleted", version: record.expectedVersion };
     return {
       state: "live",
       fence: {
@@ -148,6 +197,8 @@ export interface LegacyStageDeps {
   readonly keys: Pick<LocalSyncDeps["keys"], "namespaceHmac">;
   readonly streamCrypto?: StreamCryptoPort;
   readonly logger: Pick<LocalSyncDeps["logger"], "warn" | "info">;
+  /** In-process memory of this device's earlier passes (see `LegacyMemory`). */
+  readonly memory?: LegacyMemory;
 }
 
 /**
@@ -191,11 +242,14 @@ export async function retireLegacyOf(
       return { part: PART_DONE, rolledBack: false, pending: false };
 
     let part: DeletePart = PART_DONE;
+    let retry = false;
     for (const scope of scopes) {
       signal?.throwIfAborted();
-      part = worst(part, await retireScope(deps, ports, scope, signal));
+      const outcome = await retireScope(deps, ports, scope, signal);
+      part = worst(part, outcome.part);
+      retry ||= outcome.retry;
     }
-    return { part, rolledBack: false, pending: part.state === "pending" };
+    return { part, rolledBack: false, pending: retry };
   } catch (error) {
     if (signal?.aborted) return pending();
     deps.logger.warn(
@@ -253,27 +307,89 @@ async function retireScope(
   ports: LegacyDeletePorts,
   scope: string,
   signal?: AbortSignal,
-): Promise<DeletePart> {
-  const head = await ports.head(scope, signal);
-  if (head.state !== "live")
-    // The gateway lists the point as deleted (or never had it): what is left
-    // is blobs a finished tombstone queued.
-    return (await ports.pendingBlobs(scope)) > 0 ? PART_PENDING : PART_DONE;
-  const result = await ports.retire(scope, head.fence);
-  const { gateway } = result.steps;
-  if (gateway.status === "failed")
-    return isRefusal(gateway.code)
-      ? blocked(gateway.code)
-      : // A head that moved (fenced), the gateway down or a version conflict:
-        // the next pass reads the head again.
-        PART_PENDING;
-  // No server key, or an enclave: this device cannot delete at the gateway.
-  if (gateway.status === "skipped" && gateway.reason === "sync-disabled")
-    return blocked("needs_another_device");
-  if (result.pendingBlobDeletion || (await ports.pendingBlobs(scope)) > 0)
-    return PART_PENDING;
-  // The tombstone landed and its blobs are gone: it must read as deleted now.
-  return (await ports.head(scope, signal)).state === "live"
-    ? PART_PENDING
-    : PART_DONE;
+): Promise<ScopeOutcome> {
+  const refused = deps.memory?.refused.get(scope);
+  if (refused) return settled(blocked(refused));
+  let head = await ports.head(scope, signal);
+  if (head.state === "live") {
+    const result = await ports.retire(scope, head.fence);
+    const { gateway } = result.steps;
+    if (gateway.status === "failed") {
+      if (!isRefusal(gateway.code)) return waiting;
+      // The gateway's answer will not change: ask once, show it, and do not
+      // let it hold back a scope that is only waiting.
+      deps.memory?.refused.set(scope, gateway.code);
+      return settled(blocked(gateway.code));
+    }
+    // No server key, or an enclave: this device cannot delete at the gateway.
+    if (gateway.status === "skipped" && gateway.reason === "sync-disabled") {
+      deps.memory?.refused.set(scope, "needs_another_device");
+      return settled(blocked("needs_another_device"));
+    }
+    head = await ports.head(scope, signal);
+  }
+  // Never registered, or an account that has nothing here to retire.
+  if (head.state === "absent") return settled(PART_DONE);
+  // A head that moved, or a tombstone the registry has not kept: read again.
+  if (head.state === "live") return waiting;
+  // Work this device queued is still being drained by its sync manager.
+  if ((await ports.pendingBlobs(scope)) > 0) return waiting;
+  return confirmErased(deps, ports, scope, head.version, signal);
+}
+
+/** The legacy delete's batch: vana-storage rate-limits DELETE per owner. */
+const SWEEP_BATCH = 15;
+
+/**
+ * Whether the blobs of a deleted legacy scope are gone, decided from the
+ * gateway's history and storage's own answers, never from this device's queue.
+ * Any device can run it, in any state: storage deletes are idempotent, so
+ * repeating them is safe and an absent object (404) is the confirmation.
+ */
+async function confirmErased(
+  deps: LegacyStageDeps,
+  ports: LegacyDeletePorts,
+  scope: string,
+  tombstone: string,
+  signal?: AbortSignal,
+): Promise<ScopeOutcome> {
+  const version = BigInt(tombstone);
+  // Blobs are freed only by a final tombstone: a failed one rolls the head
+  // back to live data whose blobs must still be there.
+  const finality = await ports.finality.tombstoneState(scope, tombstone);
+  if (
+    finality.rolledBack !== null ||
+    finality.finalized === null ||
+    BigInt(finality.finalized) < version
+  )
+    return waiting;
+  const history = await ports.versions.list(scope, signal && { signal });
+  // A history read that is incomplete, or older than the head it must explain,
+  // can miss a slot with a blob.
+  if (
+    history.complete !== true ||
+    !history.versions.some(
+      (row) => row.isTombstone && BigInt(row.expectedVersion) === version,
+    )
+  )
+    return waiting;
+  const key = `${scope}@${tombstone}`;
+  const answered = deps.memory?.erased.get(key) ?? new Set<string>();
+  deps.memory?.erased.set(key, answered);
+  const slots = history.versions
+    .filter((row) => !row.isTombstone && BigInt(row.expectedVersion) <= version)
+    .map((row) => row.expectedVersion)
+    .filter((slot) => !answered.has(slot));
+  for (let at = 0; at < slots.length; at += SWEEP_BATCH) {
+    signal?.throwIfAborted();
+    const batch = slots.slice(at, at + SWEEP_BATCH);
+    const outcome = await ports.objects
+      .deleteBlobVersions(scope, batch)
+      .catch(() => null);
+    if (outcome === null || outcome.failed.length > 0) return waiting;
+    const acknowledged = new Set([...outcome.deleted, ...outcome.missing]);
+    for (const slot of acknowledged) answered.add(slot);
+    if (batch.some((slot) => !acknowledged.has(slot))) return waiting;
+  }
+  return settled(PART_DONE);
 }

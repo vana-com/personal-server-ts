@@ -672,6 +672,8 @@ export async function createPsLiteSyncManager(
               syncManager.deleteScope(scope, undefined, { fence: { head } }),
             pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
             finality: tombstoneFinality,
+            versions: logErasurePorts.versions,
+            objects: deleteData,
           }),
         });
       }

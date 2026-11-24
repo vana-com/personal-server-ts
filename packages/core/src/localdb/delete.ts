@@ -29,6 +29,7 @@ import {
   PART_DONE,
   PART_PENDING,
   type ConnectionDeleteStatus,
+  type DeleteBlockReason,
   type DeletePart,
 } from "./delete-status.js";
 import { retireLegacyOf, type LegacyDeletePorts } from "./legacy-delete.js";
@@ -50,7 +51,9 @@ export {
  */
 function storagePartOf(report: ErasureReport): DeletePart {
   if (report.unavailable) return blocked("needs_another_device");
-  let part: DeletePart = PART_DONE;
+  // A scan that could not list the deleted connections (`pending` with no
+  // connection to show for it) has judged nothing: it is not "all erased".
+  let part: DeletePart = report.pending ? PART_PENDING : PART_DONE;
   for (const { outcome } of report.connections) {
     const next: DeletePart =
       outcome.kind === "pending"
@@ -71,6 +74,13 @@ function storagePartOf(report: ErasureReport): DeletePart {
 }
 const rankOf = (p: DeletePart) =>
   p.state === "blocked" ? 2 : p.state === "pending" ? 1 : 0;
+/** The stages of an erasure pass. */
+interface Owed {
+  readonly legacy: boolean;
+  readonly storage: boolean;
+}
+const BOTH: Owed = { legacy: true, storage: true };
+const NONE: Owed = { legacy: false, storage: false };
 const isRolledBack = (o: ErasureReport["connections"][number]["outcome"]) =>
   o.kind === "stopped" && o.why === "rolled-back";
 
@@ -263,8 +273,23 @@ export function createConnectionDeleter(
   const requests = new Set<Promise<ConnectionDeleteRequest>>();
   /** Erasures running, by connector: one at a time per connector. */
   const erasures = new Map<string, Promise<void>>();
-  /** Connectors whose erasure ended `pending`, until a later pass finishes it. */
-  const erasing = new Set<string>();
+  /**
+   * Connectors whose erasure is owed, with the stages a later pass must run:
+   * fresh news (a delete settled) owes both, an unfinished pass owes only the
+   * stage that can still make progress. What a part shows is a separate fact
+   * (`judged`): a stage that ended `blocked` is not owed again.
+   */
+  const erasing = new Map<string, Owed>();
+  const owe = (connector: string, which: Owed = BOTH) => {
+    const held = erasing.get(connector);
+    erasing.set(connector, {
+      legacy: which.legacy || !!held?.legacy,
+      storage: which.storage || !!held?.storage,
+    });
+  };
+  /** What the legacy stage keeps between this device's passes (`LegacyMemory`). */
+  const refusals = new Map<string, Map<string, DeleteBlockReason>>();
+  const erasedSlots = new Map<string, Set<string>>();
   /** The start sweep (deletes settled before this process) is still owed. */
   const owesErasure = options.eraseLogs !== undefined || !!options.legacy;
   let sweepOwed = owesErasure;
@@ -698,21 +723,24 @@ export function createConnectionDeleter(
    * caller has consumed the connector's queue entry: what is queued after
    * that is news from while the pass runs, and this does not touch it.
    */
-  async function eraseSettled(connector: string): Promise<boolean> {
+  async function eraseSettled(connector: string, owed: Owed): Promise<Owed> {
     try {
-      if (stop.signal.aborted) return false;
+      if (stop.signal.aborted) return NONE;
       const skipNamespaces = await unsettledNamespaces(connector);
-      if (skipNamespaces === null) return false;
+      if (skipNamespaces === null) return NONE;
       // The legacy copy first: it needs no log port, so a device that cannot
-      // erase storage still retires it.
-      let unfinished = false;
-      const legacy = options.legacy?.();
-      if (options.legacy) {
+      // erase storage still retires it. A stage that is not owed keeps what
+      // its last pass judged and sends nothing.
+      let left: Owed = NONE;
+      if (options.legacy && owed.legacy) {
+        const legacy = options.legacy();
         if (!legacy) {
           judge(connector, { legacy: blocked("needs_another_device") });
         } else {
+          let refused = refusals.get(connector);
+          if (!refused) refusals.set(connector, (refused = new Map()));
           const outcome = await retireLegacyOf(
-            deps,
+            { ...deps, memory: { refused, erased: erasedSlots } },
             legacy,
             connector,
             stop.signal,
@@ -721,17 +749,17 @@ export function createConnectionDeleter(
             legacy: outcome.part,
             ...(outcome.rolledBack && { rolledBack: true as const }),
           });
-          unfinished = outcome.pending;
+          left = { ...left, legacy: outcome.pending };
         }
       }
-      if (!options.eraseLogs) return unfinished;
+      if (!options.eraseLogs || !owed.storage) return left;
       const report = await options.eraseLogs(connector, stop.signal, {
         skipNamespaces,
       });
       judge(connector, { storage: storagePartOf(report) });
       if (report.connections.some((c) => isRolledBack(c.outcome)))
         judge(connector, { rolledBack: true });
-      return report.pending || unfinished;
+      return { ...left, storage: report.pending };
     } catch (error) {
       // The eraser reports a failure as pending; this is its own bug or a
       // database that went away. Try again later, never fail the delete.
@@ -742,7 +770,7 @@ export function createConnectionDeleter(
         },
         "stream sync: connection log erasure failed",
       );
-      return true;
+      return owed;
     }
   }
   function judge(
@@ -766,16 +794,17 @@ export function createConnectionDeleter(
     if (!owesErasure) return Promise.resolve();
     const held = erasures.get(connector);
     if (held) {
-      erasing.add(connector);
+      owe(connector);
       return held;
     }
     const run = (async () => {
       let again: boolean;
       do {
+        const owed = erasing.get(connector) ?? BOTH;
         erasing.delete(connector);
-        const unfinished = await eraseSettled(connector);
+        const unfinished = await eraseSettled(connector, owed);
         again = erasing.has(connector) && !stop.signal.aborted;
-        if (unfinished) erasing.add(connector);
+        if (unfinished.legacy || unfinished.storage) owe(connector, unfinished);
       } while (again);
     })().finally(() => {
       if (erasures.get(connector) === run) erasures.delete(connector);
@@ -833,7 +862,7 @@ export function createConnectionDeleter(
     flights.set(connector, landing);
     // Owed from the start, so a status read between the landing's end and
     // the erasure's start does not call the connector settled.
-    if (owesErasure) erasing.add(connector);
+    if (owesErasure) owe(connector);
     // A delete that settled is erased from storage, outside its own queue.
     void done.then(
       () => eraseLogsOf(connector),
@@ -870,6 +899,7 @@ export function createConnectionDeleter(
       async () => {
         // A new delete: what an earlier pass judged says nothing of it.
         judged.delete(connector);
+        refusals.delete(connector);
         const decide = async (
           planned: Awaited<ReturnType<typeof plan>>,
           held: ReadonlySet<string>,
@@ -984,7 +1014,9 @@ export function createConnectionDeleter(
     deleteStatus,
     /** A connection of the connector was purged here: its erasure may be owed. */
     noteSettled(connector: string) {
-      if (owesErasure) erasing.add(connector);
+      if (owesErasure) owe(connector);
+      // News of this connector: a gateway answer given earlier may differ now.
+      refusals.delete(connector);
     },
     /**
      * A connection was purged and its connector is unknown: the sweep of
@@ -1007,7 +1039,7 @@ export function createConnectionDeleter(
         const rows = await deps.db.query<{ connector: string }>(
           "SELECT DISTINCT connector FROM connections WHERE control_state='deleted' ORDER BY connector",
         );
-        for (const { connector } of rows) erasing.add(connector);
+        for (const { connector } of rows) owe(connector);
         // Only once the rows are queued: a query that failed leaves it owed.
         sweepOwed = false;
       }
@@ -1016,7 +1048,7 @@ export function createConnectionDeleter(
       // while it ran. Without this wait the loop would find the queue empty
       // (a running pass has taken its entry) and stop with that work owed.
       await Promise.all(
-        [...new Set([...erasing, ...erasures.keys()])].map(
+        [...new Set([...erasing.keys(), ...erasures.keys()])].map(
           (connector) => erasures.get(connector) ?? eraseLogsOf(connector),
         ),
       );

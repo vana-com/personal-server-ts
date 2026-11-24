@@ -1399,7 +1399,7 @@ async function bootstrapServer(
         }
       },
     });
-    if (deleteData && tombstoneFinality) {
+    if (deleteData && tombstoneFinality && logErasurePorts) {
       const manager = syncManager;
       legacyDeletePorts = {
         scopesOf: legacyScopesOfConnector,
@@ -1409,6 +1409,10 @@ async function bootstrapServer(
           manager.deleteScope(scope, undefined, { fence: { head } }),
         pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
         finality: tombstoneFinality,
+        // Done is re-derived from the gateway's history and storage's own
+        // answers, never from this device's queue.
+        versions: logErasurePorts.versions,
+        objects: deleteData,
       };
     }
     syncManager.start();
