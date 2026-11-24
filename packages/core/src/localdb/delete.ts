@@ -259,9 +259,10 @@ export function createConnectionDeleter(
      */
     readonly fenceWaitMs?: number;
     /**
-     * A pass left a connector's erasure unfinished: it is queued again for the
-     * retry loop. Called when that pass ends, not when every connector's pass
-     * has, so a connector waiting on storage never holds back another's retry.
+     * A connector's erasure ended with work still owed: it is queued again for
+     * the retry loop. Called when that connector's run is over (its verdict
+     * read, and no longer in flight), not when every connector's has, so a
+     * connector waiting on storage never holds back another's retry.
      */
     readonly onUnfinished?: () => void;
   } = {},
@@ -1171,10 +1172,7 @@ export function createConnectionDeleter(
         erasing.delete(connector);
         const unfinished = await eraseSettled(connector, owed);
         again = erasing.has(connector) && !stop.signal.aborted;
-        if (unfinished.legacy || unfinished.storage) {
-          owe(connector, unfinished);
-          options.onUnfinished?.();
-        }
+        if (unfinished.legacy || unfinished.storage) owe(connector, unfinished);
       } while (again);
       // Settled for good: the delete's tombstones are not needed any more.
       try {
@@ -1190,6 +1188,11 @@ export function createConnectionDeleter(
       }
     })().finally(() => {
       if (erasures.get(connector) === run) erasures.delete(connector);
+      // Work left owed is for the retry loop, which may look at once: arm it
+      // only now that the verdict is read and the connector is no longer in
+      // flight, so the tick finds it queued instead of joining this pass.
+      if (erasing.has(connector) && !stop.signal.aborted)
+        options.onUnfinished?.();
     });
     erasures.set(connector, run);
     return run;
@@ -1465,16 +1468,16 @@ export function createConnectionDeleter(
         // Only once the rows are queued: a query that failed leaves it owed.
         sweepOwed = false;
       }
-      // A run in progress is waited for, not queued again: what it leaves
-      // unfinished is in `erasing` when it ends, and so is what arrived
-      // while it ran. Without this wait the loop would find the queue empty
-      // (a running pass has taken its entry) and stop with that work owed.
-      await Promise.all(
-        [...new Set([...erasing.keys(), ...erasures.keys()])].map(
-          (connector) => erasures.get(connector) ?? eraseLogsOf(connector),
-        ),
-      );
-      return erasing.size > 0;
+      // Only the connectors queued and not in flight run here, and only they
+      // are waited for. A pass in flight is never joined: a tick that joined
+      // it would stay pending as long as that connector's storage does, one
+      // more with each tick, and would hold back what is queued behind it.
+      // That pass takes what arrives while it runs (`again`) and arms the
+      // retry itself if it ends owing work (`onUnfinished`).
+      const queued = () =>
+        [...erasing.keys()].filter((connector) => !erasures.has(connector));
+      await Promise.all(queued().map((connector) => eraseLogsOf(connector)));
+      return queued().length > 0;
     },
     async close() {
       stop.abort(new Error("sync closed"));

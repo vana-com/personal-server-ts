@@ -1274,6 +1274,94 @@ describe("erasure wired into the connection delete", () => {
       expect(deleter.erasureOwed()).toBe(false);
     });
 
+    /** A pass that ends with the erasure unfinished: a later one still owes it. */
+    const unfinished = { ...none, pending: true } as const;
+
+    it("a retry tick runs the connectors that are queued and never waits for one still in flight", async () => {
+      const a = await settled();
+      const OTHER_CONNECTOR = "other-source";
+      let held = 0;
+      const eraseLogs = vi.fn(async (connector: string) => {
+        if (connector === OTHER_CONNECTOR) {
+          held += 1;
+          return new Promise<never>(() => {}); // storage never answers
+        }
+        return unfinished;
+      });
+      const deleter = createConnectionDeleter(a.deps, { eraseLogs });
+      deleter.noteSettled(OTHER_CONNECTOR, TOMBSTONE);
+      const stuck = deleter.resumeErasures();
+      void stuck;
+      await vi.waitFor(() => expect(held).toBe(1));
+
+      // The retry loop ticks again and again; this connector is unfinished
+      // each time. Every tick must end by itself while the other still waits:
+      // a tick that joined it would stay pending, one more each time.
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
+      let ended = 0;
+      for (let tick = 0; tick < 4; tick += 1)
+        void deleter.resumeErasures().then(() => (ended += 1));
+      await vi.waitFor(() => expect(ended).toBe(4));
+
+      // The queued connector ran; the one in flight was not asked again.
+      expect(
+        eraseLogs.mock.calls.filter(([c]) => c === CONNECTOR).length,
+      ).toBeGreaterThan(0);
+      expect(held).toBe(1);
+    });
+
+    it("arms the retry only once the connector's pass is over: its verdict read done and its place in flight given up", async () => {
+      const a = await settled();
+      const eraseLogs = vi
+        .fn()
+        .mockResolvedValueOnce(unfinished)
+        .mockResolvedValue(erased);
+      // The verdict read at the end of a pass is the first registry read after
+      // the pass's own work; hold it.
+      let hold = false;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const registry = {
+        ...a.deps.registry,
+        listControlRows: async () => {
+          if (hold) await gate;
+          return a.deps.registry.listControlRows();
+        },
+      };
+      let armed = 0;
+      let tick: Promise<boolean> | undefined;
+      const deleter: ReturnType<typeof createConnectionDeleter> =
+        createConnectionDeleter(
+          { ...a.deps, registry },
+          {
+            eraseLogs: async (...args) => {
+              const report = await eraseLogs(...args);
+              hold = true;
+              return report;
+            },
+            onUnfinished: () => {
+              armed += 1;
+              hold = false;
+              // The retry timer firing at once.
+              tick = deleter.resumeErasures();
+            },
+          },
+        );
+      deleter.noteSettled(CONNECTOR, TOMBSTONE);
+      const run = deleter.resumeErasures();
+      await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(1));
+      // The pass is over and its verdict read waits: not armed yet.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(armed).toBe(0);
+
+      release();
+      await run;
+      expect(armed).toBe(1);
+      // The tick found the connector queued, not in flight, and ran it.
+      expect(await tick).toBe(false);
+      expect(eraseLogs).toHaveBeenCalledTimes(2);
+    });
+
     it("reads a newer delete of the connector as pending until its own pass has judged it, not done on the older delete's verdict", async () => {
       const a = await settled();
       let release: () => void = () => {};
@@ -1362,7 +1450,7 @@ describe("erasure wired into the connection delete", () => {
       expect(await a.sync.deleter.deleteStatus(CONNECTOR)).toEqual(before);
     });
 
-    it("a retry that finds a pass running waits for it and reports what it leaves unfinished", async () => {
+    it("a retry that finds a pass running does not wait for it: the pass arms the retry itself when it ends unfinished", async () => {
       const a = await settled();
       let release: () => void = () => {};
       const eraseLogs = vi.fn().mockImplementationOnce(
@@ -1372,15 +1460,23 @@ describe("erasure wired into the connection delete", () => {
               resolve({ connections: [], pending: true, skipped: [] });
           }),
       );
-      const deleter = createConnectionDeleter(a.deps, { eraseLogs });
+      const onUnfinished = vi.fn();
+      const deleter = createConnectionDeleter(a.deps, {
+        eraseLogs,
+        onUnfinished,
+      });
       deleter.noteSettled(CONNECTOR, TOMBSTONE);
       const first = deleter.resumeErasures();
       await vi.waitFor(() => expect(eraseLogs).toHaveBeenCalledTimes(1));
-      // The running pass has taken the queue entry: the retry loop sees none.
-      const second = deleter.resumeErasures();
+      // The running pass has taken the queue entry: the retry loop sees none,
+      // answers at once, and asks for nothing more.
+      expect(await deleter.resumeErasures()).toBe(false);
+      expect(onUnfinished).not.toHaveBeenCalled();
+
       release();
-      // Both answer true: the pass ended pending, and the loop must run again.
-      expect(await Promise.all([first, second])).toEqual([true, true]);
+      // The pass ended pending: its caller is told, and the loop is armed.
+      expect(await first).toBe(true);
+      expect(onUnfinished).toHaveBeenCalledTimes(1);
       expect(eraseLogs).toHaveBeenCalledTimes(1);
     });
 
