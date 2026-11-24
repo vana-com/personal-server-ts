@@ -59,7 +59,9 @@ export function isGrantSalt(value: unknown): value is string {
 
 /**
  * `scopes` sorted and without duplicates, or null when it is empty or holds a
- * name that is not 1 to 128 printable ASCII characters without spaces.
+ * name that is not 1 to 128 printable ASCII characters without spaces. The
+ * sort is by character code (ordinal), never by locale; for printable ASCII
+ * that is also byte order, so other languages get the same list.
  */
 export function canonicalDataScopes(scopes: unknown): string[] | null {
   if (!Array.isArray(scopes) || scopes.length === 0) return null;
