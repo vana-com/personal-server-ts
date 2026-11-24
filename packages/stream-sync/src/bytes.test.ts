@@ -38,6 +38,23 @@ describe("canonicalBytes32", () => {
   });
 });
 
+
+describe("utf8", () => {
+  it("preserves byte-order mark, combining form and an embedded NUL", () => {
+    expect(Array.from(utf8("\uFEFFe\u0301\u0000"))).toEqual([
+      0xef, 0xbb, 0xbf, 0x65, 0xcc, 0x81, 0,
+    ]);
+  });
+
+  it("replaces unpaired UTF-16 units without losing the adjacent pair or text", () => {
+    const sample = "\uD800\uD83D\uDC1F\uDC00X";
+    expect(Array.from(utf8(sample))).toEqual([
+      0xef, 0xbf, 0xbd, 0xf0, 0x9f, 0x90, 0x9f, 0xef, 0xbf, 0xbd, 0x58,
+    ]);
+    expect(utf8Length(sample)).toBe(11);
+  });
+});
+
 describe("utf8Length", () => {
   it("counts the bytes the encoder would write", () => {
     const samples = [
