@@ -446,3 +446,91 @@ it("fold-a-repeat-of-a-record-key-in-another-type-is-a-duplicate-and-a-typed-del
   });
   expect(await bodies(a)).toEqual({ "5": '{"id":5,"v":"first"}' });
 });
+
+it("fold-a-typed-delete-keeps-hiding-the-record-key-from-a-later-separate-seed", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  // The newer layer deletes `"6"` (string); the older layer holds `6` (number).
+  // They are one record key, so the fold hides the row and tombstones the key.
+  await a.importSource("files", (base) =>
+    foldLayers(base, [
+      layer([{ id: "5", v: "five" }], [{ id: "6" }]),
+      layer([{ id: 6, v: "old-six" }]),
+    ]),
+  );
+  // Another install's upload holds the key in the other type. The tombstone
+  // covers the record key, not one typed hash of it.
+  const later = await a.importSource("other", (base) => ({
+    ...base,
+    async *records() {
+      yield { id: 6, v: "again" };
+      yield { id: 7, v: "seven" };
+    },
+  }));
+  expect(later).toMatchObject({ kind: "imported" });
+  expect(await bodies(a)).toEqual({
+    "5": '{"id":"5","v":"five"}',
+    "7": '{"id":7,"v":"seven"}',
+  });
+  const reverse = await a.importSource("third", (base) => ({
+    ...base,
+    async *records() {
+      yield { id: "6", v: "string" };
+    },
+  }));
+  expect(reverse).toMatchObject({ kind: "imported" });
+  expect(Object.keys(await bodies(a))).toEqual(["5", "7"]);
+});
+
+it("fold-a-live-row-in-another-type-fills-nothing-and-is-not-a-conflict", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("live", ["7"]);
+  // The seed holds the same record key as a number. Live wins: the row is
+  // left out, not refused as a key-type conflict, and a seed deletion of it
+  // tombstones nothing.
+  const result = await a.importSource("files", (base) => ({
+    ...base,
+    async *records() {
+      yield { id: 7, v: "old" };
+      yield { id: 8, v: "eight" };
+    },
+    async *deletions() {
+      yield { id: 7 };
+    },
+  }));
+  expect(result).toMatchObject({ kind: "imported", tombstoned: 0 });
+  expect(Object.keys(await bodies(a))).toEqual(["7", "8"]);
+  expect(await a.db.query("SELECT 1 FROM log_tombstones")).toEqual([]);
+});
+
+it("fold-every-stored-record-is-imported-or-counted-once: legacy = imported + counted", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  const newest = [
+    tagged("a", "live"), // imported
+    deleteEnvelope("a"), // a delete a live row of its own layer shadows
+    deleteEnvelope("b"), // a delete the older layer's row is hidden by
+    deleteEnvelope("b"), // a repeat of that delete
+    deleteEnvelope("d", { claim: { id: "not-d" } }), // a wrong key claim
+    deleteEnvelope("e", { op: "patch" }), // an unknown op
+    { v: "no key", $pdpp: { sourceId: SOURCE } }, // no identity
+    { id: "x", v: "untagged" }, // no source
+    tagged("f", "first"),
+    tagged("f", "repeat"), // a repeat key in one layer
+  ];
+  const older = [
+    tagged("a", "old"), // superseded
+    tagged("b", "old-b"), // hidden by the delete above
+    tagged("c", "old-c"), // imported
+  ];
+  const stored = newest.length + older.length;
+  const result = await a.importSource("files", (base) =>
+    foldLayers(base, [layer(newest), layer(older)], { sourceId: SOURCE }),
+  );
+  if (result.kind !== "imported") throw new Error(result.kind);
+  const counted = Object.values(result.quarantine).reduce((n, v) => n + v, 0);
+  expect(result.quarantine).toMatchObject({ delete_envelope: 3 });
+  expect(stored).toBe(result.receipt.rows + counted);
+  expect(await a.keys()).toEqual(["a", "c", "f"]);
+});

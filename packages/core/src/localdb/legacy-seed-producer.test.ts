@@ -204,3 +204,48 @@ describe("seedLegacyStore counts", () => {
     expect(report.quarantine).toEqual({});
   });
 });
+
+describe("seedLegacyStore deletes", () => {
+  const tag = { sourceId: "urn:fixture" };
+  const del = (id: string) => ({
+    id,
+    $pdpp: { ...tag, record: { key: { id }, op: "delete" } },
+  });
+  const row = (id: string) => ({ id, $pdpp: tag });
+  const layer = (...records: unknown[]): FoldLayer => ({
+    async *records() {
+      yield* records;
+    },
+  });
+
+  it("counts a layer of valid delete envelopes, and one a live row shadows", async () => {
+    const { port, puts } = intake();
+    const report = await seedLegacyStore(port, {
+      async *streams() {
+        yield {
+          ...stream([layer(del("a"), del("b"))]),
+          sourceId: tag.sourceId,
+        };
+        yield {
+          ...stream([layer(row("k"), del("k"))]),
+          stream: "shadowed",
+          sourceId: tag.sourceId,
+        };
+      },
+    });
+    // The delete-only stream imports nothing, and says what its records were.
+    expect(report.streams[0]).toMatchObject({
+      outcome: "empty",
+      rows: 0,
+      quarantine: { delete_envelope: 2 },
+    });
+    // A live row of the same layer outranks its delete; the delete still counts.
+    expect(report.streams[1]).toMatchObject({
+      outcome: "staged",
+      rows: 1,
+      quarantine: { delete_envelope: 1 },
+    });
+    expect(report.quarantine).toEqual({ delete_envelope: 3 });
+    expect(puts).toEqual(["shadowed"]);
+  });
+});

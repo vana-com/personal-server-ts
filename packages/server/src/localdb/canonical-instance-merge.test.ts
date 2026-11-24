@@ -90,32 +90,42 @@ function store(
 async function entries(
   reader: CanonicalImportPageReader,
   olderInstances: "merge" | "exclude" = "merge",
+  override: {
+    resolves?: boolean;
+    bound?: boolean;
+  } = {},
 ) {
   const out: ImportInventoryEntry[] = [];
   for await (const entry of createCanonicalImportSource({
     owner,
     network: "test",
     revision: "rev",
-    bindings: new Map([
-      [
-        "fixture.items",
-        {
-          connector: "fixture",
-          streams: ["items"],
-          primaryKey: { items: ["id"] },
-        },
-      ],
-    ]),
+    bindings:
+      override.bound === false
+        ? new Map()
+        : new Map([
+            [
+              "fixture.items",
+              {
+                connector: "fixture",
+                streams: ["items"],
+                primaryKey: { items: ["id"] },
+              },
+            ],
+          ]),
     reader,
     olderInstances,
-    resolveTarget: async () => ({
-      connectionId,
-      connector: "fixture",
-      stream: "items",
-      primaryKey: ["id"],
-      semantics: "mutable_state",
-      incremental: true,
-    }),
+    resolveTarget: async () =>
+      override.resolves === false
+        ? null
+        : {
+            connectionId,
+            connector: "fixture",
+            stream: "items",
+            primaryKey: ["id"],
+            semantics: "mutable_state",
+            incremental: true,
+          },
   }))
     out.push(entry);
   return out;
@@ -276,4 +286,25 @@ it("a merged source whose reader cannot count older instances carries no row cou
   expect(sources(all)).toHaveLength(1);
   expect(sources(all)[0]!.rows).toBeUndefined();
   expect("rows" in sources(all)[0]!).toBe(false);
+});
+
+it("an unresolved newest instance excludes the rows of every layer, not only its own", async () => {
+  // The newest instance is empty; the older ones hold the rows. Nothing
+  // imports, so every stored row must show in an exclusion.
+  for (const override of [{ resolves: false }, { bound: false }]) {
+    const reader = store(
+      { new: [], mid: OLD, old: NEW },
+      { new: 30, mid: 20, old: 10 },
+    );
+    const all = await entries(reader, "merge", override);
+    expect(sources(all)).toEqual([]);
+    const excluded = all.filter(
+      (e): e is Extract<ImportInventoryEntry, { kind: "excluded" }> =>
+        "kind" in e,
+    );
+    expect(excluded.reduce((n, e) => n + e.rows, 0)).toBe(
+      OLD.length + NEW.length,
+    );
+    expect(new Set(excluded.map((e) => e.reason)).size).toBe(1);
+  }
 });

@@ -79,9 +79,11 @@ const dropRawEndSchema = [
 const dropJoinSchema = [
   { sql: "DROP TABLE IF EXISTS connection_participation" },
 ];
-// A later migration's index on a table the older schema has too.
+// Later migrations' indexes on tables the older schema has too.
 const dropStampIndexSchema = [
   { sql: "DROP INDEX IF EXISTS log_tombstones_by_stamp" },
+  { sql: "DROP INDEX IF EXISTS log_tombstones_by_record_key" },
+  { sql: "DROP INDEX IF EXISTS record_changes_by_record_key" },
 ];
 // A later migration's table of the body pieces an erasure left in storage.
 const dropRetainedPiecesSchema = [
@@ -976,6 +978,13 @@ describe("view changes", () => {
         .flat()
         .flatMap((sql) => /^CREATE TRIGGER (\w+)/.exec(sql)?.[1] ?? [])
         .map((trigger) => ({ sql: `DROP TRIGGER IF EXISTS ${trigger}` })),
+      // Likewise a later migration's index on a table that stays.
+      ...MIGRATIONS.slice(viewMigration + 1)
+        .flat()
+        .flatMap(
+          (sql) => /^CREATE (?:UNIQUE )?INDEX (\w+)/.exec(sql)?.[1] ?? [],
+        )
+        .map((index) => ({ sql: `DROP INDEX IF EXISTS ${index}` })),
       // A table built under another name and renamed onto one that stays
       // (the rowid `records`) has no table of its own to drop.
       ...MIGRATIONS.slice(viewMigration + 1)

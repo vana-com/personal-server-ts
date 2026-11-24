@@ -47,9 +47,10 @@ import { importProjection } from "./sync.js";
  *
  * - `rows`: for the sources the runner offered to the database (the newest
  *   live instance of each declared source): rows the old store held, rows now
- *   imported, rows left out for want of a full identity (by reason), and rows
- *   of streams the database refused. Every old row is in exactly one of the
- *   last three: `legacy = imported + sum(quarantined) + refused`. `legacy` is
+ *   imported, rows left out (by reason: no full identity, an older copy, a
+ *   valid delete envelope as `delete_envelope`), and rows of streams the
+ *   database refused. Every stored record is in exactly one of the last
+ *   three: `legacy = imported + sum(quarantined) + refused`. `legacy` is
  *   null once any source carried no count; `refused` is null once a refused
  *   source carried none. The receipt keeps the quarantine reasons, so the
  *   count outlives the old files.

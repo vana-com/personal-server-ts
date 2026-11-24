@@ -221,22 +221,27 @@ async function importSource(
         chunk = [];
         chunkBytes = 0;
         const snapshot = await deps.db.query<{
+          record_key: string;
           pk_hash: string;
           body_sha256: string;
           seen: number;
         }>(
-          "SELECT pk_hash, body_sha256, seen FROM import_snapshot WHERE op = ? AND pk_hash IN (SELECT value FROM json_each(?))",
-          [op, JSON.stringify(rows.map((r) => r.pk_hash))],
+          "SELECT record_key, pk_hash, body_sha256, seen FROM import_snapshot WHERE op = ? AND record_key IN (SELECT value FROM json_each(?))",
+          [op, JSON.stringify(rows.map((r) => r.record_key))],
         );
-        const expected = new Map(snapshot.map((r) => [r.pk_hash, r]));
+        const expected = new Map(snapshot.map((r) => [r.record_key, r]));
         const todo: ImportRow[] = [];
         const taken = new Set<string>();
         for (const row of rows) {
-          const known = expected.get(row.pk_hash);
-          if (!known || known.body_sha256 !== row.body_sha256)
+          const known = expected.get(row.record_key);
+          if (
+            !known ||
+            known.pk_hash !== row.pk_hash ||
+            known.body_sha256 !== row.body_sha256
+          )
             return "source_changed";
-          if (known.seen || taken.has(row.pk_hash)) continue;
-          taken.add(row.pk_hash);
+          if (known.seen || taken.has(row.record_key)) continue;
+          taken.add(row.record_key);
           todo.push(row);
         }
         if (todo.length === 0) return null;
@@ -249,8 +254,8 @@ async function importSource(
             ...merge,
             { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
             ...todo.map((row) => ({
-              sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND pk_hash = ?",
-              params: [op, row.pk_hash],
+              sql: "UPDATE import_snapshot SET seen = 1 WHERE op = ? AND record_key = ?",
+              params: [op, row.record_key],
             })),
           ]),
         );
@@ -308,7 +313,9 @@ async function importSource(
             ...batch.map((key): SqlStatement => ({
               sql: `INSERT OR IGNORE INTO log_tombstones (connection_id, stream, pk_hash, record_key, stamp_o, stamp_r, rank)
                   SELECT ?, ?, ?, ?, 0, 'seed', ? WHERE NOT EXISTS (SELECT 1 FROM records r
-                    WHERE r.connection_id = ? AND r.stream = ? AND r.pk_hash = ?)`,
+                    WHERE r.connection_id = ? AND r.stream = ? AND r.record_key = ?)
+                  AND NOT EXISTS (SELECT 1 FROM log_tombstones t
+                    WHERE t.connection_id = ? AND t.stream = ? AND t.record_key = ?)`,
               params: [
                 connectionId,
                 stream,
@@ -317,7 +324,10 @@ async function importSource(
                 EXPLICIT_DELETE_RANK,
                 connectionId,
                 stream,
-                key.pk_hash,
+                key.record_key,
+                connectionId,
+                stream,
+                key.record_key,
               ],
             })),
           ]);
@@ -457,7 +467,7 @@ async function importFence(
 
 /**
  * Old data fills; it never overwrites and never resurrects. A record whose key
- * the stream holds, or that a tombstone covers, or that has a removal waiting
+ * (the legacy record key, in whatever type its fields were stored) the stream holds, or that a tombstone covers, or that has a removal waiting
  * to be published, is left out of the batch before it merges. The merge cannot
  * do this alone: it inserts an absent key whatever its stamp, and for a held
  * key an import nulls the row's first-seen checkpoint. A tombstone is written
@@ -472,11 +482,11 @@ function fillOnly(op: string, connectionId: string): SqlStatement[] {
     {
       sql: `DELETE FROM temp.incoming WHERE op = ? AND (
         EXISTS (SELECT 1 FROM records r WHERE r.connection_id = ?
-          AND r.stream = incoming.stream AND r.pk_hash = incoming.pk_hash)
+          AND r.stream = incoming.stream AND r.record_key = incoming.record_key)
         OR EXISTS (SELECT 1 FROM log_tombstones t WHERE t.connection_id = ?
-          AND t.stream = incoming.stream AND t.pk_hash = incoming.pk_hash)
+          AND t.stream = incoming.stream AND t.record_key = incoming.record_key)
         OR EXISTS (SELECT 1 FROM record_changes ch WHERE ch.connection_id = ?
-          AND ch.stream = incoming.stream AND ch.pk_hash = incoming.pk_hash
+          AND ch.stream = incoming.stream AND ch.record_key = incoming.record_key
           AND ch.op = 'remove'
           AND ch.seq > COALESCE((SELECT publish_watermark FROM stream_state
             WHERE connection_id = ? AND stream = incoming.stream), 0)))`,

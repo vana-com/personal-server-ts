@@ -27,6 +27,11 @@ export type QuarantineReason =
   | "bad_key_value"
   | "unserializable_body";
 
+/** A valid delete envelope in a layer's records. It is no row to import and no
+ * fault: it is counted under this reason so every stored record is accounted
+ * for. Like `superseded`, a benign reason. */
+export const DELETE_ENVELOPE = "delete_envelope";
+
 const QUARANTINED_ROW = Symbol.for("personal-server-ts.quarantined-row");
 
 /**

@@ -117,7 +117,10 @@ export async function classifyImportKey(
 /** One operation's disk-sortable digest view; never retain source bodies.
  * The replayable source supplies each body again for a checked merge. Owns canonical row composition,
  * not key/hash algorithms: those stay at their existing PDPP/stream-sync owners.
- * Conflicting duplicates refuse the import instead of choosing by device/order.
+ * A row is identified by its legacy record key, the key the database keeps it
+ * under; its typed `pk_hash` is the storage form of that row (and the
+ * fingerprint's order), never a second identity. Two rows of one record key
+ * that differ in body or in typed key conflict, and the import refuses.
  * A row with no full identity is left out and counted (`classifyImportRow`):
  * the digest view holds only importable rows, so the receipt proves exactly
  * what the import may bring. */
@@ -133,27 +136,33 @@ export async function stageImportSnapshot(
   await db.batch([
     {
       sql: `CREATE TEMP TABLE IF NOT EXISTS import_snapshot (
-    op TEXT NOT NULL, pk_hash TEXT NOT NULL, body_sha256 TEXT NOT NULL,
-    seen INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (op, pk_hash)) WITHOUT ROWID`,
+    op TEXT NOT NULL, pk_hash TEXT NOT NULL, record_key TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (op, pk_hash), UNIQUE (op, record_key)) WITHOUT ROWID`,
     },
   ]);
   // One worker round trip per chunk, not per row: each driver call clones its
   // message across the SQLite worker's thread boundary.
-  let chunk = new Map<string, string>();
+  let chunk = new Map<string, { pk_hash: string; body_sha256: string }>();
   const flush = async () => {
     if (chunk.size === 0) return;
-    const prior = await db.query<{ pk_hash: string; body_sha256: string }>(
-      "SELECT pk_hash, body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash IN (SELECT value FROM json_each(?))",
+    const prior = await db.query<{
+      record_key: string;
+      pk_hash: string;
+      body_sha256: string;
+    }>(
+      "SELECT record_key, pk_hash, body_sha256 FROM import_snapshot WHERE op = ? AND record_key IN (SELECT value FROM json_each(?))",
       [op, JSON.stringify([...chunk.keys()])],
     );
-    for (const row of prior)
-      if (row.body_sha256 !== chunk.get(row.pk_hash))
+    for (const row of prior) {
+      const held = chunk.get(row.record_key)!;
+      if (row.pk_hash !== held.pk_hash || row.body_sha256 !== held.body_sha256)
         throw new Error("invalid_record");
+    }
     await db.batch(
-      [...chunk].map(([pkHash, sha]) => ({
-        sql: "INSERT OR IGNORE INTO import_snapshot (op, pk_hash, body_sha256) VALUES (?, ?, ?)",
-        params: [op, pkHash, sha],
+      [...chunk].map(([recordKey, held]) => ({
+        sql: "INSERT OR IGNORE INTO import_snapshot (op, pk_hash, record_key, body_sha256) VALUES (?, ?, ?, ?)",
+        params: [op, held.pk_hash, recordKey, held.body_sha256],
       })),
     );
     chunk = new Map();
@@ -168,10 +177,17 @@ export async function stageImportSnapshot(
       continue;
     }
     const row = classified.row;
-    const inChunk = chunk.get(row.pk_hash);
-    if (inChunk !== undefined && inChunk !== row.body_sha256)
+    const inChunk = chunk.get(row.record_key);
+    if (
+      inChunk !== undefined &&
+      (inChunk.pk_hash !== row.pk_hash ||
+        inChunk.body_sha256 !== row.body_sha256)
+    )
       throw new Error("invalid_record");
-    chunk.set(row.pk_hash, row.body_sha256);
+    chunk.set(row.record_key, {
+      pk_hash: row.pk_hash,
+      body_sha256: row.body_sha256,
+    });
     if (chunk.size >= SNAPSHOT_CHUNK_ROWS) await flush();
   }
   await flush();
@@ -184,8 +200,12 @@ export async function stageImportSnapshot(
 export async function* snapshotDigests(db: SqlDriver, op: string) {
   let after = "";
   for (;;) {
-    const rows = await db.query<{ pk_hash: string; body_sha256: string }>(
-      "SELECT pk_hash, body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash > ? ORDER BY pk_hash LIMIT 128",
+    const rows = await db.query<{
+      pk_hash: string;
+      record_key: string;
+      body_sha256: string;
+    }>(
+      "SELECT pk_hash, record_key, body_sha256 FROM import_snapshot WHERE op = ? AND pk_hash > ? ORDER BY pk_hash LIMIT 128",
       [op, after],
     );
     if (rows.length === 0) return;

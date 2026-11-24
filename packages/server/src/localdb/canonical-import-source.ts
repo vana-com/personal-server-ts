@@ -78,6 +78,10 @@ export interface CanonicalImportPageReader {
  * deleted instance (the person removed the connection) is never merged: its
  * rows stay excluded as `deleted_instance`. `"exclude"` keeps the newest
  * instance only, as before.
+ *
+ * The newest instance's target decides for the whole source. When it cannot be
+ * resolved (`unknown_identity`, `unbound_store`), every live instance's rows
+ * are excluded for that reason, each instance counting its own.
  */
 export async function* createCanonicalImportSource(options: {
   readonly owner: string;
@@ -145,17 +149,16 @@ export async function* createCanonicalImportSource(options: {
       yield exclude("deleted_instance");
       continue;
     }
-    // An older live instance is a layer of the newest one's source, below.
-    if (rank > 0) {
-      if (merge) continue;
+    if (rank > 0 && !merge) {
       yield exclude("older_instance");
       continue;
     }
-    const resolved = await resolveTarget(
-      entry.sourceId!,
-      entry.instance,
-      entry.stream,
-    );
+    // The source is the newest live instance's: its target decides for every
+    // layer. An older live instance is a layer of that source, so when the
+    // target cannot be resolved, its rows are excluded for the same reason
+    // (each layer counts its own rows, once).
+    const newest = live[0]!.instance;
+    const resolved = await resolveTarget(entry.sourceId!, newest, entry.stream);
     if (
       !resolved ||
       !resolved.connectionId ||
@@ -175,6 +178,8 @@ export async function* createCanonicalImportSource(options: {
       yield exclude("unbound_store");
       continue;
     }
+    // An older live instance is a layer of the newest one's source, below.
+    if (rank > 0) continue;
     const target = Object.freeze({
       ...resolved,
       primaryKey: Object.freeze([...stream.primary_key]),

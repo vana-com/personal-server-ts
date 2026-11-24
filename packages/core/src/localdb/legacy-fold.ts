@@ -1,6 +1,10 @@
 import { classifyImportKey, classifyImportRow } from "./import-snapshot.js";
 import type { ImportSource } from "./legacy-import-types.js";
-import { QuarantinedRow, isQuarantinedRow } from "./legacy-quarantine.js";
+import {
+  DELETE_ENVELOPE,
+  QuarantinedRow,
+  isQuarantinedRow,
+} from "./legacy-quarantine.js";
 
 /**
  * Several stored versions of one stream as one `ImportSource`.
@@ -40,9 +44,13 @@ import { QuarantinedRow, isQuarantinedRow } from "./legacy-quarantine.js";
  * database keeps a row under, never the typed key hash: `{id: 42}` and
  * `{id: "42"}` are one key, and the newest layer's row stands.
  *
- * Every row or deletion the fold leaves out is counted by reason in the row
- * pass (`records()`), a malformed deletion as `deletion_<reason>`; a host that
- * reads only `records()` loses no count.
+ * Every stored record of `records()` is yielded once in the row pass, as a
+ * row or as a marker with its reason: a row left out by its reason, a valid
+ * delete envelope as `delete_envelope` (also when a live row shadows it), a
+ * malformed one as `deletion_<reason>`. So a host that reads only `records()`
+ * loses no count, and stored records = rows + markers. Keys a layer lists
+ * apart from its records (`deletions`, `deletedRecordKeys`) are not stored
+ * records; only a malformed `deletions()` key is counted.
  *
  * Memory: the record keys (and deleted record keys) of the layers read so far.
  * No body is kept; each traversal reads the layers again.
@@ -140,8 +148,13 @@ export function foldLayers(
           // so every consumer of `records()` sees it once.
           if (isQuarantinedRow(named))
             yield { row: new QuarantinedRow(`deletion_${named.reason}`) };
-          else if (!declared.has(named.id))
-            declared.set(named.id, named.record);
+          else {
+            // A valid delete envelope is a stored record that becomes no row:
+            // it is counted here, whatever happens to its key below (a live
+            // row of its layer, or a newer layer, may outrank it).
+            yield { row: new QuarantinedRow(DELETE_ENVELOPE) };
+            if (!declared.has(named.id)) declared.set(named.id, named.record);
+          }
           continue;
         }
         const row = decoded.row;
