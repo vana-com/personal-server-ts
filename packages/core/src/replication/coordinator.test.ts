@@ -508,6 +508,36 @@ describe("schedule.ts replicaEligibleAt synthetic timing", () => {
   });
 });
 
+describe("replica scheduling numeric boundaries", () => {
+  it("stops parking on a hint at the exact long-wait cutoff", () => {
+    const waitSince = 1_000;
+    const cutoff = waitSince + 600_000;
+    const item = {
+      finalityWait: true,
+      nextEligible: waitSince + 2_000,
+      waitSince,
+      checkedBlock: "42",
+    };
+    const hint = { now: cutoff - 1, head: 42n, hintRefreshAt: cutoff + 30_000 };
+    expect(replicaEligibleAt(item, hint)).toBe(cutoff);
+    expect(replicaEligibleAt(item, { ...hint, now: cutoff })).toBe(item.nextEligible);
+  });
+
+  it("caps a restored retry counter before passing it to the backoff", () => {
+    const cap = Number.MAX_SAFE_INTEGER - 1;
+    const attempts: number[] = [];
+    const result = settleReplicaWork(
+      { ...base, attempts: cap },
+      retryOutcome(),
+      T0,
+      { backoff: (attempt) => { attempts.push(attempt); return 19; } },
+    );
+    expect(attempts).toEqual([cap]);
+    expect(result.state.attempts).toBe(cap);
+    expect(result.state.nextEligible).toBe(T0 + 19);
+  });
+});
+
 describe("schedule.ts settleReplicaWork", () => {
   it("05 initial state is fresh and due at any real time", () => {
     expect(initialReplicaWorkState.attempts).toBe(0);
