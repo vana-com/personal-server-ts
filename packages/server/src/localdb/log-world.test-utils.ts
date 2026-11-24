@@ -47,6 +47,15 @@ export const sName = (i: number) => `s${i}`;
 export const idHash = (id: string | number) =>
   pkHash(async (b) => sha256(b), { id }, ["id"]);
 
+/** The blob store a world's devices share. */
+export interface WorldBlobStore {
+  put(key: string, bytes: Uint8Array): Promise<void>;
+  get(key: string): Promise<Uint8Array | null>;
+  exists(key: string): Promise<boolean>;
+  keys(): readonly string[];
+  delete(key: string): boolean;
+}
+
 const drivers: SqlDriver[] = [];
 /** Closes the databases of the devices a test opened; call it from `afterEach`. */
 export async function closeWorldDrivers(): Promise<void> {
@@ -67,6 +76,21 @@ export async function world(options: {
   policy?: FakeGatewayOptions["policy"];
   /** Each stream's declared state parents (none: no parents). */
   stateParents?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Where each device's database lives (default: in memory). A memory
+   * measurement gives it a file, so the source's bytes are not process memory.
+   */
+  database?: (deviceId: string) => SqlDriver;
+  /**
+   * The blob store the devices share (default: a map in memory). Each `get`
+   * must return fresh bytes, as a network or disk read does.
+   */
+  blobStore?: WorldBlobStore;
+  /**
+   * Appended to every device's operation ids. A world that reopens databases
+   * an earlier process wrote gives each process its own, so ids do not repeat.
+   */
+  opSalt?: string;
 }) {
   const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
   const hashes = await controlHashes(async (b) => keccak_256(b), keyCheck);
@@ -80,15 +104,19 @@ export async function world(options: {
       v.metadataHash === hashes.tombstoneMetadata,
   });
   const store = new Map<string, Uint8Array>();
-  const innerBlobs = {
+  const innerBlobs: WorldBlobStore & {
+    governor: ReturnType<typeof createMemoryStreamSyncBlobs>["governor"];
+  } = {
     governor: createMemoryStreamSyncBlobs().governor,
-    put: async (key: string, bytes: Uint8Array) => {
-      store.set(key, bytes.slice());
-    },
-    get: async (key: string) => store.get(key) ?? null,
-    exists: async (key: string) => store.has(key),
-    keys: () => [...store.keys()],
-    delete: (key: string) => store.delete(key),
+    ...(options.blobStore ?? {
+      put: async (key: string, bytes: Uint8Array) => {
+        store.set(key, bytes.slice());
+      },
+      get: async (key: string) => store.get(key) ?? null,
+      exists: async (key: string) => store.has(key),
+      keys: () => [...store.keys()],
+      delete: (key: string) => store.delete(key),
+    }),
   };
   const trace = options.trace;
   const names = Array.from({ length: options.streams }, (_, i) => sName(i));
@@ -122,11 +150,10 @@ export async function world(options: {
       deleteRetryMs?: { first: number; max: number };
     } = {},
   ) {
-    const db = await openLocalDb(openBetterSqlite3(":memory:"), {
-      owner: OWNER,
-      network: "test",
-      deviceId,
-    });
+    const db = await openLocalDb(
+      options.database?.(deviceId) ?? openBetterSqlite3(":memory:"),
+      { owner: OWNER, network: "test", deviceId },
+    );
     drivers.push(db);
     const puts: string[] = [];
     const gets: string[] = [];
@@ -215,7 +242,7 @@ export async function world(options: {
       signer: { signAddData: async () => "0x00" },
       logger: { info: () => {}, warn: () => {} },
       now: () => clock,
-      newOp: () => `${deviceId}-${++op}`,
+      newOp: () => `${deviceId}${options.opSalt ?? ""}-${++op}`,
       ...(options.publishWhileCollecting
         ? { publishWhileCollecting: true }
         : {}),
