@@ -201,6 +201,75 @@ export function createGatewayDeleteDataPort(
     };
   }
 
+  /**
+   * The one reading of the gateway's answer to a tombstone post, for the first
+   * post and the re-signed one alike, so no answer is read by only one of them.
+   * It throws on a terminal refusal or an error, returns an outcome for what is
+   * the same fact as a 404 or 410 (a head already deleted, never registered),
+   * and otherwise says the post was a version conflict or was accepted.
+   */
+  async function readTombstoneAnswer(
+    scope: string,
+    dataPointId: string,
+    res: Response,
+  ): Promise<
+    | { kind: "outcome"; outcome: TombstoneOutcome }
+    | { kind: "version-conflict"; body: unknown; statusText: string }
+    | { kind: "accepted"; body: unknown }
+  > {
+    if (res.status === 409) {
+      // A 409 is a version conflict, the owner's cutover refusal, or the
+      // gateway's word on the head itself (already deleted, never registered);
+      // the body says which. The head answers are read first: they are the
+      // same facts as a 410 and a 404, and the refusal is terminal.
+      const body = await res.json().catch(() => null);
+      const code = (body as Record<string, unknown> | null)?.code;
+      if (isGatewayAlreadyDeletedCode(code))
+        return {
+          kind: "outcome",
+          outcome: await alreadyDeleted(scope, dataPointId, body),
+        };
+      if (isGatewayHeadAbsentCode(code))
+        return {
+          kind: "outcome",
+          outcome: { status: "not-registered", dataPointId },
+        };
+      const refusal = refusalOf(409, body, res.statusText);
+      if (refusal) throw refusal;
+      return { kind: "version-conflict", body, statusText: res.statusText };
+    }
+    if (res.status === 404) {
+      // The registry lost the row between our read and our write (or the
+      // feed answered from a replica ahead of the writer): nothing to
+      // tombstone.
+      return {
+        kind: "outcome",
+        outcome: { status: "not-registered", dataPointId },
+      };
+    }
+    if (res.status === 410) {
+      // Raced with a concurrent deletion: the point is already gone.
+      return {
+        kind: "outcome",
+        outcome: await alreadyDeleted(
+          scope,
+          dataPointId,
+          await res.json().catch(() => null),
+        ),
+      };
+    }
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw (
+        refusalOf(res.status, body, res.statusText) ??
+        new Error(
+          `Gateway error: ${res.status} ${detailFromBody(body, res.statusText)}`,
+        )
+      );
+    }
+    return { kind: "accepted", body };
+  }
+
   return {
     ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(
@@ -239,33 +308,22 @@ export function createGatewayDeleteDataPort(
         metadataHash: current.metadataHash,
       };
       let version = BigInt(current.expectedVersion) + 1n;
-      let res = await sendTombstone(scope, dataPointId, version);
-      // A 409 is a version conflict, the owner's cutover refusal, or the
-      // gateway's word on the head itself (already deleted, never registered);
-      // the body says which. The head answers are read first: they are the
-      // same facts as a 410 and a 404, and the refusal is terminal.
-      const conflictBody =
-        res.status === 409 ? await res.json().catch(() => null) : null;
-      if (res.status === 409) {
-        const code = (conflictBody as Record<string, unknown> | null)?.code;
-        if (isGatewayAlreadyDeletedCode(code))
-          return alreadyDeleted(scope, dataPointId, conflictBody);
-        if (isGatewayHeadAbsentCode(code))
-          return { status: "not-registered", dataPointId };
-        const refusal = refusalOf(409, conflictBody, res.statusText);
-        if (refusal) throw refusal;
-      }
-      if (res.status === 409 && fence) {
-        throw new Error(
-          `Scope head is not the one the fenced delete saw (v${fence.head.expectedVersion}): another writer moved it`,
-        );
-      }
-      if (res.status === 409) {
+      let answer = await readTombstoneAnswer(
+        scope,
+        dataPointId,
+        await sendTombstone(scope, dataPointId, version),
+      );
+      if (answer.kind === "version-conflict") {
+        if (fence) {
+          throw new Error(
+            `Scope head is not the one the fenced delete saw (v${fence.head.expectedVersion}): another writer moved it`,
+          );
+        }
         // Another replica advanced the scope between our read and our
         // write. The 409 body carries `currentExpectedVersion` (and the
         // legacy message phrasing names the next valid version); re-sign
         // once against it.
-        const body = conflictBody;
+        const { body, statusText } = answer;
         const conflict = unwrap(body);
         // Gateway 409 body: `nextExpectedVersion` is the version to sign
         // next; `currentExpectedVersion` is the version the gateway holds,
@@ -278,7 +336,7 @@ export function createGatewayDeleteDataPort(
           integerField(conflict, "currentExpectedVersion") ??
           integerField(body, "currentExpectedVersion");
         const legacyNext = parseGatewayNextVersion(
-          detailFromBody(body, res.statusText),
+          detailFromBody(body, statusText),
         );
         const next =
           nextExplicit !== null
@@ -290,40 +348,28 @@ export function createGatewayDeleteDataPort(
                 : null;
         if (next === null) {
           throw new Error(
-            `Gateway error: 409 ${detailFromBody(body, res.statusText)}`,
+            `Gateway error: 409 ${detailFromBody(body, statusText)}`,
           );
         }
         version = next;
         // The head moved before the POST; which head this tombstone replaces
         // is not known, so no automatic re-submission may rely on it.
         replaced = null;
-        res = await sendTombstone(scope, dataPointId, version);
-      }
-      if (res.status === 404) {
-        // The registry lost the row between our read and our write (or the
-        // feed answered from a replica ahead of the writer): nothing to
-        // tombstone.
-        return { status: "not-registered", dataPointId };
-      }
-      if (res.status === 410) {
-        // Raced with a concurrent deletion: the point is already gone.
-        return alreadyDeleted(
+        // The re-signed post is read by the same decoder as the first.
+        answer = await readTombstoneAnswer(
           scope,
           dataPointId,
-          await res.json().catch(() => null),
+          await sendTombstone(scope, dataPointId, version),
         );
       }
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        throw (
-          refusalOf(res.status, body, res.statusText) ??
-          new Error(
-            `Gateway error: ${res.status} ${detailFromBody(body, res.statusText)}`,
-          )
+      if (answer.kind === "outcome") return answer.outcome;
+      if (answer.kind === "version-conflict") {
+        // A second conflict: the re-sign is once, not forever.
+        throw new Error(
+          `Gateway error: 409 ${detailFromBody(answer.body, answer.statusText)}`,
         );
       }
-      const body = await res.json().catch(() => null);
-      const row = unwrap(body);
+      const row = unwrap(answer.body);
       return {
         status: "tombstoned",
         dataPointId: stringField(row, "dataPointId") ?? dataPointId,
