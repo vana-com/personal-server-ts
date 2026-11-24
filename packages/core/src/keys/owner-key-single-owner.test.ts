@@ -223,5 +223,15 @@ describe("owner key derivation has one owner", () => {
         "recoverServerOwner",
       ]);
     });
+
+    it("reports an explicit named re-export in a barrel", () => {
+      const source = 'export { recoverServerOwner } from "./fixture.js";';
+      expect(violationsIn(other, source)).toEqual(["recoverServerOwner"]);
+    });
+
+    it("reports an ordinary reference even when there is no call", () => {
+      const source = "const reference = fixture.deriveMasterKey;";
+      expect(violationsIn(other, source)).toEqual(["deriveMasterKey"]);
+    });
   });
 });
