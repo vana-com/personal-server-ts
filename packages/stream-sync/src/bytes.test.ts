@@ -8,7 +8,11 @@ import {
   utf8,
   utf8Length,
 } from "./bytes.js";
-import { canonicalJson, canonicalJsonChunks, JSON_CHUNK_UNITS } from "./json.js";
+import {
+  canonicalJson,
+  canonicalJsonChunks,
+  JSON_CHUNK_UNITS,
+} from "./json.js";
 
 const digits = "0123456789abcdefABCDEF".repeat(3).slice(0, 64);
 const lower = `0x${digits.toLowerCase()}`;
@@ -163,13 +167,16 @@ describe("encoding JSON as bytes", () => {
         message: "only plain objects are allowed",
       }),
     );
-    expect(new TextDecoder().decode(utf8(canonicalJson({ label: value })))).toBe(
-      '{"label":"2026-06-01T00:00:00.000Z"}',
-    );
+    expect(
+      new TextDecoder().decode(utf8(canonicalJson({ label: value }))),
+    ).toBe('{"label":"2026-06-01T00:00:00.000Z"}');
   });
 
   it("terminates a partial text iterator when a later value cannot be serialized", () => {
-    const chunks = canonicalJsonChunks(["a".repeat(JSON_CHUNK_UNITS), undefined]);
+    const chunks = canonicalJsonChunks([
+      "a".repeat(JSON_CHUNK_UNITS),
+      undefined,
+    ]);
     const first = chunks.next();
     if (first.done) throw new Error("expected an initial text chunk");
     expect(first.value.startsWith('["a')).toBe(true);

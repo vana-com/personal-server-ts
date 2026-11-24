@@ -16,7 +16,6 @@ import {
 import { DEFAULT_REPLICA_STREAMED_LIMITS } from "./stream.js";
 import { ReplicaByteBudget, admit } from "./limits.js";
 
-
 it("rejects a producer failure without returning a partial digest", async () => {
   const failure = new Error("synthetic producer interrupted");
   await expect(
