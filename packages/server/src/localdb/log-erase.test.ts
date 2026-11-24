@@ -589,6 +589,74 @@ describe("erasure wired into the connection delete", () => {
       });
     });
 
+    it("reads storage as blocked(erased_elsewhere), never done, on a device that holds no record of the pieces another device kept", async () => {
+      const state = { finalized: "99" };
+      const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+      const { erasure } = ports(w, state);
+      const a = await w.device("a", {
+        erasure: () => erasure,
+        deleteRetryMs: RETRY,
+      });
+      const b = await w.device("b", {
+        erasure: () => erasure,
+        deleteRetryMs: RETRY,
+      });
+      await a.run("run-1", [big], { observedAt: 1100 });
+      await a.cycle();
+      await b.cycle();
+      expect(await b.records()).not.toEqual([]);
+
+      // Device a deletes and erases the log; the body pieces stay in storage
+      // and only a's database names them.
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+      await vi.waitFor(() => expect(erasable(w, LOG)).toEqual([]));
+      await vi.waitFor(async () =>
+        expect((await a.sync.deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+          state: "blocked",
+          reason: "body_pieces_retained",
+        }),
+      );
+
+      // Device b adopts the delete and finds the log gone. Its database has no
+      // record of the pieces; storage cannot say what is left.
+      await b.cycle();
+      await vi.waitFor(async () =>
+        expect(
+          (await b.sync.deleter.deleteStatus(CONNECTOR)).storage,
+        ).not.toEqual({ state: "pending" }),
+      );
+      expect((await b.sync.deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "blocked",
+        reason: "erased_elsewhere",
+      });
+    });
+
+    it("keeps reading storage done on the device that erased a log with no body pieces, after a restart", async () => {
+      const state = { finalized: "99" };
+      const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+      const { erasure } = ports(w, state);
+      const a = await w.device("a", {
+        erasure: () => erasure,
+        deleteRetryMs: RETRY,
+      });
+      await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
+        observedAt: 1100,
+      });
+      await a.cycle();
+      await a.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(a)).toEqual([]));
+      await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+
+      const deleter = await restarted(a, erasure);
+      deleter.noteSettled(CONNECTOR);
+      await deleter.resumeErasures();
+
+      expect((await deleter.deleteStatus(CONNECTOR)).storage).toEqual({
+        state: "done",
+      });
+    });
+
     it("reads storage as pending while the registry cannot list the deleted connections", async () => {
       const { a, erasure } = await settledDelete();
       const down = {

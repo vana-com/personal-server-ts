@@ -223,6 +223,7 @@ function world() {
       count: async (scope) =>
         new Set(kept.filter((k) => k.scope === scope).flatMap((k) => k.names))
           .size,
+      enumerated: async (scope) => kept.some((k) => k.scope === scope),
     },
     objects: {
       deleteBlobVersions: async (scope, names) => {
@@ -624,6 +625,32 @@ describe("eraseDeletedConnectionLogs", () => {
         unenumerated: 0,
       });
       expect(w.calls).toEqual([]);
+    });
+
+    it("a device with no record of the pieces does not vouch for them when it finds the log gone", async () => {
+      const w = world();
+      await w.compactedLog("alpha", NS);
+      w.setControl("alpha", NS, 2, true);
+      await eraseDeletedConnectionLogs(w.deps);
+
+      // Another device, with its own empty record, looks at the same storage.
+      const kept: string[] = [];
+      const other = await eraseDeletedConnectionLogs({
+        ...w.deps,
+        retained: {
+          keep: async (scope) => void kept.push(scope),
+          count: async () => 0,
+          enumerated: async (scope) => kept.includes(scope),
+        },
+      });
+
+      expect(other.connections[0]!.outcome).toEqual({
+        kind: "erased",
+        deleted: 0,
+        retained: 0,
+        unenumerated: 0,
+        unwitnessed: true,
+      });
     });
 
     it("a registry that cannot list the deleted connections is pending, not a throw", async () => {

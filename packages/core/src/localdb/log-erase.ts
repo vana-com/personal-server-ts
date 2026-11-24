@@ -145,6 +145,12 @@ export interface RetainedPieces {
    * what an earlier pass left in storage.
    */
   count(scope: string): Promise<number>;
+  /**
+   * Whether this device enumerated `scope`'s pieces (`keep` ran, even with no
+   * names) before it removed the log. Without it, an empty record says nothing
+   * of what another device left.
+   */
+  enumerated(scope: string): Promise<boolean>;
 }
 
 /** Rows per batch: a large body can name many pieces. */
@@ -166,6 +172,13 @@ export function retainedPiecesIn(
       );
       return Number(row?.n ?? 0);
     },
+    async enumerated(scope) {
+      const rows = await db.query(
+        "SELECT 1 FROM enumerated_logs WHERE scope = ?",
+        [scope],
+      );
+      return rows.length > 0;
+    },
     async keep(scope, names) {
       for (let at = 0; at < names.length; at += KEEP_BATCH)
         await db.batch(
@@ -174,6 +187,13 @@ export function retainedPiecesIn(
             params: [scope, name],
           })),
         );
+      // Last: a scope marked here has every name above recorded.
+      await db.batch([
+        {
+          sql: "INSERT OR IGNORE INTO enumerated_logs(scope, recorded_at) VALUES (?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+          params: [scope],
+        },
+      ]);
     },
   };
 }
@@ -240,6 +260,12 @@ export type ErasureOutcome =
       readonly deleted: number;
       readonly retained: number;
       readonly unenumerated: number;
+      /**
+       * Set when the log was already gone, this device holds no record of its
+       * pieces, and the inventory shows a log existed: another device erased
+       * it, and only that device knows whether pieces were left.
+       */
+      readonly unwitnessed?: true;
     }
   /** Not finished; the same call again continues. */
   | {
@@ -421,12 +447,19 @@ async function eraseOne(
             detail: "log head is missing with listed segments still present",
           };
       }
-      // The pieces an earlier pass left are still in storage: say so.
+      // The pieces an earlier pass left are still in storage: say so. A log
+      // that existed and was erased by another device leaves no name here.
+      const retained = await deps.retained.count(scope);
+      const unwitnessed =
+        retained === 0 &&
+        segments.size > 0 &&
+        !(await deps.retained.enumerated(scope));
       return {
         kind: "erased",
         deleted: 0,
-        retained: await deps.retained.count(scope),
+        retained,
         unenumerated: 0,
+        ...(unwitnessed && { unwitnessed: true as const }),
       };
     }
     if (opened === "unreadable")
@@ -493,7 +526,7 @@ async function eraseOne(
       };
 
     // Written down before anything that names them is deleted (see 3 above).
-    if (pieces.size > 0) await deps.retained.keep(scope, [...pieces]);
+    await deps.retained.keep(scope, [...pieces]);
 
     const rest = [...segments.keys()].filter(
       (name) => name !== headName && !gone.has(name),

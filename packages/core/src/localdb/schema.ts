@@ -702,4 +702,12 @@ END`,
   scope TEXT NOT NULL, name TEXT NOT NULL, recorded_at INTEGER NOT NULL,
   PRIMARY KEY (scope, name)) WITHOUT ROWID`,
   ],
+  [
+    // The log scopes this device enumerated before it erased them
+    // (`log-erase.ts`). A log's pieces can be named only from its segments, so
+    // a device that finds the log gone and holds no row here cannot say what
+    // another device left in storage. Device-local, kept across a purge.
+    `CREATE TABLE enumerated_logs (
+  scope TEXT PRIMARY KEY, recorded_at INTEGER NOT NULL) WITHOUT ROWID`,
+  ],
 ];

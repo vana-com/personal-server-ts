@@ -67,7 +67,9 @@ function storagePartOf(report: ErasureReport): DeletePart {
                 PART_DONE
           : outcome.retained > 0
             ? blocked("body_pieces_retained")
-            : PART_DONE;
+            : outcome.unwitnessed
+              ? blocked("erased_elsewhere")
+              : PART_DONE;
     if (rankOf(next) > rankOf(part)) part = next;
   }
   return part;

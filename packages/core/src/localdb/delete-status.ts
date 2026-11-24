@@ -32,7 +32,13 @@ export type DeleteBlockReason =
    * Out-of-line body pieces stay in storage: their names are shared with a
    * later lifetime of the connection, so they are not deleted yet.
    */
-  | "body_pieces_retained";
+  | "body_pieces_retained"
+  /**
+   * Another device erased the log. Storage no longer names the body pieces it
+   * left, and only that device recorded them, so this device cannot say they
+   * are gone.
+   */
+  | "erased_elsewhere";
 
 export type DeletePart =
   | { readonly state: "done" }

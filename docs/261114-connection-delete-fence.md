@@ -142,7 +142,16 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
 - Storage reads `body_pieces_retained` on every pass that follows the first,
   from the persisted record of pieces left (`retained_log_pieces`). That record
   is per device: a device that did not run the erasure cannot learn the names
-  from storage, because the segments that named them are gone.
+  from storage, because the segments that named them are gone. Such a device
+  (no record, and the version inventory shows a log existed) reads storage as
+  `blocked(erased_elsewhere)`, never `done`: it cannot re-check the pieces. A
+  device marks the scopes it enumerated (`enumerated_logs`) before it deletes
+  anything, so the device that erased a log keeps answering for it after a
+  restart. A log erased before this record existed reads the same way on the
+  device that erased it.
+- A cached verdict belongs to one delete. Starting or adopting a delete of a
+  connector drops the verdict, and a pass that began before that cannot write
+  one; the parts read `pending` until a pass judges the new delete.
 - `deleter.deleteStatus(connector)` answers `{ fence, legacy, storage }`, each
   `done`, `pending` or `blocked(reason)` (`localdb/delete-status.ts`). The owner
   connector routes carry it as `deleteStatus` (202 body and `GET`). An app says
