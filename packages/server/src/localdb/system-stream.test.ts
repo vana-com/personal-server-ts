@@ -377,6 +377,46 @@ it("rejects an empty scope in an otherwise valid access activity event", async (
   ).toThrow("Invalid access activity field");
 });
 
+it("accepts each supported access activity action", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  for (const action of ["read", "write", "delete", "lineage"] as const) {
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({
+        schemaVersion: 1,
+        eventId: "00000000-0000-4000-8000-000000000001",
+        instanceId: "00000000-0000-4000-8000-000000000002",
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        action,
+        scope: "synthetic.entries",
+        grantId: "synthetic-grant",
+        builder: "synthetic-builder",
+        phase: "served-start",
+      }),
+    ).not.toThrow();
+  }
+});
+
+it("accepts the maximum access activity scope length but not one character more", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    action: "read",
+    scope: "s".repeat(512),
+    grantId: "synthetic-grant",
+    builder: "synthetic-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, scope: event.scope + "s" }),
+  ).toThrow("Invalid access activity field");
+});
+
 it("retention deletes old activity canonically and persists its deletion watermark", async () => {
   const { createAccessActivity } =
     await import("../../../core/src/logging/activity-stream.js");
