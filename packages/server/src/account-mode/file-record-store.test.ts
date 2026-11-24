@@ -1,4 +1,11 @@
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -65,5 +72,50 @@ describe("the file mode record store", () => {
     await expect(
       store.save("../x", { answer: "on", generation: 0, receivedAt: 0 }),
     ).rejects.toThrow();
+  });
+
+  it("surfaces a records path that is a file instead of silently loading nothing", async () => {
+    const blocker = join(dir, "not-a-dir");
+    await writeFile(blocker, "not a directory");
+    const store = createFileModeRecordStore(blocker);
+    await expect(store.load()).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  it("reports a directory named like a record file and keeps the good records", async () => {
+    const bad: string[] = [];
+    const store = createFileModeRecordStore(dir, {
+      onCorrupt: (f) => bad.push(f),
+    });
+    await mkdir(join(dir, "weird.json"));
+    await store.save("good", { answer: "off", generation: 0, receivedAt: 1 });
+    const loaded = await store.load();
+    expect([...loaded.keys()]).toEqual(["good"]);
+    expect(bad).toEqual(["weird.json"]);
+  });
+
+  it("refuses to save when the records path is blocked by a file and leaves it untouched", async () => {
+    const blocker = join(dir, "not-a-dir");
+    await writeFile(blocker, "keep me");
+    const store = createFileModeRecordStore(blocker);
+    await expect(
+      store.save("good", { answer: "on", generation: 0, receivedAt: 0 }),
+    ).rejects.toThrow();
+    expect(await readFile(blocker, "utf8")).toBe("keep me");
+  });
+
+  it("ignores a leftover temp file from an interrupted save", async () => {
+    const store = createFileModeRecordStore(dir);
+    await writeFile(
+      join(dir, ".good.0123456789ab.tmp"),
+      JSON.stringify({ answer: "on", generation: 9, receivedAt: 9 }),
+    );
+    await store.save("good", { answer: "off", generation: 0, receivedAt: 1 });
+    const loaded = await store.load();
+    expect([...loaded.keys()]).toEqual(["good"]);
+    expect(loaded.get("good")).toEqual({
+      answer: "off",
+      generation: 0,
+      receivedAt: 1,
+    });
   });
 });
