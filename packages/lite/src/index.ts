@@ -283,3 +283,11 @@ export {
 export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";
 
 export type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
+export {
+  seedLegacyStore,
+  type FoldLayer,
+  type LegacySeedReport,
+  type LegacySeedStore,
+  type LegacySeedStream,
+  type LegacySeedStreamReport,
+} from "@opendatalabs/personal-server-ts-core/localdb";
