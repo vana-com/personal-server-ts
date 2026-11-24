@@ -160,6 +160,59 @@ describe("ServerSigner", () => {
     });
   });
 
+  it("hands its capability a copy of the lineage source list", async () => {
+    const unavailable = new Error("inert capability");
+    const sourceList = Object.freeze(["0x01", "0x02"] as const);
+    let seen: unknown;
+    const account = {
+      address: "0x1111111111111111111111111111111111111111",
+      signTypedData: async ({
+        message,
+      }: {
+        message: Record<string, unknown>;
+      }) => {
+        seen = message.sources;
+        throw unavailable;
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    const signer = createServerSigner(account, TEST_GATEWAY_CONFIG);
+    const input = { sources: sourceList } as Parameters<
+      typeof signer.signLineageAttestation
+    >[0];
+    await expect(signer.signLineageAttestation(input)).rejects.toBe(
+      unavailable,
+    );
+    expect(seen).toEqual(sourceList);
+    expect(seen).not.toBe(sourceList);
+  });
+
+  it("uses independent source lists for repeated lineage projections", async () => {
+    const unavailable = new Error("inert capability");
+    const observed: unknown[] = [];
+    const account = {
+      address: "0x1111111111111111111111111111111111111111",
+      signTypedData: async ({
+        message,
+      }: {
+        message: Record<string, unknown>;
+      }) => {
+        observed.push(message.sources);
+        throw unavailable;
+      },
+    } as Parameters<typeof createServerSigner>[0];
+    const signer = createServerSigner(account, TEST_GATEWAY_CONFIG);
+    const input = { sources: [] } as Parameters<
+      typeof signer.signLineageAttestation
+    >[0];
+    for (let i = 0; i < 2; i++) {
+      await expect(signer.signLineageAttestation(input)).rejects.toBe(
+        unavailable,
+      );
+    }
+    expect(observed).toEqual([[], []]);
+    expect(observed[0]).not.toBe(observed[1]);
+  });
+
   it("signing is deterministic", async () => {
     const { signer } = setup();
     const addDataMsg = {
