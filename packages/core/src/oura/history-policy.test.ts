@@ -9,6 +9,28 @@ const unrestricted = {
 };
 
 const cases: [string, unknown, { since: string | null } | null][] = [
+  [
+    "a streams object instead of a list",
+    {
+      streams: {
+        0: { name: "sleep" },
+        1: { name: "readiness" },
+        2: { name: "activity" },
+        length: 3,
+      },
+    },
+    null,
+  ],
+  [
+    "a range object without a string since value",
+    {
+      streams: unrestricted.streams.map((stream) => ({
+        ...stream,
+        time_range: { since: 20260103 },
+      })),
+    },
+    null,
+  ],
   ["exactly the three unrestricted streams", unrestricted, { since: null }],
   [
     "exactly the three prefixed streams with a common valid since",
