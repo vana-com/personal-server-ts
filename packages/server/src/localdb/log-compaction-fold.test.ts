@@ -22,6 +22,10 @@ import {
   sName,
   world,
 } from "./log-world.test-utils.js";
+import {
+  frameLimited,
+  SQL_FRAME_BYTES,
+} from "./frame-limited-driver.test-utils.js";
 
 afterEach(closeWorldDrivers);
 
@@ -100,4 +104,45 @@ describe("a compaction is the fold of its history", () => {
       await spool.discard();
     }, 60_000);
   }
+});
+
+describe("a compaction of large bodies writes inside the phone bridge's frame", () => {
+  it("folds, cuts parts and spools objects through a driver that refuses an oversize request", async () => {
+    const w = await world({ streams: 1, partTargetBytes: 400_000 });
+    const a = await w.device("a");
+    for (let i = 0; i < 5; i += 1) {
+      await a.run(
+        `r${i}`,
+        Array.from({ length: 24 }, (_, k) => ({
+          stream: sName(0),
+          id: `k${i * 24 + k}`,
+          pad: 90_000,
+        })),
+        { full: false, observedAt: 2000 + i },
+      );
+      await a.cycle();
+    }
+    const log = await readLogState(a.deps, CONNECTION_ID);
+    const framed = frameLimited(a.db);
+    const spool = openSpool(framed, CONNECTION_ID, "test");
+    const keyCheck = await deriveKeyCheck(async () => new Uint8Array(32));
+    const plan = await compactLog(
+      { ...a.deps, db: framed, partTargetBytes: 400_000 },
+      {
+        connectionId: CONNECTION_ID,
+        connector: CONNECTOR,
+        ns: "",
+        generation: 1,
+        keyCheck,
+        scope: LOG,
+        log,
+      },
+      spool,
+    );
+    expect(plan!.snapshot.parts.length).toBeGreaterThan(1);
+    for (const object of plan!.objects) await object.read();
+    expect(framed.frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+    expect(framed.frames.largestReply).toBeLessThan(SQL_FRAME_BYTES);
+    await spool.discard();
+  }, 60_000);
 });

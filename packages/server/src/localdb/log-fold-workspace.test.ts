@@ -26,7 +26,12 @@ import {
   type SqlDriver,
 } from "../../../core/src/localdb/index.js";
 import { openFoldWorkspace } from "../../../core/src/localdb/log-fold-workspace.js";
+import { openSpool } from "../../../core/src/localdb/log-spool.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import {
+  frameLimited,
+  SQL_FRAME_BYTES,
+} from "./frame-limited-driver.test-utils.js";
 
 const drivers: SqlDriver[] = [];
 afterEach(async () => {
@@ -459,23 +464,276 @@ function valueOf(h: History, body: LogBodyRef): JsonObject {
   throw new Error("a reference names no body of the history");
 }
 
-describe("the streaming partitioner is partitionFold", () => {
-  it("cuts the same parts on random folds and targets", () => {
-    for (let seed = 1; seed <= 100; seed += 1) {
-      const h = history(seed, { keys: 30, segments: 4, opsPerSegment: 20 });
-      const fold = foldLog({ snapshot: [], segments: h.segments });
-      const target = 100 + rng(seed).int(900);
-      const context = { ...CONTEXT, position: 4 };
-      const whole = partitionFold(fold, context, target);
-      const partitioner = createPartitioner(fold.streams, context, target);
-      const streamed = [];
-      for (const entry of fold.entries) {
-        const closed = partitioner.push(entry);
-        if (closed) streamed.push(closed);
-      }
-      streamed.push(partitioner.finish());
-      expect(streamed, `seed ${seed}`).toEqual(whole);
+// The cuts below were computed once with `partitionFold` as it is on `main`,
+// before the streaming partitioner existed, over the fixture here, and written
+// down. They do not follow the code under test: a change to how parts are cut
+// changes a part boundary that a reader of the log has already stored.
+describe("the streaming partitioner cuts the parts main's partitionFold cut", () => {
+  const stamp = (o: number, r = "a") => ({ o, r });
+  const upsert = (stream: string, pkHash: string, id: number, pad = 0) => ({
+    kind: "upsert" as const,
+    stream,
+    pkHash,
+    stamp: stamp(1),
+    firstSeen: null,
+    value: pad ? { id, pad: "x".repeat(pad) } : { id },
+  });
+  const entries: WireEntry[] = [
+    upsert("a", "h01", 1),
+    upsert("a", "h02", 2, 120),
+    upsert("a", "h03", 3, 60),
+    {
+      kind: "delete",
+      stream: "a",
+      pkHash: "h04",
+      key: ["k4"],
+      stamp: stamp(2),
+    },
+    {
+      kind: "omitted",
+      stream: "a",
+      pkHash: "h05",
+      key: ["k5"],
+      stamp: stamp(2, "b"),
+    },
+    upsert("b", "h01", 6, 300),
+    upsert("b", "h02", 7),
+    upsert("b", "h03", 8, 40),
+  ];
+  const streams = [meta("a"), meta("b")];
+  const context = { ...CONTEXT, position: 4 };
+
+  /** [the smallest target that gives these parts, the parts as the key of each entry]. Every smaller target down to the previous row gives the previous row's parts. */
+  const CUTS: readonly (readonly [number, readonly (readonly string[])[]])[] = [
+    [
+      1,
+      [
+        ["a/h01"],
+        ["a/h02"],
+        ["a/h03"],
+        ["a/h04"],
+        ["a/h05"],
+        ["b/h01"],
+        ["b/h02"],
+        ["b/h03"],
+      ],
+    ],
+    [
+      517,
+      [
+        ["a/h01"],
+        ["a/h02"],
+        ["a/h03"],
+        ["a/h04", "a/h05"],
+        ["b/h01"],
+        ["b/h02"],
+        ["b/h03"],
+      ],
+    ],
+    [
+      586,
+      [
+        ["a/h01"],
+        ["a/h02"],
+        ["a/h03"],
+        ["a/h04", "a/h05"],
+        ["b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      596,
+      [
+        ["a/h01"],
+        ["a/h02"],
+        ["a/h03", "a/h04"],
+        ["a/h05"],
+        ["b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      650,
+      [
+        ["a/h01"],
+        ["a/h02"],
+        ["a/h03", "a/h04", "a/h05"],
+        ["b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      666,
+      [
+        ["a/h01", "a/h02"],
+        ["a/h03", "a/h04", "a/h05"],
+        ["b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      799,
+      [
+        ["a/h01", "a/h02", "a/h03"],
+        ["a/h04", "a/h05"],
+        ["b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      846,
+      [
+        ["a/h01", "a/h02", "a/h03"],
+        ["a/h04", "a/h05"],
+        ["b/h01", "b/h02"],
+        ["b/h03"],
+      ],
+    ],
+    [
+      853,
+      [
+        ["a/h01", "a/h02", "a/h03", "a/h04"],
+        ["a/h05", "b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      900,
+      [
+        ["a/h01", "a/h02", "a/h03", "a/h04"],
+        ["a/h05", "b/h01", "b/h02"],
+        ["b/h03"],
+      ],
+    ],
+    [
+      907,
+      [
+        ["a/h01", "a/h02", "a/h03", "a/h04", "a/h05"],
+        ["b/h01", "b/h02"],
+        ["b/h03"],
+      ],
+    ],
+    [
+      959,
+      [
+        ["a/h01", "a/h02", "a/h03", "a/h04", "a/h05"],
+        ["b/h01", "b/h02", "b/h03"],
+      ],
+    ],
+    [
+      1280,
+      [
+        ["a/h01", "a/h02", "a/h03", "a/h04", "a/h05", "b/h01"],
+        ["b/h02", "b/h03"],
+      ],
+    ],
+    [
+      1344,
+      [
+        ["a/h01", "a/h02", "a/h03", "a/h04", "a/h05", "b/h01", "b/h02"],
+        ["b/h03"],
+      ],
+    ],
+    [
+      1457,
+      [
+        [
+          "a/h01",
+          "a/h02",
+          "a/h03",
+          "a/h04",
+          "a/h05",
+          "b/h01",
+          "b/h02",
+          "b/h03",
+        ],
+      ],
+    ],
+  ];
+
+  const keys = (parts: readonly { entries: readonly WireEntry[] }[]) =>
+    parts.map((part) => part.entries.map((e) => `${e.stream}/${e.pkHash}`));
+  const streamed = (target: number) => {
+    const partitioner = createPartitioner(streams, context, target);
+    const parts = [];
+    for (const entry of entries) {
+      const closed = partitioner.push(entry);
+      if (closed) parts.push(closed);
     }
+    parts.push(partitioner.finish());
+    return parts;
+  };
+
+  it("cuts at the targets where main's cut changes, and one byte before", () => {
+    for (const [at, [target, expected]] of CUTS.entries()) {
+      expect(keys(streamed(target)), `target ${target}`).toEqual(expected);
+      expect(
+        keys(partitionFold({ streams, entries }, context, target)),
+        `target ${target}`,
+      ).toEqual(expected);
+      if (at > 0)
+        expect(keys(streamed(target - 1)), `target ${target - 1}`).toEqual(
+          CUTS[at - 1]![1],
+        );
+    }
+  });
+
+  it("gives the parts the context, their index and the stream metas of the fold", () => {
+    const parts = streamed(700);
+    expect(parts.map((part) => part.index)).toEqual([0, 1, 2, 3]);
+    expect(parts[0]).toEqual({
+      format: LOG_FORMAT,
+      connector: "c",
+      ns: "",
+      generation: 1,
+      keyCheck: "k",
+      position: 4,
+      index: 0,
+      streams: [
+        {
+          stream: "a",
+          primaryKey: ["id"],
+          profile: { key: null, version: "1" },
+          complete: true,
+        },
+        {
+          stream: "b",
+          primaryKey: ["id"],
+          profile: { key: null, version: "1" },
+          complete: true,
+        },
+      ],
+      entries: [entries[0], entries[1]],
+    });
+    for (const part of parts) expect(part.streams).toEqual(parts[0]!.streams);
+  });
+
+  it("yields one part, with the metas and no entries, for a fold with none", () => {
+    const partitioner = createPartitioner(streams, context, 400);
+    expect(partitioner.finish()).toEqual({
+      format: LOG_FORMAT,
+      connector: "c",
+      ns: "",
+      generation: 1,
+      keyCheck: "k",
+      position: 4,
+      index: 0,
+      streams: [
+        {
+          stream: "a",
+          primaryKey: ["id"],
+          profile: { key: null, version: "1" },
+          complete: true,
+        },
+        {
+          stream: "b",
+          primaryKey: ["id"],
+          profile: { key: null, version: "1" },
+          complete: true,
+        },
+      ],
+      entries: [],
+    });
   });
 });
 
@@ -568,5 +826,99 @@ describe("a page of the fold is cut by the bytes it holds", () => {
     const { entries, largest } = await readBack(segment);
     expect(entries).toHaveLength(3);
     expect(largest).toBeLessThanOrEqual(3 * 1024 * 1024 + BODY + 1000);
+  });
+});
+
+describe("every write of the workspace and the spool fits the phone bridge's frame", () => {
+  const values = (
+    count: number,
+    make: (i: number) => JsonObject,
+  ): Segment<WireOperation> => ({
+    format: LOG_FORMAT,
+    ...CONTEXT,
+    position: 1,
+    observedAt: 1,
+    base: 0,
+    snapshot: null,
+    refs: [],
+    streams: [meta("s0")],
+    operations: Array.from({ length: count }, (_, i) => ({
+      kind: "upsert" as const,
+      stream: "s0",
+      pkHash: `h${String(i).padStart(5, "0")}`,
+      stamp: { o: 1, r: "a" },
+      firstSeen: null,
+      value: make(i),
+    })),
+  });
+
+  /** Fold `segment` through a driver with the bridge's limits and read the winners back. */
+  async function foldFramed(segment: Segment<WireOperation>) {
+    const db = frameLimited(await database());
+    const workspace = await openFoldWorkspace(db, "pdpp.c~", "test");
+    await workspace.addSegment(segment);
+    const entries: WireEntry[] = [];
+    for await (const page of workspace.pages()) entries.push(...page);
+    await workspace.close();
+    const oracle = foldLog({
+      snapshot: [],
+      segments: [segment as unknown as Segment<LogOperation>],
+    });
+    expect(entries).toEqual(oracle.entries);
+    return db.frames;
+  }
+
+  it("a segment of many 100 KB bodies is written in requests under 4 MiB", async () => {
+    // 150 bodies are 15 MB: 200 operations to a batch put all of it in one request.
+    const frames = await foldFramed(
+      values(150, (i) => ({ id: i, pad: "x".repeat(100_000) })),
+    );
+    expect(frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+  });
+
+  it("bodies over 1 MiB are staged one to a request, never more than the bridge holds", async () => {
+    // Ten bodies of 1.5 MiB: a batch of all of them stages ten values, the bridge eight.
+    const frames = await foldFramed(
+      values(10, (i) => ({ id: i, pad: "x".repeat(1_500_000) })),
+    );
+    expect(frames.mostStaged).toBeLessThanOrEqual(1);
+    expect(frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+  });
+
+  it("bodies made of quotes, which the request escapes a second time, stay under the frame", async () => {
+    // A stored body of 900 KB of `\"` is 1.8 MB in a request.
+    const frames = await foldFramed(
+      values(12, (i) => ({ id: i, pad: '"'.repeat(450_000) })),
+    );
+    expect(frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+  });
+
+  it("deletes with large keys are written in requests under 4 MiB", async () => {
+    const segment = values(0, () => ({}));
+    segment.operations = Array.from({ length: 60 }, (_, i) => ({
+      kind: "delete" as const,
+      stream: "s0",
+      pkHash: `h${String(i).padStart(5, "0")}`,
+      stamp: { o: 1, r: "a" },
+      key: ["k".repeat(200_000)],
+    }));
+    const frames = await foldFramed(segment);
+    expect(frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+  });
+
+  it("a spool holds objects of any size in requests and replies under 4 MiB", async () => {
+    const db = frameLimited(await database());
+    const spool = openSpool(db, "pdpp.c~", "op-1");
+    const sizes = [0, 1, 1_048_576, 1_048_577, 4 * 1024 * 1024, 3_000_001];
+    for (const [i, size] of sizes.entries())
+      await spool.add(`v-${i}`, new Uint8Array(size).fill(i + 1));
+    for (const [i, object] of spool.objects().entries()) {
+      const bytes = await object.read();
+      expect(bytes.length).toBe(sizes[i]);
+      if (sizes[i]! > 0) expect(bytes[sizes[i]! - 1]).toBe(i + 1);
+    }
+    expect(db.frames.largestRequest).toBeLessThan(SQL_FRAME_BYTES);
+    expect(db.frames.largestReply).toBeLessThan(SQL_FRAME_BYTES);
+    await spool.discard();
   });
 });

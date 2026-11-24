@@ -21,7 +21,14 @@ import {
 } from "../../../core/src/localdb/index.js";
 import { openFoldWorkspace } from "../../../core/src/localdb/log-fold-workspace.js";
 import { openSpool } from "../../../core/src/localdb/log-spool.js";
+import { publishLog } from "../../../core/src/localdb/log-publish.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import {
+  CONNECTION_ID,
+  closeWorldDrivers,
+  sName,
+  world,
+} from "./log-world.test-utils.js";
 
 const ID = { owner: "0xAbC", network: "moksha", deviceId: "dev-1" };
 
@@ -154,5 +161,57 @@ describe("scratch tables of the log", () => {
     await again.addSegment(segment);
     await again.close();
     expect((await rows(db, "c1")).cells).toBe(0);
+  });
+});
+
+describe("a publish that fails after it spooled leaves no rows", () => {
+  afterEach(closeWorldDrivers);
+
+  /** A database whose first query after a write to the spool fails. */
+  const failingAfterSpool = (inner: SqlDriver, seen: { failed: boolean }) => {
+    let armed = false;
+    return {
+      ...inner,
+      batch: async (statements: Parameters<SqlDriver["batch"]>[0]) => {
+        const result = await inner.batch(statements);
+        if (statements.some((s) => s.sql.includes("INSERT INTO log_spool")))
+          armed = true;
+        return result;
+      },
+      query: async (
+        sql: string,
+        params?: Parameters<SqlDriver["query"]>[1],
+      ) => {
+        if (armed) {
+          armed = false;
+          seen.failed = true;
+          throw new Error("the read after the spool failed");
+        }
+        return inner.query(sql, params);
+      },
+    } as SqlDriver;
+  };
+
+  it("clears the spool when the read that follows the spool writes fails", async () => {
+    const seen = { failed: false };
+    const w = await world({
+      streams: 1,
+      partTargetBytes: 1000,
+      database: (deviceId) =>
+        deviceId === "a"
+          ? failingAfterSpool(openBetterSqlite3(":memory:"), seen)
+          : openBetterSqlite3(":memory:"),
+    });
+    const a = await w.device("a");
+    // A body over the part target goes out of line: its pieces are spooled.
+    await a.run("r1", [{ stream: sName(0), id: "x", pad: 5000 }]);
+    await expect(publishLog(a.deps, CONNECTION_ID)).rejects.toThrow(
+      "the read after the spool failed",
+    );
+    expect(seen.failed).toBe(true);
+    const [spool] = await a.db.query<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM log_spool",
+    );
+    expect(spool!.n).toBe(0);
   });
 });

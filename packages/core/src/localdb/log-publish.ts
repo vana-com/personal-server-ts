@@ -1426,35 +1426,35 @@ async function snapshotRound(
     clock.record("encode", encodeStart);
     for (const piece of outOfLine.pieces)
       await spool.add(piece.name, piece.cipher);
-    handedOver = true;
-    return {
-      kind: "candidate",
-      candidate: {
-        lifetime: connectionLifetime(held.db, connectionId),
-        connector: connection.connector,
-        ns: connection.ns,
-        basis: await basisOf(held, connectionId, planned, log),
-        state: log,
-        base,
-        refs,
-        snapshot,
-        objects: spool.objects(),
-        spool,
-        position,
-        generation: connection.generation,
-        dataHash,
-        blobName,
-        cipher,
-        clearBytes: clear.length,
-        removes: segmentRemoves(segment.operations),
-        observedAt: segment.observedAt,
-        planned,
-        attachments,
-        controlDataHash,
-        createControl,
-        prevHash: log.refs.at(-1)?.dataHash ?? null,
-      },
+    // Everything that can fail is done before the spool changes hands: a
+    // candidate that is never returned would leave its rows with no owner.
+    const candidate: Candidate = {
+      lifetime: connectionLifetime(held.db, connectionId),
+      connector: connection.connector,
+      ns: connection.ns,
+      basis: await basisOf(held, connectionId, planned, log),
+      state: log,
+      base,
+      refs,
+      snapshot,
+      objects: spool.objects(),
+      spool,
+      position,
+      generation: connection.generation,
+      dataHash,
+      blobName,
+      cipher,
+      clearBytes: clear.length,
+      removes: segmentRemoves(segment.operations),
+      observedAt: segment.observedAt,
+      planned,
+      attachments,
+      controlDataHash,
+      createControl,
+      prevHash: log.refs.at(-1)?.dataHash ?? null,
     };
+    handedOver = true;
+    return { kind: "candidate", candidate };
   } finally {
     if (!handedOver) await spool.discard();
   }

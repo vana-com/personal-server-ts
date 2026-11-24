@@ -51,9 +51,7 @@ import {
 import { rowsWithin, SIZE_ROWS } from "./byte-pages.js";
 import type { SqlDriver, SqlStatement } from "./driver.js";
 import { FOLD_CELLS } from "./log-scratch.js";
-
-/** Operations written per batch: a bound on a batch, not on the history. */
-const OPS_PER_BATCH = 200;
+import { utf8Length, writeInBatches } from "./write-batches.js";
 
 export interface FoldWorkspace {
   /** Fold a snapshot part in. Parts go in the order the pointer lists them, before any segment. */
@@ -103,26 +101,6 @@ function fromUtf16Key(bytes: Uint8Array): string {
   for (let i = 0; i + 1 < bytes.length; i += 2)
     out += String.fromCharCode((bytes[i]! << 8) | bytes[i + 1]!);
   return out;
-}
-
-/** The bytes `value` takes as UTF-8, the unit SQLite's `LENGTH(CAST(x AS BLOB))` counts. */
-function utf8Length(value: string): number {
-  let bytes = 0;
-  for (let i = 0; i < value.length; i++) {
-    const unit = value.charCodeAt(i);
-    if (unit < 0x80) bytes += 1;
-    else if (unit < 0x800) bytes += 2;
-    else if (
-      unit >= 0xd800 &&
-      unit <= 0xdbff &&
-      i + 1 < value.length &&
-      (value.charCodeAt(i + 1) & 0xfc00) === 0xdc00
-    ) {
-      bytes += 4;
-      i += 1;
-    } else bytes += 3;
-  }
-  return bytes;
 }
 
 export async function openFoldWorkspace(
@@ -222,24 +200,11 @@ export async function openFoldWorkspace(
     ];
   };
 
-  /** The statements of `ops`, written `OPS_PER_BATCH` operations at a time. */
-  const write = async (statements: Iterable<SqlStatement[]>) => {
-    let batch: SqlStatement[] = [];
-    let n = 0;
-    for (const group of statements) {
-      batch.push(...group);
-      if (++n % OPS_PER_BATCH === 0) {
-        await db.batch(batch);
-        batch = [];
-      }
-    }
-    if (batch.length > 0) await db.batch(batch);
-  };
-
   return {
     async addPart(part) {
       for (const meta of part.streams) follow(meta);
-      await write(
+      await writeInBatches(
+        db,
         (function* () {
           for (const entry of part.entries)
             if (entry.kind === "upsert" || entry.kind === "upsert-ref")
@@ -257,7 +222,8 @@ export async function openFoldWorkspace(
     },
     async addSegment(segment) {
       for (const meta of segment.streams) follow(meta);
-      await write(
+      await writeInBatches(
+        db,
         (function* () {
           for (const op of segment.operations)
             if (op.kind === "upsert" || op.kind === "upsert-ref")

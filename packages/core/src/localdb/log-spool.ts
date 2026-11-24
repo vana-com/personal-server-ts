@@ -70,11 +70,14 @@ export function openSpool(
           },
         ]);
       }
+      // A handle keeps scalars. A closure over `cipher` would keep every
+      // sealed object in memory for as long as the spool lives.
+      const length = cipher.length;
       added.set(name, {
         name,
-        bytes: cipher.length,
+        bytes: length,
         async read() {
-          const whole = new Uint8Array(cipher.length);
+          const whole = new Uint8Array(length);
           let at = 0;
           for (let chunk = 0; chunk < chunks; chunk++) {
             const [row] = await db.query<{ cipher: Uint8Array }>(
@@ -87,7 +90,7 @@ export function openSpool(
             whole.set(row.cipher, at);
             at += row.cipher.length;
           }
-          if (at !== cipher.length)
+          if (at !== length)
             throw new Error(`publish: spooled object ${name} is cut short`);
           return whole;
         },
