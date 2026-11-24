@@ -1875,6 +1875,8 @@ async function bootstrapServer(
             (await localSyncSource()).deleter.readConnectionLifetime(connector),
           deleteStatus: async (connector) =>
             (await localSyncSource()).deleter.deleteStatus(connector),
+          deleteStatusSnapshot: async (connector) =>
+            (await localSyncSource()).deleter.deleteStatusSnapshot(connector),
         }
       : null,
     // Shutdown stops admission before the database closes.

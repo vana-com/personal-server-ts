@@ -251,7 +251,22 @@ export async function retireLegacyOf(
     let retry = false;
     for (const scope of scopes) {
       signal?.throwIfAborted();
-      const outcome = await retireScope(deps, ports, scope, signal);
+      // One scope's failed read says nothing of the others: it waits and is
+      // retried, and the scopes after it still retire.
+      const outcome = await retireScope(deps, ports, scope, signal).catch(
+        (error: unknown) => {
+          if (signal?.aborted) throw error;
+          deps.logger.warn(
+            {
+              connector,
+              scope,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "stream sync: a legacy scope could not be retired yet",
+          );
+          return waiting;
+        },
+      );
       part = worst(part, outcome.part);
       retry ||= outcome.retry;
     }

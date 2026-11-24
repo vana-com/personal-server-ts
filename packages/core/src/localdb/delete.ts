@@ -182,6 +182,13 @@ export interface ConnectionDeleter {
    */
   deleteStatus(connector: string): Promise<ConnectionDeleteStatus>;
   /**
+   * `deleteStatus` from what this device holds, with no read of the registry:
+   * for an answer that must not wait on the network (the delete request's).
+   * The verdict it reads is the one last compared with the registry, so it
+   * can lag a delete another device made until `deleteStatus` is read.
+   */
+  deleteStatusSnapshot(connector: string): Promise<ConnectionDeleteStatus>;
+  /**
    * Whether work is queued that can change a part now reading `pending`: an
    * erasure pass owed here (the start sweep, or one a pass left unfinished).
    * A delete still landing is not counted: its intent row is its queue.
@@ -526,9 +533,12 @@ export function createConnectionDeleter(
    * clears the connector's verdicts), learned, and owed to both stages. Every
    * path that reads a verdict (a status, a request, an erasure pass, the
    * start sweep) calls this first, so none can answer for a delete the
-   * registry has already moved past. A connector with no delete known here,
-   * and a namespace with no tombstone held, are not this device's to adopt:
-   * a sync of the control row does that, and names the tombstone.
+   * registry has already moved past. A connector with no delete known here
+   * is not this device's to adopt: a sync of the control row does that, and
+   * names the tombstone. For a connector with a delete on record, a tombstone
+   * in any namespace counts, one this device holds no row or connection for
+   * too: the connector's delete is what the verdict speaks for, and the
+   * erasure pass judges every deleted namespace the registry lists.
    */
   async function adoptEnded(
     connector: string,
@@ -540,7 +550,7 @@ export function createConnectionDeleter(
     const held = tombstones.get(connector);
     if (!held) return false;
     const newer = [...ended].filter(
-      ([ns, version]) => held.has(ns) && version > held.get(ns)!,
+      ([ns, version]) => version > (held.get(ns) ?? 0),
     );
     if (newer.length === 0) return false;
     await deps.db.batch([
@@ -1153,6 +1163,11 @@ export function createConnectionDeleter(
     // A verdict speaks for the tombstone it was judged at: a newer one the
     // registry shows ends it before it is read.
     await refreshTombstones([connector]);
+    return deleteStatusSnapshot(connector);
+  }
+  async function deleteStatusSnapshot(
+    connector: string,
+  ): Promise<ConnectionDeleteStatus> {
     const [open] = await deps.db.query(
       "SELECT 1 FROM delete_intents WHERE connector=?",
       [connector],
@@ -1341,6 +1356,7 @@ export function createConnectionDeleter(
     },
     resumeDelete,
     deleteStatus,
+    deleteStatusSnapshot,
     /**
      * A connection of the connector was purged here: its erasure may be owed.
      * `tombstone` is the control tombstone that ended it (namespace and

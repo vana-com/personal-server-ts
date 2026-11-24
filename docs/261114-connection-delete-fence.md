@@ -191,6 +191,14 @@ every legacy scope bound to the connector (`localdb/legacy-delete.ts`):
   status read, a delete request (its plan), the erasure pass and the start
   sweep all make that comparison first; a listing that fails leaves the known
   tombstones standing. A read that finds a newer delete arms the retry loop.
+  The rule is per connector: once this device holds a delete record for a
+  connector, a newer tombstone in any namespace counts, including one where it
+  has no connection or ledger row; the pass judges every deleted namespace the
+  registry lists. The POST answer is built from `deleteStatusSnapshot`, which
+  reads no registry; only the GET (`deleteStatus`) compares with a fresh
+  listing, so a slow registry cannot stall the answer past the fence wait.
+- The legacy stage retires scopes one by one. A scope whose read throws is
+  `pending` and retried; the scopes after it still retire.
 - A part that reads `pending` always has work queued, found from the same rows
   that gave the status. The erasure report names every deleted namespace it left
   alone (`skipped`: a live local connection holds it). A skipped tombstone reads

@@ -391,6 +391,8 @@ export function createLocalSync(
       return result;
     },
     resumeDeletes: resume,
+    deleteStatusSnapshot: (connector) =>
+      deletes().deleteStatusSnapshot(connector),
     async deleteStatus(connector) {
       const status = await deletes().deleteStatus(connector);
       // A status that found a newer delete owes its erasure: the retry loop

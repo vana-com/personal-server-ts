@@ -18,6 +18,7 @@ import {
   controlScope,
   deriveKeyCheck,
 } from "@opendatalabs/personal-server-ts-stream-sync";
+import { handleOwnerConnectorDelete } from "../../../core/src/api/owner-connector-delete.js";
 import { applyConnection } from "../../../core/src/localdb/apply.js";
 import { bootstrapConnections } from "../../../core/src/localdb/bootstrap.js";
 import {
@@ -626,6 +627,45 @@ it("writes no tombstone for a local-only purge: nothing was confirmed, so a rest
       "SELECT connector FROM delete_tombstones WHERE done_at IS NULL",
     ),
   ).toEqual([]);
+});
+
+it("answers a delete request from the status held here: a stalled registry is read once, by the plan, and the answer is 202 not fenced", async () => {
+  const f = await world();
+  const lists = vi.fn();
+  const list = f.registry.listControlRows.bind(f.registry);
+  f.registry.listControlRows = (signal) => {
+    lists();
+    // The plan's listing answers; anything after it stalls.
+    return lists.mock.calls.length === 1
+      ? list(signal)
+      : new Promise<never>(() => {});
+  };
+  // The fence never lands: the registry does not answer the post.
+  f.registry.beforePost = () => new Promise<never>(() => {});
+  const deleter = createConnectionDeleter(f.a.deps, { fenceWaitMs: 100 });
+  // A delete of this connector is known here already.
+  await f.a.db.batch([
+    {
+      sql: "INSERT INTO delete_tombstones(connector, ns, version) VALUES ('fixture-source', '', 1)",
+    },
+  ]);
+
+  const response = await handleOwnerConnectorDelete(
+    new Request("https://example.test/v1/owner/connectors/fixture-source", {
+      method: "DELETE",
+    }),
+    "fixture-source",
+    {
+      authorizeOwner: async () => {},
+      mode: { read: () => "switched" },
+      connectionDelete: deleter,
+    },
+  );
+
+  expect(response.status).toBe(202);
+  expect(await response.json()).toMatchObject({ fenced: false });
+  // The plan listed once; the status of the answer listed nothing.
+  expect(lists).toHaveBeenCalledTimes(1);
 });
 
 it("a request with no answer is sent once more, then leaves its fences to the per-row pass, which lands them (mutant: NO_RESEND_AMBIGUOUS)", async () => {

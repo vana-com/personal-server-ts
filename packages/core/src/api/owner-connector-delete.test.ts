@@ -86,7 +86,7 @@ describe("handleOwnerConnectorDelete (PS-2 W6 owner-delete)", () => {
         ...deps,
         connectionDelete: {
           ...deps.connectionDelete!,
-          deleteStatus: vi.fn(async () => deleteStatus),
+          deleteStatusSnapshot: vi.fn(async () => deleteStatus),
         },
       },
     );
@@ -97,6 +97,36 @@ describe("handleOwnerConnectorDelete (PS-2 W6 owner-delete)", () => {
       fenced: true,
       deleteStatus,
     });
+  });
+
+  it("answers a delete request from the status held here, never from a read that can wait on the network", async () => {
+    const { deps } = makeDeps();
+    const snapshot = {
+      fence: { state: "pending" },
+      legacy: { state: "pending" },
+      storage: { state: "pending" },
+    } as const;
+    const deleteStatus = vi.fn(() => new Promise<never>(() => {}));
+    const response = await handleOwnerConnectorDelete(
+      deleteRequest(),
+      "fixture",
+      {
+        ...deps,
+        connectionDelete: {
+          ...deps.connectionDelete!,
+          deleteStatus,
+          deleteStatusSnapshot: vi.fn(async () => snapshot),
+        },
+      },
+    );
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({
+      deleteId: "delete-1",
+      fenced: true,
+      deleteStatus: snapshot,
+    });
+    expect(deleteStatus).not.toHaveBeenCalled();
   });
 
   it("tells a caller whose delete could not reach the registry that it is still pending", async () => {

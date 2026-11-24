@@ -98,6 +98,8 @@ async function collected(
     dbFile?: string;
     /** Whether the device can retire a legacy copy now (default: it can). */
     legacyOn?: () => boolean;
+    /** The device's legacy ports, as a test breaks them. */
+    wrapLegacy?: (ports: LegacyDeletePorts) => LegacyDeletePorts;
   } & NonNullable<Parameters<typeof legacyPortsOver>[1]> = {},
 ) {
   const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
@@ -111,7 +113,9 @@ async function collected(
   const a = await w.device("a", {
     erasure: () => (options.erasure ?? erasurePorts)(w),
     legacyDelete: () =>
-      (options.legacyOn?.() ?? true) ? legacy.ports : undefined,
+      (options.legacyOn?.() ?? true)
+        ? (options.wrapLegacy?.(legacy.ports) ?? legacy.ports)
+        : undefined,
     deleteRetryMs: RETRY,
     ...(options.dbFile && { dbFile: options.dbFile }),
   });
@@ -801,6 +805,38 @@ describe("the legacy stage of a connection delete after the switch", () => {
       expect(rows[0]!.done_at).not.toBeNull();
     });
 
+    it("reads pending when another device deletes the connector in a namespace this device has no connection in, and the pass judges it", async () => {
+      const { w, a } = await collected();
+      await a.sync.deleter.requestConnectionDelete(GH);
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+      expect(await ledgerOf(a)).toHaveLength(1);
+
+      // Another device deletes the connector in a namespace of its own.
+      const other = "b".repeat(16);
+      const versions = w.gateway.versions.get(controlScope(GH, ""))!;
+      w.gateway.write(controlScope(GH, other), {
+        ...versions[versions.length - 1]!,
+      });
+
+      const status = await statusOf(a);
+      expect(allDone(status)).toBe(false);
+      expect(status.storage).toEqual(PENDING);
+      expect(a.sync.deleter.erasureOwed()).toBe(true);
+      expect((await ledgerOf(a)).map((row) => row.ns)).toEqual(["", other]);
+      expect((await ledgerOf(a)).every((row) => row.done_at === null)).toBe(
+        true,
+      );
+
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
+      expect((await ledgerOf(a)).every((row) => row.done_at !== null)).toBe(
+        true,
+      );
+    });
+
     it("drops the verdict when a newer delete of the connection lands", async () => {
       const { a } = await collected({ dbFile: dbFile() });
       await a.sync.deleter.requestConnectionDelete(GH);
@@ -867,6 +903,37 @@ describe("the legacy stage of a connection delete after the switch", () => {
       deleter.noteSettled(GH, { ns: "", version: 4 });
       await deleter.resumeErasures();
       expect(tries()).toBeGreaterThan(first);
+    });
+  });
+
+  describe("a scope that fails to read", () => {
+    it("reads pending and is retried, and the scopes after it still retire", async () => {
+      expect(SCOPES.length).toBeGreaterThan(1);
+      const broken = { on: true };
+      const { a, fake } = await collected({
+        wrapLegacy: (ports) => ({
+          ...ports,
+          head: async (scope, signal) => {
+            if (broken.on && scope === SCOPES[0])
+              throw new Error("the feed is down for one scope");
+            return ports.head(scope, signal);
+          },
+        }),
+      });
+      await a.sync.deleter.requestConnectionDelete(GH);
+
+      // The healthy scopes retire though the first one throws, every pass.
+      await vi.waitFor(() =>
+        expect(SCOPES.slice(1).every((s) => !fake.isLive(s))).toBe(true),
+      );
+      expect((await statusOf(a)).legacy).toEqual(PENDING);
+      expect(a.sync.deleter.erasureOwed()).toBe(true);
+
+      // The scope recovers: the retry finishes the delete.
+      broken.on = false;
+      await vi.waitFor(async () =>
+        expect(allDone(await statusOf(a))).toBe(true),
+      );
     });
   });
 

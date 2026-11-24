@@ -93,6 +93,11 @@ export interface ConnectionDeletePort {
   readConnectionLifetime?(connector: string): Promise<string>;
   /** What is left of the connector's delete here (`ConnectionDeleteStatus`). */
   deleteStatus?(connector: string): Promise<ConnectionDeleteStatus>;
+  /**
+   * The same, from what this device holds with no network read: the POST's
+   * answer, which waits for the fences only and not for a registry.
+   */
+  deleteStatusSnapshot?(connector: string): Promise<ConnectionDeleteStatus>;
 }
 
 export interface OwnerConnectorDeleteDeps {
@@ -212,7 +217,7 @@ export async function handleOwnerConnectorDelete(
         : await deps.connectionDelete.requestConnectionDelete(connectorId!, {
             lifetime,
           });
-    const deleteStatus = await deps.connectionDelete.deleteStatus?.(
+    const deleteStatus = await deps.connectionDelete.deleteStatusSnapshot?.(
       connectorId!,
     );
     return accepted(started.deleteId, started.fenced, deleteStatus);
