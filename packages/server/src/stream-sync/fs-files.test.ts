@@ -106,6 +106,35 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(chunks).toEqual([]);
   });
 
+  it("lists nested files in sorted root-relative order", async () => {
+    const files = createFsStreamSyncFiles(root);
+    const prefix = "sample";
+    const nested = ["sample/z/leaf", "sample/a/leaf", "sample/root"];
+    for (const path of [...nested, "sample-other/stays-out"]) {
+      await files.write(path, enc.encode("sample"));
+    }
+    await mkdir(join(root, prefix, "empty"));
+
+    expect(await files.list(prefix)).toEqual([...nested].sort());
+    expect(await files.list("missing")).toEqual([]);
+  });
+
+  it("reads each byte once in order across multiple chunks", async () => {
+    const files = createFsStreamSyncFiles(root);
+    const path = "samples/chunked.bin";
+    const bytes = Uint8Array.from(
+      { length: 1024 * 1024 + 31 },
+      (_, i) => i % 251,
+    );
+    await files.write(path, bytes);
+    const observed: Buffer[] = [];
+    for await (const chunk of files.readChunks(path)) {
+      observed.push(Buffer.from(chunk));
+    }
+    expect(observed.length).toBeGreaterThan(1);
+    expect(Buffer.concat(observed).equals(Buffer.from(bytes))).toBe(true);
+  });
+
   it("write replaces a file that has an open append handle", async () => {
     const files = createFsStreamSyncFiles(root);
     await files.appendMany([{ path: "s/0", bytes: enc.encode("old") }]);
