@@ -91,20 +91,50 @@ async function cycleOver(
   early: Map<string, EarlyPublish>,
   onApply?: (outcome: ApplyOutcome) => void,
 ): Promise<CycleReport> {
-  const connections = await bootstrapConnections(deps, listed);
+  const failures = new Map<string, unknown>();
+  const connections = await bootstrapConnections(deps, listed, failures);
   return {
-    connections: await Promise.all(
-      connections.map(({ connectionId }) =>
-        syncConnection(
-          deps,
-          connectionId,
-          early.get(connectionId),
-          listed,
-          onApply,
-        ),
-      ),
-    ),
+    connections: [
+      ...(await Promise.all(
+        connections
+          .filter(({ connectionId }) => !failures.has(connectionId))
+          .map(({ connectionId }) =>
+            syncConnection(
+              deps,
+              connectionId,
+              early.get(connectionId),
+              listed,
+              onApply,
+            ),
+          ),
+      )),
+      ...failedBootstraps(deps, failures, early),
+    ],
   };
+}
+
+/**
+ * A connection whose control save or purge failed is reported against itself,
+ * with what the early publish already did, and is not applied or published
+ * this pass. The other connections go on.
+ */
+function failedBootstraps(
+  deps: LocalSyncDeps,
+  failures: ReadonlyMap<string, unknown>,
+  early: ReadonlyMap<string, EarlyPublish>,
+): CycleReport["connections"] {
+  return [...failures].map(([connectionId, cause]) => {
+    const error = errorMessage(cause);
+    deps.logger.warn(
+      { connectionId, error },
+      "Stream sync cycle failed for a connection",
+    );
+    return {
+      connectionId,
+      published: early.get(connectionId)?.published ?? [],
+      error,
+    };
+  });
 }
 
 /** Retry only the named connections using one shared owner listing. */
@@ -215,14 +245,23 @@ export async function runPublish(
   let cycleError: string | undefined;
   try {
     const listed = await deps.registry.listOwnerRows();
-    const known = await bootstrapConnections(deps, listed);
-    cycle = await Promise.all(
-      known
-        .filter(({ connectionId }) => !own.has(connectionId))
-        .map(({ connectionId }) =>
-          syncConnection(deps, connectionId, early.get(connectionId), listed),
-        ),
-    );
+    const failures = new Map<string, unknown>();
+    const known = await bootstrapConnections(deps, listed, failures);
+    cycle = [
+      ...(await Promise.all(
+        known
+          .filter(
+            ({ connectionId }) =>
+              !own.has(connectionId) && !failures.has(connectionId),
+          )
+          .map(({ connectionId }) =>
+            syncConnection(deps, connectionId, early.get(connectionId), listed),
+          ),
+      )),
+      ...failedBootstraps(deps, failures, early).filter(
+        ({ connectionId }) => !own.has(connectionId),
+      ),
+    ];
   } catch (cause) {
     // Nothing of the pass ran for the siblings: each that did not settle
     // failed with this, and a connection only the pass could place with it.

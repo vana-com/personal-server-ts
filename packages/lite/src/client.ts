@@ -123,8 +123,8 @@ export type PersonalServerLitePublishOptions = {
   /**
    * The connections (`controlScope(connector, ns)`) whose publication the
    * caller awaits. `publish()` rejects only for these: another connection's
-   * failure is in `connections` and nothing more. Without it every connection
-   * is the caller's own.
+   * failure is in `connections` and nothing more. Without it, or with an empty
+   * list, every connection is the caller's own.
    */
   readonly connections?: readonly string[];
 };
@@ -702,11 +702,13 @@ export async function startPersonalServer(
       !runtimeBundle?.getLocalSync
     )
       throw new Error("Stream publication is unavailable");
-    const report = await (
-      await runtimeBundle.getLocalSync()
-    ).publish(options.connections);
+    // An empty list names no connection: it is no scope, as when omitted.
+    const awaited = options.connections?.length
+      ? options.connections
+      : undefined;
+    const report = await (await runtimeBundle.getLocalSync()).publish(awaited);
     const connections = report.connections.map(connectionPublication);
-    const own = options.connections ? new Set(options.connections) : null;
+    const own = awaited ? new Set(awaited) : null;
     const mine = connections.filter(
       (connection) => own === null || own.has(connection.connectionId),
     );

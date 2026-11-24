@@ -313,9 +313,9 @@ describe("the save path of a Web write", () => {
       expect(receipt.outcome).toBe("published");
       expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
       const mine = receipt.connections.find((c) => c.connectionId === own);
-      expect(mine?.outcome).toBe("published");
+      expect(mine).toMatchObject({ connectionId: own, outcome: "published" });
       // The fallback does not apply the caller's connection.
-      expect(mine?.error).toBeUndefined();
+      expect(mine).not.toHaveProperty("error");
     });
 
     it("still rejects for the sibling when the caller names it", async () => {
@@ -329,6 +329,14 @@ describe("the save path of a Web write", () => {
       const { server } = await withFailingSibling();
       await expect(server.publish()).rejects.toThrow(/no reply/);
     });
+  });
+
+  it("treats an empty connections list as no scope", async () => {
+    const { server, collect } = await savePathWorld(false);
+    await collect("run-own");
+    const receipt = await server.publish({ connections: [] });
+    expect(receipt.outcome).toBe("published");
+    expect(receipt.publications.map((p) => p.runIds)).toEqual([["run-own"]]);
   });
 
   it("resolves publish() at the registry commit, with every registry listing still unanswered", async () => {
