@@ -717,6 +717,110 @@ describe("erasure wired into the connection delete", () => {
       expect(logKeys(w, LOG)).toEqual(old);
     });
 
+    /**
+     * This device deleted the connector once (its tombstone is not final in
+     * storage yet) and then connected again; another device deletes that second
+     * lifetime. This device reads the new tombstone (a status read, or the
+     * start sweep) before its own sync purges the old connection.
+     */
+    async function deletedAgainElsewhere() {
+      const state: { finalized: string | null } = { finalized: null };
+      const w = await world({ streams: 1, partTargetBytes: PART_TARGET });
+      const { erasure } = ports(w, state);
+      const phone = await w.device("phone");
+      const desktop = await w.device("desktop", {
+        erasure: () => erasure,
+        deleteRetryMs: RETRY,
+      });
+      const record = { stream: sName(0), id: "x", v: 0 };
+      await desktop.run("run-1", [record], { observedAt: 1100 });
+      await desktop.cycle();
+      await desktop.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(desktop)).toEqual([]));
+
+      await desktop.run("run-2", [{ ...record, id: "y" }], {
+        connect: true,
+        observedAt: 1200,
+      });
+      await desktop.cycle();
+      await phone.cycle();
+      await phone.sync.deleter.requestConnectionDelete(CONNECTOR);
+      await vi.waitFor(async () => expect(await intents(phone)).toEqual([]));
+      return { w, desktop, phone, state };
+    }
+
+    it("erases a delete another device wrote though this device read its tombstone before purging its old connection", async () => {
+      const { w, desktop, state } = await deletedAgainElsewhere();
+      // The read adopts the newer tombstone; the old connection is still here,
+      // registered at a lifetime that tombstone ended.
+      await desktop.sync.deleter.deleteStatus(CONNECTOR);
+      state.finalized = "99";
+      // The pass that judges the adopted tombstone has run.
+      await vi.waitFor(async () =>
+        expect(
+          (await desktop.sync.deleter.deleteStatus(CONNECTOR)).storage,
+        ).not.toEqual({ state: "pending" }),
+      );
+      expect(
+        await desktop.db.query(
+          "SELECT control_state FROM connections WHERE connector = ?",
+          [CONNECTOR],
+        ),
+      ).toEqual([{ control_state: "active" }]);
+      // The local sync then purges it, naming the same tombstone.
+      await desktop.cycle();
+
+      await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+      await vi.waitFor(async () =>
+        expect(
+          (await desktop.sync.deleter.deleteStatus(CONNECTOR)).storage,
+        ).toEqual({ state: "done" }),
+      );
+    });
+
+    it("never reads an old connection of an ended lifetime as a re-add while it waits for its purge", async () => {
+      const { w, desktop, state } = await deletedAgainElsewhere();
+      await desktop.sync.deleter.deleteStatus(CONNECTOR);
+      state.finalized = "99";
+
+      // Before any purge: the erasure needs no purge to proceed, and the
+      // status never says the connection was added again.
+      await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+      expect(
+        (await desktop.sync.deleter.deleteStatus(CONNECTOR)).storage,
+      ).not.toEqual({ state: "blocked", reason: "re_added" });
+    });
+
+    it("erases once a connection that never registered, held back while it lived, is purged under the same tombstone", async () => {
+      const { w, desktop, state } = await deletedAgainElsewhere();
+      // The old connection never registered a lifetime the tombstone could have
+      // ended (a local connection added again, not published yet): this device
+      // cannot tell it from a re-add, so the namespace is held back.
+      await desktop.db.batch([
+        {
+          sql: "UPDATE connections SET control_state = 'absent' WHERE connector = ?",
+          params: [CONNECTOR],
+        },
+      ]);
+      await desktop.sync.deleter.deleteStatus(CONNECTOR);
+      state.finalized = "99";
+      await vi.waitFor(async () =>
+        expect(
+          (await desktop.sync.deleter.deleteStatus(CONNECTOR)).storage,
+        ).toEqual({ state: "blocked", reason: "re_added" }),
+      );
+      expect(logKeys(w, LOG).length).toBeGreaterThan(0);
+
+      await desktop.cycle();
+
+      await vi.waitFor(() => expect(logKeys(w, LOG)).toEqual([]));
+      await vi.waitFor(async () =>
+        expect(
+          (await desktop.sync.deleter.deleteStatus(CONNECTOR)).storage,
+        ).toEqual({ state: "done" }),
+      );
+    });
+
     it("reads storage as pending while the registry cannot list the deleted connections", async () => {
       const { a, erasure } = await settledDelete();
       const down = {
@@ -1307,6 +1411,14 @@ describe("erasure wired into the connection delete", () => {
 
     it("does not erase a namespace while a local connection of it is live", async () => {
       const { a } = await collected({ finalized: "99" });
+      // A lifetime registered after the tombstone (`TOMBSTONE.version`): a
+      // connection of an earlier one is stale, and its namespace is erased.
+      await a.db.batch([
+        {
+          sql: "UPDATE connections SET generation = ?, control_version = ? WHERE connector = ?",
+          params: [TOMBSTONE.version + 1, TOMBSTONE.version + 1, CONNECTOR],
+        },
+      ]);
       const eraseLogs = await owed(a);
       // Every pass holds the live namespace back (the default one here).
       expect(eraseLogs).toHaveBeenCalled();

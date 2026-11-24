@@ -972,11 +972,18 @@ export function createConnectionDeleter(
   }
   /**
    * The namespaces of `connector` whose delete has not settled here: a local
-   * connection in them is not purged (a connection added again, or one the
-   * purge has not reached, is another lifetime). `null` while a delete of the
-   * connector is in flight: nothing of it is settled. One namespace's live
-   * connection never holds back another's erasure: a delete that names a
-   * lifetime leaves a local connection no pin names, by design.
+   * connection in them is not purged and is not one the delete ended (a
+   * connection added again, or one registered after the tombstone, is another
+   * lifetime). `null` while a delete of the connector is in flight: nothing of
+   * it is settled. One namespace's live connection never holds back another's
+   * erasure: a delete that names a lifetime leaves a local connection no pin
+   * names, by design.
+   *
+   * A connection still `active` at a generation the held tombstone ended is
+   * stale, not a re-add: its purge is only waiting for the next sync of the
+   * control row (a status read or the start sweep can learn the tombstone
+   * first). A reconnect registers a higher generation, and one that never
+   * registered has no generation to compare: both still hold the namespace.
    */
   async function unsettledNamespaces(
     connector: string,
@@ -986,11 +993,26 @@ export function createConnectionDeleter(
       [connector],
     );
     if (intent) return null;
-    const live = await deps.db.query<{ ns: string }>(
-      "SELECT DISTINCT ns FROM connections WHERE connector=? AND control_state<>'deleted'",
+    const live = await deps.db.query<{
+      ns: string;
+      control_state: string;
+      generation: number;
+    }>(
+      "SELECT ns, control_state, generation FROM connections WHERE connector=? AND control_state<>'deleted'",
       [connector],
     );
-    return new Set(live.map((row) => row.ns));
+    const held = tombstonesOf(connector);
+    return new Set(
+      live
+        .filter(
+          (row) =>
+            !(
+              row.control_state === "active" &&
+              Number(row.generation) <= (held.get(row.ns) ?? 0)
+            ),
+        )
+        .map((row) => row.ns),
+    );
   }
   /**
    * One erasure pass for `connector`; answers whether it is unfinished. The
@@ -1100,6 +1122,17 @@ export function createConnectionDeleter(
       part.state === "pending" ||
       (part.state === "blocked" && part.reason === "needs_another_device");
     return { legacy: open(seen?.legacy), storage: open(seen?.storage) };
+  }
+  /**
+   * Forget a storage verdict of `blocked(re_added)`: it says a local
+   * connection held a namespace, and one was purged since.
+   */
+  function releaseReAdded(connector: string) {
+    const seen = judged.get(connector);
+    const storage = seen?.storage;
+    if (storage?.state !== "blocked" || storage.reason !== "re_added") return;
+    const { storage: _released, ...rest } = seen!;
+    judged.set(connector, rest);
   }
   interface JudgedPart {
     legacy?: DeletePart;
@@ -1378,6 +1411,10 @@ export function createConnectionDeleter(
         ? learnTombstone(connector, tombstone.ns, tombstone.version)
         : false;
       if (!owesErasure) return;
+      // A connection held a namespace back and is gone: what held it back is
+      // no longer true, so the same tombstone is judged again. A connection
+      // that still holds it (or another that does) holds it back again.
+      if (!newer) releaseReAdded(connector);
       const owed = newer ? BOTH : unfinishedStages(connector);
       if (owed.legacy || owed.storage) owe(connector, owed);
     },
