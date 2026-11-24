@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   alternateLegacyBindingsForScope,
+  legacyAliasScopes,
   LEGACY_SCOPE_BINDINGS,
   projectPdppRecordsToLegacyPayload,
   requiredLegacyStreams,
@@ -125,6 +126,42 @@ describe("windowed legacy projection", () => {
       }
     });
   }
+});
+
+describe("windowed projection caller contract", () => {
+  const scope = "chatgpt.conversations";
+
+  it("exports the parent key and served stream needed to make a window", () => {
+    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const window = binding.window!;
+    const aliases = legacyAliasScopes(scope);
+    const alias = aliases.find(({ connector }) => connector === "chatgpt");
+
+    expect(alias).toMatchObject({
+      windowed: true,
+      servedStream: window.parentStream,
+      window: {
+        parentStream: window.parentStream,
+        parentKey: binding.primaryKey[window.parentStream]![0],
+        childStream: window.childStream,
+        childKey: window.childKey,
+      },
+    });
+  });
+
+  it("returns a typed error instead of falling back to another known profile", () => {
+    const profileKey = "synthetic-unregistered-profile";
+    expect(
+      projectPdppRecordsToLegacyPayload(scope, [], {
+        profileKey,
+        fetchedStreams: [],
+        now: NOW,
+      }),
+    ).toEqual({
+      ok: false,
+      error: { kind: "unsupported_profile", scope, profileKey },
+    });
+  });
 });
 
 describe("legacy projection memory guard", () => {
