@@ -47,6 +47,8 @@ import {
 import {
   handleOwnerConnectorDelete,
   handleOwnerConnectorLifetime,
+  handleOwnerLegacyRetire,
+  handleOwnerLegacyRetireStatus,
   type ConnectionDeletePort,
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
@@ -1479,9 +1481,8 @@ export function createPsLiteRuntime(
           return unavailableResponse();
         }
 
-        const connectorPath = /^\/v1\/owner\/connectors\/([^/]+)$/.exec(
-          url.pathname,
-        );
+        const connectorPath =
+          /^\/v1\/owner\/connectors\/([^/]+)(\/legacy)?$/.exec(url.pathname);
         if (connectorPath) {
           if (request.method !== "DELETE" && request.method !== "GET") {
             // Owner first: a caller who is not the owner learns nothing of the route.
@@ -1504,6 +1505,14 @@ export function createPsLiteRuntime(
             mode: accountStorageMode,
             connectionDelete: options.streamSyncConnectionDelete,
           };
+          if (connectorPath[2] !== undefined)
+            return request.method === "GET"
+              ? handleOwnerLegacyRetireStatus(
+                  request,
+                  connectorId,
+                  connectorDeps,
+                )
+              : handleOwnerLegacyRetire(request, connectorId, connectorDeps);
           return request.method === "GET"
             ? handleOwnerConnectorLifetime(request, connectorId, connectorDeps)
             : handleOwnerConnectorDelete(request, connectorId, connectorDeps);

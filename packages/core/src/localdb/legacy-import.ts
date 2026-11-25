@@ -80,6 +80,7 @@ export type LegacyImportResult =
       readonly kind: "refused";
       readonly reason:
         | "connection_deleted"
+        | "legacy_retiring"
         | "generation_not_one"
         | "unknown_control"
         | "owner_mismatch"
@@ -434,9 +435,10 @@ async function importFence(
     control_state: string;
     deleted_at: number | null;
     deleting: number;
+    retiring: number;
     connector: string;
   }>(
-    `SELECT c.generation, c.control_state, c.deleted_at, c.connector, EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS deleting FROM connections c WHERE connection_id = ?`,
+    `SELECT c.generation, c.control_state, c.deleted_at, c.connector, EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS deleting, EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND r.state = 'open') AS retiring FROM connections c WHERE connection_id = ?`,
     [source.target.connectionId],
   );
   if (!row) return "unknown_control";
@@ -446,6 +448,9 @@ async function importFence(
     row.deleting
   )
     return "connection_deleted";
+  // An open legacy retirement owns the connector's legacy copy: nothing of it
+  // is read into the stream (the connection itself is untouched).
+  if (row.retiring) return "legacy_retiring";
   if (row.generation !== 1) return "generation_not_one";
   if (
     row.connector !== source.target.connector ||
@@ -543,7 +548,7 @@ function guardImport(source: ImportSource, op: string): SqlStatement[] {
       sql: "CREATE TEMP TABLE IF NOT EXISTS import_guard (op TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok = 1))",
     },
     {
-      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector)) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
+      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AND NOT EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND r.state = 'open')) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
       params: [
         op,
         connectionId,

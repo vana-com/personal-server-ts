@@ -325,4 +325,65 @@ describe("DELETE /v1/owner/connectors/:connectorId", () => {
     expect((await owner.json()).error.errorCode).toBe("METHOD_NOT_ALLOWED");
     expect(calls).toEqual([]);
   });
+
+  describe("/legacy", () => {
+    const legacyWriter: ConnectionDeletePort = {
+      ...writer,
+      async requestLegacyRetire(connector) {
+        calls.push(`legacy:${connector}`);
+        return { retireId: `retire-${connector}` };
+      },
+      async legacyRetireStatus(connector) {
+        return connector === "none"
+          ? null
+          : { retireId: `retire-${connector}`, legacy: { state: "pending" } };
+      },
+    };
+
+    it("retires the legacy copy only: the connection delete is not asked", async () => {
+      const response = await del(
+        await makeApp({ switched: true, connectionDelete: legacyWriter }),
+        "/v1/owner/connectors/github/legacy",
+      );
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({
+        retireId: "retire-github",
+        legacy: { state: "pending" },
+      });
+      expect(calls).toEqual(["legacy:github"]);
+    });
+
+    it("reads its status, and answers 404 when none was requested", async () => {
+      const app = await makeApp({
+        switched: true,
+        connectionDelete: legacyWriter,
+      });
+      const headers = { Authorization: `Bearer ${token}` };
+      const found = await app.request("/v1/owner/connectors/github/legacy", {
+        headers,
+      });
+      expect(found.status).toBe(200);
+      expect((await found.json()).retireId).toBe("retire-github");
+      const none = await app.request("/v1/owner/connectors/none/legacy", {
+        headers,
+      });
+      expect(none.status).toBe(404);
+    });
+
+    it("refuses anyone but the owner, and an unswitched account", async () => {
+      const stranger = await del(
+        await makeApp({ switched: true, connectionDelete: legacyWriter }),
+        "/v1/owner/connectors/github/legacy",
+        {},
+      );
+      expect(stranger.status).toBeGreaterThanOrEqual(401);
+      expect(stranger.status).toBeLessThan(404);
+      const unswitched = await del(
+        await makeApp({ switched: false, connectionDelete: legacyWriter }),
+        "/v1/owner/connectors/github/legacy",
+      );
+      expect(unswitched.status).toBe(409);
+      expect(calls).toEqual([]);
+    });
+  });
 });

@@ -1877,6 +1877,10 @@ async function bootstrapServer(
             (await localSyncSource()).deleter.deleteStatus(connector),
           deleteStatusSnapshot: async (connector) =>
             (await localSyncSource()).deleter.deleteStatusSnapshot(connector),
+          requestLegacyRetire: async (connector) =>
+            (await localSyncSource()).legacyRetirer.request(connector),
+          legacyRetireStatus: async (connector) =>
+            (await localSyncSource()).legacyRetirer.status(connector),
         }
       : null,
     // Shutdown stops admission before the database closes.

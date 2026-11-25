@@ -76,6 +76,13 @@ export {
   type LegacyOutcome,
 } from "./legacy-delete.js";
 export {
+  createLegacyRetirer,
+  LegacyRetireNotAdmitted,
+  LegacyRetireUnavailable,
+  type LegacyRetirer,
+  type LegacyRetireStatus,
+} from "./legacy-retire-intent.js";
+export {
   eraseDeletedConnectionLogs,
   inventoryVersionLister,
   retainedPiecesIn,

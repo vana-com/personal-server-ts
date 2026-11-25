@@ -53,6 +53,10 @@ import {
   type AliasTargets,
 } from "./resolve.js";
 import type { LegacyDeletePorts } from "./legacy-delete.js";
+import {
+  createLegacyRetirer,
+  type LegacyRetirer,
+} from "./legacy-retire-intent.js";
 import { onConnectionPurged } from "./purge.js";
 import { ELIGIBLE_CHANGE, PENDING_RUN } from "./publication-work.js";
 import { createRunEndStore } from "./run-end.js";
@@ -67,6 +71,11 @@ export interface LocalSync {
   readonly intake: RunIntake;
   readonly accessActivity: ReturnType<typeof createAccessActivity>;
   readonly deleter: ConnectionDeleter;
+  /**
+   * Retires a connector's legacy copy alone, behind its own intent
+   * (`legacy-retire-intent.ts`): the connection and its stream are not touched.
+   */
+  readonly legacyRetirer: LegacyRetirer;
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
   readonly query: RecordQuery;
@@ -516,6 +525,10 @@ export function createLocalSync(
     },
     erasureOwed: () => deletes().erasureOwed(),
   };
+  const legacyRetirer = createLegacyRetirer(deps, {
+    ports: () => options.legacyDelete?.(),
+    retryMs: { first: retryFirst, max: retryMax },
+  });
   const listingDeps = {
     ...deps,
     aliasScopes: options.aliasScopes,
@@ -540,6 +553,7 @@ export function createLocalSync(
     },
     accessActivity,
     deleter,
+    legacyRetirer,
     resolver: createLocalResolver(deps, {
       query,
       aliasQuery: query,
@@ -597,6 +611,8 @@ export function createLocalSync(
     blobs: createBlobStore(deps),
     async cycle(scope) {
       await kickDeletes();
+      // A restart resumes an open legacy retirement from its intent row.
+      await legacyRetirer.resume();
       let allApplied = true;
       const report = await runCycle(deps, scope, undefined, (outcome) => {
         if (outcome.kind !== "applied") allApplied = false;
@@ -663,6 +679,7 @@ export function createLocalSync(
     close: () => {
       closed = true;
       stopHearingPurges();
+      legacyRetirer.close();
       syncRetryTimer(); // closed (only ever turns on): clears the timer
       return (closing ??= (async () => {
         await deleteStore?.close();
