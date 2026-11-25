@@ -226,6 +226,33 @@ describe("live stream status projection", () => {
     ]);
   });
 
+  it("keeps streams of the same name in distinct connections", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      connections: [
+        { connector: "fixture", ns: "first", streams: { rows: { live: true, records: 1 } } },
+        { connector: "fixture", ns: "second", streams: { rows: { live: true, records: 2 } } },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+    expect(liveStreamCounts(status)).toEqual([
+      { connector: "fixture", ns: "first", stream: "rows", records: 1 },
+      { connector: "fixture", ns: "second", stream: "rows", records: 2 },
+    ]);
+  });
+
+  it("retains a digest for an audited complete live stream", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const digest = "a".repeat(64);
+    const status = {
+      connections: [
+        { connector: "fixture", ns: "", streams: { rows: { live: true, records: 3, digest } } },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+    expect(liveStreamCounts(status)).toEqual([
+      { connector: "fixture", ns: "", stream: "rows", records: 3, digest },
+    ]);
+  });
+
   it("preserves the distinction between unaudited and audited unavailable digests", async () => {
     const { liveStreamCounts } = await import("./service.js");
     const status = {
