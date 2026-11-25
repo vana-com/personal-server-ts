@@ -76,3 +76,31 @@ describe("persisted-write diagnostic", () => {
     );
   });
 });
+
+describe("two-step ingest index outcomes", () => {
+  it("commits exactly one index row on the ordinary successful path", async () => {
+    const storage = twoStepStorage(new Error("fixture should not be used"));
+    const rows: Parameters<typeof storage.insertEntry>[0][] = [];
+    storage.insertEntry = async (entry) => {
+      rows.push(entry);
+    };
+    expect(await ingest(storage)).toBeNull();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.path).toBeTruthy();
+  });
+
+  it("keeps the failing index entry's exact path and cause for repair", async () => {
+    const cause = new Error("fixture index unavailable");
+    const storage = twoStepStorage(cause);
+    const paths: string[] = [];
+    storage.insertEntry = async (entry) => {
+      paths.push(entry.path);
+      throw cause;
+    };
+    const error = await ingest(storage);
+    expect(paths).toHaveLength(1);
+    expect(error).toBeInstanceOf(IngestPersistedError);
+    expect((error as IngestPersistedError).cause).toBe(cause);
+    expect((error as IngestPersistedError).relativePath).toBe(paths[0]);
+  });
+});
