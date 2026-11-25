@@ -148,7 +148,14 @@ export function createLiteLegacyStoreRunner(
         storage: options.storage,
         manifests: options.manifests,
         targets,
-        onExcluded: ({ reason }) => excluded.add(reason),
+        onExcluded: ({ scope, reason }) => {
+          excluded.add(reason);
+          if (reason === "unreadable_scope")
+            options.onWarning?.(
+              "legacy scope left in place after a read failure",
+              { scope },
+            );
+        },
         receipt: async (connector, stream) => {
           if (deleted.has(connector)) {
             refused.add("deleted");
