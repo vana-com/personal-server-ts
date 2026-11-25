@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createSeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
@@ -180,6 +180,49 @@ it("an app-shaped newest body is left out without reading older versions, and la
   expect(live.report()?.streams.excluded).toEqual([
     { reason: "not_stream_rows", scopes: 1 },
   ]);
+});
+
+it("leaves an unreadable scope in place and still imports another stream", async () => {
+  const old = "2026-11-01T00:00:00.000Z";
+  const scopes: Versions = new Map([
+    [
+      "spotify.saved_tracks",
+      [
+        version([{ id: "first" }], "2026-11-02T00:00:00.000Z"),
+        version([{ id: "unreadable" }], old),
+      ],
+    ],
+    ["github.starred", [version([{ id: "g1" }], "2026-11-03T00:00:00.000Z")]],
+  ]);
+  const storage = memoryStorage(scopes) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  const read = storage.readEnvelope;
+  storage.readEnvelope = async (scope, at) => {
+    if (scope === "spotify.saved_tracks" && at === old)
+      throw new Error("unreadable fixture");
+    return read(scope, at);
+  };
+  const { intake, imported, puts } = recordingIntake();
+  const onWarning = vi.fn();
+  const live = createLiteLegacyStoreRunner({
+    storage: storage as never,
+    intake: async () => intake,
+    manifests: () => [manifest, githubManifest],
+    onWarning,
+  });
+  await expect(live.run(new AbortController().signal)).resolves.toBeUndefined();
+  expect(imported).toEqual(["g1"]);
+  expect(puts).toEqual(["github.starred"]);
+  expect(scopes.get("spotify.saved_tracks")).toHaveLength(2);
+  expect(live.report()?.streams.excluded).toContainEqual({
+    reason: "unreadable_scope",
+    scopes: 1,
+  });
+  expect(onWarning).toHaveBeenCalledWith(
+    "legacy scope left in place after a read failure",
+    { scope: "spotify.saved_tracks" },
+  );
 });
 
 it("a second wake never deletes an alias whose rows were not imported", async () => {

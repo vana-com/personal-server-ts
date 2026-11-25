@@ -7,6 +7,10 @@ import {
 } from "@opendatalabs/personal-server-ts-core/schemas";
 import { resolveRootPath } from "./paths.js";
 
+function isConfigObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 /**
  * Apply environment-variable overrides to the raw config object.
  *
@@ -19,8 +23,8 @@ import { resolveRootPath } from "./paths.js";
  *   TUNNEL_BINARY_PATH   — tunnel.binaryPath (a preinstalled frpc to run)
  *   DEV_UI_ENABLED       — devUi.enabled (boolean: "true"/"false")
  */
-function applyEnvOverrides(obj: Record<string, unknown>): void {
-  if (process.env.CLOUD_MODE !== "true") return;
+function applyEnvOverrides(obj: unknown): void {
+  if (process.env.CLOUD_MODE !== "true" || !isConfigObject(obj)) return;
 
   const {
     SERVER_PORT,
@@ -30,23 +34,29 @@ function applyEnvOverrides(obj: Record<string, unknown>): void {
     DEV_UI_ENABLED,
   } = process.env;
 
-  if (SERVER_PORT !== undefined || SERVER_ORIGIN !== undefined) {
-    const server = (obj.server as Record<string, unknown> | undefined) ?? {};
+  const server = obj.server ?? {};
+  if (
+    isConfigObject(server) &&
+    (SERVER_PORT !== undefined || SERVER_ORIGIN !== undefined)
+  ) {
     if (SERVER_PORT !== undefined) server.port = Number(SERVER_PORT);
     if (SERVER_ORIGIN !== undefined) server.origin = SERVER_ORIGIN;
     obj.server = server;
   }
 
-  if (TUNNEL_ENABLED !== undefined || TUNNEL_BINARY_PATH) {
-    const tunnel = (obj.tunnel as Record<string, unknown> | undefined) ?? {};
+  const tunnel = obj.tunnel ?? {};
+  if (
+    isConfigObject(tunnel) &&
+    (TUNNEL_ENABLED !== undefined || TUNNEL_BINARY_PATH !== undefined)
+  ) {
     if (TUNNEL_ENABLED !== undefined)
       tunnel.enabled = TUNNEL_ENABLED === "true";
     if (TUNNEL_BINARY_PATH) tunnel.binaryPath = TUNNEL_BINARY_PATH;
     obj.tunnel = tunnel;
   }
 
-  if (DEV_UI_ENABLED !== undefined) {
-    const devUi = (obj.devUi as Record<string, unknown> | undefined) ?? {};
+  const devUi = obj.devUi ?? {};
+  if (isConfigObject(devUi) && DEV_UI_ENABLED !== undefined) {
     devUi.enabled = DEV_UI_ENABLED === "true";
     obj.devUi = devUi;
   }

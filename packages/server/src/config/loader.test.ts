@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import {
   access,
+  mkdir,
   mkdtemp,
   readFile,
   writeFile,
@@ -212,6 +213,35 @@ describe("loadConfig", () => {
     });
   });
 
+  it.skipIf(process.platform === "freebsd")(
+    "rejects a directory in place of config without changing its contents",
+    async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await mkdir(configPath);
+        const sentinel = join(configPath, "existing.txt");
+        await writeFile(sentinel, "leave this alone");
+        await expect(loadConfig({ configPath })).rejects.toMatchObject({
+          code: "EISDIR",
+        });
+        expect(await readFile(sentinel, "utf-8")).toBe("leave this alone");
+      });
+    },
+  );
+
+  it("rejects a non-directory config parent without writing defaults elsewhere", async () => {
+    await withTempDir(async (dir) => {
+      const parent = join(dir, "not-a-directory");
+      await writeFile(parent, "unchanged");
+      await expect(
+        loadConfig({ configPath: join(parent, "config.json") }),
+      ).rejects.toMatchObject({
+        code: expect.stringMatching(/^(ENOTDIR|EEXIST)$/),
+      });
+      expect(await readFile(parent, "utf-8")).toBe("unchanged");
+    });
+  });
+
   it("uses rootPath when configPath is not provided", async () => {
     await withTempDir(async (dir) => {
       const rootPath = join(dir, "personal-server-root");
@@ -255,6 +285,27 @@ describe("loadConfig", () => {
         });
       });
     });
+
+    it.each([
+      ["null", "SERVER_PORT", "9999"],
+      ['{"server":false}', "SERVER_PORT", "9999"],
+      ['{"tunnel":5}', "TUNNEL_ENABLED", "false"],
+      ['{"devUi":"off"}', "DEV_UI_ENABLED", "false"],
+    ] as const)(
+      "reports invalid cloud config through the schema: %s",
+      async (raw, name, value) => {
+        await withTempDir(async (dir) => {
+          const configPath = join(dir, "config.json");
+          await writeFile(configPath, raw);
+          await withEnv({ CLOUD_MODE: "true", [name]: value }, async () => {
+            await expect(loadConfig({ configPath })).rejects.toMatchObject({
+              name: "ZodError",
+            });
+            expect(await readFile(configPath, "utf-8")).toBe(raw);
+          });
+        });
+      },
+    );
 
     it("SERVER_ORIGIN overrides default", async () => {
       await withTempDir(async (dir) => {
@@ -445,5 +496,26 @@ describe("config storage and path formatting", () => {
     const { expandHomePath } = await import("./paths.js");
     expect(expandHomePath("~")).toBe(homedir());
     expect(expandHomePath("fixture~backup")).toBe("fixture~backup");
+  });
+});
+
+it("does not silently apply defaults when the config path is a directory", async () => {
+  await withTempDir(async (dir) => {
+    await expect(loadConfig({ configPath: dir })).rejects.toMatchObject({
+      code: "EISDIR",
+    });
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+});
+
+it("preserves the edited bytes when a malformed config cannot be parsed", async () => {
+  await withTempDir(async (dir) => {
+    const configPath = join(dir, "config.json");
+    const edited = '{"server":\n';
+    await writeFile(configPath, edited);
+    await expect(loadConfig({ configPath })).rejects.toBeInstanceOf(
+      SyntaxError,
+    );
+    expect(await readFile(configPath, "utf8")).toBe(edited);
   });
 });
