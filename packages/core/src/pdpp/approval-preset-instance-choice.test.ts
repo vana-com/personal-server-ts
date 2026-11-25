@@ -111,6 +111,7 @@ afterEach(() => {
 function review(
   request: SelectionRequest,
   instanceChoices?: Record<string, string[]>,
+  inventory: InstanceInventory = twoInstances,
 ) {
   const session = sessions.create({
     subjectId: OWNER,
@@ -124,7 +125,7 @@ function review(
     tokens,
     sessionId: session.session_id,
     ownerToken: tokens.issueOwnerToken({ subjectId: OWNER }).access_token,
-    inventory: twoInstances,
+    inventory,
     instanceChoices,
   });
 }
@@ -171,6 +172,33 @@ describe("review finding 3 — a preset reaches the instance-choice step", () =>
     if (!result.ok) return;
     expect(result.result.instance_choice_required).toEqual([
       { stream: "profile", candidates: ["account-a", "account-b"] },
+    ]);
+  });
+
+  it("resolves the only eligible account on each preset stream without asking", () => {
+    const result = review(presetRequest("social_summary"), undefined, {
+      eligibleFor: () => ["account-b"],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.instance_choice_required).toBeUndefined();
+    const streams = result.result.review?.data.streams ?? [];
+    expect(streams).toHaveLength(2);
+    expect(streams.find(({ name }) => name === "top_artists")?.instance_ids)
+      .toEqual(["account-b"]);
+    expect(streams.find(({ name }) => name === "profile")?.instance_ids)
+      .toEqual(["account-b"]);
+  });
+
+  it("asks only about the ambiguous stream when another has one eligible account", () => {
+    const result = review(presetRequest("social_summary"), undefined, {
+      eligibleFor: (stream) => stream === "profile" ? ["account-a"] : ["account-a", "account-b"],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.review).toBeUndefined();
+    expect(result.result.instance_choice_required).toEqual([
+      { stream: "top_artists", candidates: ["account-a", "account-b"] },
     ]);
   });
 
