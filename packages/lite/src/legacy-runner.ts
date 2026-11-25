@@ -12,6 +12,7 @@ import {
   type QuarantineCounts,
   type SeedIntake,
 } from "@opendatalabs/personal-server-ts-core/localdb";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { ImportRunner } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
@@ -100,6 +101,12 @@ function streamScopeTargets(): ReadonlyMap<
   return new Map([...table].map(([scope, ts]) => [scope, [...ts.values()]]));
 }
 
+/** `intake.status()` throws this for a connector whose connection was deleted. */
+const isConnectionDeleted = (error: unknown) =>
+  error instanceof ProtocolError &&
+  error.code === 410 &&
+  error.errorCode === "CONNECTION_DELETED";
+
 const tally = <K extends string>() => {
   const byReason = new Map<K, { n: number; rows: number }>();
   return {
@@ -142,11 +149,33 @@ export function createLiteLegacyStoreRunner(
     async run(signal) {
       const intake = await options.intake();
       const excluded = tally<LegacyScopeExclusionReason>();
+      const statusOf = new Map<
+        string,
+        Awaited<ReturnType<SeedIntake["status"]>>
+      >();
+      const deleted = new Set<string>();
       const store = createLegacyScopeStore({
         storage: options.storage,
         manifests: options.manifests,
         targets,
         onExcluded: ({ reason }) => excluded.add(reason),
+        receipt: async (connector, stream) => {
+          if (deleted.has(connector)) return "leave";
+          let status = statusOf.get(connector);
+          if (!status) {
+            try {
+              status = await intake.status(connector);
+            } catch (error) {
+              // A deleted connector refuses its own streams only; its scope
+              // stays and the other connectors go on.
+              if (!isConnectionDeleted(error)) throw error;
+              deleted.add(connector);
+              return "leave";
+            }
+            statusOf.set(connector, status);
+          }
+          return status.streams[stream]?.state === "merged" ? "final" : "open";
+        },
       });
       // The newest stored version of each stream, to count a refused stream's
       // rows when the producer reports none.
@@ -182,6 +211,7 @@ export function createLiteLegacyStoreRunner(
           refusedRows += rows;
         }
       }
+      for (const _ of deleted) refused.add("deleted");
       const quarantined = seeded.quarantine;
       const legacy =
         seeded.rows +
@@ -241,7 +271,10 @@ async function retire(
   intake: SeedIntake,
   store: {
     scopeOf(connector: string, stream: string): string | undefined;
-    skippedVersions(connector: string, stream: string): number | undefined;
+    skippedVersions(
+      connector: string,
+      stream: string,
+    ): Promise<number> | undefined;
   },
   importedFrom: ReadonlyMap<string, string>,
   streams: readonly { connector: string; stream: string; outcome: string }[],
@@ -264,7 +297,14 @@ async function retire(
     // when every stored version of it was offered for import.
     if (importedFrom.get(JSON.stringify([s.connector, s.stream])) !== scope)
       continue;
-    if (store.skippedVersions(s.connector, s.stream) !== 0) continue;
+    // A fault reading the history keeps the copy and goes on to the next.
+    const skipped = await store
+      .skippedVersions(s.connector, s.stream)
+      ?.catch((error: unknown) => {
+        options.onWarning?.("legacy scope history unreadable", error);
+        return undefined;
+      });
+    if (skipped !== 0) continue;
     await options.storage.deleteScope(scope);
     removed += 1;
   }

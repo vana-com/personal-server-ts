@@ -22,6 +22,8 @@ import type {
  * - `ambiguous_connector`: more than one verified connector fits.
  * - `ambiguous_declaration`: several verified manifest versions fit.
  * - `no_primary_key`: the declaration has no primary key.
+ * - `shadowed_alias`: the stream also has a canonical `<source>.<stream>`
+ *   scope, which is the one read; this alias scope was not offered.
  * - `not_stream_rows`: the newest stored version is not `{records}` of plain
  *   rows (an app-shaped legacy body, or rows tagged with another stream), so
  *   it cannot be folded into stream rows.
@@ -35,6 +37,7 @@ export type LegacyScopeExclusionReason =
   | "ambiguous_connector"
   | "ambiguous_declaration"
   | "no_primary_key"
+  | "shadowed_alias"
   | "not_stream_rows";
 
 export interface LegacyScopeExclusion {
@@ -55,6 +58,14 @@ export interface LegacyScopeStoreOptions {
    * hold. A scope with one target is stored under its own name. */
   readonly targets: ReadonlyMap<string, readonly LegacyScopeTarget[]>;
   readonly onExcluded?: (exclusion: LegacyScopeExclusion) => void;
+  /** Asked before a stream's stored versions are read. `final`: the host
+   * already holds the stream's final receipt, so its history is not read now.
+   * `leave`: the host does not want the stream this time; it is not yielded.
+   * Absent or `open`: the stream is read in full. */
+  readonly receipt?: (
+    connector: string,
+    stream: string,
+  ) => Promise<"open" | "final" | "leave">;
 }
 
 export interface LegacyScopeStore extends LegacySeedStore {
@@ -63,8 +74,13 @@ export interface LegacyScopeStore extends LegacySeedStore {
   scopeOf(connector: string, stream: string): string | undefined;
   /** How many stored versions of the scope `streams()` read a stream from are
    * not plain `{records}` and so were not offered for import. Retiring that
-   * scope would erase them. Undefined until the stream has been yielded. */
-  skippedVersions(connector: string, stream: string): number | undefined;
+   * scope would erase them. Undefined until the stream has been yielded. For a
+   * stream whose receipt was already `final` the versions are read only when
+   * this is asked, and a read fault rejects. */
+  skippedVersions(
+    connector: string,
+    stream: string,
+  ): Promise<number> | undefined;
 }
 
 const PAGE = 200;
@@ -127,7 +143,7 @@ export function createLegacyScopeStore(
     options.onExcluded?.({ scope, reason });
   const { targets } = options;
   const read = new Map<string, string>();
-  const skipped = new Map<string, number>();
+  const skipped = new Map<string, () => Promise<number>>();
 
   /** The one verified declaration of a stream, or why there is none. */
   function declare(
@@ -169,7 +185,7 @@ export function createLegacyScopeStore(
     scopeOf: (connector, stream) =>
       read.get(JSON.stringify([connector, stream])),
     skippedVersions: (connector, stream) =>
-      skipped.get(JSON.stringify([connector, stream])),
+      skipped.get(JSON.stringify([connector, stream]))?.(),
     async *streams() {
       // A stream stored under several scope names (its own and an alias)
       // is read from its canonical `<source>.<stream>` scope when it exists.
@@ -195,28 +211,53 @@ export function createLegacyScopeStore(
           continue;
         }
         const scope = chosen[0]!;
+        for (const other of scopes)
+          if (other !== scope) exclude(other, "shadowed_alias");
         const declaration = declare(target.connector, target.stream);
         if (typeof declaration === "string") {
           exclude(scope, declaration);
           continue;
         }
+        const state =
+          (await options.receipt?.(target.connector, target.stream)) ?? "open";
+        if (state === "leave") continue;
         const versions = versionsNewestFirst(storage, scope);
         const newest = versions[0];
         if (!newest) continue;
-        // Every version is checked now, so the host knows before it retires
-        // the scope which stored versions were never offered.
-        const importableVersions: boolean[] = [];
-        for (const version of versions)
-          importableVersions.push(
-            plainRows(
-              (await storage.readEnvelope(scope, version.collectedAt)).data,
-            ) !== null,
-          );
-        if (!importableVersions[0]) {
-          exclude(scope, "not_stream_rows");
-          continue;
+        // How many stored versions are not plain rows, so the host knows
+        // before it retires the scope which versions were never offered.
+        const countSkipped = async () => {
+          let n = 0;
+          for (const version of versions)
+            if (
+              plainRows(
+                (await storage.readEnvelope(scope, version.collectedAt)).data,
+              ) === null
+            )
+              n += 1;
+          return n;
+        };
+        let skippedCount: () => Promise<number>;
+        if (state === "final") {
+          // The producer reads no history of a stream with a final receipt;
+          // neither does this, until the host asks to retire the scope.
+          let counted: Promise<number> | undefined;
+          skippedCount = () => (counted ??= countSkipped());
+        } else {
+          const importableVersions: boolean[] = [];
+          for (const version of versions)
+            importableVersions.push(
+              plainRows(
+                (await storage.readEnvelope(scope, version.collectedAt)).data,
+              ) !== null,
+            );
+          if (!importableVersions[0]) {
+            exclude(scope, "not_stream_rows");
+            continue;
+          }
+          const n = importableVersions.filter((ok) => !ok).length;
+          skippedCount = async () => n;
         }
-        const skippedCount = importableVersions.filter((ok) => !ok).length;
         const layers: FoldLayer[] = versions.map((version) => ({
           async *records() {
             const rows = plainRows(
