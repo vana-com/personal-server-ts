@@ -1,7 +1,3 @@
-import {
-  LEGACY_SCOPE_BINDINGS,
-  legacyAliasScopes,
-} from "../legacy-projection/index.js";
 import { manifestArtifact } from "../stream-sync/artifacts.js";
 import type { DataStoragePort } from "../ports/index.js";
 import type { FoldLayer } from "./legacy-fold.js";
@@ -15,7 +11,8 @@ import type {
  * `<source>.<stream>` whose body is `{records: [row, …]}` (one PDPP stream per
  * scope, as `withLegacyProjection` reads them).
  *
- * Which connector and stream a scope is comes from the legacy bindings; its
+ * Which connector and stream a scope is comes from `targets`, which the host
+ * derives from the legacy bindings (this layer names no connector); its
  * primary key and artifact version come from the verified manifest documents.
  * Nothing is guessed: a scope that cannot be tied to exactly one declared
  * stream is left out and reported through `onExcluded`, by reason:
@@ -54,6 +51,9 @@ export interface LegacyScopeStoreOptions {
   readonly storage: LegacyScopeStorage;
   /** Verified manifest documents, read at each `streams()` call. */
   readonly manifests: () => Iterable<string>;
+  /** The stream scopes the host knows, each with the connector streams it may
+   * hold. A scope with one target is stored under its own name. */
+  readonly targets: ReadonlyMap<string, readonly LegacyScopeTarget[]>;
   readonly onExcluded?: (exclusion: LegacyScopeExclusion) => void;
 }
 
@@ -61,35 +61,19 @@ export interface LegacyScopeStore extends LegacySeedStore {
   /** The one scope `streams()` read a stream from, once it has yielded it.
    * Only that scope's versions were offered for import. */
   scopeOf(connector: string, stream: string): string | undefined;
+  /** How many stored versions of the scope `streams()` read a stream from are
+   * not plain `{records}` and so were not offered for import. Retiring that
+   * scope would erase them. Undefined until the stream has been yielded. */
+  skippedVersions(connector: string, stream: string): number | undefined;
 }
 
 const PAGE = 200;
 
-interface Target {
+export interface LegacyScopeTarget {
   readonly connector: string;
   readonly stream: string;
 }
-
-/** Stream scopes the bindings know, each with the connector streams it may
- * hold. A binding scope with one stream is also stored under its own name. */
-function streamScopeTargets(): ReadonlyMap<string, readonly Target[]> {
-  const table = new Map<string, Map<string, Target>>();
-  const add = (scope: string, target: Target) => {
-    const targets = table.get(scope) ?? new Map<string, Target>();
-    targets.set(`${target.connector}\0${target.stream}`, target);
-    table.set(scope, targets);
-  };
-  for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
-    const source = scope.slice(0, scope.indexOf("."));
-    for (const alias of legacyAliasScopes(scope)) {
-      for (const stream of alias.streams)
-        add(`${source}.${stream}`, { connector: alias.connector, stream });
-      if (alias.streams.length === 1)
-        add(scope, { connector: alias.connector, stream: alias.streams[0]! });
-    }
-  }
-  return new Map([...table].map(([scope, ts]) => [scope, [...ts.values()]]));
-}
+type Target = LegacyScopeTarget;
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -141,8 +125,9 @@ export function createLegacyScopeStore(
   const { storage } = options;
   const exclude = (scope: string, reason: LegacyScopeExclusionReason) =>
     options.onExcluded?.({ scope, reason });
-  const targets = streamScopeTargets();
+  const { targets } = options;
   const read = new Map<string, string>();
+  const skipped = new Map<string, number>();
 
   /** The one verified declaration of a stream, or why there is none. */
   function declare(
@@ -183,6 +168,8 @@ export function createLegacyScopeStore(
   return {
     scopeOf: (connector, stream) =>
       read.get(JSON.stringify([connector, stream])),
+    skippedVersions: (connector, stream) =>
+      skipped.get(JSON.stringify([connector, stream])),
     async *streams() {
       // A stream stored under several scope names (its own and an alias)
       // is read from its canonical `<source>.<stream>` scope when it exists.
@@ -216,12 +203,20 @@ export function createLegacyScopeStore(
         const versions = versionsNewestFirst(storage, scope);
         const newest = versions[0];
         if (!newest) continue;
-        const body = (await storage.readEnvelope(scope, newest.collectedAt))
-          .data;
-        if (plainRows(body) === null) {
+        // Every version is checked now, so the host knows before it retires
+        // the scope which stored versions were never offered.
+        const importableVersions: boolean[] = [];
+        for (const version of versions)
+          importableVersions.push(
+            plainRows(
+              (await storage.readEnvelope(scope, version.collectedAt)).data,
+            ) !== null,
+          );
+        if (!importableVersions[0]) {
           exclude(scope, "not_stream_rows");
           continue;
         }
+        const skippedCount = importableVersions.filter((ok) => !ok).length;
         const layers: FoldLayer[] = versions.map((version) => ({
           async *records() {
             const rows = plainRows(
@@ -237,7 +232,9 @@ export function createLegacyScopeStore(
           version: declaration.version,
           layers,
         };
-        read.set(JSON.stringify([target.connector, target.stream]), scope);
+        const key = JSON.stringify([target.connector, target.stream]);
+        read.set(key, scope);
+        skipped.set(key, skippedCount);
         yield stream;
       }
     },

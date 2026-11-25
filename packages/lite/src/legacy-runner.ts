@@ -1,5 +1,10 @@
 import {
+  LEGACY_SCOPE_BINDINGS,
+  legacyAliasScopes,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
   createLegacyScopeStore,
+  type LegacyScopeTarget,
   seedLegacyStore,
   type LegacyScopeExclusionReason,
   type LegacySeedStore,
@@ -70,6 +75,31 @@ export interface LiteLegacyStoreRunnerOptions {
   readonly onWarning?: (message: string, detail?: unknown) => void;
 }
 
+/** Stream scopes the bindings know, each with the connector streams it may
+ * hold. A binding scope with one stream is also stored under its own name.
+ * The connector knowledge lives here, not in the database layer. */
+function streamScopeTargets(): ReadonlyMap<
+  string,
+  readonly LegacyScopeTarget[]
+> {
+  const table = new Map<string, Map<string, LegacyScopeTarget>>();
+  const add = (scope: string, target: LegacyScopeTarget) => {
+    const targets = table.get(scope) ?? new Map<string, LegacyScopeTarget>();
+    targets.set(`${target.connector}\0${target.stream}`, target);
+    table.set(scope, targets);
+  };
+  for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
+    const source = scope.slice(0, scope.indexOf("."));
+    for (const alias of legacyAliasScopes(scope)) {
+      for (const stream of alias.streams)
+        add(`${source}.${stream}`, { connector: alias.connector, stream });
+      if (alias.streams.length === 1)
+        add(scope, { connector: alias.connector, stream: alias.streams[0]! });
+    }
+  }
+  return new Map([...table].map(([scope, ts]) => [scope, [...ts.values()]]));
+}
+
 const tally = <K extends string>() => {
   const byReason = new Map<K, { n: number; rows: number }>();
   return {
@@ -100,6 +130,13 @@ export function createLiteLegacyStoreRunner(
   options: LiteLegacyStoreRunnerOptions,
 ): LiteLegacyStoreRunner {
   let last: LiteLegacyImportReport | null = null;
+  // Which scope this runner's own seed put each stream's rows from. A receipt
+  // names no source scope, so a final receipt alone does not show that the
+  // scope now offered for the stream is the one that was imported (a stream
+  // stored under its canonical name and an alias). Memory only: after a
+  // restart a stream with a receipt keeps its copy.
+  const importedFrom = new Map<string, string>();
+  const targets = streamScopeTargets();
   return {
     report: () => last,
     async run(signal) {
@@ -108,6 +145,7 @@ export function createLiteLegacyStoreRunner(
       const store = createLegacyScopeStore({
         storage: options.storage,
         manifests: options.manifests,
+        targets,
         onExcluded: ({ reason }) => excluded.add(reason),
       });
       // The newest stored version of each stream, to count a refused stream's
@@ -149,10 +187,22 @@ export function createLiteLegacyStoreRunner(
         seeded.rows +
         Object.values(quarantined).reduce((a, b) => a + b, 0) +
         refusedRows;
+      for (const s of seeded.streams) {
+        const scope = store.scopeOf(s.connector, s.stream);
+        if (s.outcome === "staged" && scope !== undefined)
+          importedFrom.set(JSON.stringify([s.connector, s.stream]), scope);
+      }
       let retired: LiteLegacyImportReport["retired"] = null;
       if (options.retireLegacy()) {
         retired = {
-          scopes: await retire(options, intake, store, seeded.streams, signal),
+          scopes: await retire(
+            options,
+            intake,
+            store,
+            importedFrom,
+            seeded.streams,
+            signal,
+          ),
         };
       }
       if (signal.aborted) return;
@@ -184,11 +234,16 @@ export function createLiteLegacyStoreRunner(
 
 /** Remove the scope copies of streams whose receipt is now final. The receipt
  * is read again after the seed, so a stream the importer did not finish keeps
- * its copy. */
+ * its copy. A scope is also kept when it is not the one the runner imported
+ * the stream from, or holds versions the import skipped. */
 async function retire(
   options: LiteLegacyStoreRunnerOptions,
   intake: SeedIntake,
-  store: { scopeOf(connector: string, stream: string): string | undefined },
+  store: {
+    scopeOf(connector: string, stream: string): string | undefined;
+    skippedVersions(connector: string, stream: string): number | undefined;
+  },
+  importedFrom: ReadonlyMap<string, string>,
   streams: readonly { connector: string; stream: string; outcome: string }[],
   signal: AbortSignal,
 ): Promise<number> {
@@ -205,6 +260,11 @@ async function retire(
     if (status.streams[s.stream]?.state !== "merged") continue;
     const scope = store.scopeOf(s.connector, s.stream);
     if (scope === undefined) continue;
+    // Only the scope this runner imported the stream from may go, and only
+    // when every stored version of it was offered for import.
+    if (importedFrom.get(JSON.stringify([s.connector, s.stream])) !== scope)
+      continue;
+    if (store.skippedVersions(s.connector, s.stream) !== 0) continue;
     await options.storage.deleteScope(scope);
     removed += 1;
   }
