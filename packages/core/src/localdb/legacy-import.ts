@@ -340,18 +340,7 @@ async function importSource(
           }
         }
         await stageImportDeletions(deps.db, op, keys);
-        const fenced = await importFence(deps, source);
-        if (fenced) return { kind: "refused", reason: fenced };
-        await deps.db.batch([
-          ...guard,
-          commitImportDeletions(
-            op,
-            { connectionId, stream },
-            EXPLICIT_DELETE_RANK,
-          ),
-        ]);
       }
-      const tombstoned = (await countTombstones()) - tombstonesBefore;
       const fence = await importFence(deps, source);
       if (fence) return { kind: "refused", reason: fence };
       const [high] = await deps.db.query<{ seq: number }>(
@@ -372,6 +361,8 @@ async function importSource(
       };
       // Final idempotent merge and receipt share this transaction. A crash
       // before it leaves only replayable batches, never a successful receipt.
+      // The staged deletions become tombstones here too, so a refused import
+      // leaves none.
       await deps.db.batch([
         ...(lastRow
           ? mergeBatch(lastRow)
@@ -379,8 +370,18 @@ async function importSource(
               ...guard,
               { sql: "UPDATE write_ctx SET origin = 'local' WHERE id = 1" },
             ])),
+        ...(source.deletions
+          ? [
+              commitImportDeletions(
+                op,
+                { connectionId, stream },
+                EXPLICIT_DELETE_RANK,
+              ),
+            ]
+          : []),
         ...ledger.statements(receipt),
       ]);
+      const tombstoned = (await countTombstones()) - tombstonesBefore;
       // `already-imported` says an earlier call completed this very revision.
       // A reopened `seed_window_closed` receipt is `excluded`: it completed
       // nothing, so this call writes the first receipt that did, however few
