@@ -38,6 +38,24 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     return n;
   }
 
+  it("distinguishes a missing file from an existing zero-byte file", async () => {
+    const files = createFsStreamSyncFiles(root);
+    expect(await files.read("missing.bin")).toBeNull();
+    expect(await files.size("missing.bin")).toBe(0);
+    expect(await files.list("absent")).toEqual([]);
+
+    await files.write("empty.bin", new Uint8Array());
+    expect(await files.read("empty.bin")).toEqual(new Uint8Array());
+    expect(await files.size("empty.bin")).toBe(0);
+  });
+
+  it("reports an existing file passed as a listing prefix instead of returning an empty list", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.write("one.bin", enc.encode("fixture"));
+    await expect(files.list("one.bin")).rejects.toMatchObject({ code: "ENOTDIR" });
+    expect(await files.read("one.bin")).toEqual(enc.encode("fixture"));
+  });
+
   it("keeps appended bytes readable at once, in order, across many files", async () => {
     const files = createFsStreamSyncFiles(root);
     for (let round = 0; round < 3; round += 1) {
