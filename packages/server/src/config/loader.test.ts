@@ -447,3 +447,24 @@ describe("config storage and path formatting", () => {
     expect(expandHomePath("fixture~backup")).toBe("fixture~backup");
   });
 });
+
+it("does not silently apply defaults when the config path is a directory", async () => {
+  await withTempDir(async (dir) => {
+    await expect(loadConfig({ configPath: dir })).rejects.toMatchObject({
+      code: "EISDIR",
+    });
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+});
+
+it("preserves the edited bytes when a malformed config cannot be parsed", async () => {
+  await withTempDir(async (dir) => {
+    const configPath = join(dir, "config.json");
+    const edited = '{"server":\n';
+    await writeFile(configPath, edited);
+    await expect(loadConfig({ configPath })).rejects.toBeInstanceOf(
+      SyntaxError,
+    );
+    expect(await readFile(configPath, "utf8")).toBe(edited);
+  });
+});
