@@ -941,7 +941,7 @@ describe("the legacy import wake of a runtime", () => {
     expect(runs[0]?.aborted).toBe(true);
   });
 
-  it("starts nothing when the host passes no importer", async () => {
+  it("starts nothing when the host passes no importer and the runtime has no local database", async () => {
     const runtime = await createIndexedDbPsLiteRuntime({
       ownerAddress,
       ownerSignature,

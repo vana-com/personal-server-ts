@@ -93,6 +93,11 @@ import {
   createPsLiteQuestionStore,
   psLiteInferenceConfigured,
 } from "./derivatives.js";
+import {
+  createLiteLegacyStoreRunner,
+  type LiteLegacyImportReport,
+  type LiteLegacyStoreRunner,
+} from "./legacy-runner.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
 import { DiagnosticsRecorder } from "./diagnostics.js";
 import {
@@ -122,9 +127,10 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    */
   accountModeStore?: ModeRecordStore;
   /**
-   * The host's legacy importer. The runtime runs it when the Account says On
-   * and once at boot when the owner is already switched; what is owed and when
-   * it is done is the importer's own record. Without one no import starts.
+   * Overrides the runtime's own legacy import. The runtime runs it when the
+   * Account says On and once at boot when the owner is already switched; what
+   * is owed and when it is done is the importer's own record. Without one the
+   * runtime imports its own legacy scope data (`createLiteLegacyStoreRunner`).
    */
   legacyImporter?: ImportRunner;
   /**
@@ -258,8 +264,16 @@ export interface IndexedDbPsLiteRuntime {
    * `importWaker.stop()` first, then close the storage, then `close()`.
    */
   accountModeAuthority: ModeAuthority;
-  /** Wakes the host's importer; present when the host passed `legacyImporter`. */
+  /**
+   * Wakes the importer: the host's `legacyImporter`, else the runtime's own
+   * legacy store runner. Present when the runtime has an owner.
+   */
   importWaker?: ImportWaker;
+  /**
+   * The last finished run of the runtime's own legacy store import, or null
+   * before one finished (or when the host passed its own `legacyImporter`).
+   */
+  legacyImportReport(): LiteLegacyImportReport | null;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -327,14 +341,6 @@ export async function createIndexedDbPsLiteRuntime(
     onWarning: (message, detail) => console.warn(message, detail),
   });
   await accountModeAuthority.ready;
-  if (options.legacyImporter && serverOwner) {
-    importWaker = createImportWaker({
-      authority: accountModeAuthority,
-      owner: serverOwner,
-      importer: options.legacyImporter,
-      onWarning: (message, detail) => console.warn(message, detail),
-    });
-  }
   // The one seal over that module. The storage makes a legacy version durable
   // only inside it, so the lock that answers an On is the lock every legacy
   // write holds. A runtime without an owner gets a seal that answers unknown.
@@ -402,6 +408,8 @@ export async function createIndexedDbPsLiteRuntime(
   // outlives the runtime, so close removes these and nothing else.
   const statusSubscriptions = new Set<() => void>();
   let runtimeRef: PsLiteRuntime | null = null;
+  // Read by the runtime's `read-status?audit=1`; set once the runner exists.
+  let legacyStoreReport: () => LiteLegacyImportReport | null = () => null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
   // Without a relay URL (or an injected provider) the layer stays off and
@@ -585,6 +593,7 @@ export async function createIndexedDbPsLiteRuntime(
     streamSyncRead,
     localSync: syncRuntime?.getLocalSync,
     streamSyncSeed,
+    legacyStoreReport: () => legacyStoreReport(),
     history: syncRuntime
       ? {
           additions: async (input) =>
@@ -632,6 +641,34 @@ export async function createIndexedDbPsLiteRuntime(
       injected?.mcpOAuthAuthorizations ?? options.mcpOAuthAuthorizationStore,
   });
   runtimeRef = runtime;
+  // The importer is built here, after the runtime's own storage and seed
+  // intake exist: it reads the intake from this scope, never through the host
+  // handle, so the boot wake below cannot run before the intake does.
+  let legacyStoreRunner: LiteLegacyStoreRunner | undefined;
+  // A runtime with no seed intake (no local database) has nothing to import into.
+  if (!options.legacyImporter && serverOwner && streamSyncSeed) {
+    legacyStoreRunner = createLiteLegacyStoreRunner({
+      storage,
+      intake: async () => {
+        if (!streamSyncSeed)
+          throw new Error("the runtime has no stream-sync seed intake");
+        return streamSyncSeed;
+      },
+      manifests: () => options.streamSyncRetainedManifests?.() ?? [],
+      retireLegacy: () => config.streamSync.retireLegacy,
+      onWarning: (message, detail) => console.warn(message, detail),
+    });
+  }
+  legacyStoreReport = () => legacyStoreRunner?.report() ?? null;
+  const legacyImporter = options.legacyImporter ?? legacyStoreRunner;
+  if (legacyImporter && serverOwner) {
+    importWaker = createImportWaker({
+      authority: accountModeAuthority,
+      owner: serverOwner,
+      importer: legacyImporter,
+      onWarning: (message, detail) => console.warn(message, detail),
+    });
+  }
   // An import owed from a saved On needs no new answer from the Account.
   void importWaker?.wake();
 
@@ -677,5 +714,6 @@ export async function createIndexedDbPsLiteRuntime(
     replicationHost,
     accountModeAuthority,
     importWaker,
+    legacyImportReport: () => legacyStoreReport(),
   };
 }
