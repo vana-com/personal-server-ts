@@ -35,7 +35,7 @@ export function requiredLegacyStreams(
 }
 
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
-export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
+export { LEGACY_SCOPE_BINDINGS, legacySourceId } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
 export {

@@ -1,3 +1,4 @@
+import type { LiteLegacyImportReport } from "./legacy-runner.js";
 import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   LocalSync,
@@ -181,6 +182,8 @@ export interface PsLiteRuntimeOptions {
   activity?: PsLiteActivitySource;
   localSync?: () => Promise<LocalSync>;
   streamSyncSeed?: SeedIntake | null;
+  /** The last legacy store import report, served at `read-status?audit=1`. */
+  legacyStoreReport?: () => LiteLegacyImportReport | null;
   history?: LocalHistory;
 
   /**
@@ -1789,11 +1792,22 @@ export function createPsLiteRuntime(
             );
           const local = await options.localSync();
           const status = await local.listing.status();
-          return jsonResponse({
+          const body = {
             listed: status.listed,
             streams: liveStreamCounts(status),
             issues: status.issues.length,
-          });
+          };
+          // The owner's diagnostics: what the last legacy store import left out.
+          return jsonResponse(
+            url.searchParams.get("audit") === "1"
+              ? {
+                  ...body,
+                  seedExclusions: {
+                    legacyStore: options.legacyStoreReport?.() ?? null,
+                  },
+                }
+              : body,
+          );
         }
         // Whether a run is saved: `GET /v1/stream-sync/runs/:runId/publication`.
         // `superseded` alone does not mean saved; a consumer must check `reason`.

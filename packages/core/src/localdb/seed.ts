@@ -42,8 +42,12 @@ export interface SeedIntake {
     connector: string,
     stream: string,
     body: AsyncIterable<Uint8Array>,
+    options?: { readonly keepStaged?: boolean },
   ): Promise<
     | { readonly state: "merged" }
+    /** Only with `keepStaged`: an upload already waits for this stream, so
+     * the body was not read and nothing changed. */
+    | { readonly state: "staged_upload_pending" }
     | {
         readonly state: "staged";
         readonly records: number;
@@ -72,7 +76,7 @@ export function createSeedIntake(seed: LocalSeedCapability): SeedIntake {
       }
       return { targetKnown: status.targetKnown, streams };
     },
-    async put(connector, stream, body) {
+    async put(connector, stream, body, options) {
       checkSeedNames(connector, stream);
       const receipt = (await seed.writer.seedStatus(connector)).receipts[
         stream
@@ -81,6 +85,10 @@ export function createSeedIntake(seed: LocalSeedCapability): SeedIntake {
         await seed.staging.drop(connector, stream);
         return { state: receipt };
       }
+      // Checked here, under the request lock that staging also holds, so no
+      // upload can stage between this check and the write below.
+      if (options?.keepStaged && (await seed.staging.staged(connector))[stream])
+        return { state: "staged_upload_pending" };
       const staged = await seed.staging.stage(connector, stream, body);
       await seed.writer.importStaged(connector);
       return {
@@ -97,9 +105,9 @@ export function createSeedIntake(seed: LocalSeedCapability): SeedIntake {
       withScopeLock(`stream-seed-request:${connector}`, () =>
         intake.status(connector),
       ),
-    put: (connector, stream, body) =>
+    put: (connector, stream, body, options) =>
       withScopeLock(`stream-seed-request:${connector}`, () =>
-        intake.put(connector, stream, body),
+        intake.put(connector, stream, body, options),
       ),
   };
 }
