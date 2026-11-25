@@ -186,3 +186,79 @@ it("a stop between storage reads ends the scan of excluded scopes at once", asyn
   }).rejects.toThrow();
   expect(reads).toHaveLength(1);
 });
+
+it("a manifest's source id, not the connector name, is the one rows must carry", async () => {
+  const named = (id: string) =>
+    JSON.stringify({
+      connector_key: "notes-app",
+      version: "1",
+      source: { id },
+      streams: [
+        { name: "items", semantics: "mutable_state", primary_key: ["id"] },
+      ],
+    });
+  // The target derives the id from the connector name; the manifest names its own.
+  const derived = {
+    connector: "notes-app",
+    stream: "items",
+    sourceId: "urn:notes-app",
+  };
+  const scopes: Versions = new Map([
+    [
+      "shared.items",
+      [layer([tagged("urn:notes_app", "1")], "2026-11-01T00:00:00Z")],
+    ],
+  ]);
+  const { streams, excluded } = await enumerate(
+    scopes,
+    [named("urn:notes_app")],
+    [derived],
+  );
+  expect(excluded).toEqual([]);
+  expect(streams.map((s) => [s.connector, s.sourceId])).toEqual([
+    ["notes-app", "urn:notes_app"],
+  ]);
+  // A manifest that names no source id keeps the derived one.
+  const unnamed = await enumerate(
+    scopes,
+    [manifestOf("notes-app", "items")],
+    [derived],
+  );
+  expect(unnamed.excluded).toEqual(["unknown_source"]);
+});
+
+it("a newest flat row marked for another stream leaves the scope out, and older versions stay unread", async () => {
+  const reads: string[] = [];
+  const scopes: Versions = new Map([
+    [
+      "shared.items",
+      [
+        layer(
+          [{ id: "2", $pdpp: { stream: { name: "other" } } }],
+          "2026-11-02T00:00:00Z",
+        ),
+        layer([{ id: "1" }], "2026-11-01T00:00:00Z"),
+      ],
+    ],
+  ]);
+  const storage = storageOf(scopes) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  const read = storage.readEnvelope;
+  storage.readEnvelope = (scope, at) => {
+    reads.push(at);
+    return read(scope, at);
+  };
+  const excluded: string[] = [];
+  const store = createLegacyScopeStore({
+    storage: storage as never,
+    manifests: () => [manifestOf("b", "items")],
+    targets: new Map([["shared.items", [B]]]),
+    onExcluded: ({ reason }) => excluded.push(reason),
+  });
+  const streams = [];
+  for await (const stream of store.streams()) streams.push(stream);
+  expect(streams).toEqual([]);
+  expect(excluded).toEqual(["not_stream_rows"]);
+  expect(reads).toEqual(["2026-11-02T00:00:00Z"]);
+});
