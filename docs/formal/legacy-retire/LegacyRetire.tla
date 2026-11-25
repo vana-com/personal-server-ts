@@ -83,7 +83,7 @@ PinHolds(s, hLive, hVer, hTombVer) ==
   ELSE hTombVer = pins[s] + 1                 \* only the tombstone that follows it
 
 Init ==
-  /\ ver = [s \in Scopes |-> 1]
+  /\ ver \in {[s \in Scopes |-> 1], [s \in Scopes |-> 0]}
   /\ tomb = [s \in Scopes |-> FALSE]
   /\ tombBy = [s \in Scopes |-> "none"]
   /\ tombVer = [s \in Scopes |-> 0]
@@ -104,7 +104,7 @@ Init ==
 
 \* ---- gateway: another writer -------------------------------------------
 Publish(s) ==
-  /\ ~tomb[s] /\ ver[s] < MaxVer
+  /\ ~tomb[s] /\ ~erased[s] /\ ver[s] < MaxVer
   /\ ver' = [ver EXCEPT ![s] = @ + 1]
   /\ lastActor' = "gateway"
   /\ UNCHANGED <<tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
@@ -112,7 +112,7 @@ Publish(s) ==
                  staleAfterDone, cc, writes, crashes>>
 
 ForeignTomb(s) ==
-  /\ ~tomb[s]
+  /\ ~tomb[s] /\ ~erased[s]
   /\ tomb' = [tomb EXCEPT ![s] = TRUE]
   /\ tombBy' = [tombBy EXCEPT ![s] = "other"]
   /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
@@ -166,7 +166,7 @@ WRead(s) ==
   /\ Open /\ pc[s] = "idle" /\ ~blk[s] /\ ~erased[s] /\ wr
   /\ snap' = [snap EXCEPT ![s] = ver[s]]
   /\ IF PinHolds(s, ~tomb[s], ver[s], tombVer[s])
-       THEN /\ pc' = [pc EXCEPT ![s] = IF tomb[s] THEN "tombd" ELSE "decided"]
+       THEN /\ pc' = [pc EXCEPT ![s] = IF ver[s] = 0 THEN "absent" ELSE IF tomb[s] THEN "tombd" ELSE "decided"]
             /\ UNCHANGED blk
        ELSE /\ blk' = [blk EXCEPT ![s] = TRUE]   \* legacy_head_changed
             /\ UNCHANGED pc
@@ -228,6 +228,37 @@ WSendEcho(s) ==
   /\ Unauth
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, erased, wr, revokes, exists, st, pins, nIntents, snap, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* A missing echo is rejected just like a different echo. The mutant accepts it
+\* and starts cleanup despite having no remote confirmation.
+WSendMissing(s) ==
+  /\ pc[s] = "decided" /\ Auth
+  /\ ~tomb[s] /\ ver[s] = snap[s]
+  /\ tomb' = [tomb EXCEPT ![s] = TRUE]
+  /\ tombBy' = [tombBy EXCEPT ![s] = "ours"]
+  /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
+  /\ cleanTo' = IF Mode = "echoMissingAccepted"
+                  THEN [cleanTo EXCEPT ![s] = ver[s] + 1] ELSE cleanTo
+  /\ pc' = [pc EXCEPT ![s] = "idle"]
+  /\ blk' = [blk EXCEPT ![s] = TRUE]
+  /\ Unauth
+  /\ lastActor' = "missing-echo"
+  /\ UNCHANGED <<ver, erased, localTo, wr, revokes, exists, st, pins, nIntents, snap,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* No remote head at request or at check, but an exact local copy was pinned.
+\* localTo=1 confirms that exact copy's erase; an unsuccessful erase can retry.
+WAbsentLocal(s) ==
+  /\ pc[s] = "absent" /\ Auth /\ ver[s] = 0 /\ pins[s] = 0
+  /\ localTo' = [localTo EXCEPT ![s] = 1]
+  /\ erased' = [erased EXCEPT ![s] = TRUE]
+  /\ pc' = [pc EXCEPT ![s] = "idle"]
+  /\ Unauth
+  /\ lastActor' = "worker"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, cleanTo, wr, revokes, exists, st, pins, nIntents, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -311,7 +342,9 @@ WDone ==
   /\ Open /\ Auth
   /\ IF Mode = "doneBeforeErase"
        THEN \A s \in Scopes : tomb[s] /\ (erased[s] \/ pc[s] = "tombd")
-       ELSE \A s \in Scopes : erased[s]
+       ELSE IF Mode = "doneWithoutLocalProof"
+              THEN \A s \in Scopes : erased[s] \/ (pins[s] = 0 /\ ver[s] = 0)
+              ELSE \A s \in Scopes : erased[s]
   /\ st' = "done"
   /\ Unauth
   /\ lastActor' = "worker"
@@ -396,7 +429,7 @@ Crash ==
                  batches, freeMerged, mergedWhileOpen, staleAfterDone, cc, writes>>
 
 Next ==
-  \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WSendEcho(s) \/ WSendLocal(s) \/ WSendAbsent(s) \/ WReread(s) \/ WLocal(s) \/ WErase(s) \/ WAbandon(s)
+  \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WSendEcho(s) \/ WSendMissing(s) \/ WAbsentLocal(s) \/ WSendLocal(s) \/ WSendAbsent(s) \/ WReread(s) \/ WLocal(s) \/ WErase(s) \/ WAbandon(s)
   \/ CWrite \/ Revoke \/ Restore \/ RRead \/ RInsert \/ WDone \/ IPre \/ IMerge \/ Crash
 
 Spec == Init /\ [][Next]_vars
@@ -406,7 +439,7 @@ TypeOK ==
   /\ ver \in [Scopes -> 0..MaxVer]
   /\ tombBy \in [Scopes -> {"none", "ours", "other"}]
   /\ st \in {"none", "open", "done"}
-  /\ pc \in [Scopes -> {"idle", "decided", "tombed", "sent", "tombd"}]
+  /\ pc \in [Scopes -> {"idle", "decided", "tombed", "sent", "tombd", "absent"}]
   /\ wr \in BOOLEAN
   /\ nIntents \in 0..2
 
@@ -421,7 +454,7 @@ CurrentConnectionUntouched ==
 \* Its local copy is gone through the pinned tombstone too: the remote state alone
 \* does not say so (a process that stopped after the tombstone left it behind).
 DoneOnlyAfterConfirm ==
-  st = "done" => \A s \in Scopes : tomb[s] /\ erased[s] /\ localTo[s] = pins[s] + 1
+  st = "done" => \A s \in Scopes : (tomb[s] \/ (pins[s] = 0 /\ ver[s] = 0)) /\ erased[s] /\ localTo[s] = pins[s] + 1
 
 \* A restart or a repeat never makes a second intent.
 OneIntent == nIntents <= 1
@@ -435,9 +468,13 @@ NoTombstoneOverMovedHead ==
 \* the pin never named).
 NoEraseOfUnpinnedVersion ==
   \A s \in Scopes :
-    /\ erased[s] => tombVer[s] = pins[s] + 1
+    /\ erased[s] => (tombVer[s] = pins[s] + 1 \/ (pins[s] = 0 /\ ver[s] = 0))
     /\ cleanTo[s] \in {0, pins[s] + 1}
     /\ localTo[s] \in {0, pins[s] + 1}
+
+\* A malformed successful response cannot authorize cleanup in that call.
+StrictConfirmation ==
+  [][(lastActor' = "missing-echo") => (cleanTo' = cleanTo /\ localTo' = localTo)]_vars
 
 \* No destructive step (tombstone post, queue write, local erase, storage delete,
 \* done verdict) ran while the host had no write authority.

@@ -1,3 +1,4 @@
+import { gatedPort } from "../ports/write-authority.js";
 /**
  * In-memory DataStoragePort for unit tests: envelopes in a Map, index rows
  * in an array, CAS revisions assigned max+1 per scope like the real index.
@@ -16,6 +17,7 @@ import type {
 export interface MemoryDataStorage extends DataStoragePort {
   /** Every index row, oldest first (test inspection). */
   readonly entries: IndexEntry[];
+  filesAbsent(scope: string): boolean;
 }
 
 export interface MemoryDataStorageOptions {
@@ -207,6 +209,8 @@ export function createMemoryDataStorage(
         0,
       );
     },
+    filesAbsent: (scope) =>
+      ![...envelopes.values()].some((e) => e.scope === scope),
     async readEnvelope(scope, collectedAt) {
       const envelope = envelopes.get(key(scope, collectedAt));
       if (!envelope)
@@ -293,7 +297,10 @@ export function createMemoryDataStorage(
       return sealedRemoval(hold, () =>
         withScopeLock(scope, async () => {
           const removed =
-            remove(
+            gatedPort(
+              fence?.writeReady,
+              remove,
+            )(
               (entry) =>
                 entry.scope === scope &&
                 entry.collectedAt === collectedAt &&

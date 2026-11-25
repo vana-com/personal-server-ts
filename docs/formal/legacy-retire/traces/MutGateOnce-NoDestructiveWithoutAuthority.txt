@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 100 and seed 4843189498901413006 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 673122] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r7/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 68 and seed 8990731346193096398 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 2028205] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file <repository>/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 16:14:37)
+Starting... (2026-11-25 17:07:00)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-25 16:14:37.
+Finished computing initial states: 2 distinct states generated at 2026-11-25 17:07:00.
 Error: Invariant NoDestructiveWithoutAuthority is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -141,7 +141,7 @@ State 4: <WRead line 166, col 3 to line 176, col 54 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 5: <Revoke line 335, col 3 to line 340, col 54 of module LegacyRetire>
+State 5: <Revoke line 368, col 3 to line 373, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
@@ -205,7 +205,7 @@ State 6: <WSend line 190, col 3 to line 210, col 54 of module LegacyRetire>
 /\ wr = FALSE
 /\ cleanTo = (s1 :> 2 @@ s2 :> 0)
 
-18404 states generated, 7633 distinct states found, 4757 states left on queue.
-The depth of the complete state graph search is 8.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 9).
-Finished in 00s at (2026-11-25 16:14:37)
+27696 states generated, 11939 distinct states found, 8005 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 13 and the 95th percentile is 9).
+Finished in 00s at (2026-11-25 17:07:00)

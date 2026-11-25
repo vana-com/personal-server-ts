@@ -1,3 +1,4 @@
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 // The standalone legacy retirement through the real local sync, the real seal,
 // the real `deleteScope` worker and real SQLite, over a fake legacy gateway:
 // a source whose delete was never sent, connected again while its legacy scopes
@@ -51,7 +52,7 @@ async function reconnected(
     /** Extra options of the fake host's ports (see `legacyPortsOver`). */
     host?: Pick<
       NonNullable<Parameters<typeof legacyPortsOver>[1]>,
-      "onAdapterHeadRead" | "wrapFetch"
+      "onAdapterHeadRead" | "wrapFetch" | "gateBlobsOnFinality"
     >;
   } = {},
 ) {
@@ -803,6 +804,160 @@ describe("a standalone legacy retirement after the switch", () => {
 // The fixture's own connector is not bound to a legacy scope: a retirement of
 // it pins nothing and is done at once, without a gateway read.
 describe("a retirement's destructive steps run only under live write authority and the pinned version", () => {
+  it.each(["list", "plannedThrough", "finality"] as const)(
+    "revoking write authority during marker lookup or finality checks (%s) queues nothing and deletes no blob",
+    async (boundary) => {
+      let ready = true;
+      const f = await reconnected({
+        writeReady: () => ready,
+        host: { gateBlobsOnFinality: true },
+      });
+      placeLocalEntries(f);
+      const queue = f.legacy.pendingBlobDeletions;
+      if (boundary === "finality") {
+        f.legacy.ports.finality.tombstoneState = async () => {
+          ready = false;
+          return { finalized: "99", settling: false, rolledBack: null };
+        };
+      } else {
+        const original = queue[boundary]!.bind(queue);
+        Object.assign(queue, {
+          [boundary]: async (...args: never[]) => {
+            const result = await (original as (...a: never[]) => unknown)(
+              ...args,
+            );
+            ready = false;
+            return result;
+          },
+        });
+      }
+      await f.a.sync.legacyRetirer.request(GH);
+      await vi.waitFor(() => expect(ready).toBe(false));
+      await f.a.sync.legacyRetirer.close();
+      expect(storageDeletes(f.fake)).toEqual([]);
+      expect(await queue.list()).toEqual([]);
+      for (const scope of SCOPES)
+        expect(f.legacy.storage.countVersions(scope)).toBe(1);
+      expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual(
+        PENDING,
+      );
+    },
+  );
+
+  it("a head absent at pin and at check still removes a local-only legacy copy before done", async () => {
+    const f = await reconnected({
+      mode: "off",
+      wrapLegacy: (ports) => ({
+        ...ports,
+        head: async () => ({ state: "absent" }),
+      }),
+    });
+    placeLocalEntries(f);
+    for (const scope of SCOPES) {
+      await f.legacy.storage.writeEnvelope(
+        createDataFileEnvelope(scope, "2026-01-01T00:00:00.000Z", {
+          legacy: true,
+        }),
+      );
+      expect(f.legacy.storage.filesAbsent(scope)).toBe(false);
+    }
+    await f.legacy.authority.submitEvidence({ owner: OWNER, state: "on" });
+    await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual(DONE),
+    );
+    for (const scope of SCOPES) {
+      expect(f.legacy.storage.countVersions(scope)).toBe(0);
+      expect(f.legacy.storage.filesAbsent(scope)).toBe(true);
+    }
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+  });
+
+  it("a local-only copy the pin cannot bound blocks instead of erasing", async () => {
+    let reads = 0;
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        head: async () => {
+          if (++reads > SCOPES.length && f.legacy.storage.entries.length === 0)
+            placeLocalEntries(f);
+          return { state: "absent" };
+        },
+      }),
+    });
+    await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual({
+        state: "blocked",
+        reason: "legacy_head_changed",
+      }),
+    );
+    for (const scope of SCOPES)
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+    expect(storageDeletes(f.fake)).toEqual([]);
+  });
+
+  it("an unindexed local file cannot be erased by an absent remote pin", async () => {
+    const f = await reconnected({
+      mode: "off",
+      wrapLegacy: (ports) => ({
+        ...ports,
+        head: async () => ({ state: "absent" }),
+      }),
+    });
+    await f.legacy.storage.writeEnvelope(
+      createDataFileEnvelope(SCOPES[0]!, "2026-01-01T00:00:00.000Z", {
+        legacy: true,
+      }),
+    );
+    await f.legacy.authority.submitEvidence({ owner: OWNER, state: "on" });
+    await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual({
+        state: "blocked",
+        reason: "legacy_head_changed",
+      }),
+    );
+    expect(f.legacy.storage.filesAbsent(SCOPES[0]!)).toBe(false);
+    expect(storageDeletes(f.fake)).toEqual([]);
+  });
+
+  it("a fenced 2xx without expectedVersion cleans nothing", async () => {
+    const f = await reconnected({
+      host: {
+        wrapFetch: (fetchImpl) =>
+          (async (input, init) => {
+            const response = await fetchImpl(input, init);
+            if (
+              init?.method !== "DELETE" ||
+              !String(input).startsWith(FAKE_GATEWAY)
+            )
+              return response;
+            const body = (await response.json()) as {
+              data: Record<string, unknown>;
+            };
+            delete body.data.expectedVersion;
+            return new Response(JSON.stringify(body), {
+              status: response.status,
+            });
+          }) as typeof fetch,
+      },
+    });
+    placeLocalEntries(f);
+    await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual({
+        state: "blocked",
+        reason: "legacy_head_changed",
+      }),
+    );
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+      expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
+    }
+  });
+
   it("revoking write authority during the adapter's head read sends no tombstone and erases nothing", async () => {
     let ready = true;
     let armed = false;
@@ -846,7 +1001,7 @@ describe("a retirement's destructive steps run only under live write authority a
       expect(f.legacy.storage.countVersions(scope)).toBe(0);
   });
 
-  it("a fenced delete whose 2xx echoes a later version cleans nothing past the pinned version", async () => {
+  it("a fenced delete whose 2xx echoes a later version blocks without cleanup", async () => {
     const f = await reconnected({
       host: {
         wrapFetch: (fetchImpl) =>
@@ -876,15 +1031,14 @@ describe("a retirement's destructive steps run only under live write authority a
     await vi.waitFor(async () =>
       expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
         retireId,
-        legacy: DONE,
+        legacy: { state: "blocked", reason: "legacy_head_changed" },
       }),
     );
-    // The pins named version 2: its tombstone is 3. No blob above it is asked for.
-    const versions = storageDeletes(f.fake).map((r) =>
-      Number(decodeURIComponent(r.url).split("/").pop()),
-    );
-    expect(versions.length).toBeGreaterThan(0);
-    expect(Math.max(...versions)).toBeLessThanOrEqual(3);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+      expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
+    }
   });
 
   it("resumes local cleanup when the process stopped after the tombstone landed", async () => {

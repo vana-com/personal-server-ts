@@ -1,3 +1,7 @@
+import {
+  gatedPort,
+  WriteAuthorityLostError,
+} from "../ports/write-authority.js";
 // A standalone retirement of a connector's legacy (pre-switch) copy, apart
 // from the connector's delete.
 //
@@ -34,6 +38,7 @@ import {
   type LegacyDeletePorts,
   type LegacyHead,
   type LegacyMemory,
+  type LegacyScopeConfirmation,
 } from "./legacy-delete.js";
 import {
   blocked,
@@ -109,14 +114,6 @@ interface Loop {
   delay: number;
 }
 
-/** A pass met a closed write gate between two host calls. */
-class WriteNotReady extends Error {
-  constructor() {
-    super("legacy retirement paused: the host has no write authority now");
-    this.name = "WriteNotReady";
-  }
-}
-
 /**
  * The ports a pass hands the stage: each host call first reads the gate, so a
  * hold that starts mid-pass stops the next call, whatever the caller was doing.
@@ -125,24 +122,28 @@ function gatedPorts(
   ports: LegacyDeletePorts,
   ready: () => boolean,
 ): LegacyDeletePorts {
-  const gate =
-    <A extends unknown[], R>(call: (...args: A) => R) =>
-    (...args: A): R => {
-      if (!ready()) throw new WriteNotReady();
-      return call(...args);
-    };
+  const gate = <A extends unknown[], R>(call: (...args: A) => R) =>
+    gatedPort(ready, call);
   return {
     ...ports,
+    ...(ports.local && {
+      local: {
+        snapshot: ports.local.snapshot.bind(ports.local),
+        absent: ports.local.absent.bind(ports.local),
+        erase: gate((scope, entries) =>
+          ports.local!.erase(scope, entries, ready),
+        ),
+      },
+    }),
     head: gate(ports.head.bind(ports)),
     // The delete worker reads the live gate again before each destructive step
     // of its own: the tombstone post, the queue write and the local erase.
-    retire: (scope, fence, options) => {
-      if (!ready()) throw new WriteNotReady();
-      return ports.retire(scope, fence, {
+    retire: gate((scope, fence, options) =>
+      ports.retire(scope, fence, {
         pinned: options?.pinned ?? false,
         writeReady: ready,
-      });
-    },
+      }),
+    ),
     pendingBlobs: gate(ports.pendingBlobs),
     finality: {
       tombstoneState: gate(ports.finality.tombstoneState.bind(ports.finality)),
@@ -152,8 +153,8 @@ function gatedPorts(
       list: gate(ports.versions.list.bind(ports.versions)),
     },
     objects: {
-      deleteBlobVersions: gate(
-        ports.objects.deleteBlobVersions.bind(ports.objects),
+      deleteBlobVersions: gate((scope, versions) =>
+        ports.objects.deleteBlobVersions(scope, versions, ready),
       ),
     },
   };
@@ -205,7 +206,6 @@ export function createLegacyRetirer(
       memory = {
         refused: new Map(),
         erased: new Map(),
-        localCleaned: new Set(),
       };
       memories.set(connector, memory);
     }
@@ -228,6 +228,7 @@ export function createLegacyRetirer(
     if (!ready()) return { part: PART_PENDING, retry: true };
     const guarded = gatedPorts(ports, ready);
     const memory = memoryOf(connector);
+    const confirmations: LegacyScopeConfirmation[] = [];
     let part: DeletePart = PART_DONE;
     let retry = false;
     for (const { scope, head } of intent.scopes) {
@@ -241,7 +242,7 @@ export function createLegacyRetirer(
         stop.signal,
       ).catch((error: unknown) => {
         if (stop.signal.aborted) throw error;
-        if (error instanceof WriteNotReady)
+        if (error instanceof WriteAuthorityLostError)
           return { part: PART_PENDING, retry: true };
         deps.logger.warn(
           {
@@ -253,6 +254,8 @@ export function createLegacyRetirer(
         );
         return { part: PART_PENDING, retry: true };
       });
+      if ("confirmation" in outcome && outcome.confirmation)
+        confirmations.push(outcome.confirmation);
       part = worst(part, outcome.part);
       retry ||= outcome.retry;
     }
@@ -260,16 +263,34 @@ export function createLegacyRetirer(
     // before the abort says the account or the heads are still what it read.
     if (part.state === "done") {
       stop.signal.throwIfAborted();
-      // The mode was read at the pass's start; a host call has run since.
-      if (!ready()) return { part: PART_PENDING, retry: true };
-      await deps.db.batch([
-        {
-          sql: "UPDATE legacy_retirements SET state = 'done' WHERE owner = ? AND connector = ? AND retire_id = ?",
-          params: [owner, connector, intent.retireId],
-        },
-      ]);
+      await writeDone(connector, intent, confirmations, ready);
     }
     return { part, retry: retry || part.state === "pending" };
+  }
+
+  /** The only durable done writer requires a proof for every pinned scope. */
+  async function writeDone(
+    connector: string,
+    intent: Intent,
+    confirmations: readonly LegacyScopeConfirmation[],
+    ready: () => boolean,
+  ) {
+    if (
+      !intent.scopes.every(({ scope }) =>
+        confirmations.some((proof) => proof.scope === scope),
+      )
+    )
+      throw new Error("missing legacy scope completion proof");
+    stop.signal.throwIfAborted();
+    await gatedPort(
+      ready,
+      deps.db.batch.bind(deps.db),
+    )([
+      {
+        sql: "UPDATE legacy_retirements SET state = 'done' WHERE owner = ? AND connector = ? AND retire_id = ?",
+        params: [owner, connector, intent.retireId],
+      },
+    ]);
   }
 
   function schedule(connector: string, delay: number): void {
@@ -360,12 +381,17 @@ export function createLegacyRetirer(
         // Pin the heads now: the intent retires these and no others.
         const scopes: Intent["scopes"][number][] = [];
         try {
-          for (const scope of ports.scopesOf(connector))
+          for (const scope of ports.scopesOf(connector)) {
+            const head = await ports.head(scope);
             scopes.push({
               scope,
-              head: await ports.head(scope),
+              head:
+                head.state === "absent" && ports.local
+                  ? { ...head, local: ports.local.snapshot(scope) }
+                  : head,
               streams: [...ports.streamsOf(connector, scope)],
             });
+          }
         } catch (error) {
           throw new LegacyRetireUnavailable(
             `a legacy head could not be read: ${

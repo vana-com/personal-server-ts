@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 85 and seed -488028380125675296 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 674212] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r7/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 30 and seed 6197427993742402964 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 2029121] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file <repository>/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 16:14:39)
+Starting... (2026-11-25 17:07:02)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-25 16:14:39.
+Finished computing initial states: 2 distinct states generated at 2026-11-25 17:07:02.
 Error: Invariant NoLegacyMergeWhileOpen is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -109,7 +109,7 @@ State 3: <RRead line 138, col 3 to line 143, col 38 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 4: <IPre line 360, col 3 to line 368, col 38 of module LegacyRetire>
+State 4: <IPre line 393, col 3 to line 401, col 38 of module LegacyRetire>
 /\ isc = s1
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
@@ -173,7 +173,7 @@ State 5: <RInsert line 147, col 3 to line 155, col 38 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 6: <IMerge line 373, col 3 to line 383, col 57 of module LegacyRetire>
+State 6: <IMerge line 406, col 3 to line 416, col 57 of module LegacyRetire>
 /\ isc = s1
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
@@ -205,7 +205,7 @@ State 6: <IMerge line 373, col 3 to line 383, col 57 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-5698 states generated, 2829 distinct states found, 1960 states left on queue.
+8111 states generated, 4177 distinct states found, 3063 states left on queue.
 The depth of the complete state graph search is 7.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 11 and the 95th percentile is 9).
-Finished in 00s at (2026-11-25 16:14:39)
+The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 11 and the 95th percentile is 10).
+Finished in 00s at (2026-11-25 17:07:02)

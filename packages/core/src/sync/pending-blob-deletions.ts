@@ -1,3 +1,4 @@
+import { gatedPort } from "../ports/write-authority.js";
 import type {
   PendingBlobDeletion,
   PendingBlobDeletionStore,
@@ -193,23 +194,23 @@ export function createPendingBlobDeletionStore(
     list() {
       return serialized(async () => (await current()).keys);
     },
-    add(keys) {
+    add(keys, writeReady) {
       return serialized(async () => {
         if (keys.length === 0) return;
         const { keys: existing, planned } = await current();
         const next = merge(existing, keys);
         if (next.length === existing.length) return;
-        await kv.write(next, planned);
+        await gatedPort(writeReady, kv.write.bind(kv))(next, planned);
       });
     },
-    remove(keys) {
+    remove(keys, writeReady) {
       return serialized(async () => {
         if (keys.length === 0) return;
         const { keys: existing, planned } = await current();
         const gone = new Set(keys.map(markerId));
         const next = existing.filter((key) => !gone.has(markerId(key)));
         if (next.length === existing.length) return;
-        await kv.write(next, planned);
+        await gatedPort(writeReady, kv.write.bind(kv))(next, planned);
       });
     },
     plannedThrough(scope) {
@@ -218,7 +219,7 @@ export function createPendingBlobDeletionStore(
         return Object.hasOwn(planned, scope) ? planned[scope] : null;
       });
     },
-    enqueue(scope, keys, through) {
+    enqueue(scope, keys, through, writeReady) {
       return serialized(async () => {
         const { keys: existing, planned } = await current();
         const next = merge(existing, keys);
@@ -228,7 +229,7 @@ export function createPendingBlobDeletionStore(
           /^\d+$/.test(through) &&
           (before === null || BigInt(through) > BigInt(before));
         if (next.length === existing.length && !raise) return;
-        await kv.write(
+        await gatedPort(writeReady, kv.write.bind(kv))(
           next,
           raise ? { ...planned, [scope]: BigInt(through).toString() } : planned,
         );

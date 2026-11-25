@@ -1061,6 +1061,12 @@ describe("the legacy stage of a connection delete after the switch", () => {
         },
       });
       const ports: LegacyDeletePorts = {
+        // This simulated host has remote blobs only, with no local rows or files.
+        local: {
+          snapshot: () => [],
+          absent: async () => true,
+          erase: async () => {},
+        },
         scopesOf: (connector) => (connector === GH ? [...scopes] : []),
         mode: () => "switched",
         head: async (scope) =>
@@ -1167,6 +1173,12 @@ describe("the legacy stage of a connection delete after the switch", () => {
       );
       const tombstone = String(slotCount + 1);
       const ports: LegacyDeletePorts = {
+        // This simulated host has remote blobs only, with no local rows or files.
+        local: {
+          snapshot: () => [],
+          absent: async () => true,
+          erase: async () => {},
+        },
         scopesOf: (connector) => (connector === GH ? ["one.s1"] : []),
         mode: () => "switched",
         head: async () => ({ state: "deleted", version: tombstone }),

@@ -42,12 +42,14 @@ export class GatewayRefusalError extends Error {
 }
 
 /** The host's write authority closed before a destructive step: nothing was sent. */
-export class WriteAuthorityLostError extends Error {
-  constructor() {
-    super("the host has no write authority now; nothing was sent");
-    this.name = "WriteAuthorityLostError";
-  }
-}
+export { WriteAuthorityLostError } from "../ports/write-authority.js";
+import {
+  gatedPort,
+  WriteAuthorityLostError,
+} from "../ports/write-authority.js";
+
+/** The gateway did not confirm the exact pinned tombstone. */
+export class LegacyHeadChangedError extends Error {}
 
 /**
  * A fenced delete cleans storage through the tombstone's version, so it may
@@ -62,9 +64,10 @@ function assertFencedTombstone(
   if (!fence) return;
   if (
     version === null ||
+    !/^\d+$/.test(version) ||
     BigInt(version) !== BigInt(fence.head.expectedVersion) + 1n
   )
-    throw new Error(
+    throw new LegacyHeadChangedError(
       `Scope is deleted at v${version ?? "?"}, not directly after the fenced head (v${fence.head.expectedVersion})`,
     );
 }
@@ -202,21 +205,22 @@ export function createGatewayDeleteDataPort(
     });
     // The head read and the signing are awaits: the host's authority is read
     // again right before the post, the one call here that deletes.
-    if (fence?.writeReady && !fence.writeReady())
-      throw new WriteAuthorityLostError();
-    return fetchImpl(`${gatewayBase}/v1/data/${dataPointId}`, {
-      method: "DELETE",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Web3Signed ${signature}`,
+    return gatedPort(fence?.writeReady, fetchImpl)(
+      `${gatewayBase}/v1/data/${dataPointId}`,
+      {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Web3Signed ${signature}`,
+        },
+        body: JSON.stringify({
+          ownerAddress: options.serverOwner,
+          scope,
+          expectedVersion: String(version),
+          signature,
+        }),
       },
-      body: JSON.stringify({
-        ownerAddress: options.serverOwner,
-        scope,
-        expectedVersion: String(version),
-        signature,
-      }),
-    });
+    );
   }
 
   /**
@@ -433,7 +437,7 @@ export function createGatewayDeleteDataPort(
       const echoed = stringField(row, "expectedVersion");
       // A fenced delete's cleanup is bounded by the version it signed, never by
       // an echo: a later one would free versions the pin never named.
-      assertFencedTombstone(fence, echoed ?? String(version));
+      assertFencedTombstone(fence, echoed);
       return {
         status: "tombstoned",
         dataPointId: stringField(row, "dataPointId") ?? dataPointId,
@@ -446,6 +450,7 @@ export function createGatewayDeleteDataPort(
     async deleteBlobVersions(
       scope: string,
       versions: string[],
+      writeReady?: () => boolean,
     ): Promise<DeleteBlobVersionsOutcome> {
       const outcome: DeleteBlobVersionsOutcome = {
         deleted: [],
@@ -464,10 +469,13 @@ export function createGatewayDeleteDataPort(
             method: "DELETE",
             uri: path,
           });
-          const res = await fetchImpl(`${storageBase}${path}`, {
-            method: "DELETE",
-            headers: { authorization },
-          });
+          const res = await gatedPort(writeReady, fetchImpl)(
+            `${storageBase}${path}`,
+            {
+              method: "DELETE",
+              headers: { authorization },
+            },
+          );
           if (res.status === 404) {
             // Idempotent: an absent object is a completed delete.
             outcome.missing.push(version);
@@ -480,6 +488,7 @@ export function createGatewayDeleteDataPort(
             });
           }
         } catch (err) {
+          if (err instanceof WriteAuthorityLostError) throw err;
           outcome.failed.push({
             version,
             error: err instanceof Error ? err.message : String(err),

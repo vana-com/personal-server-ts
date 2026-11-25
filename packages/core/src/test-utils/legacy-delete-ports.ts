@@ -13,6 +13,7 @@ import { createGatewayDeleteDataPort } from "../sync/delete-data-port.js";
 import { createMemoryPendingBlobDeletionStore } from "../sync/pending-blob-deletions.js";
 import {
   legacyHeadFrom,
+  legacyLocalFrom,
   modeFrom,
   pendingBlobsFrom,
   type LegacyDeletePorts,
@@ -107,6 +108,7 @@ export async function legacyPortsOver(
   };
   const retired: string[] = [];
   const ports: LegacyDeletePorts = {
+    local: legacyLocalFrom(storage, storage.filesAbsent),
     scopesOf: legacyScopesOfConnector,
     streamsOf: legacyStreamsOfScope,
     mode: modeFrom(seal),

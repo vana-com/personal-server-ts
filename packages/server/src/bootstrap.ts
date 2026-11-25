@@ -1,7 +1,9 @@
+import { snapshotScopeFiles } from "./storage/hierarchy.js";
 import {
   createViewChanges,
   inventoryVersionLister,
   legacyHeadFrom,
+  legacyLocalFrom,
   localDatabaseName,
   modeFrom,
   openLocalDb,
@@ -1405,6 +1407,11 @@ async function bootstrapServer(
     if (deleteData && tombstoneFinality && logErasurePorts) {
       const manager = syncManager;
       legacyDeletePorts = {
+        local: legacyLocalFrom(
+          rawDataStorage,
+          (scope) =>
+            snapshotScopeFiles(hierarchyOptions, scope).files.length === 0,
+        ),
         scopesOf: legacyScopesOfConnector,
         streamsOf: legacyStreamsOfScope,
         mode: modeFrom(legacyWriteSeal),

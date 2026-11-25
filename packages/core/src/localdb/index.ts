@@ -67,6 +67,7 @@ export type {
 } from "./delete-status.js";
 export {
   legacyHeadFrom,
+  legacyLocalFrom,
   modeFrom,
   modeOfAccount,
   pendingBlobsFrom,

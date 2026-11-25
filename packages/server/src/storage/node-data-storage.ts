@@ -1,3 +1,4 @@
+import { gatedPort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   deleteAllForScope,
   deleteDataFile,
@@ -253,11 +254,20 @@ export function createNodeDataStorage(
     work: () => Promise<T>,
   ): Promise<T> => removal(hold, () => withScopeLock(scope, work));
   /** The sidecar goes with the scope's last version, under the scope's lock. */
-  const dropLedgerUnderScopeLock = (scope: string): Promise<void> =>
-    withScopeLock(scope, () => dropLedgerIfEmpty(scope));
-  async function dropLedgerIfEmpty(scope: string): Promise<void> {
+  const dropLedgerUnderScopeLock = (
+    scope: string,
+    writeReady?: () => boolean,
+  ): Promise<void> =>
+    withScopeLock(scope, () => dropLedgerIfEmpty(scope, writeReady));
+  async function dropLedgerIfEmpty(
+    scope: string,
+    writeReady?: () => boolean,
+  ): Promise<void> {
     if (deps.indexManager.countByScope(scope) === 0) {
-      await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
+      await gatedPort(writeReady, deleteFirstSeenLedger)(
+        deps.hierarchyOptions,
+        scope,
+      );
     }
   }
 
@@ -544,7 +554,7 @@ export function createNodeDataStorage(
               entry?.collectedAt === collectedAt ? entry.path : undefined,
               hold,
             );
-        await dropLedgerUnderScopeLock(scope);
+        await dropLedgerUnderScopeLock(scope, fence?.writeReady);
         return removed;
       }
       if (!entry || entry.collectedAt !== collectedAt) return false;
@@ -557,9 +567,17 @@ export function createNodeDataStorage(
         }
         // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
         // the index row, so a real blob failure keeps the row for a retry.
-        await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);
-        deps.indexManager.deleteByPath(entry.path);
-        await dropLedgerIfEmpty(scope);
+        await gatedPort(fence?.writeReady, deleteDataFile)(
+          deps.hierarchyOptions,
+          scope,
+          collectedAt,
+          fence?.writeReady,
+        );
+        gatedPort(
+          fence?.writeReady,
+          deps.indexManager.deleteByPath.bind(deps.indexManager),
+        )(entry.path);
+        await dropLedgerIfEmpty(scope, fence?.writeReady);
         return true;
       });
     },

@@ -12,6 +12,29 @@ const A2 = { scope: "instagram.profile", version: "2" };
 const B7 = { scope: "chatgpt.conversations", version: "7" };
 
 describe("pending blob deletion store", () => {
+  it.each(["add", "enqueue", "remove"] as const)(
+    "%s rechecks authority after the serialized marker read",
+    async (method) => {
+      let ready = true;
+      const write = vi.fn();
+      const store = createPendingBlobDeletionStore({
+        read: async () => {
+          ready = false;
+          return method === "remove" ? [A1] : [];
+        },
+        write,
+      });
+      const work =
+        method === "enqueue"
+          ? store.enqueue!(A1.scope, [A1], "1", () => ready)
+          : store[method]([A1], () => ready);
+      await expect(work).rejects.toMatchObject({
+        name: "WriteAuthorityLostError",
+      });
+      expect(write).not.toHaveBeenCalled();
+    },
+  );
+
   it("adds, lists and removes exact keys without duplicates", async () => {
     const store = createMemoryPendingBlobDeletionStore();
 
