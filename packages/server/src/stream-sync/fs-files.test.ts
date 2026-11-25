@@ -52,7 +52,9 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
   it("reports an existing file passed as a listing prefix instead of returning an empty list", async () => {
     const files = createFsStreamSyncFiles(root);
     await files.write("one.bin", enc.encode("fixture"));
-    await expect(files.list("one.bin")).rejects.toMatchObject({ code: "ENOTDIR" });
+    await expect(files.list("one.bin")).rejects.toMatchObject({
+      code: "ENOTDIR",
+    });
     expect(await files.read("one.bin")).toEqual(enc.encode("fixture"));
   });
 

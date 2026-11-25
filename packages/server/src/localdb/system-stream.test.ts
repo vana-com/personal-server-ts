@@ -32,10 +32,12 @@ it("rejects an access activity descriptor with an unreadable timestamp", () => {
   };
   expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
   expect(() =>
-    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, occurredAt: "not a timestamp" }),
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      ...event,
+      occurredAt: "not a timestamp",
+    }),
   ).toThrow("Invalid access activity timestamp");
 });
-
 
 it.each([{ schemaVersion: 2 }, { phase: "finished" }])(
   "reports a stable activity descriptor error for %j",
