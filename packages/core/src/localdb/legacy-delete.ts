@@ -83,6 +83,11 @@ export type LegacyHead =
 export interface LegacyDeletePorts {
   /** The legacy scopes bound to `connector` (the host owns the binding table). */
   scopesOf(connector: string): readonly string[];
+  /**
+   * The streams of `connector` that legacy `scope` feeds. A retirement records
+   * them, so a retired scope keeps refusing the imports it would feed.
+   */
+  streamsOf?(connector: string, scope: string): readonly string[];
   /** What a legacy write would get now: `allow` is an account that has not switched. */
   mode(): "allow" | LegacyWriteVerdict;
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;

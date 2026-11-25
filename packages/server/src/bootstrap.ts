@@ -87,7 +87,10 @@ import {
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { McpScopeRequestApprovalUrlHook } from "@opendatalabs/personal-server-ts-core/mcp";
 import { mcpGrantDefaultExpiry } from "@opendatalabs/personal-server-ts-core/mcp";
-import { legacyScopesOfConnector } from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
+  legacyScopesOfConnector,
+  legacyStreamsOfScope,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   createGatewayClient,
@@ -1403,6 +1406,7 @@ async function bootstrapServer(
       const manager = syncManager;
       legacyDeletePorts = {
         scopesOf: legacyScopesOfConnector,
+        streamsOf: legacyStreamsOfScope,
         mode: modeFrom(legacyWriteSeal),
         head: legacyHeadFrom(dataPointFeed, serverOwner),
         retire: (scope, head) =>

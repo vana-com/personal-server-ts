@@ -1,6 +1,7 @@
 Error: Invariant NotBlocked is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
+/\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 0
@@ -14,19 +15,20 @@ State 1: <Initial predicate>
 /\ rpc = "idle"
 /\ rsnap = (s1 :> 0 @@ s2 :> 0)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
+/\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "init"
 /\ ver = (s1 :> 1 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ crashes = 0
-/\ sawIntent = FALSE
 /\ tombVer = (s1 :> 0 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 
-State 2: <RRead line 122, col 3 to line 127, col 38 of module LegacyRetire>
+State 2: <RRead line 123, col 3 to line 128, col 38 of module LegacyRetire>
+/\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
@@ -40,19 +42,20 @@ State 2: <RRead line 122, col 3 to line 127, col 38 of module LegacyRetire>
 /\ rpc = "read"
 /\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
+/\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "req"
 /\ ver = (s1 :> 1 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ crashes = 0
-/\ sawIntent = FALSE
 /\ tombVer = (s1 :> 0 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 
-State 3: <Publish line 91, col 3 to line 96, col 54 of module LegacyRetire>
+State 3: <Publish line 92, col 3 to line 97, col 54 of module LegacyRetire>
+/\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
@@ -66,19 +69,20 @@ State 3: <Publish line 91, col 3 to line 96, col 54 of module LegacyRetire>
 /\ rpc = "read"
 /\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
+/\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "gateway"
 /\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ crashes = 0
-/\ sawIntent = FALSE
 /\ tombVer = (s1 :> 0 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 
-State 4: <RInsert line 131, col 3 to line 139, col 38 of module LegacyRetire>
+State 4: <RInsert line 132, col 3 to line 140, col 38 of module LegacyRetire>
+/\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
@@ -92,19 +96,20 @@ State 4: <RInsert line 131, col 3 to line 139, col 38 of module LegacyRetire>
 /\ rpc = "idle"
 /\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 1 @@ s2 :> 1)
+/\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "req"
 /\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ crashes = 0
-/\ sawIntent = FALSE
 /\ tombVer = (s1 :> 0 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 
-State 5: <WRead line 143, col 3 to line 153, col 54 of module LegacyRetire>
+State 5: <WRead line 144, col 3 to line 154, col 54 of module LegacyRetire>
+/\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
@@ -118,18 +123,18 @@ State 5: <WRead line 143, col 3 to line 153, col 54 of module LegacyRetire>
 /\ rpc = "idle"
 /\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 1 @@ s2 :> 1)
+/\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "worker"
 /\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ crashes = 0
-/\ sawIntent = FALSE
 /\ tombVer = (s1 :> 0 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> TRUE @@ s2 :> FALSE)
 
-1344 states generated, 775 distinct states found, 553 states left on queue.
-The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 9 and the 95th percentile is 8).
+3655 states generated, 1971 distinct states found, 1373 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 10 and the 95th percentile is 9).

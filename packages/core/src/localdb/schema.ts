@@ -765,9 +765,9 @@ END`,
     // request to retire a connector's legacy copy, with the gateway heads of
     // its bound legacy scopes as the request read them (`scopes`, JSON). One
     // row per connector: a repeat or a restart resumes it, and it never
-    // widens. `open` fences the legacy import of the connector (and nothing
-    // else: it is not a `delete_intents` row); `done` is set only on a
-    // confirmed erasure and lifts the fence.
+    // widens. `open` fences the legacy import of the whole connector (and
+    // nothing else: it is not a `delete_intents` row); `done` is set only on a
+    // confirmed erasure and keeps fencing the bound scopes it lists, for good.
     `CREATE TABLE legacy_retirements (
       owner TEXT NOT NULL, connector TEXT NOT NULL, retire_id TEXT NOT NULL,
       state TEXT NOT NULL CHECK (state IN ('open','done')),

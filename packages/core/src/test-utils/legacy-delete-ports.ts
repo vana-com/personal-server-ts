@@ -3,7 +3,10 @@
  * legacy stage: the real seal and storage, the real gateway delete port and
  * the real `deleteScope` worker, over the fake's gateway and storage.
  */
-import { legacyScopesOfConnector } from "../legacy-projection/erase-connector.js";
+import {
+  legacyScopesOfConnector,
+  legacyStreamsOfScope,
+} from "../legacy-projection/erase-connector.js";
 import { createLegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import { deleteScope } from "../sync/workers/delete.js";
 import { createGatewayDeleteDataPort } from "../sync/delete-data-port.js";
@@ -92,6 +95,7 @@ export async function legacyPortsOver(
   const retired: string[] = [];
   const ports: LegacyDeletePorts = {
     scopesOf: legacyScopesOfConnector,
+    streamsOf: legacyStreamsOfScope,
     mode: modeFrom(seal),
     head: legacyHeadFrom(fake.feed, owner),
     retire: async (scope, fence) => {

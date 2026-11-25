@@ -403,6 +403,70 @@ describe("a standalone legacy retirement after the switch", () => {
     ).toEqual(changesBefore);
   });
 
+  // `done` must not lift the fence of a retired scope: a batch read before the
+  // retirement finished would merge the records the retirement deleted.
+  it("an import batch read before retirement completes merges nothing after the retirement is done", async () => {
+    const f = await reconnected();
+    const source: ImportSource = {
+      source: "legacy-stale",
+      owner: OWNER,
+      network: "test",
+      revision: "r1",
+      target: {
+        connectionId: controlScope(GH, ""),
+        connector: GH,
+        // A stream the connector's retired scope `github.repositories` feeds.
+        stream: "repositories",
+        primaryKey: ["id"],
+        semantics: "mutable_state",
+        incremental: true,
+      },
+      exclusions: [],
+      async *records() {
+        yield { id: "deleted-upstream" };
+      },
+    };
+    const recordsBefore = await f.a.records();
+    let retired = false;
+    const db = new Proxy(f.a.deps.db, {
+      get(target, key, receiver) {
+        if (key !== "batch") return Reflect.get(target, key, receiver);
+        return async (statements: { sql: string }[]) => {
+          if (
+            !retired &&
+            statements.some((s) => s.sql.includes("INSERT INTO import_guard"))
+          ) {
+            retired = true;
+            await f.a.sync.legacyRetirer.request(GH);
+            await vi.waitFor(async () =>
+              expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual(
+                DONE,
+              ),
+            );
+          }
+          return target.batch(statements as never);
+        };
+      },
+    });
+
+    await importLegacySource(
+      { ...f.a.deps, db },
+      createImportLedger(f.a.db),
+      source,
+    ).catch(() => undefined);
+
+    expect(retired).toBe(true);
+    expect(await f.a.records()).toEqual(recordsBefore);
+    // And a later import of the retired scope's stream is refused too.
+    expect(
+      await importLegacySource(f.a.deps, createImportLedger(f.a.db), {
+        ...source,
+        source: "legacy-later",
+        revision: "r2",
+      }),
+    ).toEqual({ kind: "refused", reason: "legacy_retired" });
+  });
+
   it("refuses an account that has not switched, and writes nothing", async () => {
     const f = await reconnected({ mode: "off" });
 

@@ -19,6 +19,17 @@ export function legacyScopesOfConnector(connector: string): string[] {
   return [...scopes];
 }
 
+/** The streams of `connector` that its legacy `scope` reads (the binding's fields). */
+export function legacyStreamsOfScope(
+  connector: string,
+  scope: string,
+): string[] {
+  const binding =
+    legacyBindingsForProfile(connector).get(scope) ??
+    LEGACY_SCOPE_BINDINGS.get(scope);
+  return binding ? Object.keys(binding.fieldsRead) : [];
+}
+
 /**
  * Removes this device's local copies of the connector's legacy scope files.
  * `deleteScope` is local only and idempotent: a scope with no files is a

@@ -81,6 +81,7 @@ export type LegacyImportResult =
       readonly reason:
         | "connection_deleted"
         | "legacy_retiring"
+        | "legacy_retired"
         | "generation_not_one"
         | "unknown_control"
         | "owner_mismatch"
@@ -425,6 +426,15 @@ async function importSource(
   });
 }
 
+/**
+ * A retirement of the import's own legacy scope: the row lists a bound scope
+ * that feeds this stream (`?` is the stream; the request wrote each scope's
+ * streams into the row). Per bound scope, not per connector: a stream no listed
+ * scope feeds is not held back.
+ */
+const RETIRED_SCOPE =
+  "EXISTS(SELECT 1 FROM json_each(r.scopes) j, json_each(j.value, '$.streams') s WHERE s.value = ?)";
+
 /** Reads the same conservative fence before refresh and every committed batch. */
 async function importFence(
   deps: LocalSyncDeps,
@@ -436,10 +446,11 @@ async function importFence(
     deleted_at: number | null;
     deleting: number;
     retiring: number;
+    retired: number;
     connector: string;
   }>(
-    `SELECT c.generation, c.control_state, c.deleted_at, c.connector, EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS deleting, EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND r.state = 'open') AS retiring FROM connections c WHERE connection_id = ?`,
-    [source.target.connectionId],
+    `SELECT c.generation, c.control_state, c.deleted_at, c.connector, EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AS deleting, EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND r.state = 'open') AS retiring, EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND ${RETIRED_SCOPE}) AS retired FROM connections c WHERE connection_id = ?`,
+    [source.target.stream, source.target.connectionId],
   );
   if (!row) return "unknown_control";
   if (
@@ -451,6 +462,9 @@ async function importFence(
   // An open legacy retirement owns the connector's legacy copy: nothing of it
   // is read into the stream (the connection itself is untouched).
   if (row.retiring) return "legacy_retiring";
+  // A retired scope stays refused: its copy was deleted on purpose, and an
+  // import of it could only bring that data back.
+  if (row.retired) return "legacy_retired";
   if (row.generation !== 1) return "generation_not_one";
   if (
     row.connector !== source.target.connector ||
@@ -548,11 +562,12 @@ function guardImport(source: ImportSource, op: string): SqlStatement[] {
       sql: "CREATE TEMP TABLE IF NOT EXISTS import_guard (op TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok = 1))",
     },
     {
-      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AND NOT EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND r.state = 'open')) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
+      sql: `INSERT INTO import_guard SELECT ?, CASE WHEN EXISTS(SELECT 1 FROM connections c WHERE c.connection_id = ? AND c.connector = ? AND c.generation = 1 AND c.control_state IN ('active','absent') AND c.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector = c.connector) AND NOT EXISTS(SELECT 1 FROM legacy_retirements r WHERE r.connector = c.connector AND (r.state = 'open' OR ${RETIRED_SCOPE}))) AND NOT EXISTS(SELECT 1 FROM stream_state s WHERE s.connection_id = ? AND s.stream = ? AND (s.last_delete_version <> 0 OR s.primary_key <> ? OR s.semantics <> ? OR s.incremental <> ?)) THEN 1 ELSE 0 END`,
       params: [
         op,
         connectionId,
         connector,
+        source.target.stream,
         connectionId,
         stream,
         JSON.stringify(primaryKey),

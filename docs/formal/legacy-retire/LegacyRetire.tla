@@ -35,6 +35,7 @@
 \*   newIntentOnRestart a restart makes a new intent for an open one
 \*   touchesCurrent  the erase also writes the current connection
 \*   oldPinHolds     the code before the fix: a tombstone satisfies any live pin
+\*   doneLiftsFence  the code before the fix: a done intent no longer fences its scopes
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Scopes,     \* the bound legacy scopes
@@ -51,13 +52,13 @@ VARIABLES
   exists, st, pins, nIntents,   \* the intent row(s)
   pc, snap, blk,                \* worker per scope
   rpc, rsnap, reqs,             \* request
-  ipc, batches, sawIntent,      \* importer
+  ipc, batches, isc, freeMerged,      \* importer
   mergedWhileOpen, staleAfterDone,
   cc, writes,                   \* the current connection
   crashes, lastActor
 
 vars == <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents,
-          pc, snap, blk, rpc, rsnap, reqs, ipc, batches, sawIntent,
+          pc, snap, blk, rpc, rsnap, reqs, ipc, batches, isc, freeMerged,
           mergedWhileOpen, staleAfterDone, cc, writes, crashes, lastActor>>
 
 Open == exists /\ st = "open"
@@ -81,7 +82,7 @@ Init ==
   /\ snap = [s \in Scopes |-> 0]
   /\ blk = [s \in Scopes |-> FALSE]
   /\ rpc = "idle" /\ rsnap = [s \in Scopes |-> 0] /\ reqs = 0
-  /\ ipc = "idle" /\ batches = 0 /\ sawIntent = FALSE
+  /\ ipc = "idle" /\ batches = 0 /\ isc = "none" /\ freeMerged = FALSE
   /\ mergedWhileOpen = FALSE /\ staleAfterDone = FALSE
   /\ cc = [control |-> "active", head |-> 0, records |-> 0] /\ writes = 0
   /\ crashes = 0 /\ lastActor = "init"
@@ -92,7 +93,7 @@ Publish(s) ==
   /\ ver' = [ver EXCEPT ![s] = @ + 1]
   /\ lastActor' = "gateway"
   /\ UNCHANGED <<tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
 ForeignTomb(s) ==
@@ -102,7 +103,7 @@ ForeignTomb(s) ==
   /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
   /\ lastActor' = "gateway"
   /\ UNCHANGED <<ver, erased, exists, st, pins, nIntents, pc, snap, blk,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
 \* ---- current-connection writer (stream sync) ---------------------------
@@ -112,7 +113,7 @@ CWrite ==
   /\ writes' = writes + 1
   /\ lastActor' = "sync"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, crashes>>
 
 \* ---- request -----------------------------------------------------------
@@ -123,7 +124,7 @@ RRead ==
   /\ rpc' = "read" /\ rsnap' = ver /\ reqs' = reqs + 1
   /\ lastActor' = "req"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
-                 ipc, batches, sawIntent, mergedWhileOpen, staleAfterDone,
+                 ipc, batches, isc, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
 \* INSERT OR IGNORE: the first row stands, a later request resumes it.
@@ -135,7 +136,7 @@ RInsert ==
        ELSE /\ exists' = TRUE /\ st' = "open" /\ pins' = rsnap /\ nIntents' = nIntents + 1
   /\ lastActor' = "req"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, pc, snap, blk, rsnap, reqs,
-                 ipc, batches, sawIntent, mergedWhileOpen, staleAfterDone,
+                 ipc, batches, isc, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
 \* ---- worker, per scope -------------------------------------------------
@@ -149,7 +150,7 @@ WRead(s) ==
             /\ UNCHANGED pc
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
 \* The tombstone is fenced to the head the read saw: it lands only if the head is
@@ -164,7 +165,7 @@ WSend(s) ==
   /\ pc' = [pc EXCEPT ![s] = "sent"]
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, erased, exists, st, pins, nIntents, snap, blk,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
 WReread(s) ==
@@ -175,7 +176,7 @@ WReread(s) ==
             /\ pc' = [pc EXCEPT ![s] = IF tomb[s] THEN "tombd" ELSE "idle"]
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, snap,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
 \* Storage deletes every slot <= the tombstone, then answers for all of them.
@@ -188,7 +189,7 @@ WErase(s) ==
        ELSE UNCHANGED cc
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, exists, st, pins, nIntents, snap, blk,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, writes, crashes>>
 
 WDone ==
@@ -199,45 +200,56 @@ WDone ==
   /\ st' = "done"
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, pins, nIntents, pc, snap, blk,
-                 rpc, rsnap, reqs, ipc, batches, sawIntent, mergedWhileOpen,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
 \* ---- importer ----------------------------------------------------------
-\* `importFence`: refused while the intent is open.
+\* The import's legacy scope: a bound scope, or "free" (a stream no bound scope feeds).
+\* `importFence` refuses while the intent is open (whole connector), and for good
+\* a stream a bound scope of a retired intent feeds. `doneLiftsFence` is the
+\* code before the fix: only an open intent fenced.
+Fenced(sc) ==
+  \/ Open
+  \/ (exists /\ st = "done" /\ sc \in Scopes /\ Mode # "doneLiftsFence")
+
 IPre ==
-  /\ ipc = "idle" /\ batches < MaxB /\ ~Open
-  /\ ipc' = "checked" /\ sawIntent' = exists
+  /\ ipc = "idle" /\ batches < MaxB
+  /\ \E sc \in Scopes \cup {"free"} :
+       /\ ~Fenced(sc)
+       /\ isc' = sc
+  /\ ipc' = "checked"
   /\ lastActor' = "importer"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
-                 rpc, rsnap, reqs, batches, mergedWhileOpen, staleAfterDone,
+                 rpc, rsnap, reqs, batches, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
 \* The merge batch. `guardImport` and the merge share one transaction (db.batch):
-\* the guard's CHECK fails and the whole batch rolls back if the intent is open.
+\* the guard's CHECK fails and the whole batch rolls back if the fence holds now.
 IMerge ==
   /\ ipc = "checked"
   /\ ipc' = "idle" /\ batches' = batches + 1
-  /\ IF Mode = "noBatchFence" \/ ~Open
+  /\ IF Mode = "noBatchFence" \/ ~Fenced(isc)
        THEN /\ cc' = [cc EXCEPT !.head = @ + 1, !.records = @ + 1]
             /\ mergedWhileOpen' = (mergedWhileOpen \/ Open)
-            /\ staleAfterDone' = (staleAfterDone \/ (exists /\ st = "done" /\ ~sawIntent))
-       ELSE UNCHANGED <<cc, mergedWhileOpen, staleAfterDone>>
+            /\ staleAfterDone' = (staleAfterDone \/ (exists /\ st = "done" /\ isc \in Scopes))
+            /\ freeMerged' = (freeMerged \/ (st = "done" /\ isc = "free"))
+       ELSE UNCHANGED <<cc, mergedWhileOpen, staleAfterDone, freeMerged>>
   /\ lastActor' = "importer"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
-                 rpc, rsnap, reqs, sawIntent, writes, crashes>>
+                 rpc, rsnap, reqs, isc, writes, crashes>>
 
 \* ---- restart -----------------------------------------------------------
 Crash ==
   /\ crashes < MaxCrash
   /\ crashes' = crashes + 1
   /\ pc' = [s \in Scopes |-> "idle"] /\ snap' = [s \in Scopes |-> 0]
-  /\ rpc' = "idle" /\ ipc' = "idle"
+  /\ rpc' = "idle" /\ ipc' = "idle" /\ isc' = "none"
   /\ IF Mode = "newIntentOnRestart" /\ Open
        THEN /\ nIntents' = nIntents + 1 /\ pins' = ver /\ st' = "open"
        ELSE UNCHANGED <<nIntents, pins, st>>
   /\ lastActor' = "crash"
   /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, blk, rsnap, reqs,
-                 batches, sawIntent, mergedWhileOpen, staleAfterDone, cc, writes>>
+                 batches, freeMerged, mergedWhileOpen, staleAfterDone, cc, writes>>
 
 Next ==
   \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WReread(s) \/ WErase(s)
@@ -276,12 +288,14 @@ NoTombstoneOverMovedHead ==
 NoEraseOfUnpinnedVersion ==
   \A s \in Scopes : erased[s] => tombVer[s] = pins[s] + 1
 
-\* Observation, not a requirement of the protocol: an import that passed its
-\* preflight before the intent existed merges after the intent is done.
+\* A retired scope stays refused: no batch merges a bound scope once the intent
+\* is done (a batch read before the retirement finished would bring back what it
+\* deleted).
 NoStaleMergeAfterDone == ~staleAfterDone
 
 \* Reachability probes: each config must FAIL, which proves the path is reachable.
 NotDone == st /= "done"
 NotBlocked == \A s \in Scopes : ~blk[s]
+NotFreeMergedAfterDone == ~freeMerged   \* an unbound stream still imports after done
 NotBlockedByForeignTomb == \A s \in Scopes : ~(blk[s] /\ tombBy[s] = "other")
 =============================================================================

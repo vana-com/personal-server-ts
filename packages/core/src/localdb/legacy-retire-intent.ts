@@ -14,7 +14,10 @@
 //     (`legacy_head_changed`) and the intent is never widened;
 //   - while it is open, the connector's legacy import is refused
 //     (`importFence`, and the merge batch's own guard), so an import cannot
-//     bring the copy back into the stream while it is retired. Nothing else
+//     bring the copy back into the stream while it is retired. Once `done`,
+//     an import of a stream a bound scope feeds stays refused for good
+//     (`legacy_retired`): a batch read before the retirement finished would
+//     otherwise merge the records it deleted. Other streams are not held. Nothing else
 //     reads it: the connection's control row, stream heads, records, sync and
 //     publish paths do not see it, and no pass sends a connector-wide fence,
 //     purges local state or erases a log;
@@ -85,7 +88,12 @@ export type LegacyRetirerDeps = Pick<
 interface Intent {
   readonly retireId: string;
   readonly state: "open" | "done";
-  readonly scopes: readonly { scope: string; head: LegacyHead }[];
+  readonly scopes: readonly {
+    scope: string;
+    head: LegacyHead;
+    /** The streams the scope feeds: what a later import is held back by. */
+    streams?: readonly string[];
+  }[];
 }
 
 interface Loop {
@@ -255,7 +263,11 @@ export function createLegacyRetirer(
         const scopes: Intent["scopes"][number][] = [];
         try {
           for (const scope of ports.scopesOf(connector))
-            scopes.push({ scope, head: await ports.head(scope) });
+            scopes.push({
+              scope,
+              head: await ports.head(scope),
+              streams: [...(ports.streamsOf?.(connector, scope) ?? [])],
+            });
         } catch (error) {
           throw new LegacyRetireUnavailable(
             `a legacy head could not be read: ${

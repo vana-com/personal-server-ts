@@ -3,6 +3,7 @@ import {
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
   legacyScopesOfConnector,
+  legacyStreamsOfScope,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import type {
   OwnedAccountStorageMode,
@@ -666,6 +667,7 @@ export async function createPsLiteSyncManager(
           // read when the stage runs, not when the database opens.
           legacyDelete: () => ({
             scopesOf: legacyScopesOfConnector,
+            streamsOf: legacyStreamsOfScope,
             mode: modeOfAccount(() => mode.read()),
             head: legacyHeadFrom(dataPointFeed, serverOwner),
             retire: (scope, head) =>

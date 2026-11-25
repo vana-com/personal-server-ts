@@ -36,6 +36,7 @@ does not directly follow the pinned head frees slots the pin never named.
 | `DoneOnlyAfterConfirm`       | `done` implies every bound head is tombstoned and its blobs are erased.                              |
 | `OneIntent`                  | A restart or a repeat never makes a second intent.                                                   |
 | `NoTombstoneOverMovedHead`   | A tombstone of ours is never written over a head that moved since the pin.                           |
+| `NoStaleMergeAfterDone`      | No batch merges a bound scope once the intent is `done`: a retired scope stays refused.              |
 | `NoEraseOfUnpinnedVersion`   | A scope is erased only for the tombstone that directly follows the pinned head (found by the model). |
 
 ## Results
@@ -45,21 +46,21 @@ It takes the shared heavy-run lock, runs `nice -n 19 ionice -c3`, and uses 4
 workers. Constants: two scopes, `MaxVer = 2`, `MaxReq = 2`, `MaxB = 2`,
 `MaxCrash = 2`, `MaxW = 2`. A run takes seconds. Logs are in `traces/`. A trace length is the number of states TLC prints.
 
-| Config                                                               | Result                                                                                          |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `Good`                                                               | No error. 3,405,762 states generated, 886,482 distinct, depth 24. All invariants above.         |
-| `MutNoBatchFence-NoLegacyMergeWhileOpen`                             | `NoLegacyMergeWhileOpen` violated, 5-state trace (the batch has no guard of its own).           |
-| `MutNoPin-NoTombstoneOverMovedHead`                                  | `NoTombstoneOverMovedHead` violated, 6-state trace (the worker does not compare to the pin).    |
-| `MutDoneBeforeErase-DoneOnlyAfterConfirm`                            | `DoneOnlyAfterConfirm` violated, 9-state trace (done once tombstoned, before the erase).        |
-| `MutNewIntentOnRestart-OneIntent`                                    | `OneIntent` violated, 4-state trace (a restart makes a new intent for an open one).             |
-| `MutTouchesCurrent-CurrentConnectionUntouched`                       | `CurrentConnectionUntouched` violated, 7-state trace (the erase also writes the connection).    |
-| `MutOldPinHolds-NoEraseOfUnpinnedVersion`                            | `NoEraseOfUnpinnedVersion` violated, 8-state trace: the code before the fix (see below).        |
-| `Probe-NotDone`, `Probe-NotBlocked`, `Probe-NotBlockedByForeignTomb` | Each fails by design: `done`, a blocked scope and a block by a foreign tombstone are reachable. |
-| `Observe-NoStaleMergeAfterDone`                                      | Violated, 12-state trace: an observation, not a requirement (see below).                        |
+| Config                                                                                               | Result                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Good`                                                                                               | No error. 9,790,694 states generated, 2,471,294 distinct, depth 24. All invariants above.                                                     |
+| `MutNoBatchFence-NoLegacyMergeWhileOpen`                                                             | `NoLegacyMergeWhileOpen` violated, 6-state trace (the batch has no guard of its own).                                                         |
+| `MutNoPin-NoTombstoneOverMovedHead`                                                                  | `NoTombstoneOverMovedHead` violated, 6-state trace (the worker does not compare to the pin).                                                  |
+| `MutDoneBeforeErase-DoneOnlyAfterConfirm`                                                            | `DoneOnlyAfterConfirm` violated, 9-state trace (done once tombstoned, before the erase).                                                      |
+| `MutNewIntentOnRestart-OneIntent`                                                                    | `OneIntent` violated, 4-state trace (a restart makes a new intent for an open one).                                                           |
+| `MutTouchesCurrent-CurrentConnectionUntouched`                                                       | `CurrentConnectionUntouched` violated, 6-state trace (the erase also writes the connection).                                                  |
+| `MutOldPinHolds-NoEraseOfUnpinnedVersion`                                                            | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the code before the fix (see below).                                                      |
+| `Probe-NotDone`, `Probe-NotBlocked`, `Probe-NotBlockedByForeignTomb`, `Probe-NotFreeMergedAfterDone` | Each fails by design: `done`, a blocked scope, a block by a foreign tombstone, and an import of an unbound stream after `done` are reachable. |
+| `MutDoneLiftsFence-NoStaleMergeAfterDone`                                                            | `NoStaleMergeAfterDone` violated, 13-state trace: the code before the fix (see below).                                                        |
 
 ## Finding: a later tombstone passed `pinHolds` (fixed)
 
-`pinHolds` once accepted any tombstone for a live pin (`MutOldPinHolds`). An 8-state trace (TLC may add an unrelated step on the other scope):
+`pinHolds` once accepted any tombstone for a live pin (`MutOldPinHolds`). A 7-state trace (TLC may add an unrelated step on the other scope):
 
 1. `RRead`: the request reads the heads at version 1.
 2. `Publish`: another writer publishes version 2.
@@ -81,6 +82,9 @@ its version is `pin.fence.expectedVersion + 1`. Any other tombstone answers
 - **Intent insert.** The pin read and the `INSERT OR IGNORE` are separate steps
   (`RRead`, `RInsert`). The model keeps them separate. The insert itself is one
   statement.
+- **Import scope.** The model's importer names a bound scope or "free". The code
+  derives the scopes from the import's connector and stream through the legacy
+  binding table, which can name several scopes for one stream.
 - **Worker order.** The code retires scopes one after another in one pass. The
   model lets each scope step in any order, a superset of the code's runs.
 - **Erase.** `confirmErased` makes several storage requests, checks finality and
@@ -98,15 +102,21 @@ its version is `pin.fence.expectedVersion + 1`. Any other tombstone answers
 - **Another writer's tombstone** after our own is not modelled. The head is final
   once deleted, and the model's gateway cannot move a tombstoned head.
 
-## Observation: an import staged before the intent
+## Finding: `done` lifted the fence (fixed)
 
-`Observe-NoStaleMergeAfterDone` shows an import that passed its preflight before
-the intent existed, and merges after the intent is `done`. `done` lifts the
-fence, so the guard passes. In the code this import reads the legacy source in
-the batch loop (`source.records()`), and a retired scope's blobs are erased, so
-the read would fail rather than merge. That is a property of the reader, not of
-the guard. It is not one of the requirements above and the model does not fail
-`Good` on it.
+An import that passed its preflight before the intent existed reads a batch.
+The retirement then finishes (tombstone, erase, `done`) before that batch's merge
+transaction. `done` lifted the fence, so the guard admitted the merge and the
+deleted records came back (`MutDoneLiftsFence`, 13-state trace: `IPre` on a bound
+scope, a full request and retire to `done`, then `IMerge`).
+
+The repair: a `legacy_retirements` row keeps fencing the scopes it lists after
+`done`. `importFence` and `guardImport` refuse (`legacy_retired`) an import whose
+stream a listed scope feeds (the request records each bound scope's streams in the
+row, from the legacy binding table, through `LegacyDeletePorts.streamsOf`). It is per bound scope: an open intent still fences the
+whole connector, a done one fences only its scopes, and a stream no listed scope
+feeds still imports (`Probe-NotFreeMergedAfterDone`). A repeated request after
+`done` returns the same done intent and sends nothing.
 
 This is bounded model evidence. It is not a refinement proof of the SQL. Tests
 in `packages/core/src/localdb/legacy-retire-intent.test.ts` run the invariants
