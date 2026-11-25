@@ -98,7 +98,11 @@ describe("detect-stuck-version-ledger", () => {
     add("m.ok", { version: 1 });
     const logger = { info: vi.fn(), warn: vi.fn() };
 
-    const result = detectStuckVersionLedger.run({ db, storageRoot: "/tmp/unused", logger });
+    const result = detectStuckVersionLedger.run({
+      db,
+      storageRoot: "/tmp/unused",
+      logger,
+    });
 
     expect(result).toEqual({
       changed: false,
@@ -106,7 +110,11 @@ describe("detect-stuck-version-ledger", () => {
     });
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ scopeCount: 2, scopes: ["a.stuck", "z.stuck"], pendingRows: 5 }),
+      expect.objectContaining({
+        scopeCount: 2,
+        scopes: ["a.stuck", "z.stuck"],
+        pendingRows: 5,
+      }),
       expect.any(String),
     );
   });
@@ -114,8 +122,9 @@ describe("detect-stuck-version-ledger", () => {
   it("does not warn or attach detail when a direct run finds no stuck scope", () => {
     add("a.ordinary", { version: 1 });
     const logger = { info: vi.fn(), warn: vi.fn() };
-    expect(detectStuckVersionLedger.run({ db, storageRoot: "/tmp/unused", logger }))
-      .toEqual({ changed: false });
+    expect(
+      detectStuckVersionLedger.run({ db, storageRoot: "/tmp/unused", logger }),
+    ).toEqual({ changed: false });
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
