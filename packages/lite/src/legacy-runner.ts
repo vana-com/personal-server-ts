@@ -7,6 +7,7 @@ import {
 import {
   createLegacyScopeStore,
   isConnectionDeleted,
+  isEnvelopeMissing,
   type LegacyScopeTarget,
   seedLegacyStore,
   type LegacyScopeExclusionReason,
@@ -144,6 +145,17 @@ export function createLiteLegacyStoreRunner(
       const excluded = tally<LegacyScopeExclusionReason>();
       const deleted = new Set<string>();
       const refused = tally<string>();
+      const connectorDeleted = async (connector: string): Promise<boolean> => {
+        if (deleted.has(connector)) return true;
+        try {
+          await intake.status(connector);
+        } catch (error) {
+          if (!isConnectionDeleted(error)) return false;
+          deleted.add(connector);
+          return true;
+        }
+        return false;
+      };
       const store = createLegacyScopeStore({
         storage: options.storage,
         manifests: options.manifests,
@@ -183,19 +195,40 @@ export function createLiteLegacyStoreRunner(
           }
           return "open";
         },
+        connectorDeleted,
         signal,
       });
-      // The newest stored version of each stream, to count a refused stream's
-      // rows when the producer reports none.
+      // The rows of each stream's newest stored version, counted as the
+      // producer first read them to the end. A refused stream is tallied from
+      // this, never from a second read: its envelopes may be gone by then.
       const offered = new Map<string, LegacySeedStream>();
+      const rowsRead = new Map<string, number>();
       const recording: LegacySeedStore = {
         async *streams() {
           for await (const stream of store.streams()) {
-            offered.set(
-              JSON.stringify([stream.connector, stream.stream]),
-              stream,
-            );
-            yield stream;
+            const key = JSON.stringify([stream.connector, stream.stream]);
+            offered.set(key, stream);
+            const [newest, ...older] = stream.layers;
+            if (!newest) {
+              yield stream;
+              continue;
+            }
+            yield {
+              ...stream,
+              layers: [
+                {
+                  async *records() {
+                    let n = 0;
+                    for await (const row of newest.records()) {
+                      n += 1;
+                      yield row;
+                    }
+                    if (!rowsRead.has(key)) rowsRead.set(key, n);
+                  },
+                },
+                ...older,
+              ],
+            };
           }
         },
       };
@@ -210,10 +243,30 @@ export function createLiteLegacyStoreRunner(
         else if (s.outcome === "merged") merged += 1;
         else if (s.outcome === "empty") empty += 1;
         else {
-          let rows = 0;
-          const layer = offered.get(JSON.stringify([s.connector, s.stream]))
-            ?.layers[0];
-          if (layer) for await (const _ of layer.records()) rows += 1;
+          const key = JSON.stringify([s.connector, s.stream]);
+          let rows = rowsRead.get(key) ?? 0;
+          // Never read to the end (refused before its read): count it now,
+          // unless its envelope is gone.
+          const layer = offered.get(key)?.layers[0];
+          if (layer && !rowsRead.has(key)) {
+            try {
+              for await (const _ of layer.records()) rows += 1;
+            } catch (error) {
+              // An envelope gone by now is a deletion when the producer
+              // refused this stream as deleted, or when its connector has been
+              // deleted since (a later stream's run). The refusal reason stays.
+              if (
+                !isConnectionDeleted(error) &&
+                !(
+                  isEnvelopeMissing(error) &&
+                  (s.reason === "deleted" ||
+                    (await connectorDeleted(s.connector)))
+                )
+              )
+                throw error;
+              rows = 0;
+            }
+          }
           refused.add(s.reason ?? "refused", rows);
           refusedRows += rows;
         }

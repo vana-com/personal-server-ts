@@ -1,9 +1,11 @@
+import { ProtocolError } from "../errors/catalog.js";
 import { manifestArtifact } from "../stream-sync/artifacts.js";
 import type { DataStoragePort } from "../ports/index.js";
 import type { FoldLayer } from "./legacy-fold.js";
-import type {
-  LegacySeedStore,
-  LegacySeedStream,
+import {
+  isEnvelopeMissing,
+  type LegacySeedStore,
+  type LegacySeedStream,
 } from "./legacy-seed-producer.js";
 
 /**
@@ -30,8 +32,13 @@ import type {
  * - `shadowed_alias`: the stream also has a canonical `<source>.<stream>`
  *   scope, which is the one read; this alias scope was not offered.
  * - `not_stream_rows`: the newest stored version is not `{records}` of plain
- *   rows (an app-shaped legacy body, or rows tagged with another stream), so
- *   it cannot be folded into stream rows.
+ *   rows (an app-shaped legacy body, or rows tagged with another stream, as a
+ *   `{stream, data}` wrapper or a `$pdpp.stream.name` marker), so it cannot be
+ *   folded into stream rows.
+ *
+ * The source id a stream's rows must carry is the one its verified manifest
+ * names (`source.id`); a target's own `sourceId` is the fallback for a
+ * manifest that names none.
  *
  * - `unreadable_scope`: a stored envelope required to admit this scope could not be read.
  *
@@ -78,6 +85,11 @@ export interface LegacyScopeStoreOptions {
     connector: string,
     stream: string,
   ) => Promise<"open" | "final" | "leave">;
+  /** Asked when a stored envelope has vanished since it was listed (the
+   * host's delete path erases legacy scopes). `true`: the connector was
+   * deleted, so its stream is offered as refused-deleted and the scan goes
+   * on. `false`: the read fails, as any other fault. */
+  readonly connectorDeleted?: (connector: string) => Promise<boolean>;
 }
 
 export type LegacyScopeStore = LegacySeedStore;
@@ -93,13 +105,29 @@ export interface LegacyScopeTarget {
 }
 type Target = LegacyScopeTarget;
 
-type Declaration = { version: string; primaryKey: readonly string[] };
+type Declaration = {
+  version: string;
+  primaryKey: readonly string[];
+  /** The `source.id` of the verified manifest, when it names one. */
+  sourceId?: string;
+};
+
+/** Reading a deleted connector's stream: the producer refuses it as deleted. */
+function connectorDeletedRecords(): never {
+  throw new ProtocolError(
+    410,
+    "CONNECTION_DELETED",
+    "The connection was deleted",
+  );
+}
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-/** `{records: [...]}` of plain rows, ignoring the server's stamps. */
-function plainRows(body: unknown): unknown[] | null {
+/** `{records: [...]}` of plain rows, ignoring the server's stamps. With
+ * `stream`, a row whose `$pdpp.stream.name` names another stream is not plain
+ * either: the fold quarantines it, so it cannot make the scope importable. */
+function plainRows(body: unknown, stream?: string): unknown[] | null {
   if (!isObject(body)) return null;
   const keys = Object.keys(body).filter(
     (key) => key !== "$writtenBy" && key !== "$lineage",
@@ -107,8 +135,19 @@ function plainRows(body: unknown): unknown[] | null {
   if (keys.length !== 1 || keys[0] !== "records") return null;
   const rows = body.records;
   if (!Array.isArray(rows)) return null;
-  const tagged = (row: unknown) =>
-    isObject(row) && typeof row.stream === "string" && isObject(row.data);
+  const tagged = (row: unknown) => {
+    if (!isObject(row)) return false;
+    if (typeof row.stream === "string" && isObject(row.data)) return true;
+    if (stream === undefined) return false;
+    const meta = Object.hasOwn(row, "$pdpp") ? row["$pdpp"] : undefined;
+    const marker =
+      isObject(meta) && Object.hasOwn(meta, "stream") ? meta.stream : undefined;
+    const name =
+      isObject(marker) && Object.hasOwn(marker, "name")
+        ? marker.name
+        : undefined;
+    return name !== undefined && name !== stream;
+  };
   return rows.some(tagged) ? null : rows;
 }
 
@@ -119,6 +158,14 @@ function sourceIdsOf(body: unknown, into: Set<string>): void {
     const id = isObject(meta) ? meta.sourceId : undefined;
     if (typeof id === "string" && id.length > 0) into.add(id);
   }
+}
+
+/** The `source.id` a verified manifest document names, if any. */
+function manifestSourceId(document: string): string | undefined {
+  const parsed: unknown = JSON.parse(document);
+  const source = isObject(parsed) ? parsed.source : undefined;
+  const id = isObject(source) ? source.id : undefined;
+  return typeof id === "string" && id !== "" ? id : undefined;
 }
 
 function versionsNewestFirst(
@@ -166,8 +213,11 @@ export function createLegacyScopeStore(
   ): Promise<{ body: unknown } | typeof unreadable> => {
     try {
       return { body: await readBody(scope, collectedAt) };
-    } catch {
+    } catch (error) {
       signal?.throwIfAborted();
+      // An envelope erased since it was listed is the caller's to judge
+      // (a deleted connector is refused, anything else stops the scan).
+      if (isEnvelopeMissing(error)) throw error;
       return unreadable;
     }
   };
@@ -178,6 +228,11 @@ export function createLegacyScopeStore(
   const exclude = (scope: string, reason: LegacyScopeExclusionReason) =>
     options.onExcluded?.({ scope, reason });
   const { targets } = options;
+  /** A read that found its envelope gone, while the host says its connector
+   * was deleted. */
+  const vanishedWithConnector = async (error: unknown, connector: string) =>
+    isEnvelopeMissing(error) &&
+    (await options.connectorDeleted?.(connector)) === true;
 
   /** The verified declarations, indexed once per `streams()` call, so every
    * decision of one enumeration reads one snapshot. */
@@ -190,10 +245,15 @@ export function createLegacyScopeStore(
       const artifact = manifestArtifact(document);
       if (!artifact) continue;
       const { connector, version } = artifact.declarations;
+      const sourceId = manifestSourceId(document);
       for (const declared of artifact.declarations.streams) {
         const key = `${connector}\0${declared.name}`;
         const list = index.get(key) ?? [];
-        list.push({ version, primaryKey: declared.primaryKey });
+        list.push({
+          version,
+          primaryKey: declared.primaryKey,
+          ...(sourceId === undefined ? {} : { sourceId }),
+        });
         index.set(key, list);
       }
     }
@@ -210,6 +270,14 @@ export function createLegacyScopeStore(
   return {
     async *streams() {
       const declare = indexDeclarations();
+      /** The source id a target's rows must carry: the verified manifest's
+       * own, else the target's. */
+      const expectedSource = (t: Target): string | undefined => {
+        const declaration = declare(t.connector, t.stream);
+        return typeof declaration === "string"
+          ? t.sourceId
+          : (declaration.sourceId ?? t.sourceId);
+      };
       /** The source ids of a scope's newest stored version. */
       const newestSources = async (
         scope: string,
@@ -242,7 +310,7 @@ export function createLegacyScopeStore(
         if (ids.size === 0) return "ambiguous_connector";
         if (ids.size > 1) return "source_conflict";
         const [id] = ids;
-        const matching = declared.filter((t) => t.sourceId === id);
+        const matching = declared.filter((t) => expectedSource(t) === id);
         if (matching.length === 0) return "unknown_source";
         return matching.length === 1 ? matching[0]! : "ambiguous_connector";
       };
@@ -254,10 +322,39 @@ export function createLegacyScopeStore(
           target: Target;
           declaration: Declaration | LegacyScopeExclusionReason;
           scopes: string[];
+          /** Its connector was deleted while the scan ran. */
+          deleted?: true;
         }
       >();
       for (const scope of listAllScopes(storage)) {
-        const target = await scopeTarget(scope);
+        let target: Target | LegacyScopeExclusionReason;
+        try {
+          target = await scopeTarget(scope);
+        } catch (error) {
+          // The newest envelope of a shared scope erased since it was listed:
+          // each candidate whose connector was deleted is refused as deleted;
+          // with none, the fault stops the scan.
+          if (!isEnvelopeMissing(error)) throw error;
+          let refused = false;
+          for (const t of targets.get(scope) ?? []) {
+            const declaration = declare(t.connector, t.stream);
+            if (typeof declaration === "string") continue;
+            if (!(await options.connectorDeleted?.(t.connector))) continue;
+            refused = true;
+            // Grouped with the stream's other scopes: one refusal per stream.
+            const key = `${t.connector}\0${t.stream}`;
+            const entry = byStream.get(key) ?? {
+              target: t,
+              declaration,
+              scopes: [],
+            };
+            entry.scopes.push(scope);
+            entry.deleted = true;
+            byStream.set(key, entry);
+          }
+          if (!refused) throw error;
+          continue;
+        }
         if (typeof target === "string") {
           exclude(scope, target);
           continue;
@@ -275,7 +372,18 @@ export function createLegacyScopeStore(
         target,
         declaration,
         scopes,
+        deleted,
       } of byStream.values()) {
+        if (deleted && typeof declaration !== "string") {
+          yield {
+            connector: target.connector,
+            stream: target.stream,
+            primaryKey: declaration.primaryKey,
+            version: declaration.version,
+            layers: [{ records: connectorDeletedRecords }],
+          };
+          continue;
+        }
         const canonical = scopes.filter(
           (scope) => scope.slice(scope.indexOf(".") + 1) === target.stream,
         );
@@ -303,37 +411,57 @@ export function createLegacyScopeStore(
         // without reading any older version.
         let sourceId: string | undefined;
         if (state !== "final") {
-          const latest = await admissionBody(scope, newest.collectedAt);
-          if (latest === unreadable) {
-            exclude(scope, "unreadable_scope");
-            continue;
-          }
-          if (plainRows(latest.body) === null) {
-            exclude(scope, "not_stream_rows");
-            continue;
-          }
-          // Every stored layer must name the one source the connector claims.
-          const ids = new Set<string>();
-          sourceIdsOf(latest.body, ids);
-          for (const version of versions.slice(1)) {
-            const read = await admissionBody(scope, version.collectedAt);
-            if (read === unreadable) {
+          try {
+            const latest = await admissionBody(scope, newest.collectedAt);
+            if (latest === unreadable) {
               exclude(scope, "unreadable_scope");
-              continue streams;
+              continue;
             }
-            sourceIdsOf(read.body, ids);
-          }
-          if (ids.size > 1) {
-            exclude(scope, "source_conflict");
-            continue;
-          }
-          [sourceId] = ids;
-          if (sourceId !== undefined && sourceId !== target.sourceId) {
-            exclude(scope, "unknown_source");
+            if (plainRows(latest.body, target.stream) === null) {
+              exclude(scope, "not_stream_rows");
+              continue;
+            }
+            // Every stored layer must name the one source the connector claims.
+            const ids = new Set<string>();
+            sourceIdsOf(latest.body, ids);
+            for (const version of versions.slice(1)) {
+              const read = await admissionBody(scope, version.collectedAt);
+              if (read === unreadable) {
+                exclude(scope, "unreadable_scope");
+                continue streams;
+              }
+              sourceIdsOf(read.body, ids);
+            }
+            if (ids.size > 1) {
+              exclude(scope, "source_conflict");
+              continue;
+            }
+            [sourceId] = ids;
+            if (sourceId !== undefined && sourceId !== expectedSource(target)) {
+              exclude(scope, "unknown_source");
+              continue;
+            }
+          } catch (error) {
+            // An envelope erased since it was listed: if its connector was
+            // deleted, the producer refuses this stream as deleted and the
+            // scan goes on; any other fault stops the scan.
+            if (!(await vanishedWithConnector(error, target.connector)))
+              throw error;
+            yield {
+              connector: target.connector,
+              stream: target.stream,
+              primaryKey: declaration.primaryKey,
+              version: declaration.version,
+              layers: [{ records: connectorDeletedRecords }],
+            };
             continue;
           }
         }
         const layers: FoldLayer[] = versions.map((version) => ({
+          // A vanished envelope is not judged here: this read runs inside the
+          // seed put, under the intake's request lock, so asking the intake
+          // would wait on that lock. The producer judges it once the put has
+          // released the lock.
           async *records() {
             const rows = plainRows(await readBody(scope, version.collectedAt));
             if (rows) yield* rows;
