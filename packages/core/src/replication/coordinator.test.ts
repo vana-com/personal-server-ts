@@ -2339,9 +2339,11 @@ describe("abortable replication I/O", () => {
     const transportError = new Error("transport closed");
 
     try {
-      await expect(abortable(signal, () => {
-        throw transportError;
-      })).rejects.toBe(transportError);
+      await expect(
+        abortable(signal, () => {
+          throw transportError;
+        }),
+      ).rejects.toBe(transportError);
       expect(added).toHaveBeenCalledTimes(1);
       expect(removed).toHaveBeenCalledWith("abort", added.mock.calls[0]![1]);
       expect(removed).toHaveBeenCalledTimes(1);

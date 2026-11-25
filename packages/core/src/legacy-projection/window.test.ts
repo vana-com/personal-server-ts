@@ -224,14 +224,18 @@ describe("required legacy stream planning", () => {
 describe("legacy projection binding selection", () => {
   it("keeps an unknown scope unknown even with an explicit profile", () => {
     const scope = "no-such-connector.synthetic_records";
-    expect(legacyScopeToPdppSelection(scope, { profileKey: "github-browser" })).toEqual({
+    expect(
+      legacyScopeToPdppSelection(scope, { profileKey: "github-browser" }),
+    ).toEqual({
       ok: false,
       error: { kind: "unknown_scope", scope },
     });
-    expect(projectPdppRecordsToLegacyPayload(scope, [], {
-      profileKey: "github-browser",
-      fetchedStreams: [],
-    })).toEqual({ ok: false, error: { kind: "unknown_scope", scope } });
+    expect(
+      projectPdppRecordsToLegacyPayload(scope, [], {
+        profileKey: "github-browser",
+        fetchedStreams: [],
+      }),
+    ).toEqual({ ok: false, error: { kind: "unknown_scope", scope } });
   });
 
   it("does not fall back to the default binding for a mismatched explicit profile", () => {
@@ -239,10 +243,15 @@ describe("legacy projection binding selection", () => {
     const profileKey = "github-browser";
     expect(legacyScopeToPdppSelection(scope).ok).toBe(true);
     const error = { kind: "unsupported_profile", scope, profileKey };
-    expect(legacyScopeToPdppSelection(scope, { profileKey })).toEqual({ ok: false, error });
-    expect(projectPdppRecordsToLegacyPayload(scope, [], {
-      profileKey,
-      fetchedStreams: [],
-    })).toEqual({ ok: false, error });
+    expect(legacyScopeToPdppSelection(scope, { profileKey })).toEqual({
+      ok: false,
+      error,
+    });
+    expect(
+      projectPdppRecordsToLegacyPayload(scope, [], {
+        profileKey,
+        fetchedStreams: [],
+      }),
+    ).toEqual({ ok: false, error });
   });
 });
