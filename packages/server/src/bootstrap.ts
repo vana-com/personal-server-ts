@@ -1411,7 +1411,11 @@ async function bootstrapServer(
         head: legacyHeadFrom(dataPointFeed, serverOwner),
         retire: (scope, head, options) =>
           manager.deleteScope(scope, undefined, {
-            fence: { head, pinned: options?.pinned === true },
+            fence: {
+              head,
+              pinned: options?.pinned === true,
+              ...(options?.writeReady && { writeReady: options.writeReady }),
+            },
           }),
         pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
         finality: tombstoneFinality,

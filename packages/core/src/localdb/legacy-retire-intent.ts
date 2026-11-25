@@ -134,7 +134,15 @@ function gatedPorts(
   return {
     ...ports,
     head: gate(ports.head.bind(ports)),
-    retire: gate(ports.retire.bind(ports)),
+    // The delete worker reads the live gate again before each destructive step
+    // of its own: the tombstone post, the queue write and the local erase.
+    retire: (scope, fence, options) => {
+      if (!ready()) throw new WriteNotReady();
+      return ports.retire(scope, fence, {
+        pinned: options?.pinned ?? false,
+        writeReady: ready,
+      });
+    },
     pendingBlobs: gate(ports.pendingBlobs),
     finality: {
       tombstoneState: gate(ports.finality.tombstoneState.bind(ports.finality)),
@@ -194,7 +202,11 @@ export function createLegacyRetirer(
   function memoryOf(connector: string): LegacyMemory {
     let memory = memories.get(connector);
     if (!memory) {
-      memory = { refused: new Map(), erased: new Map() };
+      memory = {
+        refused: new Map(),
+        erased: new Map(),
+        localCleaned: new Set(),
+      };
       memories.set(connector, memory);
     }
     return memory;

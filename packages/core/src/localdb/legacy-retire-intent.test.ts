@@ -48,6 +48,11 @@ async function reconnected(
     wrapLegacy?: (ports: LegacyDeletePorts) => LegacyDeletePorts;
     dbFile?: string;
     writeReady?: () => boolean;
+    /** Extra options of the fake host's ports (see `legacyPortsOver`). */
+    host?: Pick<
+      NonNullable<Parameters<typeof legacyPortsOver>[1]>,
+      "onAdapterHeadRead" | "wrapFetch"
+    >;
   } = {},
 ) {
   const w = await world({ streams: 1 });
@@ -56,6 +61,7 @@ async function reconnected(
   const legacy = await legacyPortsOver(fake, {
     ...(options.mode && { mode: options.mode }),
     ...(options.finality && { finality: options.finality }),
+    ...options.host,
   });
   const a = await w.device("a", {
     legacyDelete: () => options.wrapLegacy?.(legacy.ports) ?? legacy.ports,
@@ -87,6 +93,26 @@ async function currentState(f: Fixture) {
     registry: [...f.w.gateway.versions].map(([scope, v]) => [scope, v.length]),
     intents: await f.a.db.query("SELECT * FROM delete_intents"),
   };
+}
+
+/** A local legacy entry per scope, as the pre-switch writes left them. */
+function placeLocalEntries(f: Fixture) {
+  // The seal refuses a new legacy write, so the index rows are placed directly.
+  SCOPES.forEach((scope, id) =>
+    f.legacy.storage.entries.push({
+      id: id + 1,
+      fileId: null,
+      schemaId: null,
+      path: `${scope}/2026-01-01T00:00:00.000Z.json`,
+      scope,
+      collectedAt: "2026-01-01T00:00:00.000Z",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      sizeBytes: 1,
+      version: 1,
+      casRevision: 1,
+      dataPointId: null,
+    }),
+  );
 }
 
 const gatewayDeletes = (fake: Fixture["fake"]) =>
@@ -776,6 +802,161 @@ describe("a standalone legacy retirement after the switch", () => {
 
 // The fixture's own connector is not bound to a legacy scope: a retirement of
 // it pins nothing and is done at once, without a gateway read.
+describe("a retirement's destructive steps run only under live write authority and the pinned version", () => {
+  it("revoking write authority during the adapter's head read sends no tombstone and erases nothing", async () => {
+    let ready = true;
+    let armed = false;
+    const f = await reconnected({
+      writeReady: () => ready,
+      host: {
+        onAdapterHeadRead: () => {
+          if (armed) ready = false;
+        },
+      },
+    });
+    placeLocalEntries(f);
+    f.fake.requests.length = 0;
+    armed = true;
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(() => expect(ready).toBe(false));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(f.fake.isLive(scope)).toBe(true);
+      expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+    }
+    expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+      retireId,
+      legacy: PENDING,
+    });
+
+    // The authority comes back: the same pass finishes, locally too.
+    armed = false;
+    ready = true;
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    for (const scope of SCOPES)
+      expect(f.legacy.storage.countVersions(scope)).toBe(0);
+  });
+
+  it("a fenced delete whose 2xx echoes a later version cleans nothing past the pinned version", async () => {
+    const f = await reconnected({
+      host: {
+        wrapFetch: (fetchImpl) =>
+          (async (input, init) => {
+            const res = await fetchImpl(input, init);
+            if (
+              init?.method !== "DELETE" ||
+              !String(input).startsWith(FAKE_GATEWAY)
+            )
+              return res;
+            const body = (await res.json()) as {
+              data: Record<string, unknown>;
+            };
+            return new Response(
+              JSON.stringify({ data: { ...body.data, expectedVersion: "9" } }),
+              {
+                status: res.status,
+                headers: { "content-type": "application/json" },
+              },
+            );
+          }) as typeof fetch,
+      },
+    });
+    placeLocalEntries(f);
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    // The pins named version 2: its tombstone is 3. No blob above it is asked for.
+    const versions = storageDeletes(f.fake).map((r) =>
+      Number(decodeURIComponent(r.url).split("/").pop()),
+    );
+    expect(versions.length).toBeGreaterThan(0);
+    expect(Math.max(...versions)).toBeLessThanOrEqual(3);
+  });
+
+  it("resumes local cleanup when the process stopped after the tombstone landed", async () => {
+    const dbFile = tempDbFile();
+    let crashed = true;
+    const f = await reconnected({ dbFile });
+    placeLocalEntries(f);
+    const deleteVersion = f.legacy.storage.deleteVersion.bind(f.legacy.storage);
+    f.legacy.storage.deleteVersion = async (...args) => {
+      if (crashed)
+        throw new Error("the process stopped before the local erase");
+      return deleteVersion(...args);
+    };
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(() =>
+      expect(gatewayDeletes(f.fake)).toHaveLength(SCOPES.length),
+    );
+    await f.a.sync.legacyRetirer.close();
+    for (const scope of SCOPES) {
+      expect(f.fake.isLive(scope)).toBe(false);
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+    }
+
+    // A new process: no memory, a deleted head, local files left behind.
+    crashed = false;
+    const restarted = await f.a.restart();
+    await vi.waitFor(async () =>
+      expect(await restarted.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    for (const scope of SCOPES)
+      expect(f.legacy.storage.countVersions(scope)).toBe(0);
+    // Still one tombstone per scope: the retry cleaned, it did not delete again.
+    expect(gatewayDeletes(f.fake)).toHaveLength(SCOPES.length);
+  });
+
+  it("a failed local erase keeps the retirement pending", async () => {
+    const f = await reconnected();
+    placeLocalEntries(f);
+    let failing = true;
+    const deleteVersion = f.legacy.storage.deleteVersion.bind(f.legacy.storage);
+    f.legacy.storage.deleteVersion = async (...args) => {
+      if (failing) throw new Error("disk error");
+      return deleteVersion(...args);
+    };
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(() =>
+      expect(gatewayDeletes(f.fake)).toHaveLength(SCOPES.length),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+      retireId,
+      legacy: PENDING,
+    });
+    for (const scope of SCOPES)
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+
+    failing = false;
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    for (const scope of SCOPES)
+      expect(f.legacy.storage.countVersions(scope)).toBe(0);
+  });
+});
+
 describe("a connector with no bound legacy scope", () => {
   it("is done at once and sends nothing", async () => {
     const f = await reconnected();

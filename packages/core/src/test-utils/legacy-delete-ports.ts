@@ -42,6 +42,10 @@ export async function legacyPortsOver(
      * next N writes to this device's queue throw, after the tombstone landed.
      */
     queueWritesLost?: number;
+    /** Runs after the tombstone adapter read a head, before it decides anything. */
+    onAdapterHeadRead?: () => void;
+    /** Wraps the gateway fetch the delete adapter posts through. */
+    wrapFetch?: (fetch: typeof globalThis.fetch) => typeof globalThis.fetch;
   } = {},
 ) {
   const owner = fake.owner;
@@ -73,7 +77,16 @@ export async function legacyPortsOver(
   };
   const deleteData = createGatewayDeleteDataPort({
     gatewayUrl: FAKE_GATEWAY,
-    dataPointFeed: fake.feed,
+    dataPointFeed: options.onAdapterHeadRead
+      ? {
+          ...fake.feed,
+          getDataPoint: async (...args) => {
+            const head = await fake.feed.getDataPoint(...args);
+            options.onAdapterHeadRead!();
+            return head;
+          },
+        }
+      : fake.feed,
     serverOwner: owner as `0x${string}`,
     signer: fake.signer,
     storage: {
@@ -81,7 +94,7 @@ export async function legacyPortsOver(
       chainId: FAKE_CHAIN_ID,
       signMessage: async () => `0x${"ab".repeat(65)}` as `0x${string}`,
     },
-    fetch: fake.fetch,
+    fetch: options.wrapFetch ? options.wrapFetch(fake.fetch) : fake.fetch,
   });
   const finalityOf = (scope: string) => {
     const f = options.finality;
@@ -116,7 +129,15 @@ export async function legacyPortsOver(
           } as never,
         },
         scope,
-        { fence: { head: fence, pinned: retireOptions?.pinned === true } },
+        {
+          fence: {
+            head: fence,
+            pinned: retireOptions?.pinned === true,
+            ...(retireOptions?.writeReady && {
+              writeReady: retireOptions.writeReady,
+            }),
+          },
+        },
       );
     },
     pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),

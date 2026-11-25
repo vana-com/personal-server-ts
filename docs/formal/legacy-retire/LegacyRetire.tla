@@ -38,6 +38,12 @@
 \*   adapterCleansFirst the code before round 4: the delete adapter accepts any deleted head and cleans up before the worker's pin check
 \*   absentCleans    the code before round 5: a fenced delete whose adapter sees the head absent still queues cleanup and erases local entries
 \*   doneLiftsFence  the code before the fix: a done intent no longer fences its scopes
+\*   gateOnce        the code before round 7: the host's write authority is read when the
+\*                   pass calls the delete, not again before each destructive step
+\*   echoCleans      the code before round 7: a 2xx tombstone answer that echoes a later
+\*                   version bounds the cleanup (queue and local erase)
+\*   resumeSkipsLocal the code before round 7: a pass that finds the tombstone landed
+\*                   checks the remote copy only and never retries the local erase
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Scopes,     \* the bound legacy scopes
@@ -46,12 +52,15 @@ CONSTANTS Scopes,     \* the bound legacy scopes
           MaxB,       \* the most import batches
           MaxCrash,   \* the most restarts
           MaxW,       \* the most current-connection writes
+          MaxRev,     \* the most times the host's write authority closes
           Mode
 
 VARIABLES
   ver, tomb, tombBy, tombVer,   \* gateway head per scope
   erased,                       \* blobs of the scope are gone (confirmed)
   cleanTo,                      \* highest version storage cleanup was queued or done for (0: none)
+  localTo,                      \* highest version the local erase went through (0: none)
+  wr, revokes, unauth,          \* the host's write authority, its closings, a destructive step run without it
   exists, st, pins, nIntents,   \* the intent row(s)
   pc, snap, blk,                \* worker per scope
   rpc, rsnap, reqs,             \* request
@@ -60,7 +69,7 @@ VARIABLES
   cc, writes,                   \* the current connection
   crashes, lastActor
 
-vars == <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents,
+vars == <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents,
           pc, snap, blk, rpc, rsnap, reqs, ipc, batches, isc, freeMerged,
           mergedWhileOpen, staleAfterDone, cc, writes, crashes, lastActor>>
 
@@ -80,6 +89,8 @@ Init ==
   /\ tombVer = [s \in Scopes |-> 0]
   /\ erased = [s \in Scopes |-> FALSE]
   /\ cleanTo = [s \in Scopes |-> 0]
+  /\ localTo = [s \in Scopes |-> 0]
+  /\ wr = TRUE /\ revokes = 0 /\ unauth = FALSE
   /\ exists = FALSE /\ st = "none" /\ nIntents = 0
   /\ pins = [s \in Scopes |-> 0]
   /\ pc = [s \in Scopes |-> "idle"]
@@ -96,7 +107,7 @@ Publish(s) ==
   /\ ~tomb[s] /\ ver[s] < MaxVer
   /\ ver' = [ver EXCEPT ![s] = @ + 1]
   /\ lastActor' = "gateway"
-  /\ UNCHANGED <<tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -106,7 +117,7 @@ ForeignTomb(s) ==
   /\ tombBy' = [tombBy EXCEPT ![s] = "other"]
   /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
   /\ lastActor' = "gateway"
-  /\ UNCHANGED <<ver, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -116,7 +127,7 @@ CWrite ==
   /\ cc' = [cc EXCEPT !.head = @ + 1, !.records = @ + 1]
   /\ writes' = writes + 1
   /\ lastActor' = "sync"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, crashes>>
 
@@ -127,7 +138,7 @@ RRead ==
   /\ rpc = "idle" /\ reqs < MaxReq /\ \A s \in Scopes : ~tomb[s]
   /\ rpc' = "read" /\ rsnap' = ver /\ reqs' = reqs + 1
   /\ lastActor' = "req"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  ipc, batches, isc, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
@@ -139,13 +150,20 @@ RInsert ==
        THEN UNCHANGED <<exists, st, pins, nIntents>>
        ELSE /\ exists' = TRUE /\ st' = "open" /\ pins' = rsnap /\ nIntents' = nIntents + 1
   /\ lastActor' = "req"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, pc, snap, blk, rsnap, reqs,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, pc, snap, blk, rsnap, reqs,
                  ipc, batches, isc, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
 \* ---- worker, per scope -------------------------------------------------
+\* The host's write authority (`writeReady`). The pass reads it at its start and,
+\* since round 7, again right before each destructive step: the tombstone post,
+\* the blob queue write, the local erase, the storage deletes and the done verdict.
+\* `gateOnce` is the code before: only the pass's start (`WRead`) read it.
+Auth == IF Mode = "gateOnce" THEN TRUE ELSE wr
+Unauth == unauth' = (unauth \/ ~wr)
+
 WRead(s) ==
-  /\ Open /\ pc[s] = "idle" /\ ~blk[s] /\ ~erased[s]
+  /\ Open /\ pc[s] = "idle" /\ ~blk[s] /\ ~erased[s] /\ wr
   /\ snap' = [snap EXCEPT ![s] = ver[s]]
   /\ IF PinHolds(s, ~tomb[s], ver[s], tombVer[s])
        THEN /\ pc' = [pc EXCEPT ![s] = IF tomb[s] THEN "tombd" ELSE "decided"]
@@ -153,7 +171,7 @@ WRead(s) ==
        ELSE /\ blk' = [blk EXCEPT ![s] = TRUE]   \* legacy_head_changed
             /\ UNCHANGED pc
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -165,23 +183,66 @@ WRead(s) ==
 \* version at once. The good adapter accepts a deleted head only when its tombstone
 \* directly follows the fence; `adapterCleansFirst` is the code before the fix, which
 \* accepted any (the worker's pin check ran only after, in `WReread`). A moved live
-\* head refuses the fenced tombstone and writes nothing.
+\* head refuses the fenced tombstone and writes nothing. The adapter reads the
+\* write authority again right before it posts (`Auth`): a closed gate sends
+\* nothing and the pass ends (`WAbandon`).
 WSend(s) ==
-  /\ pc[s] = "decided"
+  /\ pc[s] = "decided" /\ Auth
   /\ IF ~tomb[s]
        THEN IF ver[s] = snap[s]
               THEN /\ tomb' = [tomb EXCEPT ![s] = TRUE]
                    /\ tombBy' = [tombBy EXCEPT ![s] = "ours"]
                    /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
                    /\ cleanTo' = [cleanTo EXCEPT ![s] = ver[s] + 1]
-              ELSE UNCHANGED <<tomb, tombBy, tombVer, cleanTo>>
+                   /\ pc' = [pc EXCEPT ![s] = "tombed"]
+              ELSE /\ UNCHANGED <<tomb, tombBy, tombVer, cleanTo>>
+                   /\ pc' = [pc EXCEPT ![s] = "sent"]
        ELSE IF Mode = "adapterCleansFirst" \/ tombVer[s] = snap[s] + 1
               THEN /\ cleanTo' = [cleanTo EXCEPT ![s] = tombVer[s]]
                    /\ UNCHANGED <<tomb, tombBy, tombVer>>
-              ELSE UNCHANGED <<tomb, tombBy, tombVer, cleanTo>>
-  /\ pc' = [pc EXCEPT ![s] = "sent"]
+                   /\ pc' = [pc EXCEPT ![s] = "tombed"]
+              ELSE /\ UNCHANGED <<tomb, tombBy, tombVer, cleanTo>>
+                   /\ pc' = [pc EXCEPT ![s] = "sent"]
+  /\ Unauth
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, erased, exists, st, pins, nIntents, snap, blk,
+  /\ UNCHANGED <<ver, erased, localTo, wr, revokes, exists, st, pins, nIntents, snap, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* The same tombstone post answered 2xx with an `expectedVersion` above the one
+\* signed. The good adapter checks a fenced answer against the version it signed and
+\* throws: the tombstone landed, nothing is queued or erased, the worker reads again.
+\* `echoCleans` is the code before round 7: the echo bounded the cleanup (queue and
+\* local erase), a bound no pin names.
+WSendEcho(s) ==
+  /\ pc[s] = "decided" /\ Auth
+  /\ ~tomb[s] /\ ver[s] = snap[s]
+  /\ tomb' = [tomb EXCEPT ![s] = TRUE]
+  /\ tombBy' = [tombBy EXCEPT ![s] = "ours"]
+  /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
+  /\ IF Mode = "echoCleans"
+       THEN /\ cleanTo' = [cleanTo EXCEPT ![s] = MaxVer + 10]
+            /\ localTo' = [localTo EXCEPT ![s] = MaxVer + 10]
+       ELSE UNCHANGED <<cleanTo, localTo>>
+  /\ pc' = [pc EXCEPT ![s] = "sent"]
+  /\ Unauth
+  /\ lastActor' = "worker"
+  /\ UNCHANGED <<ver, erased, wr, revokes, exists, st, pins, nIntents, snap, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* The local erase of the adapter's own call, after the tombstone and the queue
+\* write. It may fail (the disk): the local copy stays and the pass goes on to read
+\* the head again. A crash between `WSend` and this step is `Crash` from "tombed".
+\* The erase covers the versions the tombstone covers: the version it wrote.
+WSendLocal(s) ==
+  /\ pc[s] = "tombed" /\ Auth
+  /\ \/ localTo' = [localTo EXCEPT ![s] = tombVer[s]]
+     \/ UNCHANGED localTo
+  /\ pc' = [pc EXCEPT ![s] = "sent"]
+  /\ Unauth
+  /\ lastActor' = "worker"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, wr, revokes, exists, st, pins, nIntents, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -199,7 +260,7 @@ WSendAbsent(s) ==
                   ELSE cleanTo
   /\ pc' = [pc EXCEPT ![s] = "sent"]
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, localTo, wr, revokes, unauth, exists, st, pins, nIntents, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -210,31 +271,79 @@ WReread(s) ==
        ELSE /\ UNCHANGED blk
             /\ pc' = [pc EXCEPT ![s] = IF tomb[s] THEN "tombd" ELSE "idle"]
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, snap,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, snap,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
-\* Storage deletes every slot <= the tombstone, then answers for all of them.
+\* A pass that found the pinned tombstone landed runs the fenced delete again over
+\* it (`cleanLocal`): the queue is not queued twice, and the local erase covers the
+\* versions up to the pinned tombstone. The tombstone may have landed in a pass or a
+\* process that stopped before its local erase, or whose erase failed. It may fail
+\* again, which leaves `localTo` as it was.
+WLocal(s) ==
+  /\ pc[s] = "tombd" /\ Auth /\ localTo[s] # pins[s] + 1
+  /\ \/ localTo' = [localTo EXCEPT ![s] = tombVer[s]]
+     \/ UNCHANGED localTo
+  /\ Unauth
+  /\ lastActor' = "worker"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, wr, revokes, exists, st, pins, nIntents, snap, blk, pc,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* Storage deletes every slot <= the tombstone, then answers for all of them. A
+\* pinned scope reaches it only once its local copy is gone (`resumeSkipsLocal` is
+\* the code before: the remote copy alone was enough).
 WErase(s) ==
-  /\ pc[s] = "tombd"
+  /\ pc[s] = "tombd" /\ Auth
+  /\ Mode = "resumeSkipsLocal" \/ localTo[s] = pins[s] + 1
   /\ erased' = [erased EXCEPT ![s] = TRUE]
   /\ pc' = [pc EXCEPT ![s] = "idle"]
   /\ IF Mode = "touchesCurrent"
        THEN cc' = [cc EXCEPT !.head = @ + 1]
        ELSE UNCHANGED cc
+  /\ Unauth
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, cleanTo, exists, st, pins, nIntents, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, cleanTo, localTo, wr, revokes, exists, st, pins, nIntents, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, writes, crashes>>
 
 WDone ==
-  /\ Open
+  /\ Open /\ Auth
   /\ IF Mode = "doneBeforeErase"
        THEN \A s \in Scopes : tomb[s] /\ (erased[s] \/ pc[s] = "tombd")
        ELSE \A s \in Scopes : erased[s]
   /\ st' = "done"
+  /\ Unauth
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, exists, pins, nIntents, pc, snap, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* The write authority closed: the pass ends at its next host call, and a later
+\* pass starts again from a head read. Nothing more is sent.
+WAbandon(s) ==
+  /\ ~wr /\ pc[s] # "idle"
+  /\ pc' = [pc EXCEPT ![s] = "idle"] /\ snap' = [snap EXCEPT ![s] = 0]
+  /\ lastActor' = "worker"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+\* ---- host: write authority ---------------------------------------------
+\* A registration hold closes the authority; the registration comes back later.
+Revoke ==
+  /\ wr /\ revokes < MaxRev
+  /\ wr' = FALSE /\ revokes' = revokes + 1
+  /\ lastActor' = "host"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, unauth, exists, st, pins, nIntents, pc, snap, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
+Restore ==
+  /\ ~wr
+  /\ wr' = TRUE
+  /\ lastActor' = "host"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -254,7 +363,7 @@ IPre ==
        /\ isc' = sc
   /\ ipc' = "checked"
   /\ lastActor' = "importer"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, batches, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
@@ -270,7 +379,7 @@ IMerge ==
             /\ freeMerged' = (freeMerged \/ (st = "done" /\ isc = "free"))
        ELSE UNCHANGED <<cc, mergedWhileOpen, staleAfterDone, freeMerged>>
   /\ lastActor' = "importer"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, isc, writes, crashes>>
 
 \* ---- restart -----------------------------------------------------------
@@ -283,12 +392,12 @@ Crash ==
        THEN /\ nIntents' = nIntents + 1 /\ pins' = ver /\ st' = "open"
        ELSE UNCHANGED <<nIntents, pins, st>>
   /\ lastActor' = "crash"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, blk, rsnap, reqs,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, localTo, wr, revokes, unauth, exists, blk, rsnap, reqs,
                  batches, freeMerged, mergedWhileOpen, staleAfterDone, cc, writes>>
 
 Next ==
-  \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WSendAbsent(s) \/ WReread(s) \/ WErase(s)
-  \/ CWrite \/ RRead \/ RInsert \/ WDone \/ IPre \/ IMerge \/ Crash
+  \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WSendEcho(s) \/ WSendLocal(s) \/ WSendAbsent(s) \/ WReread(s) \/ WLocal(s) \/ WErase(s) \/ WAbandon(s)
+  \/ CWrite \/ Revoke \/ Restore \/ RRead \/ RInsert \/ WDone \/ IPre \/ IMerge \/ Crash
 
 Spec == Init /\ [][Next]_vars
 
@@ -297,7 +406,8 @@ TypeOK ==
   /\ ver \in [Scopes -> 0..MaxVer]
   /\ tombBy \in [Scopes -> {"none", "ours", "other"}]
   /\ st \in {"none", "open", "done"}
-  /\ pc \in [Scopes -> {"idle", "decided", "sent", "tombd"}]
+  /\ pc \in [Scopes -> {"idle", "decided", "tombed", "sent", "tombd"}]
+  /\ wr \in BOOLEAN
   /\ nIntents \in 0..2
 
 \* No importer batch merges while the intent is open.
@@ -308,7 +418,10 @@ CurrentConnectionUntouched ==
   [][(lastActor' \in {"req", "worker", "crash"}) => cc' = cc]_vars
 
 \* Done means every bound head is confirmed tombstoned and its blobs are erased.
-DoneOnlyAfterConfirm == st = "done" => \A s \in Scopes : tomb[s] /\ erased[s]
+\* Its local copy is gone through the pinned tombstone too: the remote state alone
+\* does not say so (a process that stopped after the tombstone left it behind).
+DoneOnlyAfterConfirm ==
+  st = "done" => \A s \in Scopes : tomb[s] /\ erased[s] /\ localTo[s] = pins[s] + 1
 
 \* A restart or a repeat never makes a second intent.
 OneIntent == nIntents <= 1
@@ -324,6 +437,11 @@ NoEraseOfUnpinnedVersion ==
   \A s \in Scopes :
     /\ erased[s] => tombVer[s] = pins[s] + 1
     /\ cleanTo[s] \in {0, pins[s] + 1}
+    /\ localTo[s] \in {0, pins[s] + 1}
+
+\* No destructive step (tombstone post, queue write, local erase, storage delete,
+\* done verdict) ran while the host had no write authority.
+NoDestructiveWithoutAuthority == ~unauth
 
 \* A retired scope stays refused: no batch merges a bound scope once the intent
 \* is done (a batch read before the retirement finished would bring back what it

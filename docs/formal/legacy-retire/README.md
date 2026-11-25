@@ -14,14 +14,15 @@ Code owners:
 
 ## What is modelled
 
-| Actor    | Steps                                                                                                                                           |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| request  | `RRead` reads every bound head (the pin). `RInsert` is `INSERT OR IGNORE`: the first row stands, a repeat resumes it.                           |
-| worker   | per scope: `WRead` (compare to the pin), `WSend` (the adapter: reads the head itself, tombstones or cleans), `WReread`, `WErase`, then `WDone`. |
-| importer | `IPre` is the preflight `importFence`. `IMerge` is the merge batch: its guard and the merge are one transaction.                                |
-| crash    | `Crash` loses every in-flight step. Durable rows (intent, gateway, blobs, current connection) stay.                                             |
-| gateway  | `Publish` and `ForeignTomb`: another writer moves the head or tombstones it. In the real system the head normally stays still.                  |
-| sync     | `CWrite`: the current connection keeps writing.                                                                                                 |
+| Actor    | Steps                                                                                                                                                                                                                                      |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| request  | `RRead` reads every bound head (the pin). `RInsert` is `INSERT OR IGNORE`: the first row stands, a repeat resumes it.                                                                                                                      |
+| worker   | per scope: `WRead` (compare to the pin), `WSend` (the adapter: reads the head itself, tombstones or cleans), `WSendLocal` (its local erase), `WReread`, `WLocal` (the fenced local cleanup of a landed tombstone), `WErase`, then `WDone`. |
+| importer | `IPre` is the preflight `importFence`. `IMerge` is the merge batch: its guard and the merge are one transaction.                                                                                                                           |
+| crash    | `Crash` loses every in-flight step. Durable rows (intent, gateway, blobs, local erase, current connection) stay.                                                                                                                           |
+| host     | `Revoke` and `Restore`: the host's write authority (a registration hold) closes and comes back.                                                                                                                                            |
+| gateway  | `Publish` and `ForeignTomb`: another writer moves the head or tombstones it. In the real system the head normally stays still.                                                                                                             |
+| sync     | `CWrite`: the current connection keeps writing.                                                                                                                                                                                            |
 
 A live head at version `v` is tombstoned at `v + 1`. Erasing a tombstone at
 version `t` frees every blob slot `<= t` (`confirmErased`), so a tombstone that
@@ -29,36 +30,40 @@ does not directly follow the pinned head frees slots the pin never named.
 
 ## Invariants
 
-| Invariant                    | Meaning                                                                                                                      |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `NoLegacyMergeWhileOpen`     | No importer batch merges while the intent is open.                                                                           |
-| `CurrentConnectionUntouched` | An action of request, worker or restart never changes the current connection (action property).                              |
-| `DoneOnlyAfterConfirm`       | `done` implies every bound head is tombstoned and its blobs are erased.                                                      |
-| `OneIntent`                  | A restart or a repeat never makes a second intent.                                                                           |
-| `NoTombstoneOverMovedHead`   | A tombstone of ours is never written over a head that moved since the pin.                                                   |
-| `NoStaleMergeAfterDone`      | No batch merges a bound scope once the intent is `done`: a retired scope stays refused.                                      |
-| `NoEraseOfUnpinnedVersion`   | No erase and no storage cleanup, queued or done, for a tombstone that does not directly follow the pin (found by the model). |
+| Invariant                       | Meaning                                                                                                                                       |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NoLegacyMergeWhileOpen`        | No importer batch merges while the intent is open.                                                                                            |
+| `CurrentConnectionUntouched`    | An action of request, worker or restart never changes the current connection (action property).                                               |
+| `DoneOnlyAfterConfirm`          | `done` implies every bound head is tombstoned, its blobs are erased and its local copy is gone through the pinned tombstone.                  |
+| `OneIntent`                     | A restart or a repeat never makes a second intent.                                                                                            |
+| `NoTombstoneOverMovedHead`      | A tombstone of ours is never written over a head that moved since the pin.                                                                    |
+| `NoStaleMergeAfterDone`         | No batch merges a bound scope once the intent is `done`: a retired scope stays refused.                                                       |
+| `NoEraseOfUnpinnedVersion`      | No erase (blobs or local) and no storage cleanup, queued or done, for a tombstone that does not directly follow the pin (found by the model). |
+| `NoDestructiveWithoutAuthority` | No tombstone post, queue write, local erase, storage delete or done verdict runs while the host has no write authority.                       |
 
 ## Results
 
 Run with `TLA2TOOLS=<tla2tools.jar> [JAVA=...] [WORKERS=4] ./run.sh <Config> [outdir]`.
 It takes the shared heavy-run lock, runs `nice -n 19 ionice -c3`, and uses 4
-workers. Constants: two scopes, `MaxVer = 2`, `MaxReq = 2`, `MaxB = 2`,
-`MaxCrash = 2`, `MaxW = 2`. A run takes seconds. Logs are in `traces/`. A trace length is the number of states TLC prints; with several workers it can differ by one between runs.
+workers. Constants: two scopes, `MaxVer = 2`, `MaxReq = 2`, `MaxB = 1`,
+`MaxCrash = 2`, `MaxW = 1`, `MaxRev = 1`. `Good` takes about 2 minutes; a mutant takes seconds to a minute. Round 7 lowered `MaxB` and `MaxW` from 2 to 1: the new variables made the old bounds too large, and no invariant needs a second import batch or a second current write. Logs are in `traces/`. A trace length is the number of states TLC prints; with several workers it can differ by one between runs.
 
 | Config                                                                                               | Result                                                                                                                                        |
 | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Good`                                                                                               | No error. 20,889,799 states generated, 4,905,606 distinct, depth 26. All invariants above.                                                    |
-| `MutNoBatchFence-NoLegacyMergeWhileOpen`                                                             | `NoLegacyMergeWhileOpen` violated, 5-state trace (the batch has no guard of its own).                                                         |
+| `Good`                                                                                               | No error. 62,676,431 states generated, 13,846,227 distinct, depth 27. All invariants above.                                                   |
+| `MutNoBatchFence-NoLegacyMergeWhileOpen`                                                             | `NoLegacyMergeWhileOpen` violated, 6-state trace (the batch has no guard of its own).                                                         |
 | `MutNoPin-NoTombstoneOverMovedHead`                                                                  | `NoTombstoneOverMovedHead` violated, 6-state trace (the worker does not compare to the pin).                                                  |
-| `MutDoneBeforeErase-DoneOnlyAfterConfirm`                                                            | `DoneOnlyAfterConfirm` violated, 8-state trace (done once tombstoned, before the erase).                                                      |
-| `MutNewIntentOnRestart-OneIntent`                                                                    | `OneIntent` violated, 4-state trace (a restart makes a new intent for an open one).                                                           |
-| `MutTouchesCurrent-CurrentConnectionUntouched`                                                       | `CurrentConnectionUntouched` violated, 6-state trace (the erase also writes the connection).                                                  |
+| `MutDoneBeforeErase-DoneOnlyAfterConfirm`                                                            | `DoneOnlyAfterConfirm` violated, 9-state trace (done once tombstoned, before the erase).                                                      |
+| `MutNewIntentOnRestart-OneIntent`                                                                    | `OneIntent` violated, 5-state trace (a restart makes a new intent for an open one).                                                           |
+| `MutTouchesCurrent-CurrentConnectionUntouched`                                                       | `CurrentConnectionUntouched` violated, 7-state trace (the erase also writes the connection).                                                  |
 | `MutOldPinHolds-NoEraseOfUnpinnedVersion`                                                            | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the code before the fix (see below).                                                      |
 | `Probe-NotDone`, `Probe-NotBlocked`, `Probe-NotBlockedByForeignTomb`, `Probe-NotFreeMergedAfterDone` | Each fails by design: `done`, a blocked scope, a block by a foreign tombstone, and an import of an unbound stream after `done` are reachable. |
-| `MutDoneLiftsFence-NoStaleMergeAfterDone`                                                            | `NoStaleMergeAfterDone` violated, 12-state trace: the code before the fix (see below).                                                        |
+| `MutDoneLiftsFence-NoStaleMergeAfterDone`                                                            | `NoStaleMergeAfterDone` violated, 15-state trace: the code before the fix (see below).                                                        |
 | `MutAbsentCleans-NoEraseOfUnpinnedVersion`                                                           | `NoEraseOfUnpinnedVersion` violated, 6-state trace: the adapter before round 5 (see below).                                                   |
 | `MutAdapterCleansFirst-NoEraseOfUnpinnedVersion`                                                     | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the delete adapter before round 4 (see below).                                            |
+| `MutGateOnce-NoDestructiveWithoutAuthority`                                                          | `NoDestructiveWithoutAuthority` violated, 6-state trace: the code before round 7 (see below).                                                 |
+| `MutEchoCleans-NoEraseOfUnpinnedVersion`                                                             | `NoEraseOfUnpinnedVersion` violated, 6-state trace: the code before round 7 (see below).                                                      |
+| `MutResumeSkipsLocal-DoneOnlyAfterConfirm`                                                           | `DoneOnlyAfterConfirm` violated, 10-state trace: the code before round 7 (see below).                                                         |
 
 ## Finding: a later tombstone passed `pinHolds` (fixed)
 
@@ -143,7 +148,8 @@ keeps the scope waiting. A connector delete's fence is not pinned and keeps
   (a test holds a storage call open). It is not a model step.
 - **Erase.** `confirmErased` makes several storage requests, checks finality and
   the history, and can report pending. The model's `WErase` is one step. A crash
-  between `WSend` and `WErase` is covered: the next read sees the tombstone.
+  between `WSend` and `WErase` is covered: the next read sees the tombstone, and
+  since round 7 the next pass also runs `WLocal` before `WErase`.
 - **Retries and backoff.** The model has no timers. A worker step is always
   enabled while the intent is open. A status poll (GET) is not a model step: it
   starts a worker only when none exists, and the model assumes that worker runs.
@@ -155,6 +161,39 @@ keeps the scope waiting. A connector delete's fence is not pinned and keeps
   scope without a head change.
 - **Another writer's tombstone** after our own is not modelled. The head is final
   once deleted, and the model's gateway cannot move a tombstoned head.
+
+## Round 7: authority, echoed versions and local cleanup (fixed)
+
+Three findings, one rule: destructive work runs only under live write
+authority, bounded by the pinned version, and `done` means the remote and the
+local copy are both gone.
+
+- **Authority read once** (`MutGateOnce`). The host's `writeReady` was read when
+  the pass called the delete, and the adapter then read the head again. A
+  registration hold that began in between still got its tombstone, queue write
+  and local erase. Trace: `RRead`, `RInsert`, `WRead`, `Revoke`, `WSend`. The
+  repair: `writeReady` rides the fence into the adapter (read right before the
+  post) and into `deleteScope` (read before the queue write and before the local
+  erase). `Good` disables each step while the authority is closed; `WAbandon`
+  ends the pass.
+- **Echoed version** (`MutEchoCleans`). A 2xx tombstone answer that echoed a
+  later `expectedVersion` bounded the cleanup. Trace: `WSendEcho` queues and
+  erases up to a version no pin names. The repair: a fenced 2xx is checked against
+  the version signed (`assertFencedTombstone`); a different echo throws, nothing is
+  cleaned, and the worker reads the head again.
+- **Local copy after a restart** (`MutResumeSkipsLocal`). A pass that found the
+  tombstone landed checked remote storage only. Trace: `WSend` tombstones, `Crash`
+  before `WSendLocal`, `WRead` sees the tombstone, `WErase`, `WDone` with the local
+  copy still present. A failed local erase had the same gap. The repair: a pinned
+  pass runs the fenced delete again over the pinned tombstone (`cleanLocal`,
+  `WLocal`) before it confirms the blobs, and a local erase that did not finish
+  leaves the pass pending. The local index tells which entries a tombstone covers
+  (`isEntryCoveredByTombstone`: a registered entry by its version, a local-only
+  entry by its re-add marker), so the erase is bounded by the pinned tombstone.
+
+The model already had a crash point between the tombstone and the erase (`Crash`
+from any step); round 7 made the local erase a step of its own, so that crash now
+leaves a local copy behind. `Good` passes with it.
 
 ## Finding: `done` lifted the fence (fixed)
 

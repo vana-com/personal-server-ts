@@ -95,7 +95,15 @@ export interface LegacyDeletePorts {
   retire(
     scope: string,
     fence: TombstoneFence,
-    options?: { readonly pinned: boolean },
+    options?: {
+      readonly pinned: boolean;
+      /**
+       * The caller's live write authority. The host hands it to the delete
+       * worker, which reads it right before the tombstone post, the blob queue
+       * write and the local erase.
+       */
+      readonly writeReady?: () => boolean;
+    },
   ): Promise<DeleteScopeResult>;
   /** Blob deletions of `scope` still queued on this device behind its tombstone. */
   pendingBlobs(scope: string): Promise<number>;
@@ -116,6 +124,12 @@ export interface LegacyMemory {
   readonly refused: Map<string, DeleteBlockReason>;
   /** Slots storage answered for, by `<scope>@<tombstone version>`. */
   readonly erased: Map<string, Set<string>>;
+  /**
+   * `<scope>@<tombstone version>` whose fenced local cleanup this process saw
+   * finish. Only a spared request: a restart cleans again, and that costs one
+   * idempotent delete.
+   */
+  readonly localCleaned?: Set<string>;
   /**
    * The control tombstone this delete confirmed, by namespace (its registry
    * version). The delete is judged against these, not against whatever head
@@ -394,6 +408,8 @@ export async function retireLegacyScope(
   let head = await ports.head(scope, signal);
   if (pin && !pinHolds(pin, head))
     return settled(blocked("legacy_head_changed"));
+  // Whether this call's own delete finished the local copy.
+  let cleanedHere = false;
   if (head.state === "live") {
     const result = await ports.retire(scope, head.fence, {
       pinned: pin !== undefined,
@@ -424,6 +440,7 @@ export async function retireLegacyScope(
       deps.memory?.refused.set(scope, "needs_another_device");
       return settled(blocked("needs_another_device"));
     }
+    cleanedHere = result.steps.local.status === "ok";
     head = await ports.head(scope, signal);
     if (pin && !pinHolds(pin, head))
       return settled(blocked("legacy_head_changed"));
@@ -432,9 +449,58 @@ export async function retireLegacyScope(
   if (head.state === "absent") return settled(PART_DONE);
   // A head that moved, or a tombstone the registry has not kept: read again.
   if (head.state === "live") return waiting;
+  // A pinned retirement is done only when the local copy is gone too. The
+  // tombstone may have landed in an earlier pass or process that stopped (or
+  // failed) before its local erase, so a deleted head is not evidence of it:
+  // the fenced delete runs again, bounded by the pinned tombstone.
+  if (pin && !cleanedHere && !(await cleanLocal(deps, ports, scope, pin, head)))
+    return waiting;
   // Work this device queued is still being drained by its sync manager.
   if ((await ports.pendingBlobs(scope)) > 0) return waiting;
   return confirmErased(deps, ports, scope, head.version, signal);
+}
+
+/**
+ * The fence for a deleted head: the live head `pin` named, or, for a pin that
+ * was a tombstone already, the version just below it. The adapter reads only
+ * the version of a fence it finds a deleted head under, and a head that moved
+ * past the tombstone (a re-add) fails the same version check.
+ */
+function fenceOfPinnedTombstone(pin: LegacyPin, tombstone: string) {
+  return pin.state === "live"
+    ? pin.fence
+    : {
+        expectedVersion: (BigInt(tombstone) - 1n).toString(),
+        dataHash: "",
+        metadataHash: "",
+      };
+}
+
+/**
+ * Run the fenced delete again over the pinned tombstone, so its local erase and
+ * blob queue are decided from this device's own files, not from the gateway.
+ * `true` once the local copy of every version the tombstone covers is gone.
+ * The delete is idempotent: queued blob work is not queued twice.
+ */
+async function cleanLocal(
+  deps: LegacyScopeDeps,
+  ports: LegacyDeletePorts,
+  scope: string,
+  pin: LegacyPin,
+  head: Extract<LegacyHead, { state: "deleted" }>,
+): Promise<boolean> {
+  const key = `${scope}@${head.version}`;
+  const cleaned = deps.memory?.localCleaned;
+  if (cleaned?.has(key)) return true;
+  const result = await ports.retire(
+    scope,
+    fenceOfPinnedTombstone(pin, head.version),
+    { pinned: true },
+  );
+  if (result.steps.gateway.status === "failed") return false;
+  if (result.steps.local.status !== "ok") return false;
+  cleaned?.add(key);
+  return true;
 }
 
 /** The legacy delete's batch: vana-storage rate-limits DELETE per owner. */

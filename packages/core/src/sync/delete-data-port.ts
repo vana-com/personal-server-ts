@@ -4,6 +4,7 @@ import type {
   DeleteBlobVersionsOutcome,
   DeleteDataPort,
   TombstoneOutcome,
+  TombstoneDeleteFence,
   TombstoneFence,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
@@ -37,6 +38,14 @@ export class GatewayRefusalError extends Error {
   ) {
     super(`Gateway error: ${status} ${detail}`);
     this.name = "GatewayRefusalError";
+  }
+}
+
+/** The host's write authority closed before a destructive step: nothing was sent. */
+export class WriteAuthorityLostError extends Error {
+  constructor() {
+    super("the host has no write authority now; nothing was sent");
+    this.name = "WriteAuthorityLostError";
   }
 }
 
@@ -182,6 +191,7 @@ export function createGatewayDeleteDataPort(
     scope: string,
     dataPointId: string,
     version: bigint,
+    fence: TombstoneDeleteFence | undefined,
   ): Promise<Response> {
     const signature = await options.signer.signAddData({
       ownerAddress: options.serverOwner,
@@ -190,6 +200,10 @@ export function createGatewayDeleteDataPort(
       metadataHash: TOMBSTONE_METADATA_HASH,
       expectedVersion: version,
     });
+    // The head read and the signing are awaits: the host's authority is read
+    // again right before the post, the one call here that deletes.
+    if (fence?.writeReady && !fence.writeReady())
+      throw new WriteAuthorityLostError();
     return fetchImpl(`${gatewayBase}/v1/data/${dataPointId}`, {
       method: "DELETE",
       headers: {
@@ -310,7 +324,7 @@ export function createGatewayDeleteDataPort(
     ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(
       scope: string,
-      fence?: { head: TombstoneFence; pinned?: boolean },
+      fence?: TombstoneDeleteFence,
     ): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await currentHead(scope);
@@ -351,7 +365,7 @@ export function createGatewayDeleteDataPort(
       let answer = await readTombstoneAnswer(
         scope,
         dataPointId,
-        await sendTombstone(scope, dataPointId, version),
+        await sendTombstone(scope, dataPointId, version, fence),
       );
       if (answer.kind === "version-conflict") {
         if (fence) {
@@ -399,7 +413,7 @@ export function createGatewayDeleteDataPort(
         answer = await readTombstoneAnswer(
           scope,
           dataPointId,
-          await sendTombstone(scope, dataPointId, version),
+          await sendTombstone(scope, dataPointId, version, fence),
         );
       }
       if (answer.kind === "outcome") {
@@ -416,10 +430,14 @@ export function createGatewayDeleteDataPort(
         );
       }
       const row = unwrap(answer.body);
+      const echoed = stringField(row, "expectedVersion");
+      // A fenced delete's cleanup is bounded by the version it signed, never by
+      // an echo: a later one would free versions the pin never named.
+      assertFencedTombstone(fence, echoed ?? String(version));
       return {
         status: "tombstoned",
         dataPointId: stringField(row, "dataPointId") ?? dataPointId,
-        version: stringField(row, "expectedVersion") ?? String(version),
+        version: echoed ?? String(version),
         replaced,
         deletedAt: stringField(row, "deletedAt"),
       };

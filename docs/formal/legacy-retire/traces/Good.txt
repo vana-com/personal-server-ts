@@ -1,14 +1,25 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 102 and seed 9124670247025251197 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 610924] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r7/docs/formal/legacy-retire/LegacyRetire.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 14:16:59)
+Starting... (2026-11-25 16:11:43)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-25 14:16:59.
-Progress(13) at 2026-11-25 14:17:02: 2,237,667 states generated (2,237,667 s/min), 730,066 distinct states found (730,066 ds/min), 345,305 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 16:11:43.
+Progress(12) at 2026-11-25 16:11:46: 1,439,250 states generated (1,439,250 s/min), 521,447 distinct states found (521,447 ds/min), 298,752 states left on queue.
+Progress(17) at 2026-11-25 16:12:46: 30,797,396 states generated (29,358,146 s/min), 7,925,003 distinct states found (7,403,556 ds/min), 2,248,916 states left on queue.
+Progress(19) at 2026-11-25 16:13:46: 52,794,366 states generated (21,996,970 s/min), 12,251,923 distinct states found (4,326,920 ds/min), 1,450,751 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 4.3E-6
-  based on the actual fingerprints:  val = 3.4E-7
-20889799 states generated, 4905606 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 26.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 11 and the 95th percentile is 4).
-Finished in 22s at (2026-11-25 14:17:21)
+  calculated (optimistic):  val = 3.7E-5
+  based on the actual fingerprints:  val = 4.1E-6
+62676431 states generated, 13846227 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 27.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 14 and the 95th percentile is 5).
+Finished in 02min 19s at (2026-11-25 16:14:02)

@@ -473,6 +473,18 @@ export interface TombstoneFence {
   metadataHash: string;
 }
 
+/** What a fenced delete is held to: the head it saw, and the authority it acts under. */
+export interface TombstoneDeleteFence {
+  head: TombstoneFence;
+  pinned?: boolean;
+  /**
+   * The host's live write authority. A destructive step (the tombstone post,
+   * the blob queue write, the local erase) reads it right before it runs and
+   * does not run once it answers false.
+   */
+  writeReady?: () => boolean;
+}
+
 export type TombstoneOutcome =
   | {
       status: "tombstoned";
@@ -531,10 +543,14 @@ export interface DeleteDataPort {
    * head, or a 409 (another writer moved the head), throws instead of
    * re-signing, so an automatic re-submission can never delete a write that
    * landed after the head it saw.
+   *
+   * `fence.writeReady` is the host's live write authority: the adapter reads it
+   * right before it posts, so an authority that closed during its own head read
+   * sends nothing (the call throws `WriteAuthorityLostError`).
    */
   tombstone(
     scope: string,
-    fence?: { head: TombstoneFence; pinned?: boolean },
+    fence?: TombstoneDeleteFence,
   ): Promise<TombstoneOutcome>;
   /**
    * Head of a gateway-reserved (`vana.system.*`) point through a read the
