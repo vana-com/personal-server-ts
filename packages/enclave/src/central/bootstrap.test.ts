@@ -1219,3 +1219,58 @@ it("joins pending admission and its durable demotion before closing listeners", 
     await rm(path, { recursive: true, force: true });
   }
 });
+
+it("closes the fleet HTTP listeners even when MCP close rejects", async () => {
+  const path = await mkdtemp(join(tmpdir(), "central-mcp-close-error-"));
+  const dstack = createFakeDstackClient({ appId: CONTROLLER_APP_ID });
+  const info = await dstack.info();
+  const keys = generateKeyPairSync("ed25519");
+  const env = await controllerEnv(path, []);
+  const primary = new Error("synthetic MCP close failure");
+  const startMcp = mcpService.startMcpRouter;
+  let restoreMcp: (() => void) | undefined;
+  const closeMcp = vi.fn();
+  const startSpy = vi
+    .spyOn(mcpService, "startMcpRouter")
+    .mockImplementation(async (...args) => {
+      const router = await startMcp(...args);
+      if (router) {
+        const close = router.close.bind(router);
+        const intercepted = vi
+          .spyOn(router, "close")
+          .mockImplementation(async () => {
+            closeMcp();
+            await close();
+            throw primary;
+          });
+        restoreMcp = () => intercepted.mockRestore();
+      }
+      return router;
+    });
+  let runtime: Awaited<ReturnType<typeof startFleetCentral>> | undefined;
+  try {
+    runtime = await startFleetCentral(
+      signedConfig(env, info, keys),
+      dstack,
+      async () => {
+        throw new Error("unexpected external request");
+      },
+    );
+    expect(restoreMcp).toBeDefined();
+    const { admin, control, peer } = runtime.ports;
+    await expect(runtime.close()).rejects.toBe(primary);
+    expect(closeMcp).toHaveBeenCalledTimes(1);
+    for (const port of [admin, control, peer]) {
+      await expect(
+        fetch(`http://127.0.0.1:${port}/`, {
+          signal: AbortSignal.timeout(1_000),
+        }),
+      ).rejects.toMatchObject({ cause: { code: "ECONNREFUSED" } });
+    }
+  } finally {
+    restoreMcp?.();
+    startSpy.mockRestore();
+    await runtime?.close().catch(() => undefined);
+    await rm(path, { recursive: true, force: true });
+  }
+});
