@@ -50,8 +50,6 @@ export interface LiteLegacyImportReport {
     readonly quarantined: QuarantineCounts;
     readonly refused: number;
   };
-  /** Old scope copies removed this run; null while `retireLegacy` is off. */
-  readonly retired: { readonly scopes: number } | null;
 }
 
 export interface LiteLegacyStoreRunner extends ImportRunner {
@@ -63,15 +61,13 @@ export interface LiteLegacyStoreRunnerOptions {
   /** The raw legacy storage: stored bodies, not their projected views. */
   readonly storage: Pick<
     DataStoragePort,
-    "listScopes" | "listVersions" | "readEnvelope" | "deleteScope"
+    "listScopes" | "listVersions" | "readEnvelope"
   >;
   /** The runtime's own seed intake, once it exists. Waits, or throws if the
    * runtime has none. */
   readonly intake: () => Promise<SeedIntake>;
   /** Verified manifest documents, read at each run. */
   readonly manifests: () => Iterable<string>;
-  /** Read at each run, so it follows `streamSync.retireLegacy`. */
-  readonly retireLegacy: () => boolean;
   readonly now?: () => number;
   readonly onWarning?: (message: string, detail?: unknown) => void;
 }
@@ -125,24 +121,17 @@ const tally = <K extends string>() => {
  * Lite's own legacy scope store (the storage `withLegacyProjection` reads) is a
  * one-time seed for a switched owner. One run folds each declared stream's
  * stored versions into the runtime's seed intake, so the importer, its
- * receipts and its fill-only rules apply as for any seed. Then, only when
- * `streamSync.retireLegacy` is on, it removes the scope copies of streams
- * whose receipt is final. A stream that was refused, empty or left out keeps
- * its copy; with the setting off nothing is removed.
+ * receipts and its fill-only rules apply as for any seed. Import only: this
+ * runner never removes a legacy scope.
  *
- * A failed run (no intake, a read fault) removes nothing; the waker logs it and
- * runs again at the next Account answer or start. Shutdown aborts the run.
+ * A failed run (no intake, a read fault) imports what the importer already
+ * accepted; the waker logs it and runs again at the next Account answer or
+ * start. Shutdown aborts the run.
  */
 export function createLiteLegacyStoreRunner(
   options: LiteLegacyStoreRunnerOptions,
 ): LiteLegacyStoreRunner {
   let last: LiteLegacyImportReport | null = null;
-  // Which scope this runner's own seed put each stream's rows from. A receipt
-  // names no source scope, so a final receipt alone does not show that the
-  // scope now offered for the stream is the one that was imported (a stream
-  // stored under its canonical name and an alias). Memory only: after a
-  // restart a stream with a receipt keeps its copy.
-  const importedFrom = new Map<string, string>();
   const targets = streamScopeTargets();
   return {
     report: () => last,
@@ -154,13 +143,17 @@ export function createLiteLegacyStoreRunner(
         Awaited<ReturnType<SeedIntake["status"]>>
       >();
       const deleted = new Set<string>();
+      const refused = tally<string>();
       const store = createLegacyScopeStore({
         storage: options.storage,
         manifests: options.manifests,
         targets,
         onExcluded: ({ reason }) => excluded.add(reason),
         receipt: async (connector, stream) => {
-          if (deleted.has(connector)) return "leave";
+          if (deleted.has(connector)) {
+            refused.add("deleted");
+            return "leave";
+          }
           let status = statusOf.get(connector);
           if (!status) {
             try {
@@ -170,6 +163,7 @@ export function createLiteLegacyStoreRunner(
               // stays and the other connectors go on.
               if (!isConnectionDeleted(error)) throw error;
               deleted.add(connector);
+              refused.add("deleted");
               return "leave";
             }
             statusOf.set(connector, status);
@@ -193,7 +187,6 @@ export function createLiteLegacyStoreRunner(
       };
       const seeded = await seedLegacyStore(intake, recording, { signal });
       if (signal.aborted) return;
-      const refused = tally<string>();
       let refusedRows = 0;
       let staged = 0;
       let merged = 0;
@@ -211,30 +204,11 @@ export function createLiteLegacyStoreRunner(
           refusedRows += rows;
         }
       }
-      for (const _ of deleted) refused.add("deleted");
       const quarantined = seeded.quarantine;
       const legacy =
         seeded.rows +
         Object.values(quarantined).reduce((a, b) => a + b, 0) +
         refusedRows;
-      for (const s of seeded.streams) {
-        const scope = store.scopeOf(s.connector, s.stream);
-        if (s.outcome === "staged" && scope !== undefined)
-          importedFrom.set(JSON.stringify([s.connector, s.stream]), scope);
-      }
-      let retired: LiteLegacyImportReport["retired"] = null;
-      if (options.retireLegacy()) {
-        retired = {
-          scopes: await retire(
-            options,
-            intake,
-            store,
-            importedFrom,
-            seeded.streams,
-            signal,
-          ),
-        };
-      }
       if (signal.aborted) return;
       last = {
         finishedAt: (options.now ?? Date.now)(),
@@ -256,57 +230,7 @@ export function createLiteLegacyStoreRunner(
           quarantined,
           refused: refusedRows,
         },
-        retired,
       };
     },
   };
-}
-
-/** Remove the scope copies of streams whose receipt is now final. The receipt
- * is read again after the seed, so a stream the importer did not finish keeps
- * its copy. A scope is also kept when it is not the one the runner imported
- * the stream from, or holds versions the import skipped. */
-async function retire(
-  options: LiteLegacyStoreRunnerOptions,
-  intake: SeedIntake,
-  store: {
-    scopeOf(connector: string, stream: string): string | undefined;
-    skippedVersions(
-      connector: string,
-      stream: string,
-    ): Promise<number> | undefined;
-  },
-  importedFrom: ReadonlyMap<string, string>,
-  streams: readonly { connector: string; stream: string; outcome: string }[],
-  signal: AbortSignal,
-): Promise<number> {
-  let removed = 0;
-  const statusOf = new Map<string, Awaited<ReturnType<SeedIntake["status"]>>>();
-  for (const s of streams) {
-    if (signal.aborted) break;
-    if (s.outcome !== "staged" && s.outcome !== "merged") continue;
-    let status = statusOf.get(s.connector);
-    if (!status) {
-      status = await intake.status(s.connector);
-      statusOf.set(s.connector, status);
-    }
-    if (status.streams[s.stream]?.state !== "merged") continue;
-    const scope = store.scopeOf(s.connector, s.stream);
-    if (scope === undefined) continue;
-    // Only the scope this runner imported the stream from may go, and only
-    // when every stored version of it was offered for import.
-    if (importedFrom.get(JSON.stringify([s.connector, s.stream])) !== scope)
-      continue;
-    // A fault reading the history keeps the copy and goes on to the next.
-    const skipped = await store
-      .skippedVersions(s.connector, s.stream)
-      ?.catch((error: unknown) => {
-        options.onWarning?.("legacy scope history unreadable", error);
-        return undefined;
-      });
-    if (skipped !== 0) continue;
-    await options.storage.deleteScope(scope);
-    removed += 1;
-  }
-  return removed;
 }

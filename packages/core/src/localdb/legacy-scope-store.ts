@@ -68,20 +68,7 @@ export interface LegacyScopeStoreOptions {
   ) => Promise<"open" | "final" | "leave">;
 }
 
-export interface LegacyScopeStore extends LegacySeedStore {
-  /** The one scope `streams()` read a stream from, once it has yielded it.
-   * Only that scope's versions were offered for import. */
-  scopeOf(connector: string, stream: string): string | undefined;
-  /** How many stored versions of the scope `streams()` read a stream from are
-   * not plain `{records}` and so were not offered for import. Retiring that
-   * scope would erase them. Undefined until the stream has been yielded. For a
-   * stream whose receipt was already `final` the versions are read only when
-   * this is asked, and a read fault rejects. */
-  skippedVersions(
-    connector: string,
-    stream: string,
-  ): Promise<number> | undefined;
-}
+export type LegacyScopeStore = LegacySeedStore;
 
 const PAGE = 200;
 
@@ -142,8 +129,6 @@ export function createLegacyScopeStore(
   const exclude = (scope: string, reason: LegacyScopeExclusionReason) =>
     options.onExcluded?.({ scope, reason });
   const { targets } = options;
-  const read = new Map<string, string>();
-  const skipped = new Map<string, () => Promise<number>>();
 
   /** The one verified declaration of a stream, or why there is none. */
   function declare(
@@ -182,10 +167,6 @@ export function createLegacyScopeStore(
   };
 
   return {
-    scopeOf: (connector, stream) =>
-      read.get(JSON.stringify([connector, stream])),
-    skippedVersions: (connector, stream) =>
-      skipped.get(JSON.stringify([connector, stream]))?.(),
     async *streams() {
       // A stream stored under several scope names (its own and an alias)
       // is read from its canonical `<source>.<stream>` scope when it exists.
@@ -224,39 +205,18 @@ export function createLegacyScopeStore(
         const versions = versionsNewestFirst(storage, scope);
         const newest = versions[0];
         if (!newest) continue;
-        // How many stored versions are not plain rows, so the host knows
-        // before it retires the scope which versions were never offered.
-        const countSkipped = async () => {
-          let n = 0;
-          for (const version of versions)
-            if (
-              plainRows(
-                (await storage.readEnvelope(scope, version.collectedAt)).data,
-              ) === null
-            )
-              n += 1;
-          return n;
-        };
-        let skippedCount: () => Promise<number>;
-        if (state === "final") {
-          // The producer reads no history of a stream with a final receipt;
-          // neither does this, until the host asks to retire the scope.
-          let counted: Promise<number> | undefined;
-          skippedCount = () => (counted ??= countSkipped());
-        } else {
-          const importableVersions: boolean[] = [];
-          for (const version of versions)
-            importableVersions.push(
-              plainRows(
-                (await storage.readEnvelope(scope, version.collectedAt)).data,
-              ) !== null,
-            );
-          if (!importableVersions[0]) {
-            exclude(scope, "not_stream_rows");
-            continue;
-          }
-          const n = importableVersions.filter((ok) => !ok).length;
-          skippedCount = async () => n;
+        // The producer reads no history of a stream with a final receipt, and
+        // neither does this. Otherwise the newest body alone decides whether
+        // the scope is importable: an app-shaped newest body is left out
+        // without reading any older version.
+        if (
+          state !== "final" &&
+          plainRows(
+            (await storage.readEnvelope(scope, newest.collectedAt)).data,
+          ) === null
+        ) {
+          exclude(scope, "not_stream_rows");
+          continue;
         }
         const layers: FoldLayer[] = versions.map((version) => ({
           async *records() {
@@ -273,9 +233,6 @@ export function createLegacyScopeStore(
           version: declaration.version,
           layers,
         };
-        const key = JSON.stringify([target.connector, target.stream]);
-        read.set(key, scope);
-        skipped.set(key, skippedCount);
         yield stream;
       }
     },

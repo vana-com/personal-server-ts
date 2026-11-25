@@ -3,18 +3,20 @@ import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createLiteLegacyStoreRunner } from "./legacy-runner.js";
 
-// The runner's retirement decisions, over in-memory scope storage and a
+// The runner's import decisions, over in-memory scope storage and a
 // recording seed intake.
 
-const manifestOf = (connector: string, stream: string) =>
+const manifestOf = (connector: string, ...streams: string[]) =>
   JSON.stringify({
     connector_key: connector,
     version: "1",
-    streams: [
-      { name: stream, semantics: "mutable_state", primary_key: ["id"] },
-    ],
+    streams: streams.map((name) => ({
+      name,
+      semantics: "mutable_state",
+      primary_key: ["id"],
+    })),
   });
-const manifest = manifestOf("spotify", "saved_tracks");
+const manifest = manifestOf("spotify", "saved_tracks", "profile");
 const githubManifest = manifestOf("github", "starred");
 
 type Versions = Map<string, { collectedAt: string; body: unknown }[]>;
@@ -36,9 +38,6 @@ function memoryStorage(scopes: Versions, reads: string[] = []) {
         ?.find((v) => v.collectedAt === collectedAt);
       if (!found) throw new Error(`missing envelope ${scope}@${collectedAt}`);
       return { data: found.body };
-    },
-    deleteScope: async (scope: string) => {
-      scopes.delete(scope);
     },
   } as never;
 }
@@ -82,17 +81,16 @@ const version = (rows: unknown, collectedAt = "2026-11-01T00:00:00.000Z") => ({
 function runner(
   scopes: Versions,
   intake: SeedIntake,
-  options: { retire?: boolean; reads?: string[] } = {},
+  options: { reads?: string[] } = {},
 ) {
   return createLiteLegacyStoreRunner({
     storage: memoryStorage(scopes, options.reads),
     intake: async () => intake,
     manifests: () => [manifest, githubManifest],
-    retireLegacy: () => options.retire ?? true,
   });
 }
 
-it("keeps a scope whose older version the import skipped", async () => {
+it("imports the newest rows and leaves an older app-shaped version out", async () => {
   const scopes: Versions = new Map([
     [
       "spotify.saved_tracks",
@@ -112,6 +110,42 @@ it("keeps a scope whose older version the import skipped", async () => {
   expect(scopes.has("spotify.saved_tracks")).toBe(true);
 });
 
+it("an app-shaped newest body is left out without reading older versions, and later streams still import", async () => {
+  const scopes: Versions = new Map([
+    [
+      "spotify.saved_tracks",
+      [
+        {
+          collectedAt: "2026-11-02T00:00:00.000Z",
+          body: { savedTracks: [{ id: "app" }] },
+        },
+        // An older version whose envelope is unreadable.
+        { collectedAt: "2026-11-01T00:00:00.000Z", body: null },
+      ],
+    ],
+    ["github.starred", [version([{ id: "g1" }], "2026-11-03T00:00:00.000Z")]],
+  ]);
+  const storage = memoryStorage(scopes, []) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  const read = storage.readEnvelope;
+  storage.readEnvelope = async (scope, at) => {
+    if (at === "2026-11-01T00:00:00.000Z") throw new Error("unreadable");
+    return read(scope, at);
+  };
+  const { intake, imported } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: storage as never,
+    intake: async () => intake,
+    manifests: () => [manifest, githubManifest],
+  });
+  await live.run(new AbortController().signal);
+  expect(imported).toEqual(["g1"]);
+  expect(live.report()?.streams.excluded).toEqual([
+    { reason: "not_stream_rows", scopes: 1 },
+  ]);
+});
+
 it("a second wake never deletes an alias whose rows were not imported", async () => {
   const scopes: Versions = new Map([
     ["spotify.saved_tracks", [version([{ id: "canonical" }])]],
@@ -127,25 +161,27 @@ it("a second wake never deletes an alias whose rows were not imported", async ()
   ]);
   await live.run(signal);
   expect(imported).toEqual(["canonical"]);
-  // Either every row of both scopes is imported, or the alias is kept.
-  expect(imported.includes("alias") || scopes.has("spotify.savedTracks")).toBe(
-    true,
-  );
-  expect(scopes.has("spotify.saved_tracks")).toBe(false);
+  // Nothing is removed: both scopes stay.
+  expect([...scopes.keys()].sort()).toEqual([
+    "spotify.savedTracks",
+    "spotify.saved_tracks",
+  ]);
 });
 
-it("retires a scope it imported itself", async () => {
+it("imports a scope and never removes it", async () => {
   const scopes: Versions = new Map([
     ["spotify.saved_tracks", [version([{ id: "a" }])]],
   ]);
-  const { intake } = recordingIntake();
+  const { intake, imported } = recordingIntake();
   await runner(scopes, intake).run(new AbortController().signal);
-  expect(scopes.size).toBe(0);
+  expect(imported).toEqual(["a"]);
+  expect(scopes.has("spotify.saved_tracks")).toBe(true);
 });
 
 it("a deleted connector is refused and the next connector still imports", async () => {
   const scopes: Versions = new Map([
     ["spotify.saved_tracks", [version([{ id: "s1" }])]],
+    ["spotify.profile", [version([{ id: "p1" }])]],
     ["github.starred", [version([{ id: "g1" }])]],
   ]);
   const { intake, imported } = recordingIntake(["spotify"]);
@@ -153,9 +189,9 @@ it("a deleted connector is refused and the next connector still imports", async 
   await live.run(new AbortController().signal);
   expect(imported).toEqual(["g1"]);
   expect(scopes.has("spotify.saved_tracks")).toBe(true);
-  expect(scopes.has("github.starred")).toBe(false);
+  expect(scopes.has("github.starred")).toBe(true);
   expect(live.report()?.streams.refused).toEqual([
-    { reason: "deleted", streams: 1, rows: 0 },
+    { reason: "deleted", streams: 2, rows: 0 },
   ]);
 });
 
@@ -171,7 +207,7 @@ it("a second wake reads no history of a completed stream, and its missing old en
   ]);
   const reads: string[] = [];
   const { intake, imported } = recordingIntake();
-  const live = runner(scopes, intake, { retire: false, reads });
+  const live = runner(scopes, intake, { reads });
   const signal = new AbortController().signal;
   await live.run(signal);
   expect(imported.sort()).toEqual(["s0", "s1"]);

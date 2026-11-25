@@ -655,7 +655,6 @@ export async function createIndexedDbPsLiteRuntime(
         return streamSyncSeed;
       },
       manifests: () => options.streamSyncRetainedManifests?.() ?? [],
-      retireLegacy: () => config.streamSync.retireLegacy,
       onWarning: (message, detail) => console.warn(message, detail),
     });
   }

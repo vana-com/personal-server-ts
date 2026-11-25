@@ -209,10 +209,9 @@ it("quarantines a row without a full key and still imports the rest: legacy = st
   expect(await records(context)).toHaveLength(4);
 });
 
-const twoStreams = async (retire: boolean) => {
+const twoStreams = async () => {
   const f = await fixture();
   const context = await f.boot();
-  context.config.streamSync.retireLegacy = retire;
   await f.answer(context, "off");
   await writeLegacy(context, "chatgpt.memories", rows(2));
   // One key twice with different bodies: this stream is refused whole.
@@ -225,9 +224,8 @@ const twoStreams = async (retire: boolean) => {
   return { context, report };
 };
 
-it("with retireLegacy off every legacy copy stays", async () => {
-  const { context, report } = await twoStreams(false);
-  expect(report.retired).toBeNull();
+it("imports one stream, refuses the other, and leaves every legacy copy", async () => {
+  const { context, report } = await twoStreams();
   expect(report.streams.refused).toEqual([
     { reason: "invalid_record", streams: 1, rows: 2 },
   ]);
@@ -235,12 +233,6 @@ it("with retireLegacy off every legacy copy stays", async () => {
     "chatgpt.conversations",
     "chatgpt.memories",
   ]);
-});
-
-it("with retireLegacy on imported streams lose their copy and a refused stream keeps its own", async () => {
-  const { context, report } = await twoStreams(true);
-  expect(report.retired).toEqual({ scopes: 1 });
-  expect(scopesOf(context)).toEqual(["chatgpt.conversations"]);
   expect(await records(context)).toHaveLength(2);
 });
 
