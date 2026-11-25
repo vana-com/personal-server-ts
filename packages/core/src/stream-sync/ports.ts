@@ -215,6 +215,19 @@ export class ChangeFeedAbsentError extends Error {
   }
 }
 
+/**
+ * The gateway refused the cursor a change request carried (`after` or
+ * `since`): it cannot read it, for instance after a change of cursor format.
+ * Sending the same cursor again cannot succeed. The caller drops it and asks
+ * from no position, which the gateway answers at once with a fresh one.
+ */
+export class ChangeCursorRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChangeCursorRejectedError";
+  }
+}
+
 declare const changeCursorBrand: unique symbol;
 
 /**
@@ -224,22 +237,26 @@ declare const changeCursorBrand: unique symbol;
  * in range. A client keeps it exactly as received, compares it with `===`, and
  * sends it back.
  *
- * The type is a branded `symbol`, though the value at run time is the wire
- * string. TypeScript refuses `<`, `>`, `+`, `-`, `BigInt(...)`, and a template
- * literal on a symbol, and a `string` or `number` would allow them. Only
+ * The type is a branded `string`: the value at run time is the wire string,
+ * and a `symbol` brand would have been a lie (`Symbol.keyFor(cursor)` compiled
+ * and threw). The brand keeps a bare `string` or `number` from passing for a
+ * cursor, and TypeScript still refuses `-`, `*` and `Symbol.keyFor` on it. It
+ * cannot refuse `<`, `>`, `+`, `Number(...)`, `BigInt(...)` or `parseInt(...)`,
+ * which a string allows: ESLint rejects those on cursor-named values in the
+ * files that handle cursors (see `eslint.config.js`). Only
  * {@link changeCursorFromWire} makes one and {@link changeCursorToWire} sends
  * one; no other code has a reason to look at the characters.
  */
-export type ChangeCursor = symbol & { readonly [changeCursorBrand]: true };
+export type ChangeCursor = string & { readonly [changeCursorBrand]: true };
 
 /** The one place a cursor is made: the string the gateway answered with. */
 export function changeCursorFromWire(wire: string): ChangeCursor {
-  return wire as unknown as ChangeCursor;
+  return wire as ChangeCursor;
 }
 
 /** The one place a cursor is read: the request parameter that returns it. */
 export function changeCursorToWire(cursor: ChangeCursor): string {
-  return cursor as unknown as string;
+  return cursor as string;
 }
 
 /** The answer to one held change request. */

@@ -916,6 +916,57 @@ describe("waitForChange", () => {
     ).rejects.toThrow(/change answer/);
   });
 
+  it.each([
+    ["after", "Invalid after: expected a change-feed cursor"],
+    ["since", "Invalid since: expected a change-feed cursor"],
+  ])(
+    "reads the change route's 400 on its %s cursor as a rejected cursor",
+    async (_name, error) => {
+      const { registry } = waiting(
+        () => new Response(JSON.stringify({ error }), { status: 400 }),
+      );
+      const failure = await registry.waitForChange!(
+        cursorOf("12"),
+        25_000,
+        new AbortController().signal,
+        cursorOf("11"),
+      ).catch((e: unknown) => e);
+      expect(failure).toMatchObject({ name: "ChangeCursorRejectedError" });
+    },
+  );
+
+  it("keeps any other 400 a generic failure, and the legacy-route 400 an absent route", async () => {
+    const other = waiting(
+      () =>
+        new Response(JSON.stringify({ error: "Invalid wait: too long" }), {
+          status: 400,
+        }),
+    );
+    const failure = await other.registry.waitForChange!(
+      cursorOf("c1"),
+      25_000,
+      new AbortController().signal,
+      undefined,
+    ).catch((e: unknown) => e);
+    expect((failure as Error).name).toBe("Error");
+    expect((failure as Error).message).toMatch(/400/);
+    const legacy = waiting(
+      () =>
+        new Response(
+          JSON.stringify({ error: "Invalid dataPointId: changes" }),
+          { status: 400 },
+        ),
+    );
+    await expect(
+      legacy.registry.waitForChange!(
+        undefined,
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
+    ).rejects.toMatchObject({ name: "ChangeFeedAbsentError" });
+  });
+
   it("a 400 on the cursor it sent is a failure that may pass, not an absent route (a numeric cursor from before the opaque one)", async () => {
     const { registry } = waiting(
       () =>

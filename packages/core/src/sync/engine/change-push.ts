@@ -1,5 +1,6 @@
 import { NODE_MAX_TIMER_DELAY_MS } from "../../stream-sync/timer.js";
 import {
+  ChangeCursorRejectedError,
   ChangeFeedAbsentError,
   RegistryOverloadError,
   type ChangeCursor,
@@ -101,6 +102,11 @@ export function createRegistryChangePush(
       let healthy = false;
       let afterFailure = false;
       let failures = 0;
+      // A rejected cursor is retried once at once, with no cursor. Set by that
+      // retry, cleared when a request that carried a cursor is answered: a
+      // gateway that rejects every cursor it hands out gets the back-off, not
+      // a request loop.
+      let droppedCursor = false;
       const setHealth = (next: boolean) => {
         if (healthy === next || lifetime.signal.aborted) return;
         healthy = next;
@@ -128,7 +134,9 @@ export function createRegistryChangePush(
         }
       };
 
-      async function once(): Promise<"answer" | "failed" | "absent" | number> {
+      async function once(): Promise<
+        "answer" | "failed" | "rejected" | "absent" | number
+      > {
         const request = new AbortController();
         let timer: ReturnType<typeof setTimeout> | undefined;
         let onStop: (() => void) | undefined;
@@ -150,13 +158,21 @@ export function createRegistryChangePush(
           lifetime.signal.addEventListener("abort", onStop, { once: true });
         });
         try {
-          const since = cursor === undefined ? undefined : handlers.since();
+          const sentCursor = cursor !== undefined;
+          const since = sentCursor ? handlers.since() : undefined;
           const wait = waitForChange!(cursor, waitMs, request.signal, since);
           wait.catch(() => {}); // a late failure after the race is not ours
           const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
           cursor = answer.cursor;
-          failures = 0;
+          // An answer to a request with no cursor, after one was rejected,
+          // only says the gateway can mint cursors. The failure run ends when
+          // a request that carried one is answered, so a gateway that rejects
+          // every cursor it hands out meets a growing back-off.
+          if (sentCursor || !droppedCursor) {
+            droppedCursor = false;
+            failures = 0;
+          }
           setHealth(true);
           // The position first: the cycle a poke starts samples it.
           handlers.onPosition(answer.cursor);
@@ -168,6 +184,11 @@ export function createRegistryChangePush(
         } catch (error) {
           if (error instanceof RegistryOverloadError) return error.retryAfterMs;
           if (error instanceof ChangeFeedAbsentError) return "absent";
+          if (
+            error instanceof ChangeCursorRejectedError &&
+            cursor !== undefined
+          )
+            return "rejected";
           return "failed";
         } finally {
           clearTimeout(timer);
@@ -193,7 +214,19 @@ export function createRegistryChangePush(
             await sleep(waitMs);
             continue;
           }
-          if (outcome === "failed") {
+          if (outcome === "rejected") {
+            // The gateway cannot read the cursor held: resending it cannot
+            // succeed. Ask from no position (the gateway answers at once with
+            // a fresh cursor); that first answer pokes a full pull. The retry
+            // is at once, once; after that the back-off below applies.
+            cursor = undefined;
+            const retryAtOnce = !droppedCursor;
+            droppedCursor = true;
+            setHealth(false);
+            afterFailure = true;
+            if (retryAtOnce) continue;
+          }
+          if (outcome === "failed" || outcome === "rejected") {
             setHealth(false);
             afterFailure = true;
             const wait = changePushBackoffMs(failures);

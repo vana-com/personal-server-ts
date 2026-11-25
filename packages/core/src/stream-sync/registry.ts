@@ -28,6 +28,7 @@ import {
   AmbiguousRegistryReplyError,
   RegistryUnavailableError,
   RegistryOverloadError,
+  ChangeCursorRejectedError,
   ChangeFeedAbsentError,
   RegistryRefusedError,
   RegistryBatchRouteMissingError,
@@ -710,12 +711,20 @@ export function createGatewayStreamSyncRegistry(
       // dataPointId..."). Any other 400 is the change route refusing this
       // request (the route's own errors name `user`, `after`, `wait` or `since`): a
       // failure that may pass, not an absence.
+      // A 400's message is read once: it tells a legacy route's refusal and the
+      // change route's refusal of a cursor apart from any other 400.
+      const refusal = res.status === 400 ? await refusalMessage(res) : "";
       if (
         res.status === 404 ||
         res.status === 405 ||
-        (res.status === 400 && (await isLegacyRouteRefusal(res)))
+        refusal.startsWith(LEGACY_REFUSAL)
       ) {
         throw absentFeed(res.status);
+      }
+      if (/^Invalid (after|since):/.test(refusal)) {
+        throw new ChangeCursorRejectedError(
+          `registry change wait failed: 400 ${refusal}`,
+        );
       }
       if (!res.ok) {
         throw new Error(`registry change wait failed: ${res.status}`);
@@ -802,20 +811,17 @@ function parseDelta(
 const LEGACY_REFUSAL = "Invalid dataPointId";
 
 /**
- * True when a 400 is the gateway's `/v1/data/:dataPointId` handler refusing the
- * path segment `changes`, which is what a gateway without the change route
- * answers. That handler's refusals say "Invalid dataPointId"; the change
- * route's own 400s say "Invalid user", "Invalid after", "Invalid wait" or
- * "Invalid since".
+ * The `error` text of a 400, or "" when the body has none. A gateway without
+ * the change route answers its `/v1/data/:dataPointId` handler's refusal of
+ * the id `changes` ("Invalid dataPointId..."); the change route's own 400s say
+ * "Invalid user", "Invalid after", "Invalid wait" or "Invalid since".
  */
-async function isLegacyRouteRefusal(res: Response): Promise<boolean> {
+async function refusalMessage(res: Response): Promise<string> {
   try {
     const body = (await res.json()) as { error?: unknown };
-    return (
-      typeof body.error === "string" && body.error.startsWith(LEGACY_REFUSAL)
-    );
+    return typeof body.error === "string" ? body.error : "";
   } catch {
-    return false;
+    return "";
   }
 }
 
