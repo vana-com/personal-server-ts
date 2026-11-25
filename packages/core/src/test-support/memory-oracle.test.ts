@@ -299,6 +299,55 @@ describe("memory-oracle temp roots", () => {
   });
 });
 
+describe("memory-oracle workload contract", () => {
+  it("loads the module without calling an export in load-only mode", async () => {
+    const root = mkdtempSync(join(tmpdir(), "memory-oracle-load-only-"));
+    try {
+      const module = join(root, "workload.mjs");
+      const marker = join(root, "imported.txt");
+      writeFileSync(
+        module,
+        [
+          'import { writeFileSync } from "node:fs";',
+          "writeFileSync(" + JSON.stringify(marker) + ', "loaded");',
+          'export function mustNotRun() { throw new Error("wrong invocation"); }',
+        ].join("\n"),
+      );
+      const measured = await run({ module, exportName: "" });
+      expect(readFileSync(marker, "utf8")).toBe("loaded");
+      expect(measured.result).toBe(null);
+      expect(measured.baselineBytes).toBeGreaterThan(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("passes the JSON argument to the named async export and returns its result", async () => {
+    const root = mkdtempSync(join(tmpdir(), "memory-oracle-workload-"));
+    try {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        "export async function work(input) { return { payload: input, present: true }; }",
+      );
+      const args = {
+        values: [0, false, null, "fixture"],
+        nested: { count: 3 },
+      };
+      const measured = await run(
+        { module, exportName: "work", args },
+        { gc: "none" },
+      );
+      expect(measured.result).toEqual({ payload: args, present: true });
+      expect(measured.peakBytes).toBe(
+        Math.max(0, measured.rawPeakBytes - measured.baselineBytes),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
 describe("memory-oracle error paths", () => {
   function withWorkloadDir<T>(runFn: (root: string) => Promise<T>): Promise<T> {
     const temporary = join(homedir(), ".tmp");
