@@ -584,6 +584,9 @@ export function createLocalListing(
           connector: row.connector,
           ns: row.ns,
           control: row.control_state,
+          // A reconnect resets stream versions, so only the generation tells
+          // it from the connection it replaced. The audit output omits it.
+          ...(audit ? {} : { generation: row.generation }),
           streams,
         });
       }

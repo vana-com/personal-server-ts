@@ -248,6 +248,12 @@ export interface StreamSyncConnectionStatus {
   readonly connector: string;
   readonly ns: string;
   readonly control: ControlState["kind"];
+  /**
+   * The connection's generation. It changes when the connection is deleted
+   * and connected again, which resets stream versions. Present only in the
+   * plain status; the audited status omits it.
+   */
+  readonly generation?: number;
   readonly streams: Readonly<
     Record<
       string,
