@@ -502,3 +502,44 @@ describe("createReplicationDriver", () => {
       ).toThrow(RangeError);
   });
 });
+
+it("keeps failure visible until the scheduled retry succeeds", async () => {
+  const clock = fakeTimers();
+  const { stepper, steps } = manualStepper();
+  const driver = createReplicationDriver({
+    stepper,
+    budget,
+    timers: clock.timers,
+  });
+  driver.start();
+  steps[0]!.done.reject(new Error("temporary read failure"));
+  await flush();
+  expect(driver.status().lastError).toBe("temporary read failure");
+  expect(driver.status().nextWakeAt).toBe(T0 + REPLICA_STEP_ERROR_DELAY_MS);
+  clock.advance(REPLICA_STEP_ERROR_DELAY_MS);
+  expect(driver.status().lastError).toBe("temporary read failure");
+  steps[1]!.done.resolve(report());
+  await flush();
+  expect(driver.status().lastError).toBeUndefined();
+  expect(driver.status().lastStepAt).toBe(T0 + REPLICA_STEP_ERROR_DELAY_MS);
+  await driver.stop(0);
+});
+
+it("clears a failed step's retry timer when the driver is stopped", async () => {
+  const clock = fakeTimers();
+  const { stepper, steps } = manualStepper();
+  const driver = createReplicationDriver({
+    stepper,
+    budget,
+    timers: clock.timers,
+  });
+  driver.start();
+  steps[0]!.done.reject(new Error("temporary read failure"));
+  await flush();
+  expect(clock.armed()).toEqual([REPLICA_STEP_ERROR_DELAY_MS]);
+  expect(await driver.stop(0)).toBe(true);
+  expect(clock.armed()).toEqual([]);
+  clock.advance(REPLICA_STEP_ERROR_DELAY_MS);
+  expect(steps).toHaveLength(1);
+  expect(driver.status().state).toBe("stopped");
+});
