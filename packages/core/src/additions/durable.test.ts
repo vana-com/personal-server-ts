@@ -73,7 +73,6 @@ it("refuses an impossible calendar day instead of normalizing the display", () =
   expect(read("2026-02-30")).toBeNull();
 });
 
-
 const OWNER = "0x1111111111111111111111111111111111111111";
 const SOURCE = "test.conversations";
 const MASTER_KEY = new Uint8Array(32).fill(17);
