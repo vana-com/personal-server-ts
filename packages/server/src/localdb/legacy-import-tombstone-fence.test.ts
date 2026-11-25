@@ -47,3 +47,44 @@ it("import-refused-by-the-final-fence-leaves-no-tombstones", async () => {
     ),
   ).toEqual([]);
 });
+
+it("a transient count failure after receipt commit cannot turn it into a deletion refusal", async () => {
+  const w = await world();
+  const a = await w.device("a");
+  await a.run("live", ["live"]);
+  const query = a.db.query.bind(a.db);
+  let counts = 0;
+  let tripped = false;
+  a.db.query = (async (sql: string, params?: unknown[]) => {
+    if (sql.includes("SELECT count(*) AS n FROM log_tombstones") && ++counts === 2) {
+      tripped = true;
+      await a.db.batch([
+        {
+          sql: "INSERT INTO delete_intents(connector,delete_id,intent) VALUES ('fixture','d','{}')",
+        },
+      ]);
+      throw new Error("transient tombstone count failure after commit");
+    }
+    return query(sql, params);
+  }) as typeof a.db.query;
+
+  const result = await a.importSource("files", (base) => ({
+    ...base,
+    async *records() {
+      yield { id: "kept", v: "row" };
+    },
+    async *deletions() {
+      yield { id: "gone-1" };
+      yield { id: "gone-2" };
+    },
+  }));
+
+  expect(tripped).toBe(true);
+  expect(counts).toBe(3);
+  expect(result).toMatchObject({ kind: "imported", tombstoned: 2 });
+  expect(
+    await a.db.query(
+      "SELECT 1 FROM log_tombstones WHERE connection_id = 'pdpp.fixture~'",
+    ),
+  ).toHaveLength(2);
+});
