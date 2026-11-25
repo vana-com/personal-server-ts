@@ -356,4 +356,35 @@ describe("memory-oracle error paths", () => {
       ).rejects.toThrow(/unknown gc mode bogus/);
     });
   }, 30_000);
+
+  // The child prints its own report line after the workload returns, and the
+  // parent parses the last MEMORY_ORACLE line. A workload that schedules a
+  // later line therefore controls what the parent parses.
+  it("rejects a syntactically valid report with the wrong shape", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        "export function poisonReport(line) { setTimeout(() => { process.stdout.write(`MEMORY_ORACLE ${line}\\n`); }, 10); return 0; }",
+      );
+      await expect(
+        run({ module, exportName: "poisonReport", args: "{}" }),
+      ).rejects.toThrow(/malformed report/);
+    });
+  }, 30_000);
+
+  // Before the fix the JSON.parse throw escaped the close handler, so the
+  // promise never settled (and the throw surfaced as an uncaught error).
+  it("rejects a malformed report line instead of hanging", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        "export function poisonReport(line) { setTimeout(() => { process.stdout.write(`MEMORY_ORACLE ${line}\\n`); }, 10); return 0; }",
+      );
+      await expect(
+        run({ module, exportName: "poisonReport", args: "{not json" }),
+      ).rejects.toThrow(/unreadable report/);
+    });
+  }, 30_000);
 });
