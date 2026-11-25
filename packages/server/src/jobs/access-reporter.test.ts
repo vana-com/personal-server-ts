@@ -330,6 +330,29 @@ describe("access reporter batching", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("interrupts an in-flight retry backoff when shutdown begins", async () => {
+    const send = vi.fn(async () => new Response(null, { status: 503 }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    const flushed = instance.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    const stopping = instance.stop();
+    let settled = false;
+    void stopping.then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(true);
+    await Promise.all([flushed, stopping]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ attempts: 1, droppedTotal: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
   it("sends once on shutdown rather than waiting out the backoff", async () => {
     const send = vi.fn(async () => {
       throw new Error("connect ECONNREFUSED");
