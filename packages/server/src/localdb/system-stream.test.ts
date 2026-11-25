@@ -16,6 +16,26 @@ import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
+import { ACCESS_ACTIVITY_DESCRIPTOR } from "../../../core/src/logging/activity-stream.js";
+
+it("rejects an access activity descriptor with an unreadable timestamp", () => {
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    action: "read",
+    scope: "fixture.scope",
+    grantId: "fixture-grant",
+    builder: "fixture-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, occurredAt: "not a timestamp" }),
+  ).toThrow("Invalid access activity timestamp");
+});
+
 
 it.each([{ schemaVersion: 2 }, { phase: "finished" }])(
   "reports a stable activity descriptor error for %j",
