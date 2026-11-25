@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readdir, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readdir, readFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAccessLogWriter, type AccessLogEntry } from "./access-log.js";
+import { createAccessLogReader } from "./access-reader.js";
 
 function makeEntry(overrides: Partial<AccessLogEntry> = {}): AccessLogEntry {
   return {
@@ -158,6 +159,144 @@ describe("AccessLogWriter", () => {
 
     const content2 = await readFile(join(logsDir, files[1]), "utf-8");
     expect(JSON.parse(content2.trim()).logId).toBe("day2");
+  });
+
+  it("buckets an entry by UTC date, not local date", async () => {
+    const logsDir = join(tempDir, "logs");
+    const writer = createAccessLogWriter(logsDir);
+
+    // 23:30 on Jan 28 in UTC-05:00 is 04:30 on Jan 29 in UTC.
+    await writer.write(
+      makeEntry({
+        logId: "utc-bucket",
+        timestamp: "2026-01-28T23:30:00-05:00",
+      }),
+    );
+
+    const files = await readdir(logsDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toBe("access-2026-01-29.log");
+  });
+});
+
+describe("AccessLogReader", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "access-log-reader-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns an empty result when the logs directory does not exist", async () => {
+    const reader = createAccessLogReader(join(tempDir, "logs"));
+
+    const result = await reader.read();
+
+    expect(result).toEqual({ logs: [], total: 0, limit: 50, offset: 0 });
+  });
+
+  it("returns entries newest-first across day files with total and defaults", async () => {
+    const logsDir = join(tempDir, "logs");
+    const writer = createAccessLogWriter(logsDir);
+
+    await writer.write(
+      makeEntry({ logId: "old", timestamp: "2026-01-28T10:00:00Z" }),
+    );
+    await writer.write(
+      makeEntry({ logId: "mid", timestamp: "2026-01-28T12:00:00Z" }),
+    );
+    await writer.write(
+      makeEntry({ logId: "new", timestamp: "2026-01-29T09:00:00Z" }),
+    );
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(3);
+    expect(result.limit).toBe(50);
+    expect(result.offset).toBe(0);
+    expect(result.logs.map((entry) => entry.logId)).toEqual([
+      "new",
+      "mid",
+      "old",
+    ]);
+  });
+
+  it("round-trips entries written by the writer with all fields intact", async () => {
+    const logsDir = join(tempDir, "logs");
+    const writer = createAccessLogWriter(logsDir);
+    const entry = makeEntry();
+
+    await writer.write(entry);
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(1);
+    expect(result.logs[0]).toEqual(entry);
+  });
+
+  it("paginates with limit and offset", async () => {
+    const logsDir = join(tempDir, "logs");
+    const writer = createAccessLogWriter(logsDir);
+
+    await writer.write(
+      makeEntry({ logId: "old", timestamp: "2026-01-28T10:00:00Z" }),
+    );
+    await writer.write(
+      makeEntry({ logId: "mid", timestamp: "2026-01-28T12:00:00Z" }),
+    );
+    await writer.write(
+      makeEntry({ logId: "new", timestamp: "2026-01-29T09:00:00Z" }),
+    );
+
+    const reader = createAccessLogReader(logsDir);
+
+    const page1 = await reader.read({ limit: 2 });
+    expect(page1.logs.map((entry) => entry.logId)).toEqual(["new", "mid"]);
+    expect(page1.total).toBe(3);
+    expect(page1.limit).toBe(2);
+    expect(page1.offset).toBe(0);
+
+    const page2 = await reader.read({ limit: 2, offset: 2 });
+    expect(page2.logs.map((entry) => entry.logId)).toEqual(["old"]);
+    expect(page2.total).toBe(3);
+
+    const beyond = await reader.read({ limit: 2, offset: 3 });
+    expect(beyond.logs).toEqual([]);
+    expect(beyond.total).toBe(3);
+  });
+
+  it("skips malformed lines and ignores non-access files", async () => {
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+
+    const good = makeEntry({ logId: "good" });
+    const alsoGood = makeEntry({
+      logId: "also-good",
+      timestamp: "2026-01-28T13:00:00Z",
+    });
+    await writeFile(
+      join(logsDir, "access-2026-01-28.log"),
+      `${JSON.stringify(good)}\nnot-json\n${JSON.stringify(alsoGood)}\n`,
+    );
+    await writeFile(
+      join(logsDir, "notes.log"),
+      `${JSON.stringify(makeEntry({ logId: "stray-log" }))}\n`,
+    );
+    await writeFile(
+      join(logsDir, "access-2026-01-28.txt"),
+      `${JSON.stringify(makeEntry({ logId: "stray-txt" }))}\n`,
+    );
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(2);
+    expect(result.logs.map((entry) => entry.logId).sort()).toEqual([
+      "also-good",
+      "good",
+    ]);
   });
 });
 
