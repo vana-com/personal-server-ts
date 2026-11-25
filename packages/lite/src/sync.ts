@@ -18,7 +18,6 @@ import {
   createViewChanges,
   inventoryVersionLister,
   legacyHeadFrom,
-  legacyLocalFrom,
   modeOfAccount,
   pendingBlobsFrom,
   type LocalSyncDeps,
@@ -672,10 +671,6 @@ export async function createPsLiteSyncManager(
           // and in storage by this runtime's own scope delete: the manager is
           // read when the stage runs, not when the database opens.
           legacyDelete: () => ({
-            local: legacyLocalFrom(
-              options.storage,
-              (scope) => options.storage.scopeFilesAbsent?.(scope) ?? false,
-            ),
             scopesOf: legacyScopesOfConnector,
             streamsOf: legacyStreamsOfScope,
             mode: modeOfAccount(() => mode.read()),

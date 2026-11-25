@@ -1,4 +1,3 @@
-import { gatedPort } from "@opendatalabs/personal-server-ts-core/ports";
 import { existsSync, statSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
@@ -545,24 +544,22 @@ export function createImportOperations(
     ): Promise<boolean> {
       await finishOwedPublications(hold);
       return removal(hold, scope, () =>
-        immediate(
-          gatedPort(fence.writeReady, () => {
-            recover(undefined);
-            const row = index.findByPath(fence.path);
-            if (
-              !row ||
-              row.id !== fence.id ||
-              row.scope !== scope ||
-              row.collectedAt !== collectedAt
-            ) {
-              return false;
-            }
-            retire("path = @path", { path: fence.path });
-            deleteDataFileSync(options, scope, collectedAt);
-            index.deleteByPath(fence.path);
-            return true;
-          }),
-        ),
+        immediate(() => {
+          recover(undefined);
+          const row = index.findByPath(fence.path);
+          if (
+            !row ||
+            row.id !== fence.id ||
+            row.scope !== scope ||
+            row.collectedAt !== collectedAt
+          ) {
+            return false;
+          }
+          retire("path = @path", { path: fence.path });
+          deleteDataFileSync(options, scope, collectedAt);
+          index.deleteByPath(fence.path);
+          return true;
+        }),
       );
     },
     /**

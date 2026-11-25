@@ -1,4 +1,3 @@
-import { gatedPort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataStoragePort,
   DataVersionWriter,
@@ -77,16 +76,12 @@ export interface PsLiteDataFileStore {
    * it was. Stores without it cannot take streamed scope uploads.
    */
   openEnvelopeWriter?(path: string): Promise<PsLiteEnvelopeWriter>;
-  deleteEnvelope(path: string, writeReady?: () => boolean): Promise<void>;
-  scopeFilesAbsent?(scope: string): Promise<boolean>;
+  deleteEnvelope(path: string): Promise<void>;
   readBlockManifest?(path: string): Promise<DataBlockManifest | null>;
   writeBlockManifest?(path: string, manifest: DataBlockManifest): Promise<void>;
   readBlockPayload?(path: string): Promise<DataScopeBlock | null>;
   writeBlockPayload?(path: string, block: DataScopeBlock): Promise<void>;
-  deleteBlockTree?(
-    pathPrefix: string,
-    writeReady?: () => boolean,
-  ): Promise<void>;
+  deleteBlockTree?(pathPrefix: string): Promise<void>;
 }
 
 /** One envelope file being written by `PsLiteDataFileStore.openEnvelopeWriter`. */
@@ -207,14 +202,6 @@ export function createIndexedDbFallbackDataFileStore(
 ): PsLiteDataFileStore {
   return {
     kind: "indexeddb",
-    async scopeFilesAbsent(scope) {
-      const prefixes = [`data/${scope}/`, `blocks/${scope}/`];
-      return ![
-        ...envelopes.keys(),
-        ...blockManifests.keys(),
-        ...blockPayloads.keys(),
-      ].some((path) => prefixes.some((prefix) => path.startsWith(prefix)));
-    },
     async readEnvelope(path) {
       return envelopes.get(path) ?? null;
     },
@@ -227,8 +214,8 @@ export function createIndexedDbFallbackDataFileStore(
       envelopes.set(path, envelope);
       return new TextEncoder().encode(JSON.stringify(envelope)).length;
     },
-    async deleteEnvelope(path, writeReady) {
-      gatedPort(writeReady, envelopes.delete.bind(envelopes))(path);
+    async deleteEnvelope(path) {
+      envelopes.delete(path);
     },
     async readBlockManifest(path) {
       return blockManifests.get(path) ?? null;
@@ -242,9 +229,9 @@ export function createIndexedDbFallbackDataFileStore(
     async writeBlockPayload(path, block) {
       blockPayloads.set(path, block);
     },
-    async deleteBlockTree(pathPrefix, writeReady) {
-      gatedPort(writeReady, deleteMapPrefix)(blockManifests, pathPrefix);
-      gatedPort(writeReady, deleteMapPrefix)(blockPayloads, pathPrefix);
+    async deleteBlockTree(pathPrefix) {
+      deleteMapPrefix(blockManifests, pathPrefix);
+      deleteMapPrefix(blockPayloads, pathPrefix);
     },
   };
 }
@@ -308,38 +295,6 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
 
   return {
     kind: "opfs",
-    async scopeFilesAbsent(scope) {
-      const containsFile = async (
-        dir: FileSystemDirectoryHandle,
-      ): Promise<boolean> => {
-        const iterable = dir as FileSystemDirectoryHandle & {
-          values(): AsyncIterable<
-            FileSystemFileHandle | FileSystemDirectoryHandle
-          >;
-        };
-        for await (const child of iterable.values()) {
-          if (
-            child.kind === "file" ||
-            (await containsFile(child as FileSystemDirectoryHandle))
-          )
-            return true;
-        }
-        return false;
-      };
-      for (const prefix of ["data", "blocks"]) {
-        try {
-          const parent = await root.getDirectoryHandle(prefix);
-          const dir = await parent.getDirectoryHandle(scope);
-          if (await containsFile(dir)) return false;
-        } catch (error) {
-          if (!(
-            error instanceof DOMException && error.name === "NotFoundError"
-          ))
-            throw error;
-        }
-      }
-      return true;
-    },
     async readEnvelope(path) {
       try {
         const handle = await getOpfsFileHandle(root, path);
@@ -409,13 +364,13 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
         },
       };
     },
-    async deleteEnvelope(path, writeReady) {
+    async deleteEnvelope(path) {
       const parts = path.split("/").filter(Boolean);
       const fileName = parts.pop();
       if (!fileName) return;
       try {
         const dir = await getOrCreateOpfsDirectory(root, parts);
-        await gatedPort(writeReady, dir.removeEntry.bind(dir))(fileName);
+        await dir.removeEntry(fileName);
       } catch (err) {
         if (err instanceof DOMException && err.name === "NotFoundError") {
           return;
@@ -435,8 +390,8 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
     async writeBlockPayload(path, block) {
       await writeJsonOpfsFile(root, path, block);
     },
-    async deleteBlockTree(pathPrefix, writeReady) {
-      await removeOpfsDirectoryTree(root, pathPrefix, writeReady);
+    async deleteBlockTree(pathPrefix) {
+      await removeOpfsDirectoryTree(root, pathPrefix);
     },
   };
 }
@@ -474,17 +429,13 @@ async function writeJsonOpfsFile(
 async function removeOpfsDirectoryTree(
   root: FileSystemDirectoryHandle,
   pathPrefix: string,
-  writeReady?: () => boolean,
 ): Promise<void> {
   const parts = pathPrefix.split("/").filter(Boolean);
   const directoryName = parts.pop();
   if (!directoryName) return;
   try {
     const parent = await getOrCreateOpfsDirectory(root, parts);
-    await gatedPort(writeReady, parent.removeEntry.bind(parent))(
-      directoryName,
-      { recursive: true },
-    );
+    await parent.removeEntry(directoryName, { recursive: true });
   } catch (err) {
     if (err instanceof DOMException && err.name === "NotFoundError") {
       return;
@@ -871,12 +822,6 @@ export async function createPersistentPsLiteStorage(
   }
 
   const storagePort: PsLiteStoragePort = {
-    async scopeFilesAbsent(scope) {
-      return (
-        (await fileStore.scopeFilesAbsent?.(scope)) === true &&
-        (await fallbackStore.scopeFilesAbsent?.(scope)) === true
-      );
-    },
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
     legacyWriteSeal,
@@ -1379,14 +1324,13 @@ export async function createPersistentPsLiteStorage(
       const path = envelopePath(scope, collectedAt);
       return removal(hold, () =>
         withPathLock(path, () =>
-          gatedPort(fence?.writeReady, eraseUnderPathLock)(
+          eraseUnderPathLock(
             path,
             (e) =>
               e.scope === scope &&
               e.collectedAt === collectedAt &&
               e.path === path &&
               (fence === undefined || e.id === fence.id),
-            fence?.writeReady,
           ),
         ),
       ).then((outcome) => outcome === true);
@@ -1441,16 +1385,10 @@ export async function createPersistentPsLiteStorage(
    * delete that asked for it: a failure leaves the scope on the pending list,
    * which is retried on load and on the next call.
    */
-  async function dropLedger(
-    scope: string,
-    writeReady?: () => boolean,
-  ): Promise<void> {
+  async function dropLedger(scope: string): Promise<void> {
     const attempt = async (name: string): Promise<boolean> => {
       try {
-        await gatedPort(
-          writeReady,
-          storagePort.deleteFirstSeenLedger!.bind(storagePort),
-        )(name);
+        await storagePort.deleteFirstSeenLedger!(name);
         return true;
       } catch {
         return false;
@@ -1521,7 +1459,6 @@ export async function createPersistentPsLiteStorage(
   async function eraseUnderPathLock(
     path: string,
     match: (entry: IndexEntry) => boolean,
-    writeReady?: () => boolean,
   ): Promise<boolean | "moved"> {
     const found = await enqueue<ErasedRow | "moved" | null>(async () => {
       const entry = state.entries.find(match);
@@ -1546,26 +1483,10 @@ export async function createPersistentPsLiteStorage(
       const blob = envelopePath(found.scope, found.collectedAt);
       const tree = blockTreePath(found.scope, found.collectedAt);
       const parts = await Promise.allSettled([
-        gatedPort(writeReady, fileStore.deleteEnvelope.bind(fileStore))(
-          blob,
-          writeReady,
-        ),
-        gatedPort(writeReady, fallbackStore.deleteEnvelope.bind(fallbackStore))(
-          blob,
-          writeReady,
-        ),
-        (fileStore.deleteBlockTree &&
-          gatedPort(writeReady, fileStore.deleteBlockTree.bind(fileStore))(
-            tree,
-            writeReady,
-          )) ??
-          Promise.resolve(),
-        (fallbackStore.deleteBlockTree &&
-          gatedPort(
-            writeReady,
-            fallbackStore.deleteBlockTree.bind(fallbackStore),
-          )(tree, writeReady)) ??
-          Promise.resolve(),
+        fileStore.deleteEnvelope(blob),
+        fallbackStore.deleteEnvelope(blob),
+        fileStore.deleteBlockTree?.(tree) ?? Promise.resolve(),
+        fallbackStore.deleteBlockTree?.(tree) ?? Promise.resolve(),
       ]);
       const failed = parts.find(
         (part): part is PromiseRejectedResult => part.status === "rejected",
@@ -1573,10 +1494,7 @@ export async function createPersistentPsLiteStorage(
       if (failed) throw failed.reason;
       await enqueue(async () => {
         if (!state.entries.some((e) => e.id === found.id)) return;
-        await gatedPort(
-          writeReady,
-          publish,
-        )({
+        await publish({
           ...state,
           entries: state.entries.filter((e) => e.id !== found.id),
         });
@@ -1584,7 +1502,7 @@ export async function createPersistentPsLiteStorage(
       // The sidecar goes with the scope's last version.
       await persist();
       if (!state.entries.some((e) => e.scope === found.scope)) {
-        await dropLedger(found.scope, writeReady);
+        await dropLedger(found.scope);
       }
       return true;
     });

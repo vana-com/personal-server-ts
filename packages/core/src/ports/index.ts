@@ -1,4 +1,3 @@
-export { gatedPort, WriteAuthorityLostError } from "./write-authority.js";
 import type {
   LegacyWriteHold,
   LegacyWriteSeal,
@@ -139,7 +138,6 @@ export type VersionCommitResult =
  * that takes the same collection stamp has a different id.
  */
 export interface VersionFence {
-  writeReady?: () => boolean;
   id: number;
   path: string;
 }
@@ -179,8 +177,6 @@ export interface DataStoragePort extends RuntimeStoragePort {
   };
   listVersions(scope: string, options: DataStorageListOptions): IndexEntry[];
   countVersions(scope: string): number;
-  /** Physical scope absence, including files no longer named in the index. */
-  scopeFilesAbsent?(scope: string): Promise<boolean>;
   /**
    * Return an entry only if entry.scope === lookup.scope, including fileId
    * lookups; otherwise return undefined exactly as for a nonexistent fileId.
@@ -570,7 +566,6 @@ export interface DeleteDataPort {
   deleteBlobVersions(
     scope: string,
     versions: string[],
-    writeReady?: () => boolean,
   ): Promise<DeleteBlobVersionsOutcome>;
 }
 
@@ -659,11 +654,8 @@ export interface TombstoneFinalityPort {
  */
 export interface PendingBlobDeletionStore {
   list(): Promise<PendingBlobDeletion[]>;
-  add(keys: PendingBlobDeletion[], writeReady?: () => boolean): Promise<void>;
-  remove(
-    keys: PendingBlobDeletion[],
-    writeReady?: () => boolean,
-  ): Promise<void>;
+  add(keys: PendingBlobDeletion[]): Promise<void>;
+  remove(keys: PendingBlobDeletion[]): Promise<void>;
   /**
    * Highest tombstone version whose covered registry range (versions 1..v)
    * this store has already taken on for `scope`: every key in it is either
@@ -681,7 +673,6 @@ export interface PendingBlobDeletionStore {
     scope: string,
     keys: PendingBlobDeletion[],
     through: string | null,
-    writeReady?: () => boolean,
   ): Promise<void>;
 }
 

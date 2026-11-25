@@ -1,4 +1,3 @@
-import { gatedPort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   LegacyWriteHold,
@@ -200,9 +199,6 @@ export function createMemoryPsLiteStorage(
         : unsynced.slice(0, options.limit);
     },
 
-    async scopeFilesAbsent(scope) {
-      return ![...envelopes.values()].some((e) => e.scope === scope);
-    },
     async readEnvelope(scope, collectedAt) {
       return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
     },
@@ -444,32 +440,29 @@ export function createMemoryPsLiteStorage(
     },
 
     deleteVersion(scope, collectedAt, fence, hold) {
-      return removing(
-        hold,
-        gatedPort(fence?.writeReady, async () => {
-          for (const [path, entry] of entries.entries()) {
-            if (
-              entry.scope === scope &&
-              entry.collectedAt === collectedAt &&
-              (fence === undefined ||
-                (entry.id === fence.id && entry.path === fence.path))
-            ) {
-              entries.delete(path);
-              envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
-              const key = blockKey(entry.scope, entry.collectedAt);
-              blockManifests.delete(key);
-              for (const payloadKey of blockPayloads.keys()) {
-                if (payloadKey.startsWith(`${key}\n`)) {
-                  blockPayloads.delete(payloadKey);
-                }
+      return removing(hold, async () => {
+        for (const [path, entry] of entries.entries()) {
+          if (
+            entry.scope === scope &&
+            entry.collectedAt === collectedAt &&
+            (fence === undefined ||
+              (entry.id === fence.id && entry.path === fence.path))
+          ) {
+            entries.delete(path);
+            envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
+            const key = blockKey(entry.scope, entry.collectedAt);
+            blockManifests.delete(key);
+            for (const payloadKey of blockPayloads.keys()) {
+              if (payloadKey.startsWith(`${key}\n`)) {
+                blockPayloads.delete(payloadKey);
               }
-              dropEmptyLedger(entry.scope);
-              return true;
             }
+            dropEmptyLedger(entry.scope);
+            return true;
           }
-          return false;
-        }),
-      );
+        }
+        return false;
+      });
     },
 
     deleteByFileId(fileId, hold) {
@@ -527,14 +520,6 @@ export function createMemoryPsLiteDataFileStore(
   const blockPayloads = new Map<string, DataScopeBlock>();
   return {
     kind,
-    async scopeFilesAbsent(scope) {
-      const prefixes = [`data/${scope}/`, `blocks/${scope}/`];
-      return ![
-        ...files.keys(),
-        ...blockManifests.keys(),
-        ...blockPayloads.keys(),
-      ].some((path) => prefixes.some((prefix) => path.startsWith(prefix)));
-    },
     async readEnvelope(path) {
       return files.get(path) ?? null;
     },

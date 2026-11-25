@@ -1,7 +1,3 @@
-import {
-  gatedPort,
-  WriteAuthorityLostError,
-} from "../../ports/write-authority.js";
 import type { Logger } from "../../logger/index.js";
 import type { LegacyWriteHold } from "../../storage/legacy-write-seal.js";
 import type { IndexEntry } from "../../storage/index/types.js";
@@ -21,7 +17,6 @@ import type {
 import { computeDataPointId } from "../data-point-id.js";
 import {
   GatewayRefusalError,
-  LegacyHeadChangedError,
   isGatewayReservedScope,
 } from "../delete-data-port.js";
 import { isGatewayRefusalCode } from "../gateway-refusal.js";
@@ -95,7 +90,7 @@ export interface DeleteScopeStep {
    * The gateway's terminal refusal when status is "failed" and the gateway
    * named one (`GATEWAY_REFUSAL_CODES`) or the already-deleted answer: a retry will not change it.
    */
-  code?: GatewayRefusalError["code"] | "legacy_head_changed";
+  code?: GatewayRefusalError["code"];
 }
 
 export interface DeleteScopeResult {
@@ -374,58 +369,25 @@ function sealedTombstone<T>(
   return hold || !seal ? send() : seal.remove(send);
 }
 
-/** Bind authority once to every destructive worker port, including queue retries. */
-function gatedDeletePorts(
-  deps: DeleteScopeDeps,
-  ready: (() => boolean) | undefined,
-): DeleteScopeDeps {
-  if (!ready) return deps;
-  const storage = deps.storage;
-  const remote = deps.deleteData;
-  const queue = deps.pendingBlobDeletions;
-  return {
-    ...deps,
-    storage: {
-      ...storage,
-      deleteScope: gatedPort(ready, storage.deleteScope.bind(storage)),
-      deleteVersion: (scope, at, fence, hold) =>
-        gatedPort(ready, storage.deleteVersion.bind(storage))(
-          scope,
-          at,
-          fence && { ...fence, writeReady: ready },
-          hold,
-        ),
-      ...(storage.deleteFirstSeenLedger && {
-        deleteFirstSeenLedger: gatedPort(
-          ready,
-          storage.deleteFirstSeenLedger.bind(storage),
-        ),
-      }),
-    },
-    ...(remote && {
-      deleteData: {
-        ...remote,
-        tombstone: gatedPort(ready, (scope, fence) =>
-          remote.tombstone(scope, fence && { ...fence, writeReady: ready }),
-        ),
-        deleteBlobVersions: gatedPort(ready, (scope, versions) =>
-          remote.deleteBlobVersions(scope, versions, ready),
-        ),
-      },
-    }),
-    ...(queue && {
-      pendingBlobDeletions: {
-        ...queue,
-        add: gatedPort(ready, (keys) => queue.add(keys, ready)),
-        remove: gatedPort(ready, (keys) => queue.remove(keys, ready)),
-        ...(queue.enqueue && {
-          enqueue: gatedPort(ready, (scope, keys, through) =>
-            queue.enqueue!(scope, keys, through, ready),
-          ),
-        }),
-      },
-    }),
-  };
+/** The caller's write authority closed (`fence.writeReady` answers false). */
+function authorityLost(options: DeleteScopeOptions): boolean {
+  const ready = options.fence?.writeReady;
+  return ready !== undefined && !ready();
+}
+
+/**
+ * The pass stops where it is: the tombstone may have landed, and nothing
+ * after it ran. The caller repeats the delete once its authority is back; the
+ * local copy and the blob work are still there to resume from.
+ */
+function heldForAuthority(result: DeleteScopeResult): DeleteScopeResult {
+  if (result.steps.storage.status === "skipped")
+    result.steps.storage = {
+      status: "skipped",
+      reason: "write-authority-lost",
+    };
+  result.steps.local = { status: "skipped", reason: "write-authority-lost" };
+  return result;
 }
 
 export async function deleteScope(
@@ -433,7 +395,6 @@ export async function deleteScope(
   scope: string,
   options: DeleteScopeOptions = {},
 ): Promise<DeleteScopeResult> {
-  deps = gatedDeletePorts(deps, options.fence?.writeReady);
   const { storage, deleteData, pendingBlobDeletions, scopeDeletions, logger } =
     deps;
   const now = deps.now ?? (() => new Date());
@@ -540,15 +501,11 @@ export async function deleteScope(
       }
       result.durable = true;
     } catch (err) {
-      if (err instanceof WriteAuthorityLostError) throw err;
       const message = errorMessage(err);
       result.steps.gateway = {
         status: "failed",
         error: message,
         ...(err instanceof GatewayRefusalError && { code: err.code }),
-        ...(err instanceof LegacyHeadChangedError && {
-          code: "legacy_head_changed" as const,
-        }),
       };
       result.steps.storage = { status: "skipped", reason: "gateway-failed" };
       result.steps.local = { status: "skipped", reason: "gateway-failed" };
@@ -582,6 +539,9 @@ export async function deleteScope(
           covered.push(entry);
       }
     }
+    // The authority is read again before the queue write and the blob
+    // deletes: the tombstone call above awaited the gateway.
+    if (authorityLost(options)) return heldForAuthority(result);
     const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
     const storageStep = await deleteScopeBlobs(
       {
@@ -599,6 +559,10 @@ export async function deleteScope(
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
   }
+
+  // The authority is read once more before the one step that cannot be undone
+  // here: the storage step awaited the gateway too.
+  if (authorityLost(options)) return heldForAuthority(result);
 
   // 3. Local copy. Safe now: the registry row is a tombstone (or the point
   // was never registered / sync is off), so nothing can re-pull it. Only the
@@ -919,7 +883,6 @@ async function drainOnePass(
     try {
       outcome = await deleteData.deleteBlobVersions(scope, versions);
     } catch (err) {
-      if (err instanceof WriteAuthorityLostError) throw err;
       // The port reports per-key failures; a thrown error means none of the
       // batch can be trusted as done.
       const message = errorMessage(err);
@@ -984,25 +947,14 @@ async function deleteScopeBlobs(
     deps.pendingBlobDeletions ?? null;
   // This scope's markers already in the durable store before this call.
   let queuedBefore: PendingBlobDeletion[] = [];
-  let released: ReleasedMarker[] | undefined;
   if (store) {
     try {
       const markers = await store.list();
       queuedBefore = markers.filter((m) => m.scope === scope);
       const through = await resumePoint(store, scope, markers);
       work = withUnknown(unplannedWork(scope, plan, through, replacedHead));
-      // Finality can await too: settle the read before admitting any queue write.
-      if (storagePass)
-        released = (
-          await releasableMarkers(
-            deps.tombstoneFinality,
-            [...queuedBefore, ...work],
-            logger,
-          )
-        ).released;
       await recordPlannedWork(store, scope, work, plan.range?.to ?? null);
     } catch (markerErr) {
-      if (markerErr instanceof WriteAuthorityLostError) throw markerErr;
       logger.error(
         { scope, error: errorMessage(markerErr), keys: countPendingKeys(work) },
         "Could not record pending blob deletion markers",
@@ -1022,15 +974,13 @@ async function deleteScopeBlobs(
   let outcome: ScopePassOutcome;
   let remainingKeys: number;
   try {
-    const { released: queued } = released
-      ? { released }
-      : storagePass
-        ? await releasableMarkers(
-            deps.tombstoneFinality,
-            (await passStore.list()).filter((m) => m.scope === scope),
-            logger,
-          )
-        : { released: [] };
+    const { released: queued } = storagePass
+      ? await releasableMarkers(
+          deps.tombstoneFinality,
+          (await passStore.list()).filter((m) => m.scope === scope),
+          logger,
+        )
+      : { released: [] };
     outcome = (await drainOnePass(deleteData, passStore, queued)).get(
       scope,
     ) ?? { deleted: [], missing: [], failed: [] };
@@ -1038,7 +988,6 @@ async function deleteScopeBlobs(
       (await passStore.list()).filter((m) => m.scope === scope),
     );
   } catch (markerErr) {
-    if (markerErr instanceof WriteAuthorityLostError) throw markerErr;
     // A marker write failed mid-pass. The store never loses owed keys (see
     // drainOnePass), so the queue still holds this scope's work.
     const message = errorMessage(markerErr);

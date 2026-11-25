@@ -1,5 +1,3 @@
-import { gatedPort } from "../ports/write-authority.js";
-import type { DataStoragePort, VersionFence } from "../ports/index.js";
 // The legacy stage of a connection delete: retire the connector's legacy copy
 // at the gateway and in storage once the connection's control tombstone is
 // final.
@@ -73,7 +71,7 @@ import type { LocalSyncDeps } from "./deps.js";
 
 /** A legacy scope's gateway head, as the stage needs it. */
 export type LegacyHead =
-  | { readonly state: "absent"; readonly local?: readonly LegacyLocalEntry[] }
+  | { readonly state: "absent" }
   | {
       readonly state: "deleted";
       /** The tombstone's registry version: it bounds every slot with a blob. */
@@ -81,48 +79,8 @@ export type LegacyHead =
     }
   | { readonly state: "live"; readonly fence: TombstoneFence };
 
-/** Exact local identity persisted with an absent remote pin. */
-export interface LegacyLocalEntry extends Pick<VersionFence, "id" | "path"> {
-  readonly collectedAt: string;
-}
-
-/** Local evidence and exact-copy cleanup share the raw storage's row/file fence. */
-export function legacyLocalFrom(
-  storage: DataStoragePort,
-  filesAbsent: (scope: string) => boolean | Promise<boolean>,
-) {
-  const snapshot = (scope: string): LegacyLocalEntry[] => {
-    const rows: LegacyLocalEntry[] = [];
-    for (let offset = 0; ; offset += 500) {
-      const page = storage.listVersions(scope, { limit: 500, offset });
-      rows.push(
-        ...page.map(({ id, path, collectedAt }) => ({ id, path, collectedAt })),
-      );
-      if (page.length < 500) return rows;
-    }
-  };
-  return {
-    snapshot,
-    absent: async (scope: string) =>
-      (await filesAbsent(scope)) && snapshot(scope).length === 0,
-    async erase(
-      scope: string,
-      entries: readonly LegacyLocalEntry[],
-      ready?: () => boolean,
-    ) {
-      for (const entry of entries)
-        await gatedPort(ready, storage.deleteVersion.bind(storage))(
-          scope,
-          entry.collectedAt,
-          { ...entry, writeReady: ready },
-        );
-    },
-  };
-}
-
 /** What the stage needs from the host: the legacy side of this device. */
 export interface LegacyDeletePorts {
-  readonly local?: ReturnType<typeof legacyLocalFrom>;
   /** The legacy scopes bound to `connector` (the host owns the binding table). */
   scopesOf(connector: string): readonly string[];
   /**
@@ -167,6 +125,12 @@ export interface LegacyMemory {
   /** Slots storage answered for, by `<scope>@<tombstone version>`. */
   readonly erased: Map<string, Set<string>>;
   /**
+   * `<scope>@<tombstone version>` whose fenced local cleanup this process saw
+   * finish. Only a spared request: a restart cleans again, and that costs one
+   * idempotent delete.
+   */
+  readonly localCleaned?: Set<string>;
+  /**
    * The control tombstone this delete confirmed, by namespace (its registry
    * version). The delete is judged against these, not against whatever head
    * the control rows hold now: a reconnect replaces a tombstone with a live
@@ -192,33 +156,7 @@ export interface LegacyOutcome {
 export interface LegacyScopeOutcome {
   readonly part: DeletePart;
   readonly retry: boolean;
-  readonly confirmation?: LegacyScopeConfirmation;
 }
-declare const confirmedScope: unique symbol;
-/** Only confirmDone can issue a scope completion proof. */
-export interface LegacyScopeConfirmation {
-  readonly [confirmedScope]: true;
-  readonly scope: string;
-}
-
-/** The sole completion constructor: remote evidence and fresh local absence. */
-async function confirmDone(
-  ports: LegacyDeletePorts,
-  scope: string,
-  pin: LegacyPin | undefined,
-  head: Exclude<LegacyHead, { state: "live" }>,
-): Promise<LegacyScopeOutcome> {
-  if (pin && !pinHolds(pin, head))
-    return settled(blocked("legacy_head_changed"));
-  if (!ports.local) return settled(blocked("needs_another_device"));
-  if (!(await ports.local.absent(scope))) return waiting;
-  return {
-    part: PART_DONE,
-    retry: false,
-    confirmation: { scope } as LegacyScopeConfirmation,
-  };
-}
-
 const settled = (part: DeletePart): LegacyScopeOutcome => ({
   part,
   retry: false,
@@ -484,10 +422,6 @@ export async function retireLegacyScope(
       gateway.status === "failed" &&
       !isGatewayAlreadyDeletedCode(gateway.code)
     ) {
-      if (gateway.code === "legacy_head_changed") {
-        deps.memory?.refused.set(scope, gateway.code);
-        return settled(blocked(gateway.code));
-      }
       if (!isGatewayRefusalCode(gateway.code)) {
         // A fenced delete that failed may have failed because the head moved:
         // read it again, so a head that is not the pin's blocks the scope
@@ -511,41 +445,19 @@ export async function retireLegacyScope(
     if (pin && !pinHolds(pin, head))
       return settled(blocked("legacy_head_changed"));
   }
-  if (head.state === "absent") {
-    if (pin) {
-      if (!ports.local) return settled(blocked("needs_another_device"));
-      const remaining = ports.local.snapshot(scope);
-      const bound = pin.state === "absent" ? pin.local : undefined;
-      if (
-        remaining.some(
-          (row) =>
-            !bound?.some(
-              (entry) =>
-                entry.id === row.id &&
-                entry.path === row.path &&
-                entry.collectedAt === row.collectedAt,
-            ),
-        )
-      )
-        return settled(blocked("legacy_head_changed"));
-      if (remaining.length === 0 && !(await ports.local.absent(scope)))
-        return settled(blocked("legacy_head_changed"));
-      await ports.local.erase(scope, bound ?? []);
-    }
-    return confirmDone(ports, scope, pin, head);
-  }
+  // Never registered, or an account that has nothing here to retire.
+  if (head.state === "absent") return settled(PART_DONE);
   // A head that moved, or a tombstone the registry has not kept: read again.
   if (head.state === "live") return waiting;
   // A pinned retirement is done only when the local copy is gone too. The
   // tombstone may have landed in an earlier pass or process that stopped (or
   // failed) before its local erase, so a deleted head is not evidence of it:
   // the fenced delete runs again, bounded by the pinned tombstone.
-  if (pin && !cleanedHere && !(await cleanLocal(ports, scope, pin, head)))
+  if (pin && !cleanedHere && !(await cleanLocal(deps, ports, scope, pin, head)))
     return waiting;
   // Work this device queued is still being drained by its sync manager.
   if ((await ports.pendingBlobs(scope)) > 0) return waiting;
-  const erased = await confirmErased(deps, ports, scope, head.version, signal);
-  return erased ? confirmDone(ports, scope, pin, head) : waiting;
+  return confirmErased(deps, ports, scope, head.version, signal);
 }
 
 /**
@@ -571,11 +483,15 @@ function fenceOfPinnedTombstone(pin: LegacyPin, tombstone: string) {
  * The delete is idempotent: queued blob work is not queued twice.
  */
 async function cleanLocal(
+  deps: LegacyScopeDeps,
   ports: LegacyDeletePorts,
   scope: string,
   pin: LegacyPin,
   head: Extract<LegacyHead, { state: "deleted" }>,
 ): Promise<boolean> {
+  const key = `${scope}@${head.version}`;
+  const cleaned = deps.memory?.localCleaned;
+  if (cleaned?.has(key)) return true;
   const result = await ports.retire(
     scope,
     fenceOfPinnedTombstone(pin, head.version),
@@ -583,6 +499,7 @@ async function cleanLocal(
   );
   if (result.steps.gateway.status === "failed") return false;
   if (result.steps.local.status !== "ok") return false;
+  cleaned?.add(key);
   return true;
 }
 
@@ -601,7 +518,7 @@ async function confirmErased(
   scope: string,
   tombstone: string,
   signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<LegacyScopeOutcome> {
   const version = BigInt(tombstone);
   // Blobs are freed only by a final tombstone: a failed one rolls the head
   // back to live data whose blobs must still be there.
@@ -611,7 +528,7 @@ async function confirmErased(
     finality.finalized === null ||
     BigInt(finality.finalized) < version
   )
-    return false;
+    return waiting;
   const history = await ports.versions.list(scope, signal && { signal });
   // A history read that is incomplete, or older than the head it must explain,
   // can miss a slot with a blob.
@@ -621,7 +538,7 @@ async function confirmErased(
       (row) => row.isTombstone && BigInt(row.expectedVersion) === version,
     )
   )
-    return false;
+    return waiting;
   const key = `${scope}@${tombstone}`;
   const answered = deps.memory?.erased.get(key) ?? new Set<string>();
   deps.memory?.erased.set(key, answered);
@@ -635,14 +552,14 @@ async function confirmErased(
     const outcome = await ports.objects
       .deleteBlobVersions(scope, batch)
       .catch(() => null);
-    if (outcome === null) return false;
+    if (outcome === null) return waiting;
     // Record what storage answered before reporting pending: a retry then
     // starts at the slots still left, so a steady 429 on some slots cannot
     // spend every pass on the ones already gone.
     const acknowledged = new Set([...outcome.deleted, ...outcome.missing]);
     for (const slot of acknowledged) answered.add(slot);
-    if (outcome.failed.length > 0) return false;
-    if (batch.some((slot) => !acknowledged.has(slot))) return false;
+    if (outcome.failed.length > 0) return waiting;
+    if (batch.some((slot) => !acknowledged.has(slot))) return waiting;
   }
-  return true;
+  return settled(PART_DONE);
 }

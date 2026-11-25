@@ -1,4 +1,3 @@
-import { gatedPort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   PhysicalScopeError,
   isPhysicalScope,
@@ -642,15 +641,14 @@ export async function deleteDataFile(
   options: HierarchyManagerOptions,
   scope: string,
   collectedAt: string,
-  writeReady?: () => boolean,
 ): Promise<void> {
   const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
   try {
-    await gatedPort(writeReady, unlink)(filePath);
+    await unlink(filePath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
-  await deleteBlockSidecars(options, scope, collectedAt, writeReady);
+  await deleteBlockSidecars(options, scope, collectedAt);
 }
 
 /**
@@ -772,15 +770,11 @@ async function deleteBlockSidecars(
   options: HierarchyManagerOptions,
   scope: string,
   collectedAt: string,
-  writeReady?: () => boolean,
 ): Promise<void> {
-  await gatedPort(writeReady, rm)(
-    buildBlockDir(options.dataDir, scope, collectedAt),
-    {
-      recursive: true,
-      force: true,
-    },
-  );
+  await rm(buildBlockDir(options.dataDir, scope, collectedAt), {
+    recursive: true,
+    force: true,
+  });
 }
 
 function buildBlockDir(

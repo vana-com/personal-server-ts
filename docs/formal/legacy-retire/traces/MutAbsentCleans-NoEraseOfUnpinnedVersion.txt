@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 8 and seed -6318737299381743352 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 1628721] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file <repository>/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 29 and seed -4764878067362655488 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 658424] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r7/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 16:48:12)
+Starting... (2026-11-25 16:14:07)
 Computing initial states...
-Finished computing initial states: 2 distinct states generated at 2026-11-25 16:48:12.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 16:14:07.
 Error: Invariant NoEraseOfUnpinnedVersion is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -45,7 +45,39 @@ State 1: <Initial predicate>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 2: <RRead line 138, col 3 to line 143, col 38 of module LegacyRetire>
+State 2: <Publish line 107, col 3 to line 112, col 54 of module LegacyRetire>
+/\ isc = "none"
+/\ unauth = FALSE
+/\ erased = (s1 :> FALSE @@ s2 :> FALSE)
+/\ staleAfterDone = FALSE
+/\ reqs = 0
+/\ snap = (s1 :> 0 @@ s2 :> 0)
+/\ writes = 0
+/\ cc = [control |-> "active", head |-> 0, records |-> 0]
+/\ exists = FALSE
+/\ mergedWhileOpen = FALSE
+/\ pc = (s1 :> "idle" @@ s2 :> "idle")
+/\ tombBy = (s1 :> "none" @@ s2 :> "none")
+/\ rpc = "idle"
+/\ rsnap = (s1 :> 0 @@ s2 :> 0)
+/\ pins = (s1 :> 0 @@ s2 :> 0)
+/\ freeMerged = FALSE
+/\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
+/\ lastActor = "gateway"
+/\ ver = (s1 :> 2 @@ s2 :> 1)
+/\ st = "none"
+/\ nIntents = 0
+/\ revokes = 0
+/\ crashes = 0
+/\ tombVer = (s1 :> 0 @@ s2 :> 0)
+/\ ipc = "idle"
+/\ localTo = (s1 :> 0 @@ s2 :> 0)
+/\ batches = 0
+/\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ wr = TRUE
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
+
+State 3: <RRead line 138, col 3 to line 143, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
@@ -59,12 +91,12 @@ State 2: <RRead line 138, col 3 to line 143, col 38 of module LegacyRetire>
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
 /\ tombBy = (s1 :> "none" @@ s2 :> "none")
 /\ rpc = "read"
-/\ rsnap = (s1 :> 1 @@ s2 :> 1)
+/\ rsnap = (s1 :> 2 @@ s2 :> 1)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
 /\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "req"
-/\ ver = (s1 :> 1 @@ s2 :> 1)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ revokes = 0
@@ -77,7 +109,7 @@ State 2: <RRead line 138, col 3 to line 143, col 38 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 3: <RInsert line 147, col 3 to line 155, col 38 of module LegacyRetire>
+State 4: <RInsert line 147, col 3 to line 155, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
@@ -91,12 +123,12 @@ State 3: <RInsert line 147, col 3 to line 155, col 38 of module LegacyRetire>
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
 /\ tombBy = (s1 :> "none" @@ s2 :> "none")
 /\ rpc = "idle"
-/\ rsnap = (s1 :> 1 @@ s2 :> 1)
-/\ pins = (s1 :> 1 @@ s2 :> 1)
+/\ rsnap = (s1 :> 2 @@ s2 :> 1)
+/\ pins = (s1 :> 2 @@ s2 :> 1)
 /\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "req"
-/\ ver = (s1 :> 1 @@ s2 :> 1)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ revokes = 0
@@ -109,13 +141,13 @@ State 3: <RInsert line 147, col 3 to line 155, col 38 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 4: <WRead line 166, col 3 to line 176, col 54 of module LegacyRetire>
+State 5: <WRead line 166, col 3 to line 176, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
-/\ snap = (s1 :> 1 @@ s2 :> 0)
+/\ snap = (s1 :> 2 @@ s2 :> 0)
 /\ writes = 0
 /\ cc = [control |-> "active", head |-> 0, records |-> 0]
 /\ exists = TRUE
@@ -123,12 +155,12 @@ State 4: <WRead line 166, col 3 to line 176, col 54 of module LegacyRetire>
 /\ pc = (s1 :> "decided" @@ s2 :> "idle")
 /\ tombBy = (s1 :> "none" @@ s2 :> "none")
 /\ rpc = "idle"
-/\ rsnap = (s1 :> 1 @@ s2 :> 1)
-/\ pins = (s1 :> 1 @@ s2 :> 1)
+/\ rsnap = (s1 :> 2 @@ s2 :> 1)
+/\ pins = (s1 :> 2 @@ s2 :> 1)
 /\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "worker"
-/\ ver = (s1 :> 1 @@ s2 :> 1)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ revokes = 0
@@ -141,13 +173,13 @@ State 4: <WRead line 166, col 3 to line 176, col 54 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 5: <WSendAbsent line 287, col 3 to line 296, col 54 of module LegacyRetire>
+State 6: <WSendAbsent line 256, col 3 to line 265, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
-/\ snap = (s1 :> 1 @@ s2 :> 0)
+/\ snap = (s1 :> 2 @@ s2 :> 0)
 /\ writes = 0
 /\ cc = [control |-> "active", head |-> 0, records |-> 0]
 /\ exists = TRUE
@@ -155,12 +187,12 @@ State 5: <WSendAbsent line 287, col 3 to line 296, col 54 of module LegacyRetire
 /\ pc = (s1 :> "sent" @@ s2 :> "idle")
 /\ tombBy = (s1 :> "none" @@ s2 :> "none")
 /\ rpc = "idle"
-/\ rsnap = (s1 :> 1 @@ s2 :> 1)
-/\ pins = (s1 :> 1 @@ s2 :> 1)
+/\ rsnap = (s1 :> 2 @@ s2 :> 1)
+/\ pins = (s1 :> 2 @@ s2 :> 1)
 /\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "worker"
-/\ ver = (s1 :> 1 @@ s2 :> 1)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ revokes = 0
@@ -173,7 +205,7 @@ State 5: <WSendAbsent line 287, col 3 to line 296, col 54 of module LegacyRetire
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 12 @@ s2 :> 0)
 
-10159 states generated, 5058 distinct states found, 3759 states left on queue.
-The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 11 and the 95th percentile is 10).
-Finished in 00s at (2026-11-25 16:48:12)
+7184 states generated, 3463 distinct states found, 2407 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 11 and the 95th percentile is 9).
+Finished in 00s at (2026-11-25 16:14:07)

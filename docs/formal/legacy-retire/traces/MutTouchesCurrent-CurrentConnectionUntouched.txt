@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 106 and seed 5617568196965320559 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 2031917] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file <repository>/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 35 and seed -764602881576248826 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 677632] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r7/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 17:07:08)
+Starting... (2026-11-25 16:14:46)
 Computing initial states...
-Finished computing initial states: 2 distinct states generated at 2026-11-25 17:07:08.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 16:14:47.
 Error: Action property CurrentConnectionUntouched is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -173,7 +173,7 @@ State 5: <WRead line 166, col 3 to line 176, col 54 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 6: <WLocal line 315, col 3 to line 322, col 54 of module LegacyRetire>
+State 6: <WLocal line 284, col 3 to line 291, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
@@ -205,7 +205,7 @@ State 6: <WLocal line 315, col 3 to line 322, col 54 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 7: <WErase line 328, col 3 to line 339, col 50 of module LegacyRetire>
+State 7: <WErase line 297, col 3 to line 308, col 50 of module LegacyRetire>
 /\ isc = "none"
 /\ unauth = FALSE
 /\ erased = (s1 :> TRUE @@ s2 :> FALSE)
@@ -237,7 +237,7 @@ State 7: <WErase line 328, col 3 to line 339, col 50 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-95304 states generated, 37546 distinct states found, 23666 states left on queue.
-The depth of the complete state graph search is 8.
-The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 13 and the 95th percentile is 9).
-Finished in 01s at (2026-11-25 17:07:09)
+38469 states generated, 15576 distinct states found, 10024 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 12 and the 95th percentile is 9).
+Finished in 01s at (2026-11-25 16:14:47)

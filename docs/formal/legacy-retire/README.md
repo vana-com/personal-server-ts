@@ -9,7 +9,7 @@ open, `importLegacySource` refuses the connector's legacy import.
 Code owners:
 
 - `packages/core/src/localdb/legacy-retire-intent.ts`: request, status, resume, pass
-- `packages/core/src/localdb/legacy-delete.ts`: `retireLegacyScope`, `pinHolds`, `confirmErased`, `confirmDone`
+- `packages/core/src/localdb/legacy-delete.ts`: `retireLegacyScope`, `pinHolds`, `confirmErased`
 - `packages/core/src/localdb/legacy-import.ts`: `importFence` (preflight), `guardImport` (in the merge transaction)
 
 ## What is modelled
@@ -41,69 +41,29 @@ does not directly follow the pinned head frees slots the pin never named.
 | `NoEraseOfUnpinnedVersion`      | No erase (blobs or local) and no storage cleanup, queued or done, for a tombstone that does not directly follow the pin (found by the model). |
 | `NoDestructiveWithoutAuthority` | No tombstone post, queue write, local erase, storage delete or done verdict runs while the host has no write authority.                       |
 
-`StrictConfirmation` is an action property: a successful response without an echoed version cannot queue cleanup or erase local data in that call.
-
-## Effect and completion owners
-
-`ports/write-authority.ts` owns the synchronous authority check. The worker binds
-its destructive ports once; the HTTP adapter checks after signing, the marker
-store checks after its serialized read, and storage checks inside its locks.
-A closed gate throws `WriteAuthorityLostError`; the pass remains pending. Finality
-reads precede the first durable queue write, so revocation during those reads
-cannot queue cleanup.
-
-`confirmDone` is the only scope-completion constructor. It issues an opaque
-confirmation only for a remote absent/deleted head allowed by the pin and fresh
-absence of local index entries and physical files. The sole durable `writeDone`
-writer requires one such confirmation for every scope. No process-local cache
-can substitute for local proof. A pin that was absent remotely includes the
-exact local id/path/collection-time identities captured with it. Cleanup can
-erase those identities only; a replacement or an unindexed file blocks. A
-failed erase remains pending.
-
-A fenced successful response must explicitly echo `expectedVersion = pin + 1`.
-Missing and different echoes both block with `legacy_head_changed` before any
-cleanup. [The await audit](await-audit.md) lists the pass, worker and port awaits
-and the invariant that covers the next effect.
-
-The absent-head start assumes the pin captured exact local row identities. Tests cover unindexed files and replacements that the pin cannot bound; those cases are not separate model actors.
-
-The model starts with either live heads or absent heads with local copies.
-`WAbsentLocal` confirms removal of the exact local copy before completion.
-`WSendMissing` models a successful tombstone response without a version.
-`StrictConfirmation` forbids that response from authorizing cleanup in its call.
-Gateway moves remain adversarial before erasure; after confirmation they stop,
-as new legacy writes are excluded by the switched-account policy. The model does
-not prove safety against a gateway that violates that policy after confirmation.
-
 ## Results
 
 Run with `TLA2TOOLS=<tla2tools.jar> [JAVA=...] [WORKERS=4] ./run.sh <Config> [outdir]`.
 It takes the shared heavy-run lock, runs `nice -n 19 ionice -c3`, and uses 4
 workers. Constants: two scopes, `MaxVer = 2`, `MaxReq = 2`, `MaxB = 1`,
-`MaxCrash = 2`, `MaxW = 1`, `MaxRev = 1`. `Good` takes about 3 minutes; a mutant takes seconds to a minute. Round 7 lowered `MaxB` and `MaxW` from 2 to 1: the new variables made the old bounds too large, and no invariant needs a second import batch or a second current write. Logs are in `traces/`. A trace length is the number of states TLC prints; with several workers it can differ by one between runs.
+`MaxCrash = 2`, `MaxW = 1`, `MaxRev = 1`. `Good` takes about 2 minutes; a mutant takes seconds to a minute. Round 7 lowered `MaxB` and `MaxW` from 2 to 1: the new variables made the old bounds too large, and no invariant needs a second import batch or a second current write. Logs are in `traces/`. A trace length is the number of states TLC prints; with several workers it can differ by one between runs.
 
-| Config                                           | Result                                                                                               |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `Good`                                           | No error. 135,437,743 generated; 30,645,420 distinct; depth 27.                                      |
-| `MutAbsentCleans-NoEraseOfUnpinnedVersion`       | `NoEraseOfUnpinnedVersion` violated, 5-state trace. 10,159 generated; 5,058 distinct; depth 6.       |
-| `MutAdapterCleansFirst-NoEraseOfUnpinnedVersion` | `NoEraseOfUnpinnedVersion` violated, 7-state trace. 104,742 generated; 40,915 distinct; depth 8.     |
-| `MutDoneBeforeErase-DoneOnlyAfterConfirm`        | `DoneOnlyAfterConfirm` violated, 8-state trace. 269,093 generated; 104,762 distinct; depth 9.        |
-| `MutDoneLiftsFence-NoStaleMergeAfterDone`        | `NoStaleMergeAfterDone` violated, 10-state trace. 2,103,836 generated; 773,553 distinct; depth 11.   |
-| `MutDoneWithoutLocalProof-DoneOnlyAfterConfirm`  | `DoneOnlyAfterConfirm` violated, 4-state trace. 3,442 generated; 2,057 distinct; depth 6.            |
-| `MutEchoCleans-NoEraseOfUnpinnedVersion`         | `NoEraseOfUnpinnedVersion` violated, 6-state trace. 7,700 generated; 4,018 distinct; depth 6.        |
-| `MutEchoMissingAccepted-StrictConfirmation`      | `StrictConfirmation` violated, 6-state trace. 11,003 generated; 5,510 distinct; depth 6.             |
-| `MutGateOnce-NoDestructiveWithoutAuthority`      | `NoDestructiveWithoutAuthority` violated, 6-state trace. 27,696 generated; 11,939 distinct; depth 7. |
-| `MutNewIntentOnRestart-OneIntent`                | `OneIntent` violated, 5-state trace. 2,189 generated; 1,573 distinct; depth 5.                       |
-| `MutNoBatchFence-NoLegacyMergeWhileOpen`         | `NoLegacyMergeWhileOpen` violated, 6-state trace. 8,111 generated; 4,177 distinct; depth 7.          |
-| `MutNoPin-NoTombstoneOverMovedHead`              | `NoTombstoneOverMovedHead` violated, 6-state trace. 30,081 generated; 12,799 distinct; depth 7.      |
-| `MutOldPinHolds-NoEraseOfUnpinnedVersion`        | `NoEraseOfUnpinnedVersion` violated, 8-state trace. 87,364 generated; 34,646 distinct; depth 8.      |
-| `MutResumeSkipsLocal-DoneOnlyAfterConfirm`       | `DoneOnlyAfterConfirm` violated, 10-state trace. 887,811 generated; 336,769 distinct; depth 10.      |
-| `MutTouchesCurrent-CurrentConnectionUntouched`   | `CurrentConnectionUntouched` violated, 7-state trace. 95,304 generated; 37,546 distinct; depth 8.    |
-| `Probe-NotBlocked`                               | `NotBlocked` violated, 6-state trace. 9,083 generated; 4,650 distinct; depth 6.                      |
-| `Probe-NotBlockedByForeignTomb`                  | `NotBlockedByForeignTomb` violated, 6-state trace. 30,108 generated; 12,804 distinct; depth 7.       |
-| `Probe-NotDone`                                  | `NotDone` violated, 8-state trace. 324,662 generated; 125,235 distinct; depth 9.                     |
-| `Probe-NotFreeMergedAfterDone`                   | `NotFreeMergedAfterDone` violated, 10-state trace. 2,296,051 generated; 834,770 distinct; depth 11.  |
+| Config                                                                                               | Result                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Good`                                                                                               | No error. 62,676,431 states generated, 13,846,227 distinct, depth 27. All invariants above.                                                   |
+| `MutNoBatchFence-NoLegacyMergeWhileOpen`                                                             | `NoLegacyMergeWhileOpen` violated, 6-state trace (the batch has no guard of its own).                                                         |
+| `MutNoPin-NoTombstoneOverMovedHead`                                                                  | `NoTombstoneOverMovedHead` violated, 6-state trace (the worker does not compare to the pin).                                                  |
+| `MutDoneBeforeErase-DoneOnlyAfterConfirm`                                                            | `DoneOnlyAfterConfirm` violated, 9-state trace (done once tombstoned, before the erase).                                                      |
+| `MutNewIntentOnRestart-OneIntent`                                                                    | `OneIntent` violated, 5-state trace (a restart makes a new intent for an open one).                                                           |
+| `MutTouchesCurrent-CurrentConnectionUntouched`                                                       | `CurrentConnectionUntouched` violated, 7-state trace (the erase also writes the connection).                                                  |
+| `MutOldPinHolds-NoEraseOfUnpinnedVersion`                                                            | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the code before the fix (see below).                                                      |
+| `Probe-NotDone`, `Probe-NotBlocked`, `Probe-NotBlockedByForeignTomb`, `Probe-NotFreeMergedAfterDone` | Each fails by design: `done`, a blocked scope, a block by a foreign tombstone, and an import of an unbound stream after `done` are reachable. |
+| `MutDoneLiftsFence-NoStaleMergeAfterDone`                                                            | `NoStaleMergeAfterDone` violated, 15-state trace: the code before the fix (see below).                                                        |
+| `MutAbsentCleans-NoEraseOfUnpinnedVersion`                                                           | `NoEraseOfUnpinnedVersion` violated, 6-state trace: the adapter before round 5 (see below).                                                   |
+| `MutAdapterCleansFirst-NoEraseOfUnpinnedVersion`                                                     | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the delete adapter before round 4 (see below).                                            |
+| `MutGateOnce-NoDestructiveWithoutAuthority`                                                          | `NoDestructiveWithoutAuthority` violated, 6-state trace: the code before round 7 (see below).                                                 |
+| `MutEchoCleans-NoEraseOfUnpinnedVersion`                                                             | `NoEraseOfUnpinnedVersion` violated, 6-state trace: the code before round 7 (see below).                                                      |
+| `MutResumeSkipsLocal-DoneOnlyAfterConfirm`                                                           | `DoneOnlyAfterConfirm` violated, 10-state trace: the code before round 7 (see below).                                                         |
 
 ## Finding: a later tombstone passed `pinHolds` (fixed)
 

@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 14 and seed 8403904296579727675 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 2027059] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file <repository>/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 95 and seed -8782955689844935969 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 672577] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r7/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 17:06:58)
+Starting... (2026-11-25 16:14:36)
 Computing initial states...
-Finished computing initial states: 2 distinct states generated at 2026-11-25 17:06:58.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 16:14:36.
 Error: Invariant NoEraseOfUnpinnedVersion is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -205,7 +205,7 @@ State 6: <WSendEcho line 218, col 3 to line 232, col 54 of module LegacyRetire>
 /\ wr = TRUE
 /\ cleanTo = (s1 :> 12 @@ s2 :> 0)
 
-7700 states generated, 4018 distinct states found, 2997 states left on queue.
-The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 11 and the 95th percentile is 10).
-Finished in 00s at (2026-11-25 17:06:58)
+6526 states generated, 3245 distinct states found, 2278 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 11 and the 95th percentile is 9).
+Finished in 00s at (2026-11-25 16:14:36)

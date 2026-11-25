@@ -66,30 +66,6 @@ function makePort(
 }
 
 describe("createGatewayDeleteDataPort.tombstone", () => {
-  it("revoking authority during storage signing sends no blob DELETE", async () => {
-    let ready = true;
-    const fetchImpl = vi.fn();
-    const port = createGatewayDeleteDataPort({
-      gatewayUrl: GATEWAY,
-      dataPointFeed: { getDataPoint: vi.fn(), listDataPointsByOwner: vi.fn() },
-      serverOwner: OWNER,
-      signer: { signAddData: vi.fn() },
-      storage: {
-        endpoint: STORAGE,
-        chainId: CHAIN_ID,
-        signMessage: async () => {
-          ready = false;
-          return "0xabc" as const;
-        },
-      },
-      fetch: fetchImpl,
-    });
-    await expect(
-      port.deleteBlobVersions(SCOPE, ["1"], () => ready),
-    ).rejects.toMatchObject({ name: "WriteAuthorityLostError" });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
   it("signs AddData with the tombstone hashes at current+1 and sends DELETE /v1/data/:id", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, {
