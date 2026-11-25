@@ -17,6 +17,29 @@ import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 
+it.each([{ schemaVersion: 2 }, { phase: "finished" }])(
+  "reports a stable activity descriptor error for %j",
+  async (change) => {
+    const { ACCESS_ACTIVITY_DESCRIPTOR } =
+      await import("../../../core/src/logging/activity-stream.js");
+    const event = {
+      schemaVersion: 1,
+      eventId: "00000000-0000-4000-8000-000000000001",
+      instanceId: "00000000-0000-4000-8000-000000000002",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      action: "read",
+      scope: "fixture.scope",
+      grantId: "fixture-grant",
+      builder: "fixture-builder",
+      phase: "served-start",
+    };
+    expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, ...change }),
+    ).toThrow(/^Invalid access activity event$/);
+  },
+);
+
 const owner = `0x${"12".repeat(20)}` as const;
 const descriptor = {
   connector: "vana-system-access-v1",
