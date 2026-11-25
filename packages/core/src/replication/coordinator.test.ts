@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   ProgressReport,
   ReplicaPhaseHandler,
   ReplicaWorkItem,
 } from "./coordinator.js";
-import { createReplicaCoordinator, REPLICA_STEP_BYTES } from "./coordinator.js";
+import {
+  abortable,
+  createReplicaCoordinator,
+  REPLICA_STEP_BYTES,
+} from "./coordinator.js";
 import type {
   ReplicaDependency,
   ReplicaOutcome,
@@ -2324,5 +2328,26 @@ describe("replica timer eligibility", () => {
         hintRefreshAt: undefined,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("abortable replication I/O", () => {
+  it("removes its abort listener if the transport fails before returning a promise", async () => {
+    const { signal } = new AbortController();
+    const added = vi.spyOn(signal, "addEventListener");
+    const removed = vi.spyOn(signal, "removeEventListener");
+    const transportError = new Error("transport closed");
+
+    try {
+      await expect(abortable(signal, () => {
+        throw transportError;
+      })).rejects.toBe(transportError);
+      expect(added).toHaveBeenCalledTimes(1);
+      expect(removed).toHaveBeenCalledWith("abort", added.mock.calls[0]![1]);
+      expect(removed).toHaveBeenCalledTimes(1);
+    } finally {
+      removed.mockRestore();
+      added.mockRestore();
+    }
   });
 });
