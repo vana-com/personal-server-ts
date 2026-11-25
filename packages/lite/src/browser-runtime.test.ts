@@ -960,6 +960,45 @@ describe("the legacy import wake of a runtime", () => {
     });
     expect(runtime.importWaker).toBeUndefined();
   });
+
+  it("starts nothing for a sync-enabled runtime with no local database", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const store = createMemoryModeRecordStore();
+      await store.save(ownerAddress.toLowerCase(), {
+        answer: "on",
+        generation: 0,
+        receivedAt: 1,
+      });
+      const runtime = await createIndexedDbPsLiteRuntime({
+        ownerAddress,
+        ownerSignature,
+        persistence: memoryBundle(),
+        accountModeStore: store,
+        gateway: createMockPsLiteGateway(),
+        auth: createBearerTokenPsLiteAuth({
+          ownerToken: "owner-token",
+          builderToken: "builder-token",
+        }),
+        active: true,
+        streamSyncRegistry: createMemoryStreamSyncRegistry(),
+        streamSyncBlobs: createMemoryStreamSyncBlobs(),
+        configDefaults: {
+          gateway: { url: "https://gateway.local" },
+          sync: { enabled: true },
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(runtime.importWaker).toBeUndefined();
+      expect(
+        warn.mock.calls.filter(([, detail]) =>
+          JSON.stringify(detail ?? "").includes("STREAM_READ_UNAVAILABLE"),
+        ),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 describe("startPersonalServer publication receipts", () => {

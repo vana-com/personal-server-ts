@@ -1,6 +1,8 @@
 import {
+  alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
+  legacySourceId,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import {
   createLegacyScopeStore,
@@ -88,10 +90,18 @@ function streamScopeTargets(): ReadonlyMap<
   for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
     const source = scope.slice(0, scope.indexOf("."));
     for (const alias of legacyAliasScopes(scope)) {
+      const binding =
+        alternateLegacyBindingsForScope(scope).get(alias.connector) ??
+        LEGACY_SCOPE_BINDINGS.get(scope);
+      const sourceId = binding && legacySourceId(binding.pdppSource);
+      const target = (stream: string): LegacyScopeTarget => ({
+        connector: alias.connector,
+        stream,
+        ...(sourceId ? { sourceId } : {}),
+      });
       for (const stream of alias.streams)
-        add(`${source}.${stream}`, { connector: alias.connector, stream });
-      if (alias.streams.length === 1)
-        add(scope, { connector: alias.connector, stream: alias.streams[0]! });
+        add(`${source}.${stream}`, target(stream));
+      if (alias.streams.length === 1) add(scope, target(alias.streams[0]!));
     }
   }
   return new Map([...table].map(([scope, ts]) => [scope, [...ts.values()]]));

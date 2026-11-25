@@ -5017,3 +5017,18 @@ export const LEGACY_SCOPE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
       "strava.coverage_diagnostics": stravaCoverageDiagnostics,
     }),
   );
+
+const CONNECTOR_ID_PREFIX = "https://registry.pdpp.dev/connectors/";
+const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
+
+/** Most connector keys match their public source; Anthropic collects Claude. */
+export function legacySourceId(pdppSource: string): string {
+  if (
+    pdppSource === ANTHROPIC_CONNECTOR_ID ||
+    pdppSource === "https://registry.pdpp.dev/connectors/anthropic-live"
+  )
+    return CLAUDE_SOURCE_ID;
+  return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
+    ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
+    : pdppSource;
+}

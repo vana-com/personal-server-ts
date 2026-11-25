@@ -645,8 +645,15 @@ export async function createIndexedDbPsLiteRuntime(
   // intake exist: it reads the intake from this scope, never through the host
   // handle, so the boot wake below cannot run before the intake does.
   let legacyStoreRunner: LiteLegacyStoreRunner | undefined;
-  // A runtime with no seed intake (no local database) has nothing to import into.
-  if (!options.legacyImporter && serverOwner && streamSyncSeed) {
+  // Sync creates a seed intake even without a local database, but that intake
+  // cannot read stream state then: with no local database there is nothing to
+  // import into.
+  if (
+    !options.legacyImporter &&
+    serverOwner &&
+    streamSyncSeed &&
+    options.localDb
+  ) {
     legacyStoreRunner = createLiteLegacyStoreRunner({
       storage,
       intake: async () => {

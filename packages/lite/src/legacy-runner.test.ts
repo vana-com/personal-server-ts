@@ -221,3 +221,45 @@ it("a second wake reads no history of a completed stream, and its missing old en
   expect(imported).toContain("g1");
   expect(reads.every((r) => r.startsWith("github.starred"))).toBe(true);
 });
+
+it("rows stamped with another connector's source id are not imported under the retained one", async () => {
+  const scopes: Versions = new Map([
+    [
+      "spotify.saved_tracks",
+      [
+        version([
+          {
+            id: "x",
+            $pdpp: { sourceId: "https://registry.pdpp.dev/sources/other" },
+          },
+        ]),
+      ],
+    ],
+  ]);
+  const { intake, imported } = recordingIntake();
+  const live = runner(scopes, intake);
+  await live.run(new AbortController().signal);
+  expect(imported).toEqual([]);
+  expect(live.report()?.streams.excluded).toEqual([
+    { reason: "unknown_source", scopes: 1 },
+  ]);
+});
+
+it("rows stamped with the connector's own source id import", async () => {
+  const scopes: Versions = new Map([
+    [
+      "spotify.saved_tracks",
+      [
+        version([
+          {
+            id: "x",
+            $pdpp: { sourceId: "https://registry.pdpp.dev/sources/spotify" },
+          },
+        ]),
+      ],
+    ],
+  ]);
+  const { intake, imported } = recordingIntake();
+  await runner(scopes, intake).run(new AbortController().signal);
+  expect(imported).toEqual(["x"]);
+});
