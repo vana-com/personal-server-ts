@@ -1,7 +1,10 @@
 import { expect, it } from "vitest";
 import type { SeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+import { createSeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createLiteLegacyStoreRunner } from "./legacy-runner.js";
+import { createPsLiteSeedStaging } from "./seed-staging.js";
+import { createMemoryPsLiteStateStore } from "./test-support/memory.js";
 
 // The runner's import decisions, over in-memory scope storage and a
 // recording seed intake.
@@ -309,6 +312,92 @@ it("a stream with a pending staged upload is left alone, counted, and its upload
     { reason: "staged_upload_pending", streams: 1, rows: 0 },
   ]);
   expect(scopes.has("spotify.saved_tracks")).toBe(true);
+});
+
+it("a host upload that stages while the legacy fold reads survives, and the stream is counted", async () => {
+  const scopes: Versions = new Map([
+    ["spotify.saved_tracks", [version([{ id: "legacy" }])]],
+    ["spotify.profile", [version([{ id: "p1" }])]],
+  ]);
+  const staging = createPsLiteSeedStaging(
+    createMemoryPsLiteStateStore(),
+    "0xabc",
+    "network",
+  );
+  // The real intake and staging; the target is not known yet, so an upload
+  // waits staged. The writer holds no receipts.
+  const intake = createSeedIntake({
+    staging,
+    writer: {
+      importStaged: async () => {},
+      seedStatus: async () => ({ targetKnown: false, receipts: {} }),
+    },
+  });
+  const encoder = new TextEncoder();
+  const upload = (id: string) =>
+    (async function* () {
+      yield encoder.encode(
+        JSON.stringify({
+          primaryKey: ["id"],
+          profile: { key: null, version: "1" },
+          records: 1,
+        }) +
+          "\n" +
+          JSON.stringify({ id }) +
+          "\n",
+      );
+    })();
+  const stagedRows = async () => {
+    const rows: unknown[] = [];
+    const source = staging.source(await staging.installId(), async () => ({
+      receipts: {},
+      skipped: [],
+    }));
+    for await (const row of source.records("spotify", "saved_tracks"))
+      rows.push(row);
+    return rows;
+  };
+  // Pause the first stored read: the runner has passed its own pending check.
+  let release!: () => void;
+  const paused = new Promise<void>((resolve) => (release = resolve));
+  let reading!: () => void;
+  const started = new Promise<void>((resolve) => (reading = resolve));
+  const base = memoryStorage(scopes) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  let first = true;
+  const storage = {
+    ...base,
+    listScopes: (base as never as { listScopes: () => unknown }).listScopes,
+    listVersions: (base as never as { listVersions: () => unknown })
+      .listVersions,
+    readEnvelope: async (scope: string, at: string) => {
+      if (first && scope === "spotify.saved_tracks") {
+        first = false;
+        reading();
+        await paused;
+      }
+      return base.readEnvelope(scope, at);
+    },
+  } as never;
+  const live = createLiteLegacyStoreRunner({
+    storage,
+    intake: async () => intake,
+    manifests: () => [manifest, githubManifest],
+  });
+  const running = live.run(new AbortController().signal);
+  await started;
+  await intake.put("spotify", "saved_tracks", upload("host-seed"));
+  release();
+  await running;
+  expect(await stagedRows()).toEqual([{ id: "host-seed" }]);
+  expect(live.report()?.streams.refused).toContainEqual({
+    reason: "staged_upload_pending",
+    streams: 1,
+    rows: 1,
+  });
+  // The other stream still imported.
+  expect(live.report()?.streams.staged).toBe(1);
 });
 
 it("a connection deleted after preflight costs only that connector", async () => {

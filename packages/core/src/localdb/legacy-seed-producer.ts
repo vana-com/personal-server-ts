@@ -63,8 +63,10 @@ export interface LegacySeedStreamReport {
   /** Why the stream was refused: `invalid_record`; `source_changed` when
    * the store's content changed between the counting pass and the upload; or
    * `deleted` when the intake refused its connector as a deleted connection
-   * (this stream only, the next connector goes on). */
-  readonly reason?: "invalid_record" | "source_changed" | "deleted";
+   * (this stream only, the next connector goes on); or `staged_upload_pending`
+   * when a host upload waits for its target and is never replaced. */
+  readonly reason?:
+    "invalid_record" | "source_changed" | "deleted" | "staged_upload_pending";
   /** Rows put to the intake. */
   readonly rows: number;
   /** Rows left out for want of a full identity, by reason. */
@@ -330,7 +332,9 @@ export async function seedLegacyStore(
     options.signal?.throwIfAborted();
     let put: Awaited<ReturnType<SeedIntake["put"]>>;
     try {
-      put = await intake.put(connector, name, body());
+      // The intake refuses, under its own request lock, to replace an upload
+      // that waits for its target.
+      put = await intake.put(connector, name, body(), { keepStaged: true });
     } catch (error) {
       if (isConnectionDeleted(error)) {
         refuseDeleted(connector, name);
@@ -352,6 +356,18 @@ export async function seedLegacyStore(
       continue;
     }
     statusOf.delete(connector);
+    if (put.state === "staged_upload_pending") {
+      reports.push({
+        connector,
+        stream: name,
+        outcome: "refused",
+        reason: "staged_upload_pending",
+        rows: 0,
+        quarantine: {},
+        invalid: 0,
+      });
+      continue;
+    }
     if (put.state === "merged") {
       // A final receipt appeared after `status()`: the body was not consumed
       // and nothing was imported here. The receipt holds its own counts.
