@@ -33,6 +33,27 @@ const cases: [string, unknown, { since: string | null } | null][] = [
   ],
   ["exactly the three unrestricted streams", unrestricted, { since: null }],
   [
+    "the same unrestricted selection in another order",
+    {
+      streams: [
+        unrestricted.streams[2],
+        unrestricted.streams[0],
+        unrestricted.streams[1],
+      ],
+    },
+    { since: null },
+  ],
+  [
+    "a real leap day common to all three streams",
+    {
+      streams: unrestricted.streams.map((stream) => ({
+        name: stream.name,
+        time_range: { since: "2024-02-29" },
+      })),
+    },
+    { since: "2024-02-29" },
+  ],
+  [
     "exactly the three prefixed streams with a common valid since",
     {
       streams: [
