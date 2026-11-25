@@ -304,7 +304,7 @@ describe("a malformed answer", () => {
 });
 
 describe("a 400 on a cursor of the older numeric kind", () => {
-  it("backs off 1 s, 2 s, 4 s ... up to 30 s and never spins, and is not read as a missing route", async () => {
+  it("is dropped, not resent: the next request asks from no position, and the gateway's fresh cursor is held from then on, and it is not read as a missing route", async () => {
     const gateway = createFakeChangeGateway({ seq: 5 });
     // A bare decimal: what a gateway of the older kind answered. The gateway
     // that implements the contract refuses it.
@@ -313,26 +313,17 @@ describe("a 400 on a cursor of the older numeric kind", () => {
     );
     const t = subscribed(gateway);
     await flush();
-    expect(t.positions()).toEqual(["12"]);
+    const fresh = mintCursor(EPOCH_A, 5);
+    expect(t.positions()).toEqual(["12", fresh]);
     expect(gateway.requests[1]).toMatchObject({ after: "12" });
-    const arrivals: number[] = [];
-    const start = Date.now();
-    let seen = gateway.requests.length;
-    for (let ms = 0; ms < 62_000; ms += 100) {
-      await vi.advanceTimersByTimeAsync(100);
-      while (seen < gateway.requests.length) {
-        seen += 1;
-        arrivals.push(Date.now() - start);
-      }
-    }
-    // Every retry sends the same cursor and gets the same 400.
-    expect(gateway.requests.every((r, i) => i === 0 || r.after === "12")).toBe(
-      true,
-    );
-    const gaps = arrivals.map((at, i) => at - (arrivals[i - 1] ?? 0));
-    expect(gaps).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
-    expect(t.changes()).toEqual([undefined]);
-    expect(t.events.at(-1)).toEqual({ kind: "health", healthy: false });
+    expect(gateway.requests[2]).toMatchObject({ after: undefined });
+    expect(gateway.requests[3]).toMatchObject({ after: fresh });
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS * 2);
+    expect(gateway.requests.slice(3).every((r) => r.after !== "12")).toBe(true);
+    expect(t.changes()).toEqual([undefined, undefined]);
+    expect(
+      t.events.flatMap((e) => (e.kind === "health" ? [e.healthy] : [])),
+    ).toEqual([true, false, true]);
     t.stop();
   });
 });
@@ -463,5 +454,88 @@ describe("a cycle in flight when an answer with a new epoch's cursor arrives", (
       expect([undefined, EPOCH_B]).toContain(request.since);
     }
     await manager.stop();
+  });
+});
+
+describe("a cursor the gateway rejects", () => {
+  it("is dropped: the next request carries no cursor, its fresh answer pokes a full pull once, and later requests carry the fresh cursor", async () => {
+    const gateway = createFakeChangeGateway({ seq: 5 });
+    const t = subscribed(gateway);
+    await flush();
+    const a = mintCursor(EPOCH_A, 5);
+    expect(gateway.requests[1]).toMatchObject({ after: a });
+    gateway.rejectCursorOnce(a);
+    const b = gateway.commit();
+    await flush(); // no timer advance: the retry is at once
+    expect(gateway.requests[2]).toMatchObject({
+      after: undefined,
+      since: undefined,
+    });
+    expect(t.positions()).toEqual([a, b]);
+    expect(t.changes()).toEqual([undefined, undefined]);
+    expect(gateway.requests[3]).toMatchObject({ after: b, wait: "25" });
+    expect(t.events.filter((e) => e.kind === "health")).toEqual([
+      { kind: "health", healthy: true },
+      { kind: "health", healthy: false },
+      { kind: "health", healthy: true },
+    ]);
+    t.stop();
+  });
+
+  it("backs off, and does not spin, when the request without a cursor is rejected too", async () => {
+    const gateway = createFakeChangeGateway({ seq: 5 });
+    const t = subscribed(gateway);
+    await flush();
+    const a = mintCursor(EPOCH_A, 5);
+    gateway.rejectCursorOnce(a);
+    gateway.answerRequestWith(
+      2,
+      () =>
+        new Response(
+          JSON.stringify({
+            error: "Invalid after: expected a change-feed cursor",
+          }),
+          { status: 400 },
+        ),
+    );
+    gateway.commit();
+    await flush();
+    expect(gateway.requests).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(gateway.requests).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(gateway.requests[3]).toMatchObject({ after: undefined });
+    // It answered at once, so the next request is held with its cursor.
+    expect(gateway.requests).toHaveLength(5);
+    expect(gateway.requests[4]).toMatchObject({ after: gateway.cursor() });
+    await vi.advanceTimersByTimeAsync(CHANGE_PUSH_WAIT_MS * 2);
+    expect(gateway.requests.length).toBeLessThan(8);
+    t.stop();
+  });
+  it("backs off with growing delays when the gateway rejects every fresh cursor it hands out", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5); // back-off steps exactly 1 s, 2 s, 4 s
+    const gateway = createFakeChangeGateway({ seq: 5 });
+    const t = subscribed(gateway);
+    await flush();
+    gateway.rejectEveryCursor();
+    gateway.commit();
+    await flush();
+    const cursorless = () =>
+      gateway.requests.slice(2).filter((r) => r.after === undefined).length;
+    // The rejected held cursor is retried at once without one; that answer's
+    // fresh cursor is rejected too, and the back-off starts at 1 s.
+    expect(cursorless()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(cursorless()).toBe(2);
+    // A cursorless answer does not end the failure run: the next step is 2 s.
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(cursorless()).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(cursorless()).toBe(3);
+    await vi.advanceTimersByTimeAsync(3_999);
+    expect(cursorless()).toBe(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(cursorless()).toBe(4);
+    t.stop();
   });
 });
