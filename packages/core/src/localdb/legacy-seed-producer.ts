@@ -255,6 +255,11 @@ export async function seedLegacyStore(
         counted.update(encoder.encode(JSON.stringify(row) + "\n"));
       }
     } catch (error) {
+      // A connector deleted while its store was read refuses its streams.
+      if (isConnectionDeleted(error)) {
+        refuseDeleted(connector, name);
+        continue;
+      }
       // A conflict the fold found refuses this stream only. Anything else,
       // an abort included, stops the seed.
       if (!(error instanceof Error) || error.message !== "invalid_record")

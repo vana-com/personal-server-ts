@@ -4,7 +4,12 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createSeedIntake } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createLiteLegacyStoreRunner } from "./legacy-runner.js";
 import { createPsLiteSeedStaging } from "./seed-staging.js";
-import { createMemoryPsLiteStateStore } from "./test-support/memory.js";
+import {
+  createMemoryPsLiteStateStore,
+  createMemoryPsLiteStorage,
+} from "./test-support/memory.js";
+import { eraseLegacyScopesOf } from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 
 // The runner's import decisions, over in-memory scope storage and a
 // recording seed intake.
@@ -457,4 +462,113 @@ it("stop during a scan of excluded scopes reads nothing more", async () => {
   });
   await live.run(controller.signal).catch(() => {});
   expect(reads).toHaveLength(1);
+});
+
+it("a source whose name differs from its connector name imports its rows", async () => {
+  const named = JSON.stringify({
+    connector_key: "spotify",
+    version: "1",
+    source: { id: "https://registry.pdpp.dev/sources/spotify_music" },
+    streams: [
+      { name: "saved_tracks", semantics: "mutable_state", primary_key: ["id"] },
+    ],
+  });
+  const scopes: Versions = new Map([
+    [
+      "spotify.saved_tracks",
+      [
+        version([
+          {
+            id: "s1",
+            $pdpp: {
+              sourceId: "https://registry.pdpp.dev/sources/spotify_music",
+            },
+          },
+        ]),
+      ],
+    ],
+  ]);
+  const { intake, imported } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: memoryStorage(scopes),
+    intake: async () => intake,
+    manifests: () => [named],
+  });
+  await live.run(new AbortController().signal);
+  expect(imported).toEqual(["s1"]);
+  expect(live.report()?.streams.excluded).toEqual([]);
+});
+
+it("a connector erased mid-run through the real delete path costs only that connector, and the report still publishes", async () => {
+  const storage = createMemoryPsLiteStorage();
+  const write = async (scope: string, id: string) => {
+    const collectedAt = "2026-11-01T00:00:00.000Z";
+    const envelope = createDataFileEnvelope(scope, collectedAt, {
+      records: [{ id }],
+    });
+    const stored = await storage.writeEnvelope(envelope);
+    await storage.insertEntry({
+      fileId: null,
+      schemaId: null,
+      path: stored.relativePath,
+      scope,
+      collectedAt,
+      sizeBytes: stored.sizeBytes,
+      afterTombstoneVersion: null,
+    });
+  };
+  await write("spotify.saved_tracks", "s1");
+  await write("spotify.profile", "p1");
+  await write("github.starred", "g1");
+  // The first read of a spotify body finds the connector erased: the delete
+  // path runs just before it, as Lite's connection delete does.
+  const real = storage.readEnvelope.bind(storage);
+  let erased = false;
+  const racing = {
+    listScopes: storage.listScopes.bind(storage),
+    listVersions: storage.listVersions.bind(storage),
+    readEnvelope: async (scope: string, collectedAt: string) => {
+      if (scope.startsWith("spotify.") && !erased) {
+        erased = true;
+        await eraseLegacyScopesOf("spotify", storage);
+      }
+      return real(scope, collectedAt);
+    },
+  };
+  const { intake, imported } = recordingIntake([], {
+    deletedAfterPreflight: ["spotify"],
+  });
+  const live = createLiteLegacyStoreRunner({
+    storage: racing as never,
+    intake: async () => intake,
+    manifests: () => [manifest, githubManifest],
+  });
+  await live.run(new AbortController().signal);
+  expect(erased).toBe(true);
+  expect(imported).toEqual(["g1"]);
+  expect(live.report()?.streams.refused).toEqual([
+    { reason: "deleted", streams: 2, rows: 0 },
+  ]);
+  expect(live.report()?.streams.staged).toBe(1);
+});
+
+it("an envelope missing with no deletion fails closed", async () => {
+  const scopes: Versions = new Map([
+    ["spotify.saved_tracks", [version([{ id: "s1" }])]],
+  ]);
+  const storage = memoryStorage(scopes) as unknown as {
+    readEnvelope: () => Promise<unknown>;
+  };
+  storage.readEnvelope = async () => {
+    throw new Error("Envelope not found");
+  };
+  const { intake } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: storage as never,
+    intake: async () => intake,
+    manifests: () => [manifest],
+  });
+  await expect(live.run(new AbortController().signal)).rejects.toThrow(
+    "Envelope not found",
+  );
 });
