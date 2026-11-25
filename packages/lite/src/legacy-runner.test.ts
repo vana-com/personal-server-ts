@@ -605,70 +605,78 @@ function realIntakeOver(erased: { value: boolean }, onPut: { value: boolean }) {
   return intake;
 }
 
-it("an envelope erased during the upload pass refuses the stream as deleted, without waiting on the seed lock", { timeout: 3000 }, async () => {
-  const scopes: Versions = new Map([
-    ["spotify.profile", [version([{ id: "p1" }])]],
-    ["github.starred", [version([{ id: "g1" }])]],
-  ]);
-  const erased = { value: false };
-  const inPut = { value: false };
-  const base = memoryStorage(scopes) as unknown as {
-    readEnvelope: (scope: string, at: string) => Promise<unknown>;
-    listScopes: () => unknown;
-    listVersions: () => unknown;
-  };
-  const storage = {
-    listScopes: base.listScopes,
-    listVersions: base.listVersions,
-    readEnvelope: async (scope: string, at: string) => {
-      if (inPut.value && scope === "spotify.profile") {
-        erased.value = true;
-        throw new Error("Envelope not found");
-      }
-      return base.readEnvelope(scope, at);
-    },
-  } as never;
-  const live = createLiteLegacyStoreRunner({
-    storage,
-    intake: async () => realIntakeOver(erased, inPut),
-    manifests: () => [manifest, githubManifest],
-  });
-  await live.run(new AbortController().signal);
-  expect(live.report()?.streams.refused).toContainEqual({
-    reason: "deleted",
-    streams: 1,
-    rows: 1,
-  });
-  expect(live.report()?.streams.staged).toBe(1);
-});
+it(
+  "an envelope erased during the upload pass refuses the stream as deleted, without waiting on the seed lock",
+  { timeout: 3000 },
+  async () => {
+    const scopes: Versions = new Map([
+      ["spotify.profile", [version([{ id: "p1" }])]],
+      ["github.starred", [version([{ id: "g1" }])]],
+    ]);
+    const erased = { value: false };
+    const inPut = { value: false };
+    const base = memoryStorage(scopes) as unknown as {
+      readEnvelope: (scope: string, at: string) => Promise<unknown>;
+      listScopes: () => unknown;
+      listVersions: () => unknown;
+    };
+    const storage = {
+      listScopes: base.listScopes,
+      listVersions: base.listVersions,
+      readEnvelope: async (scope: string, at: string) => {
+        if (inPut.value && scope === "spotify.profile") {
+          erased.value = true;
+          throw new Error("Envelope not found");
+        }
+        return base.readEnvelope(scope, at);
+      },
+    } as never;
+    const live = createLiteLegacyStoreRunner({
+      storage,
+      intake: async () => realIntakeOver(erased, inPut),
+      manifests: () => [manifest, githubManifest],
+    });
+    await live.run(new AbortController().signal);
+    expect(live.report()?.streams.refused).toContainEqual({
+      reason: "deleted",
+      streams: 1,
+      rows: 1,
+    });
+    expect(live.report()?.streams.staged).toBe(1);
+  },
+);
 
-it("an envelope missing during the upload pass with no deletion still fails", { timeout: 3000 }, async () => {
-  const scopes: Versions = new Map([
-    ["spotify.profile", [version([{ id: "p1" }])]],
-  ]);
-  const inPut = { value: false };
-  const base = memoryStorage(scopes) as unknown as {
-    readEnvelope: (scope: string, at: string) => Promise<unknown>;
-    listScopes: () => unknown;
-    listVersions: () => unknown;
-  };
-  const storage = {
-    listScopes: base.listScopes,
-    listVersions: base.listVersions,
-    readEnvelope: async (scope: string, at: string) => {
-      if (inPut.value) throw new Error("Envelope not found");
-      return base.readEnvelope(scope, at);
-    },
-  } as never;
-  const live = createLiteLegacyStoreRunner({
-    storage,
-    intake: async () => realIntakeOver({ value: false }, inPut),
-    manifests: () => [manifest],
-  });
-  await expect(live.run(new AbortController().signal)).rejects.toThrow(
-    "Envelope not found",
-  );
-});
+it(
+  "an envelope missing during the upload pass with no deletion still fails",
+  { timeout: 3000 },
+  async () => {
+    const scopes: Versions = new Map([
+      ["spotify.profile", [version([{ id: "p1" }])]],
+    ]);
+    const inPut = { value: false };
+    const base = memoryStorage(scopes) as unknown as {
+      readEnvelope: (scope: string, at: string) => Promise<unknown>;
+      listScopes: () => unknown;
+      listVersions: () => unknown;
+    };
+    const storage = {
+      listScopes: base.listScopes,
+      listVersions: base.listVersions,
+      readEnvelope: async (scope: string, at: string) => {
+        if (inPut.value) throw new Error("Envelope not found");
+        return base.readEnvelope(scope, at);
+      },
+    } as never;
+    const live = createLiteLegacyStoreRunner({
+      storage,
+      intake: async () => realIntakeOver({ value: false }, inPut),
+      manifests: () => [manifest],
+    });
+    await expect(live.run(new AbortController().signal)).rejects.toThrow(
+      "Envelope not found",
+    );
+  },
+);
 
 it("an envelope erased during shared-scope attribution refuses that connector as deleted and the run goes on", async () => {
   const browserManifest = manifestOf("github-browser", "starred");
