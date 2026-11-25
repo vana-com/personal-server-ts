@@ -286,7 +286,11 @@ export function createLegacyRetirer(
       if (!intent) return null;
       if (intent.state === "done")
         return { retireId: intent.retireId, legacy: PART_DONE };
-      schedule(connector, 0);
+      // A poll reports the verdict. It starts a worker only where none was
+      // started (a process that has not cycled since a restart): it is not a
+      // retry, so it neither skips a pending intent's backoff nor restarts a
+      // blocked one.
+      if (!loops.has(connector)) schedule(connector, 0);
       return {
         retireId: intent.retireId,
         legacy: verdicts.get(connector) ?? PART_PENDING,

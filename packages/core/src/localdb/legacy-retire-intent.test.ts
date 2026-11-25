@@ -18,7 +18,10 @@ import { LegacyRetireNotAdmitted } from "./legacy-retire-intent.js";
 import { legacyScopesOfConnector } from "../legacy-projection/erase-connector.js";
 import { legacyPortsOver } from "../test-utils/legacy-delete-ports.js";
 import { createLegacyGatewayFake } from "../test-utils/legacy-gateway-fake.js";
-import { FAKE_GATEWAY } from "../test-utils/legacy-gateway-fake.js";
+import {
+  FAKE_GATEWAY,
+  FAKE_STORAGE,
+} from "../test-utils/legacy-gateway-fake.js";
 import type { LegacyDeletePorts } from "./legacy-delete.js";
 
 afterEach(closeWorldDrivers);
@@ -84,6 +87,11 @@ async function currentState(f: Fixture) {
 const gatewayDeletes = (fake: Fixture["fake"]) =>
   fake.requests.filter(
     (r) => r.url.startsWith(FAKE_GATEWAY) && r.method === "DELETE",
+  );
+
+const storageDeletes = (fake: Fixture["fake"]) =>
+  fake.requests.filter(
+    (r) => r.url.startsWith(FAKE_STORAGE) && r.method === "DELETE",
   );
 
 describe("a standalone legacy retirement after the switch", () => {
@@ -194,6 +202,205 @@ describe("a standalone legacy retirement after the switch", () => {
     expect(await f.a.db.query("SELECT state FROM legacy_retirements")).toEqual([
       { state: "open" },
     ]);
+  });
+
+  // The request pins live v2. Another writer then publishes v3 and tombstones
+  // it at v4: that tombstone does not follow the pin, and erasing it would free
+  // the slot of v3, which the pin never named.
+  it("blocks on a tombstone that does not directly follow the pinned head, and erases nothing", async () => {
+    const gate = (() => {
+      let open!: () => void;
+      const opened = new Promise<void>((resolve) => (open = resolve));
+      return { opened, open };
+    })();
+    const read = new Set<string>();
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        head: async (scope, signal) => {
+          if (read.has(scope)) await gate.opened;
+          read.add(scope);
+          return ports.head(scope, signal);
+        },
+      }),
+    });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    for (const scope of SCOPES) {
+      f.fake.moveHead(scope);
+      f.fake.foreignTombstone(scope);
+    }
+    gate.open();
+
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: { state: "blocked", reason: "legacy_head_changed" },
+      }),
+    );
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) expect(f.fake.blobCount(scope)).toBe(3);
+  });
+
+  it("accepts a tombstone another writer put directly after the pinned head", async () => {
+    const gate = (() => {
+      let open!: () => void;
+      const opened = new Promise<void>((resolve) => (open = resolve));
+      return { opened, open };
+    })();
+    const read = new Set<string>();
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        head: async (scope, signal) => {
+          if (read.has(scope)) await gate.opened;
+          read.add(scope);
+          return ports.head(scope, signal);
+        },
+      }),
+    });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    for (const scope of SCOPES) f.fake.foreignTombstone(scope);
+    gate.open();
+
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) expect(f.fake.blobCount(scope)).toBe(0);
+  });
+
+  // A status poll reports the verdict. It is not a retry: a blocked intent is
+  // not read again, and a pending one keeps its backoff.
+  it("does not restart a blocked intent when its status is polled", async () => {
+    const gate = (() => {
+      let open!: () => void;
+      const opened = new Promise<void>((resolve) => (open = resolve));
+      return { opened, open };
+    })();
+    const read = new Set<string>();
+    let reads = 0;
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        head: async (scope, signal) => {
+          reads += 1;
+          if (read.has(scope)) await gate.opened;
+          read.add(scope);
+          return ports.head(scope, signal);
+        },
+      }),
+    });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    for (const scope of SCOPES) f.fake.moveHead(scope);
+    gate.open();
+    const blockedStatus = {
+      retireId,
+      legacy: { state: "blocked", reason: "legacy_head_changed" },
+    };
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual(blockedStatus),
+    );
+    // Let any pass the polls above started finish before counting.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const settled = reads;
+
+    for (let poll = 0; poll < 20; poll++)
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual(blockedStatus);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(reads).toBe(settled);
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+  });
+
+  it("starts a pass on a status poll only when no worker exists for the intent", async () => {
+    const dbFile = tempDbFile();
+    const f = await reconnected({ dbFile });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual(DONE),
+    );
+    // A restart that has not cycled yet has no worker; a poll of an open
+    // intent starts one. Reopen the intent to prove it.
+    await f.a.db.batch([
+      {
+        sql: "UPDATE legacy_retirements SET state = 'open' WHERE retire_id = ?",
+        params: [retireId],
+      },
+    ]);
+    const restarted = await f.a.restart();
+    await vi.waitFor(async () =>
+      expect(await restarted.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+  });
+
+  // The preflight `importFence` and the merge are two steps. An intent that is
+  // persisted between them must still stop the merge: only the guard inside the
+  // merge transaction can.
+  it("merges no record when the intent is persisted after the import's last preflight check", async () => {
+    const f = await reconnected();
+    const source: ImportSource = {
+      source: "legacy-race",
+      owner: OWNER,
+      network: "test",
+      revision: "r1",
+      target: {
+        connectionId: controlScope(GH, ""),
+        connector: GH,
+        stream: sName(0),
+        primaryKey: ["id"],
+        semantics: "mutable_state",
+        incremental: true,
+      },
+      exclusions: [],
+      async *records() {
+        yield { id: "raced" };
+      },
+    };
+    const recordsBefore = await f.a.records();
+    const changesBefore = await f.a.db.query(
+      "SELECT count(*) AS n FROM record_changes",
+    );
+    let persisted = false;
+    const db = new Proxy(f.a.deps.db, {
+      get(target, key, receiver) {
+        if (key !== "batch") return Reflect.get(target, key, receiver);
+        return async (statements: { sql: string }[]) => {
+          // The merge transaction is the batch that carries the guard.
+          if (
+            !persisted &&
+            statements.some((s) => s.sql.includes("INSERT INTO import_guard"))
+          ) {
+            persisted = true;
+            await f.a.db.batch([
+              {
+                sql: "INSERT INTO legacy_retirements (owner, connector, retire_id, state, scopes, created_at) VALUES (?, ?, 'race', 'open', '[]', 1)",
+                params: [OWNER.toLowerCase(), GH],
+              },
+            ]);
+          }
+          return target.batch(statements as never);
+        };
+      },
+    });
+
+    await importLegacySource(
+      { ...f.a.deps, db },
+      createImportLedger(f.a.db),
+      source,
+    ).catch(() => undefined);
+
+    expect(persisted).toBe(true);
+    expect(await f.a.records()).toEqual(recordsBefore);
+    expect(
+      await f.a.db.query("SELECT count(*) AS n FROM record_changes"),
+    ).toEqual(changesBefore);
   });
 
   it("refuses an account that has not switched, and writes nothing", async () => {

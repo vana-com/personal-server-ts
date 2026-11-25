@@ -349,9 +349,12 @@ function pinHolds(pin: LegacyPin, head: LegacyHead): boolean {
   if (pin.state === "absent") return head.state === "absent";
   if (pin.state === "deleted")
     return head.state === "deleted" && head.version === pin.version;
-  // A live pin: still that head, or already tombstoned (by this device, a
-  // device of the account that retired it, or a retry of ours).
-  if (head.state === "deleted") return true;
+  // A live pin: still that head, or already tombstoned by this device, a
+  // device of the account that retired it, or a retry of ours. A tombstone
+  // is the pinned head's own only if it is the next version: a later one sits
+  // over a version the pin never named, and erasing it frees that version's blob.
+  if (head.state === "deleted")
+    return BigInt(head.version) === BigInt(pin.fence.expectedVersion) + 1n;
   return (
     head.state === "live" &&
     head.fence.expectedVersion === pin.fence.expectedVersion &&
