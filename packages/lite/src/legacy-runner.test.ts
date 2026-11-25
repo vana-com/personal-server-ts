@@ -734,3 +734,63 @@ it("an envelope missing during shared-scope attribution with no deletion still f
     "Envelope not found",
   );
 });
+
+it("a stream refused before its rows were counted is still reported when a later stream deletes its connector", async () => {
+  // spotify.profile holds one key twice with different bodies, so its
+  // counting pass stops at the conflict before a total is recorded. The
+  // next spotify stream then deletes the connector, and profile's envelope
+  // is gone when the report counts its rows.
+  const scopes: Versions = new Map([
+    [
+      "spotify.profile",
+      [
+        version([
+          { id: "x", n: 1 },
+          { id: "x", n: 2 },
+        ]),
+      ],
+    ],
+    ["spotify.saved_tracks", [version([{ id: "t1" }])]],
+  ]);
+  const base = memoryStorage(scopes) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+    listScopes: () => unknown;
+    listVersions: () => unknown;
+  };
+  const deletedByPut = { value: false };
+  const storage = {
+    listScopes: base.listScopes,
+    listVersions: base.listVersions,
+    readEnvelope: async (scope: string, at: string) => {
+      if (deletedByPut.value) throw new Error("Envelope not found");
+      return base.readEnvelope(scope, at);
+    },
+  } as never;
+  const { intake } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage,
+    intake: async () => ({
+      // The connector is deleted by saved_tracks' own upload.
+      status: async (connector: string) => {
+        if (deletedByPut.value) throw gone();
+        return intake.status(connector);
+      },
+      put: async (...args: Parameters<SeedIntake["put"]>) => {
+        if (args[1] === "saved_tracks") {
+          deletedByPut.value = true;
+          throw gone();
+        }
+        return intake.put(...args);
+      },
+    }),
+    manifests: () => [manifest],
+  });
+  await live.run(new AbortController().signal);
+  const report = live.report();
+  expect(report).not.toBeNull();
+  expect(report?.streams.refused).toContainEqual({
+    reason: "invalid_record",
+    streams: 1,
+    rows: 0,
+  });
+});

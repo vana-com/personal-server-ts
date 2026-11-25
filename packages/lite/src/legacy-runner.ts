@@ -145,6 +145,17 @@ export function createLiteLegacyStoreRunner(
       const excluded = tally<LegacyScopeExclusionReason>();
       const deleted = new Set<string>();
       const refused = tally<string>();
+      const connectorDeleted = async (connector: string): Promise<boolean> => {
+        if (deleted.has(connector)) return true;
+        try {
+          await intake.status(connector);
+        } catch (error) {
+          if (!isConnectionDeleted(error)) return false;
+          deleted.add(connector);
+          return true;
+        }
+        return false;
+      };
       const store = createLegacyScopeStore({
         storage: options.storage,
         manifests: options.manifests,
@@ -177,17 +188,7 @@ export function createLiteLegacyStoreRunner(
           }
           return "open";
         },
-        connectorDeleted: async (connector) => {
-          if (deleted.has(connector)) return true;
-          try {
-            await intake.status(connector);
-          } catch (error) {
-            if (!isConnectionDeleted(error)) return false;
-            deleted.add(connector);
-            return true;
-          }
-          return false;
-        },
+        connectorDeleted,
         signal,
       });
       // The rows of each stream's newest stored version, counted as the
@@ -244,11 +245,16 @@ export function createLiteLegacyStoreRunner(
             try {
               for await (const _ of layer.records()) rows += 1;
             } catch (error) {
-              // The producer refused this stream as deleted, so an envelope
-              // gone by now is that deletion.
+              // An envelope gone by now is a deletion when the producer
+              // refused this stream as deleted, or when its connector has been
+              // deleted since (a later stream's run). The refusal reason stays.
               if (
                 !isConnectionDeleted(error) &&
-                !(s.reason === "deleted" && isEnvelopeMissing(error))
+                !(
+                  isEnvelopeMissing(error) &&
+                  (s.reason === "deleted" ||
+                    (await connectorDeleted(s.connector)))
+                )
               )
                 throw error;
               rows = 0;
