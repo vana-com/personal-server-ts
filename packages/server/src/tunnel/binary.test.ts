@@ -119,6 +119,18 @@ describe("tunnel/binary", () => {
       expect(version).toBeNull();
     });
 
+    it.each([{ version: 17 }, { version: ["0.67.0"] }, { version: { value: "0.67.0" } }])(
+      "reports an unknown version when version metadata is not a string (%j)",
+      async ({ version }) => {
+        await mkdir(join(tempDir, "bin"), { recursive: true });
+        await writeFile(
+          join(tempDir, "bin", "frpc-version.json"),
+          JSON.stringify({ version }),
+        );
+        expect(await getInstalledVersion(tempDir)).toBeNull();
+      },
+    );
+
     it("reads version from valid metadata file", async () => {
       await mkdir(join(tempDir, "bin"), { recursive: true });
       await writeFile(
