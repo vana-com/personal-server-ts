@@ -252,6 +252,26 @@ describe("declared-text projection diagnostics", () => {
 });
 
 describe("legacy scope binding self-check", () => {
+  it("accepts zero and explicit null scores for the legacy display", async () => {
+    const { assertOuraLegacyScoresAreIntegers } = await import("./index.js");
+    expect(() =>
+      assertOuraLegacyScoresAreIntegers("oura.readiness", {
+        days: [{ score: 0 }],
+        dailyScores: [{ score: null }],
+      }),
+    ).not.toThrow();
+  });
+
+  it("locates a non-integer display score in the second collection", async () => {
+    const { assertOuraLegacyScoresAreIntegers } = await import("./index.js");
+    expect(() =>
+      assertOuraLegacyScoresAreIntegers("oura.sleep", {
+        days: [{ score: 0 }],
+        dailyScores: [{ score: null }, { score: 1.5 }],
+      }),
+    ).toThrow("oura.sleep.dailyScores[1].score must be an integer or null");
+  });
+
   it("pins every GitHub projection to the verified 0.7.2 artifact and vendored profile bytes", () => {
     expect(githubDeclaration.version).toBe("0.7.2");
     expect(githubProvenance.source.revision).toBe(
