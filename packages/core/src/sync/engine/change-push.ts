@@ -2,6 +2,7 @@ import { NODE_MAX_TIMER_DELAY_MS } from "../../stream-sync/timer.js";
 import {
   ChangeFeedAbsentError,
   RegistryOverloadError,
+  type ChangeCursor,
   type StreamSyncRegistry,
 } from "../../stream-sync/ports.js";
 import type { ChangePush } from "./sync-manager.js";
@@ -56,22 +57,23 @@ export interface RegistryChangePushOptions {
  * A subscription to the gateway's "the registry moved" signal.
  *
  * It keeps one held request open. Each answer carries the registry's
- * sequence, the registry's position; the next request sends it back, so the
- * gateway compares two numbers and a poke that was lost on the wire is found
- * by the next request. An answer that ends the wait with nothing new carries
- * the gateway's current sequence too, read when the wait ended. The position is
+ * cursor, the registry's position; the next request sends it back, so the
+ * gateway compares it with its own and a poke that was lost on the wire is
+ * found by the next request. An answer that ends the wait with nothing new
+ * carries the gateway's current cursor too, read when the wait ended. The
+ * push holds a cursor as received and only compares it for equality. The position is
  * not data: the manager reads the registry itself and trusts the position only
  * to say that nothing moved since a cycle that started under it, so a wake that
  * was lost is found at the next answer. It does four things:
  *
- *  - every answer reports its sequence as the position (`onPosition`), before
+ *  - every answer reports its cursor as the position (`onPosition`), before
  *    anything else, so the cycle a poke starts samples the position it follows;
  *  - an answer that says `changed` is a poke (`onChange`): the manager pulls,
  *    or applies the answer's delta. Each held request sends the position the
  *    manager holds the registry up to (`since`), so the gateway can answer
  *    with what changed after it;
  *  - the first answer after any failure is a poke too, whether or not the
- *    sequence moved, so a poke lost with the connection costs one pull. A
+ *    cursor moved, so a poke lost with the connection costs one pull. A
  *    failed attempt is not a poke: with every answer lost, only the manager's
  *    timer cycle (and its probe) finds the change;
  *  - `onHealth(false)` on any failure or silence, `onHealth(true)` on the next
@@ -91,15 +93,11 @@ export function createRegistryChangePush(
   return {
     subscribe(handlers) {
       const lifetime = new AbortController();
-      let cursor: string | undefined;
-      // The gateway database's epoch, held beside the cursor: the generation
-      // the cursor's number belongs to. It is sent with every request. An
-      // answer under another epoch means the database was replaced (a dev
-      // reset, a restore), so the cursor and the `since` built on it say
-      // nothing: that answer is a reset, whatever its `changed` says. A gateway
-      // that sends none leaves the push as it was, and one seen earlier stays. The
-      // first epoch to arrive beside a cursor held without one is a reset too.
-      let epoch: string | undefined;
+      // The last answer's cursor, exactly as the gateway sent it. It carries
+      // the database epoch inside, so a replaced database is the gateway's to
+      // see: it answers `changed` with a reset delta, and the push passes that
+      // on like any other answer.
+      let cursor: ChangeCursor | undefined;
       let healthy = false;
       let afterFailure = false;
       let failures = 0;
@@ -153,38 +151,16 @@ export function createRegistryChangePush(
         });
         try {
           const since = cursor === undefined ? undefined : handlers.since();
-          const wait = waitForChange!(
-            cursor,
-            waitMs,
-            request.signal,
-            since,
-            epoch,
-          );
+          const wait = waitForChange!(cursor, waitMs, request.signal, since);
           wait.catch(() => {}); // a late failure after the race is not ours
           const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
-          // A cursor held with no epoch beside it came from an epoch-less
-          // gateway; the first epoch seen then names a generation the cursor
-          // was never checked against, so it counts as a move too.
-          const epochMoved =
-            answer.epoch !== undefined &&
-            (epoch === undefined
-              ? cursor !== undefined
-              : answer.epoch !== epoch);
-          if (answer.epoch !== undefined) epoch = answer.epoch;
-          cursor = answer.seq;
+          cursor = answer.cursor;
           failures = 0;
           setHealth(true);
           // The position first: the cycle a poke starts samples it.
-          handlers.onPosition(answer.seq);
-          if (epochMoved) {
-            afterFailure = false;
-            handlers.onChange(
-              answer.delta?.reset
-                ? answer.delta
-                : { since: since ?? answer.seq, seq: answer.seq, reset: true },
-            );
-          } else if (answer.changed || afterFailure) {
+          handlers.onPosition(answer.cursor);
+          if (answer.changed || afterFailure) {
             afterFailure = false;
             handlers.onChange(answer.changed ? answer.delta : undefined);
           }

@@ -70,7 +70,7 @@ function gateway() {
       changed && since !== undefined
         ? {
             since,
-            seq: String(seq),
+            cursor: String(seq),
             reset: false,
             rows: [...deletes].some((d) => d > Number(since) && d <= seq)
               ? [TOMBSTONE]
@@ -79,7 +79,7 @@ function gateway() {
             serversChanged: false,
           }
         : undefined;
-    return { seq: String(seq), changed, ...(delta ? { delta } : {}) };
+    return { cursor: String(seq), changed, ...(delta ? { delta } : {}) };
   };
   const registry = {
     waitForChange: (
@@ -225,7 +225,7 @@ describe("changes that follow one another", () => {
     first.release();
     await flush();
     expect(t.applyDelta).toHaveBeenCalledTimes(2);
-    expect(t.applyDelta.mock.calls[1]![0]).toMatchObject({ seq: second });
+    expect(t.applyDelta.mock.calls[1]![0]).toMatchObject({ cursor: second });
     expect(t.cycle).not.toHaveBeenCalled();
     expect(t.feed.requests.at(-1)).toEqual({ after: second, since: second });
     await t.manager.stop();
@@ -256,7 +256,7 @@ describe("changes that follow one another", () => {
     const t = setup({
       applyDelta: async (d) => {
         if (!d.reset && d.rows.some((r) => r.read.found && r.read.deleted))
-          purged.push(d.seq);
+          purged.push(d.cursor);
         return APPLIED;
       },
     });
