@@ -249,6 +249,53 @@ describe("createReplicationDriver", () => {
     expect(driver.status().lastError).toBeUndefined();
   });
 
+  it("clears a prior step error on recovery and records the new step time", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      timers: clock.timers,
+    });
+    driver.start();
+    steps[0]!.done.reject(new Error("synthetic step failure"));
+    await flush();
+    expect(driver.status().lastError).toBe("synthetic step failure");
+    expect(driver.status()).not.toHaveProperty("lastStepAt");
+
+    clock.advance(REPLICA_STEP_ERROR_DELAY_MS);
+    steps[1]!.done.resolve(report());
+    await flush();
+    expect(driver.status()).not.toHaveProperty("lastError");
+    expect(driver.status().lastStepAt).toBe(T0 + REPLICA_STEP_ERROR_DELAY_MS);
+    await driver.stop(0);
+  });
+
+  it("restarts after a settled stop and ignores a redundant start", async () => {
+    const clock = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      budget,
+      timers: clock.timers,
+    });
+    driver.start();
+    steps[0]!.done.resolve(report());
+    await flush();
+    expect(await driver.stop(0)).toBe(true);
+    expect(clock.armed()).toEqual([]);
+
+    driver.start();
+    driver.start();
+    expect(steps).toHaveLength(2);
+    expect(steps[1]!.signal.aborted).toBe(false);
+    steps[1]!.done.resolve(report());
+    await flush();
+    expect(steps).toHaveLength(2);
+    expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+    await driver.stop(0);
+  });
+
   it("aborts a step that passes its deadline and clears the deadline after a step", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();
