@@ -18,6 +18,49 @@ afterEach(closeWorldDrivers);
 const STREAM = sName(0);
 const SEGMENT = /\/s-[0-9a-f]+$/;
 const REMOVING = PARTS_IN_FLIGHT + 8;
+const PREPASS_WAIT_MS = 3_000;
+
+function readiness() {
+  let signal!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    signal = resolve;
+  });
+  return { ready, signal };
+}
+
+async function beforeDeadline<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Timed out after ${PREPASS_WAIT_MS} ms waiting for ${label}`)),
+          PREPASS_WAIT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function waitForPrepass(
+  ready: Promise<void>,
+  applying: Promise<unknown>,
+  label: string,
+): Promise<void> {
+  return beforeDeadline(
+    Promise.race([
+      ready,
+      applying.then(
+        () => { throw new Error(`Restore settled before ${label}`); },
+        (cause: unknown) => { throw new Error(`Restore failed before ${label}`, { cause }); },
+      ),
+    ]),
+    label,
+  );
+}
 
 async function deletionHeavyLog(w: Awaited<ReturnType<typeof world>>) {
   const a = await w.device("a");
@@ -44,6 +87,7 @@ it("reads each removing segment from storage once, and not all of them at once",
 
   let waiting = 0;
   let widest = 0;
+  const windowFull = readiness();
   let open = false;
   let head: string | undefined;
   let release!: () => void;
@@ -59,8 +103,8 @@ it("reads each removing segment from storage once, and not all of them at once",
       head ??= key;
       if (key === head) return;
       widest = Math.max(widest, ++waiting);
-      await gate;
-      waiting--;
+      if (waiting >= PARTS_IN_FLIGHT) windowFull.signal();
+      try { await gate; } finally { waiting--; }
     },
   });
   await b.db.batch([
@@ -70,15 +114,21 @@ it("reads each removing segment from storage once, and not all of them at once",
     },
   ]);
   const applying = applyConnection(b.deps, CONNECTION_ID);
-  // Wait until the prepass has put its full window of downloads in flight.
-  // More removing segments wait than the window holds, so it stops there.
-  while (waiting < PARTS_IN_FLIGHT) await new Promise((r) => setTimeout(r, 1));
-  // A download past the window would arrive within a few turns of the last.
-  for (let turn = 0; turn < 10; turn++) await new Promise((r) => setTimeout(r));
-  const started = widest;
-  open = true;
-  release();
-  await applying;
+  let started: number;
+  try {
+    await waitForPrepass(windowFull.ready, applying, "the full download window");
+    // Give an incorrectly larger window a chance to start another download.
+    const turns = async () => {
+      for (let turn = 0; turn < 10; turn++)
+        await new Promise((resolve) => setTimeout(resolve));
+    };
+    await waitForPrepass(turns(), applying, "the in-flight concurrency check");
+    started = widest;
+  } finally {
+    open = true;
+    release();
+  }
+  await beforeDeadline(applying, "restore completion");
 
   expect(started).toBe(PARTS_IN_FLIGHT);
   const perSegment = new Map<string, number>();
@@ -97,6 +147,9 @@ it("ends the prepass downloads before it discards the spool when the load fails"
   await deletionHeavyLog(w);
 
   let waiting = 0;
+  const windowFull = readiness();
+  const failureInjected = readiness();
+  const spoolDiscarded = readiness();
   let head: string | undefined;
   let release!: () => void;
   const gate = new Promise<void>((r) => {
@@ -110,7 +163,8 @@ it("ends the prepass downloads before it discards the spool when the load fails"
       head ??= key;
       if (key === head) return;
       waiting++;
-      await gate;
+      if (waiting >= PARTS_IN_FLIGHT) windowFull.signal();
+      try { await gate; } finally { waiting--; }
     },
   });
   await b.db.batch([
@@ -123,30 +177,38 @@ it("ends the prepass downloads before it discards the spool when the load fails"
   // of the prepass has a download in flight.
   const batch = b.db.batch.bind(b.db);
   let failedAfterGets = -1;
+  let inFlightAtDiscard: number | undefined;
   b.db.batch = (async (statements: Parameters<typeof batch>[0]) => {
     if (
       failedAfterGets < 0 &&
       statements.some((s) => /stream_partial/.test(s.sql))
     ) {
-      while (waiting < PARTS_IN_FLIGHT)
-        await new Promise((r) => setTimeout(r, 1));
+      await waitForPrepass(windowFull.ready, applying, "failed restore's download window");
       failedAfterGets = b.gets.length;
+      failureInjected.signal();
       throw new Error("setup_failed");
     }
-    return batch(statements);
+    const discarding =
+      failedAfterGets >= 0 &&
+      statements.some((s) => /\bDELETE\s+FROM\s+log_spool\b/i.test(s.sql));
+    if (discarding) inFlightAtDiscard = waiting;
+    const result = await batch(statements);
+    if (discarding) spoolDiscarded.signal();
+    return result;
   }) as typeof b.db.batch;
 
-  const applying = applyConnection(b.deps, CONNECTION_ID).then(
-    () => "applied",
-    (error: Error) => error.message,
-  );
-  while (failedAfterGets < 0) await new Promise((r) => setTimeout(r, 1));
-  release();
-  expect(await applying).toBe("setup_failed");
-  // Let any worker the failure left behind run.
-  for (let turn = 0; turn < 20; turn++)
-    await new Promise((r) => setTimeout(r, 2));
-
+  // Start on the next microtask: the batch wrapper can then race applying.
+  const applying = Promise.resolve()
+    .then(() => applyConnection(b.deps, CONNECTION_ID))
+    .then(() => "applied", (error: Error) => error.message);
+  try {
+    await waitForPrepass(failureInjected.ready, applying, "the injected setup failure");
+  } finally {
+    release();
+  }
+  await waitForPrepass(spoolDiscarded.ready, applying, "the spool discard");
+  expect(await beforeDeadline(applying, "failed restore completion")).toBe("setup_failed");
+  expect(inFlightAtDiscard).toBe(0);
   expect(b.gets.length).toBe(failedAfterGets);
   const [kept] = await b.db.query<{ n: number }>(
     "SELECT COUNT(*) AS n FROM log_spool",
