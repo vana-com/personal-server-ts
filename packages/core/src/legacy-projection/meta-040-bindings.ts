@@ -35,7 +35,7 @@ const instagramPosts040: LegacyScopeBinding = {
     const invalidLiker = records.some(
       (record) =>
         record.stream === "post_likes" &&
-        (!Number.isInteger(record.data.liker_ordinal) ||
+        (!Number.isSafeInteger(record.data.liker_ordinal) ||
           (record.data.liker_ordinal as number) < 0),
     );
     if (invalidLiker) {
