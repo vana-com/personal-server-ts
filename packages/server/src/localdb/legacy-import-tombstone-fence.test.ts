@@ -56,7 +56,10 @@ it("a transient count failure after receipt commit cannot turn it into a deletio
   let counts = 0;
   let tripped = false;
   a.db.query = (async (sql: string, params?: unknown[]) => {
-    if (sql.includes("SELECT count(*) AS n FROM log_tombstones") && ++counts === 2) {
+    if (
+      sql.includes("SELECT count(*) AS n FROM log_tombstones") &&
+      ++counts === 2
+    ) {
       tripped = true;
       await a.db.batch([
         {

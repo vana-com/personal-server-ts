@@ -35,7 +35,12 @@ async function beforeDeadline<T>(work: Promise<T>, label: string): Promise<T> {
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`Timed out after ${PREPASS_WAIT_MS} ms waiting for ${label}`)),
+          () =>
+            reject(
+              new Error(
+                `Timed out after ${PREPASS_WAIT_MS} ms waiting for ${label}`,
+              ),
+            ),
           PREPASS_WAIT_MS,
         );
       }),
@@ -54,8 +59,12 @@ function waitForPrepass(
     Promise.race([
       ready,
       applying.then(
-        () => { throw new Error(`Restore settled before ${label}`); },
-        (cause: unknown) => { throw new Error(`Restore failed before ${label}`, { cause }); },
+        () => {
+          throw new Error(`Restore settled before ${label}`);
+        },
+        (cause: unknown) => {
+          throw new Error(`Restore failed before ${label}`, { cause });
+        },
       ),
     ]),
     label,
@@ -104,7 +113,11 @@ it("reads each removing segment from storage once, and not all of them at once",
       if (key === head) return;
       widest = Math.max(widest, ++waiting);
       if (waiting >= PARTS_IN_FLIGHT) windowFull.signal();
-      try { await gate; } finally { waiting--; }
+      try {
+        await gate;
+      } finally {
+        waiting--;
+      }
     },
   });
   await b.db.batch([
@@ -116,7 +129,11 @@ it("reads each removing segment from storage once, and not all of them at once",
   const applying = applyConnection(b.deps, CONNECTION_ID);
   let started: number;
   try {
-    await waitForPrepass(windowFull.ready, applying, "the full download window");
+    await waitForPrepass(
+      windowFull.ready,
+      applying,
+      "the full download window",
+    );
     // Give an incorrectly larger window a chance to start another download.
     const turns = async () => {
       for (let turn = 0; turn < 10; turn++)
@@ -164,7 +181,11 @@ it("ends the prepass downloads before it discards the spool when the load fails"
       if (key === head) return;
       waiting++;
       if (waiting >= PARTS_IN_FLIGHT) windowFull.signal();
-      try { await gate; } finally { waiting--; }
+      try {
+        await gate;
+      } finally {
+        waiting--;
+      }
     },
   });
   await b.db.batch([
@@ -183,7 +204,11 @@ it("ends the prepass downloads before it discards the spool when the load fails"
       failedAfterGets < 0 &&
       statements.some((s) => /stream_partial/.test(s.sql))
     ) {
-      await waitForPrepass(windowFull.ready, applying, "failed restore's download window");
+      await waitForPrepass(
+        windowFull.ready,
+        applying,
+        "failed restore's download window",
+      );
       failedAfterGets = b.gets.length;
       failureInjected.signal();
       throw new Error("setup_failed");
@@ -200,14 +225,23 @@ it("ends the prepass downloads before it discards the spool when the load fails"
   // Start on the next microtask: the batch wrapper can then race applying.
   const applying = Promise.resolve()
     .then(() => applyConnection(b.deps, CONNECTION_ID))
-    .then(() => "applied", (error: Error) => error.message);
+    .then(
+      () => "applied",
+      (error: Error) => error.message,
+    );
   try {
-    await waitForPrepass(failureInjected.ready, applying, "the injected setup failure");
+    await waitForPrepass(
+      failureInjected.ready,
+      applying,
+      "the injected setup failure",
+    );
   } finally {
     release();
   }
   await waitForPrepass(spoolDiscarded.ready, applying, "the spool discard");
-  expect(await beforeDeadline(applying, "failed restore completion")).toBe("setup_failed");
+  expect(await beforeDeadline(applying, "failed restore completion")).toBe(
+    "setup_failed",
+  );
   expect(inFlightAtDiscard).toBe(0);
   expect(b.gets.length).toBe(failedAfterGets);
   const [kept] = await b.db.query<{ n: number }>(
