@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 import {
   access,
+  mkdir,
   mkdtemp,
   readFile,
   writeFile,
@@ -209,6 +210,35 @@ describe("loadConfig", () => {
 
       expect(config.logging.level).toBe("warn");
       expect(config.server.port).toBe(8080);
+    });
+  });
+
+  it.skipIf(process.platform === "freebsd")(
+    "rejects a directory in place of config without changing its contents",
+    async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        await mkdir(configPath);
+        const sentinel = join(configPath, "existing.txt");
+        await writeFile(sentinel, "leave this alone");
+        await expect(loadConfig({ configPath })).rejects.toMatchObject({
+          code: "EISDIR",
+        });
+        expect(await readFile(sentinel, "utf-8")).toBe("leave this alone");
+      });
+    },
+  );
+
+  it("rejects a non-directory config parent without writing defaults elsewhere", async () => {
+    await withTempDir(async (dir) => {
+      const parent = join(dir, "not-a-directory");
+      await writeFile(parent, "unchanged");
+      await expect(
+        loadConfig({ configPath: join(parent, "config.json") }),
+      ).rejects.toMatchObject({
+        code: expect.stringMatching(/^(ENOTDIR|EEXIST)$/),
+      });
+      expect(await readFile(parent, "utf-8")).toBe("unchanged");
     });
   });
 
