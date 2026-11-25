@@ -1110,7 +1110,7 @@ describe("the real subscription driving the manager", () => {
   function heldRegistry() {
     const pending: Array<{
       after: string | undefined;
-      answer: (a: { seq: string; changed: boolean }) => void;
+      answer: (a: { cursor: string; changed: boolean }) => void;
       fail: (e: Error) => void;
     }> = [];
     const registry = {
@@ -1119,7 +1119,7 @@ describe("the real subscription driving the manager", () => {
         _waitMs: number,
         signal: AbortSignal,
       ) =>
-        new Promise<{ seq: string; changed: boolean }>((resolve, reject) => {
+        new Promise<{ cursor: string; changed: boolean }>((resolve, reject) => {
           pending.push({ after, answer: resolve, fail: reject });
           signal.addEventListener("abort", () => reject(signal.reason), {
             once: true,
@@ -1140,7 +1140,7 @@ describe("the real subscription driving the manager", () => {
     });
     manager.start();
     await vi.advanceTimersByTimeAsync(0);
-    pending[0].answer({ seq: "1", changed: true }); // learns the cursor
+    pending[0].answer({ cursor: "1", changed: true }); // learns the cursor
     await vi.advanceTimersByTimeAsync(0);
     await manager.requestPull(); // m1 applied
     cycle.mockClear();
@@ -1149,7 +1149,7 @@ describe("the real subscription driving the manager", () => {
 
   it("a changed sequence cycles although the probe marker is unchanged", async () => {
     const { manager, pending, cycle } = await started();
-    pending[1].answer({ seq: "2", changed: true });
+    pending[1].answer({ cursor: "2", changed: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(cycle).toHaveBeenCalledTimes(1);
     await manager.stop();
@@ -1177,11 +1177,11 @@ describe("the real subscription driving the manager", () => {
     await vi.advanceTimersByTimeAsync(2_000); // back-off, then the next request
     expect(pending.length).toBeGreaterThanOrEqual(3);
     const atFailure = cycle.mock.calls.length; // the push turning unhealthy read
-    pending[2].answer({ seq: "1", changed: false });
+    pending[2].answer({ cursor: "1", changed: false });
     await vi.advanceTimersByTimeAsync(0);
     expect(cycle).toHaveBeenCalledTimes(atFailure + 1);
     // Later empty answers do not cycle.
-    pending[3].answer({ seq: "1", changed: false });
+    pending[3].answer({ cursor: "1", changed: false });
     await vi.advanceTimersByTimeAsync(0);
     expect(cycle).toHaveBeenCalledTimes(atFailure + 1);
     await manager.stop();
@@ -1475,14 +1475,14 @@ it("does not run a full pull when a healthy change feed is overloaded", async ()
   let overload!: (response: Response) => void;
   const fetch = vi
     .fn()
-    .mockResolvedValueOnce(Response.json({ seq: "1", changed: true }))
+    .mockResolvedValueOnce(Response.json({ cursor: "1", changed: true }))
     .mockImplementationOnce(
       () =>
         new Promise<Response>((resolve) => {
           overload = resolve;
         }),
     )
-    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockResolvedValueOnce(Response.json({ cursor: "1", changed: false }))
     .mockImplementation(() => new Promise(() => {}));
   const registry = createGatewayStreamSyncRegistry({
     gatewayUrl: "https://gateway.test",

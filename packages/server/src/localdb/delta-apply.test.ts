@@ -79,7 +79,7 @@ async function deltaOf(
     rows.push({ scope, read: await device.deps.registry.read(scope) });
   return {
     since: "1",
-    seq: "2",
+    cursor: "2",
     reset: false,
     rows,
     gone: [],
@@ -585,7 +585,11 @@ describe("applying a change delta", () => {
 
   it("a reset hands to the cycle", async () => {
     const { w, here } = await peerCommitted();
-    const out = await applied(w, here, { since: "0", seq: "2", reset: true });
+    const out = await applied(w, here, {
+      since: "0",
+      cursor: "2",
+      reset: true,
+    });
     expect(out.result.outcome).toBe("cycle");
   });
 });
@@ -1078,7 +1082,10 @@ it("a first-create pair avoids the owner listing and downloads only its segment"
   await here.cycle(); // establish an empty owner baseline
   await peer.run("first", [{ stream: sName(0), id: "first-record" }]);
   await peer.cycle();
-  const delta = await deltaOf(here, [CONTROL, LOG], { since: "0", seq: "2" });
+  const delta = await deltaOf(here, [CONTROL, LOG], {
+    since: "0",
+    cursor: "2",
+  });
   const list = vi.spyOn(here.deps.registry, "listOwnerRows");
   const out = await applied(w, here, delta);
   if (out.result.outcome === "cycle") await here.cycle();
@@ -1097,10 +1104,24 @@ async function firstCreated() {
   await here.cycle();
   await peer.run("first", [{ stream: sName(0), id: "first" }]);
   await peer.cycle();
-  const delta = await deltaOf(here, [CONTROL, LOG], { since: "0", seq: "2" });
+  const delta = await deltaOf(here, [CONTROL, LOG], {
+    since: "0",
+    cursor: "2",
+  });
   if (delta.reset) throw new Error("expected rows");
   return { w, peer, here, delta };
 }
+
+it("a first-create delta that reaches the cursor it started from is no delta: the cycle takes it", async () => {
+  // Cursors have no order, so "reaches above `since`" is "reaches another
+  // cursor than `since`". An answer with the same cursor on both ends says
+  // nothing was read between them.
+  const { here, delta } = await firstCreated();
+  const before = await localState(here);
+  const out = await here.sync.applyDelta({ ...delta, cursor: delta.since });
+  expect(out.outcome).toBe("cycle");
+  expect(await localState(here)).toEqual(before);
+});
 
 it.each([
   "control only",
@@ -1117,7 +1138,7 @@ it.each([
   if (scenario === "log only")
     candidate = { ...delta, rows: delta.rows.slice(1) };
   if (scenario === "reset")
-    candidate = { since: delta.since, seq: delta.seq, reset: true };
+    candidate = { since: delta.since, cursor: delta.cursor, reset: true };
   if (scenario === "foreign control" || scenario === "later generation") {
     candidate = {
       ...delta,
@@ -1159,7 +1180,7 @@ it("a pair split across answers keeps reconciliation until the connection is est
         await here.sync.applyDelta({
           ...delta,
           since: String(index),
-          seq: String(index + 1),
+          cursor: String(index + 1),
           rows: [row],
         })
       ).outcome,

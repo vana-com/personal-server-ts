@@ -37,12 +37,12 @@ const mutations = [
     pattern: "a reset waits for the full listing",
   },
   {
-    name: "late answer regresses the observed position",
+    name: "a delta that reaches the held position is applied again",
     source: manager,
-    from: "BigInt(position) >= BigInt(knownPosition)",
-    to: "true",
+    from: "if (delta && !delta.reset && delta.cursor === syncedPosition) return;",
+    to: "",
     test: "packages/core/src/sync/engine/sync-manager.delta.test.ts",
-    pattern: "overlapping answers serialize",
+    pattern: "already held",
   },
   {
     name: "one failure leaves a sibling running",

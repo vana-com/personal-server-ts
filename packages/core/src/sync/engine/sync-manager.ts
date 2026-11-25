@@ -21,6 +21,7 @@ import { createDownloadRetryMemory } from "../retry-memory.js";
 import { createTombstoneResubmitTracker } from "../tombstone-resubmits.js";
 import { changePushBackoffMs } from "./change-push.js";
 import type {
+  ChangeCursor,
   DeltaApplyResult,
   RegistryChangeDelta,
 } from "../../stream-sync/ports.js";
@@ -68,8 +69,9 @@ export interface ChangeProbe {
 
 /**
  * A server push that says where the registry is. Its position is the gateway's
- * exact sequence for the owner: it changes whenever anything a client can see
- * changed. A poke can still be lost, doubled or late, and the marker the probe
+ * cursor for the owner: it changes whenever anything a client can see changed,
+ * and when the gateway's database was replaced. The manager holds a position as
+ * the gateway sent it and compares it for equality only. A poke can still be lost, doubled or late, and the marker the probe
  * compares fingerprints one row, so neither decides alone.
  *
  * A poke runs a cycle at once. It does not go through the marker comparison,
@@ -100,7 +102,7 @@ export interface ChangePush {
   /**
    * Start a subscription; the returned function ends it. `onPosition(p)` is
    * the registry's position as of an answer; it comes before the `onChange` of
-   * the same answer. `onChange` means the registry's sequence moved since the
+   * the same answer. `onChange` means the registry's cursor moved since the
    * last answer, or the first answer after a failure came back: run a cycle.
    * Its `delta`, when the gateway sent one, is what changed after the `since`
    * the request carried. Both are called on a successful answer only; a
@@ -115,8 +117,8 @@ export interface ChangePush {
   subscribe(handlers: {
     onChange(delta: RegistryChangeDelta | undefined): void;
     onHealth(healthy: boolean): void;
-    onPosition(position: string): void;
-    since(): string | undefined;
+    onPosition(position: ChangeCursor): void;
+    since(): ChangeCursor | undefined;
   }): () => void;
 }
 
@@ -430,7 +432,7 @@ export function createSyncManager(
   // `since` in `startChangePush`), so a change that lands during the pass
   // comes back with a delta. Read only while a cycle is in flight, and set by
   // each cycle before its pass starts.
-  let inFlightTarget: string | undefined;
+  let inFlightTarget: ChangeCursor | undefined;
   // Failed cycles in a row, and the pending retry of the follow-up they owe.
   // `retryTimer` set means cooling down: a pushed change only marks the flag.
   let cycleFailures = 0;
@@ -465,14 +467,14 @@ export function createSyncManager(
   // `syncedPosition` is the position the last cleanly finished pass started
   // under; it is undefined while a pass runs or when the last one did not
   // finish clean.
-  let knownPosition: string | undefined;
-  let syncedPosition: string | undefined;
+  let knownPosition: ChangeCursor | undefined;
+  let syncedPosition: ChangeCursor | undefined;
   // What the last pass that ran to its end left owed, and the position it
   // started under. Null while a pass runs or when the last one did not end
   // clean. A retry limited to `connections` is sound only while the push still
   // reports that position: see `owedScope`.
   let lastPass: {
-    readonly position: string;
+    readonly position: ChangeCursor;
     readonly connections: readonly string[];
   } | null = null;
   // The owed work last reported, so the log says it when it changes, not on
@@ -481,7 +483,7 @@ export function createSyncManager(
 
   // A format this build cannot read needs an update, not repeated polling.
   // This position suppresses that repeat but is never offered as `since`.
-  let refusedPosition: string | undefined;
+  let refusedPosition: ChangeCursor | undefined;
   // The host paused the manager (no one is looking): no request, no timer.
   // `owedWhilePaused` remembers a local ingest that arrived meanwhile.
   let paused = false;
@@ -636,25 +638,25 @@ export function createSyncManager(
    * `heldUpTo`, so this device held the registry as of that position, and a
    * clean pass found its server registered. The gateway numbers changes in
    * commit order with no gap, and the delta lists every row whose latest
-   * change is above `delta.since`, read in one snapshot at `delta.seq`. When
+   * change is above `delta.since`, read in one snapshot at `delta.cursor`. When
    * `delta.since` is `heldUpTo`, no server change is in it, and every row in
-   * it is applied, the device holds what the registry held at `delta.seq`:
+   * it is applied, the device holds what the registry held at `delta.cursor`:
    * what a full pass that started under it would read. The manager settles
-   * the pass at `delta.seq` only when that is also the position the push
+   * the pass at `delta.cursor` only when that is also the position the push
    * reported last (`startedUnder`), as for any pass. Only the switched
    * (stream database) pass has this path; a legacy pass reads per scope.
    */
   async function deltaPass(
     delta: RegistryChangeDelta,
-    heldUpTo: string | undefined,
-    startedUnder: string | undefined,
+    heldUpTo: ChangeCursor | undefined,
+    startedUnder: ChangeCursor | undefined,
   ): Promise<"settle" | "owed" | "full"> {
     const localSync = options?.localSync;
     if (
       !localSync ||
       delta.reset ||
       delta.since !== heldUpTo ||
-      delta.seq !== startedUnder ||
+      delta.cursor !== startedUnder ||
       blocked !== null ||
       options?.accountStorageMode?.read() !== "switched"
     )
@@ -688,7 +690,7 @@ export function createSyncManager(
     downloadDeps.logger.info(
       {
         since: delta.since,
-        seq: delta.seq,
+        cursor: delta.cursor,
         rows: delta.rows.length,
         connections: result.connections,
         blobGets: result.blobGets,
@@ -734,7 +736,7 @@ export function createSyncManager(
     delta?: RegistryChangeDelta,
     retry?: {
       readonly connections: readonly string[];
-      readonly position: string;
+      readonly position: ChangeCursor;
     },
   ): Promise<void> {
     // Prevent concurrent cycles
@@ -800,11 +802,11 @@ export function createSyncManager(
         let held = heldUpTo;
         for (let i = 0; i < passDeltas.length && byDelta !== "full"; i++) {
           const d = passDeltas[i]!;
-          const target = i === passDeltas.length - 1 ? startedUnder : d.seq;
+          const target = i === passDeltas.length - 1 ? startedUnder : d.cursor;
           const result = await deltaPass(d, held, target);
           if (result === "full") byDelta = "full";
           else if (result === "owed") byDelta = "owed";
-          held = d.seq;
+          held = d.cursor;
         }
         if (byDelta !== "full") {
           if (byDelta === "settle") settle();
@@ -1400,7 +1402,10 @@ export function createSyncManager(
    * name) retries in full, as before.
    */
   function owedScope():
-    | { readonly connections: readonly string[]; readonly position: string }
+    | {
+        readonly connections: readonly string[];
+        readonly position: ChangeCursor;
+      }
     | undefined {
     if (
       !pushAnnouncesChanges() ||
@@ -1478,23 +1483,11 @@ export function createSyncManager(
     stopPush = push.subscribe({
       onChange(delta) {
         if (run !== lifecycle || !isRunning) return;
-        // A reset can describe a restored registry whose counter went back.
-        // It always owes a listing. Ordinary late answers cannot move either
-        // the observed or the applied position backwards.
-        if (delta?.reset) {
-          // A lower counter needs a fresh baseline after the listing. It
-          // cannot settle this answer's older position, even after restore.
-          knownPosition =
-            knownPosition !== undefined &&
-            BigInt(delta.seq) < BigInt(knownPosition)
-              ? undefined
-              : delta.seq;
-        } else if (
-          delta &&
-          syncedPosition !== undefined &&
-          BigInt(delta.seq) <= BigInt(syncedPosition)
-        )
-          return;
+        // A reset always owes a listing: the gateway sends one when it cannot
+        // say what changed, a replaced database included. A delta that reaches
+        // the position the last clean pass started under is already held.
+        // Positions have no order here, so only that equal one is skipped.
+        if (delta && !delta.reset && delta.cursor === syncedPosition) return;
         cycleNow(delta);
       },
       // The position this device holds the registry up to once its work in
@@ -1521,13 +1514,12 @@ export function createSyncManager(
         // have skipped its last tick on the strength of that position.
         if (wasHealthy && !healthy && isRunning) cycleNow();
       },
+      // The push answers one request at a time, so the latest answer is the
+      // newest the gateway gave; there is no order to check, and none to
+      // check it with.
       onPosition(position) {
         if (run !== lifecycle || !isRunning) return;
-        if (
-          knownPosition === undefined ||
-          BigInt(position) >= BigInt(knownPosition)
-        )
-          knownPosition = position;
+        knownPosition = position;
       },
     });
   }
