@@ -272,18 +272,6 @@ export async function runPublish(
     return {
       connections: [...early].map(([id, e]) => earlyEntry(id, e)),
     };
-  if (!isolated) {
-    const cycle = await cycleOver(
-      deps,
-      await deps.registry.listOwnerRows(),
-      early,
-      undefined,
-      final,
-    );
-    return { connections: [...finalEntries, ...cycle.connections] };
-  }
-
-  // The fallback runs for the rest and reports its failures, never throws.
   const siblings = [...early].filter(([id]) => !final.has(id));
   let cycle: CycleReport["connections"] = [];
   let cycleError: string | undefined;
@@ -299,6 +287,7 @@ export async function runPublish(
       )
     ).connections;
   } catch (cause) {
+    if (!isolated) throw cause;
     // Nothing of the pass ran for the siblings: each that did not settle
     // failed with this, and a connection only the pass could place with it.
     cycleError = errorMessage(cause);
