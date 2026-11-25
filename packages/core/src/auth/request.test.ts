@@ -9,6 +9,30 @@ import {
   createTestWallet,
 } from "../test-utils/wallet.js";
 
+describe("request lifetime diagnostic formatting", () => {
+  it("serializes the diagnostic without losing the measured duration", () => {
+    const diagnostic = new TokenLifetimeError(37);
+    expect(diagnostic.toJSON()).toEqual({
+      error: {
+        code: 401,
+        errorCode: "EXPIRED_TOKEN",
+        message: expect.stringMatching(/Token lifetime.*seconds/),
+        details: {
+          reason: "Token lifetime exceeds the server cap",
+          maxLifetimeSeconds: expect.any(Number),
+          lifetimeSeconds: 37,
+        },
+      },
+    });
+  });
+
+  it("distinguishes a typed diagnostic from generic copy with the same message", () => {
+    const diagnostic = new TokenLifetimeError(37);
+    expect(isWeb3SignedLifetimeError(diagnostic)).toBe(true);
+    expect(isWeb3SignedLifetimeError(new Error(diagnostic.message))).toBe(false);
+  });
+});
+
 const SERVER_ORIGIN = "http://localhost:8080";
 const wallet = createTestWallet(0);
 
