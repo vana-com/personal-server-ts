@@ -658,6 +658,11 @@ export async function createPsLiteSyncManager(
         localSync = createLocalSync(localSyncDeps, {
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
           aliasTargets: legacyAliasScopes,
+          // A held registration confers no write authority, whoever asks:
+          // the worker reads this before every host call.
+          ...(options.registrationReady && {
+            legacyWriteReady: options.registrationReady,
+          }),
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),

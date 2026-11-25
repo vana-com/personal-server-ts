@@ -47,6 +47,7 @@ async function reconnected(
       : never;
     wrapLegacy?: (ports: LegacyDeletePorts) => LegacyDeletePorts;
     dbFile?: string;
+    writeReady?: () => boolean;
   } = {},
 ) {
   const w = await world({ streams: 1 });
@@ -59,6 +60,7 @@ async function reconnected(
   const a = await w.device("a", {
     legacyDelete: () => options.wrapLegacy?.(legacy.ports) ?? legacy.ports,
     deleteRetryMs: RETRY,
+    ...(options.writeReady && { legacyWriteReady: options.writeReady }),
     ...(options.dbFile && { dbFile: options.dbFile }),
   });
   await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
@@ -601,7 +603,8 @@ describe("a standalone legacy retirement after the switch", () => {
     };
     await f.a.sync.legacyRetirer.request(GH);
 
-    await vi.waitFor(() => expect(retired).toBe(SCOPES.length));
+    // The pass stops at the next host call once the mode reads unknown.
+    await vi.waitFor(() => expect(retired).toBe(1));
     // The pass ends; its verdict is pending, never done.
     await vi.waitFor(async () =>
       expect(await f.a.sync.legacyRetirer.status(GH)).toMatchObject({
@@ -610,6 +613,35 @@ describe("a standalone legacy retirement after the switch", () => {
     );
     await f.a.sync.legacyRetirer.close();
     expect(doneWrites).toEqual([]);
+  });
+
+  it("a persisted retirement polled during a registration hold does no destructive work", async () => {
+    let ready = false;
+    const f = await reconnected({ writeReady: () => ready });
+    f.fake.requests.length = 0;
+
+    // The DELETE records the intent and answers pending; a GET reads it.
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+      retireId,
+      legacy: PENDING,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(await f.a.sync.legacyRetirer.status(GH)).toMatchObject({
+      legacy: PENDING,
+    });
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) expect(f.fake.isLive(scope)).toBe(true);
+
+    ready = true;
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    for (const scope of SCOPES) expect(f.fake.isLive(scope)).toBe(false);
   });
 
   it("refuses admission when the host cannot name the streams of a scope, and writes nothing", async () => {

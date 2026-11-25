@@ -173,6 +173,8 @@ export async function world(options: {
       erasure?: () => LogErasurePorts | undefined;
       /** The host's ports for retiring a deleted connection's legacy copy. */
       legacyDelete?: () => LegacyDeletePorts | undefined;
+      /** The host's write authority for a legacy retirement. */
+      legacyWriteReady?: () => boolean;
       /** Waits between retries of a delete or erasure (shortened for tests). */
       deleteRetryMs?: { first: number; max: number };
       /**
@@ -290,6 +292,9 @@ export async function world(options: {
     const syncOptions = {
       ...(hooks.erasure ? { erasure: hooks.erasure } : {}),
       ...(hooks.legacyDelete ? { legacyDelete: hooks.legacyDelete } : {}),
+      ...(hooks.legacyWriteReady
+        ? { legacyWriteReady: hooks.legacyWriteReady }
+        : {}),
       ...(hooks.deleteRetryMs ? { deleteRetryMs: hooks.deleteRetryMs } : {}),
       // A digest `<connector>@<version>` names a connector version; a bare
       // connector name is version 1.

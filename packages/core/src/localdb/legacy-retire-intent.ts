@@ -109,12 +109,60 @@ interface Loop {
   delay: number;
 }
 
+/** A pass met a closed write gate between two host calls. */
+class WriteNotReady extends Error {
+  constructor() {
+    super("legacy retirement paused: the host has no write authority now");
+    this.name = "WriteNotReady";
+  }
+}
+
+/**
+ * The ports a pass hands the stage: each host call first reads the gate, so a
+ * hold that starts mid-pass stops the next call, whatever the caller was doing.
+ */
+function gatedPorts(
+  ports: LegacyDeletePorts,
+  ready: () => boolean,
+): LegacyDeletePorts {
+  const gate =
+    <A extends unknown[], R>(call: (...args: A) => R) =>
+    (...args: A): R => {
+      if (!ready()) throw new WriteNotReady();
+      return call(...args);
+    };
+  return {
+    ...ports,
+    head: gate(ports.head.bind(ports)),
+    retire: gate(ports.retire.bind(ports)),
+    pendingBlobs: gate(ports.pendingBlobs),
+    finality: {
+      tombstoneState: gate(ports.finality.tombstoneState.bind(ports.finality)),
+    },
+    versions: {
+      ...ports.versions,
+      list: gate(ports.versions.list.bind(ports.versions)),
+    },
+    objects: {
+      deleteBlobVersions: gate(
+        ports.objects.deleteBlobVersions.bind(ports.objects),
+      ),
+    },
+  };
+}
+
 export function createLegacyRetirer(
   deps: LegacyRetirerDeps,
   options: {
     /** Read when a pass runs; `undefined`: this host cannot retire a legacy copy. */
     readonly ports: () => LegacyDeletePorts | undefined;
     readonly retryMs: { readonly first: number; readonly max: number };
+    /**
+     * Host write authority, read before every host call of a pass: while it
+     * answers false (a registration that is held) a pass sends no tombstone,
+     * queues no row and erases no blob. Absent: always ready.
+     */
+    readonly writeReady?: () => boolean;
   },
 ): LegacyRetirer {
   const owner = deps.ownerAddress.toLowerCase();
@@ -163,6 +211,10 @@ export function createLegacyRetirer(
     if (!ports) return { part: blocked("needs_another_device"), retry: true };
     // Nothing is sent before the switch, or while the mode is unknown.
     if (ports.mode() !== "switched") return { part: PART_PENDING, retry: true };
+    const ready = () =>
+      ports.mode() === "switched" && (options.writeReady?.() ?? true);
+    if (!ready()) return { part: PART_PENDING, retry: true };
+    const guarded = gatedPorts(ports, ready);
     const memory = memoryOf(connector);
     let part: DeletePart = PART_DONE;
     let retry = false;
@@ -171,12 +223,14 @@ export function createLegacyRetirer(
       // One scope's failed read says nothing of the others.
       const outcome = await retireLegacyScope(
         { memory },
-        ports,
+        guarded,
         scope,
         head,
         stop.signal,
       ).catch((error: unknown) => {
         if (stop.signal.aborted) throw error;
+        if (error instanceof WriteNotReady)
+          return { part: PART_PENDING, retry: true };
         deps.logger.warn(
           {
             connector,
@@ -195,8 +249,7 @@ export function createLegacyRetirer(
     if (part.state === "done") {
       stop.signal.throwIfAborted();
       // The mode was read at the pass's start; a host call has run since.
-      if (ports.mode() !== "switched")
-        return { part: PART_PENDING, retry: true };
+      if (!ready()) return { part: PART_PENDING, retry: true };
       await deps.db.batch([
         {
           sql: "UPDATE legacy_retirements SET state = 'done' WHERE owner = ? AND connector = ? AND retire_id = ?",

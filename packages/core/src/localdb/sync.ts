@@ -145,6 +145,11 @@ export function createLocalSync(
      * delete status says another device must.
      */
     readonly legacyDelete?: () => LegacyDeletePorts | undefined;
+    /**
+     * The host's write authority for a legacy retirement; false while a
+     * registration is held. Absent: always ready.
+     */
+    readonly legacyWriteReady?: () => boolean;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
     readonly currentLease?: () => string | null;
     /** Waits between resumes of a delete that keeps failing (tests shorten). */
@@ -527,6 +532,7 @@ export function createLocalSync(
   };
   const legacyRetirer = createLegacyRetirer(deps, {
     ports: () => options.legacyDelete?.(),
+    ...(options.legacyWriteReady && { writeReady: options.legacyWriteReady }),
     retryMs: { first: retryFirst, max: retryMax },
   });
   const listingDeps = {
