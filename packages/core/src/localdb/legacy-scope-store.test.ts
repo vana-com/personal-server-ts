@@ -262,3 +262,28 @@ it("a newest flat row marked for another stream leaves the scope out, and older 
   expect(excluded).toEqual(["not_stream_rows"]);
   expect(reads).toEqual(["2026-11-02T00:00:00Z"]);
 });
+
+it("a connector deleted during discovery yields one refusal per stream, though its canonical scope and an alias both vanished", async () => {
+  const scopes: Versions = new Map([
+    ["shared.items", [layer([{ id: "1" }], "2026-11-01T00:00:00Z")]],
+    ["shared.itemsAlias", [layer([{ id: "1" }], "2026-11-01T00:00:00Z")]],
+  ]);
+  const storage = storageOf(scopes) as unknown as {
+    readEnvelope: () => Promise<unknown>;
+  };
+  storage.readEnvelope = async () => {
+    throw new Error("Envelope not found");
+  };
+  const store = createLegacyScopeStore({
+    storage: storage as never,
+    manifests: () => [manifestOf("a", "items"), manifestOf("b", "items")],
+    targets: new Map([
+      ["shared.items", [A, B]],
+      ["shared.itemsAlias", [A, B]],
+    ]),
+    connectorDeleted: async (connector) => connector === "a",
+  });
+  const streams = [];
+  for await (const stream of store.streams()) streams.push(stream);
+  expect(streams.map((s) => `${s.connector}.${s.stream}`)).toEqual(["a.items"]);
+});

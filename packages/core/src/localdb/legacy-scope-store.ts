@@ -295,6 +295,8 @@ export function createLegacyScopeStore(
           target: Target;
           declaration: Declaration | LegacyScopeExclusionReason;
           scopes: string[];
+          /** Its connector was deleted while the scan ran. */
+          deleted?: true;
         }
       >();
       for (const scope of listAllScopes(storage)) {
@@ -312,13 +314,16 @@ export function createLegacyScopeStore(
             if (typeof declaration === "string") continue;
             if (!(await options.connectorDeleted?.(t.connector))) continue;
             refused = true;
-            yield {
-              connector: t.connector,
-              stream: t.stream,
-              primaryKey: declaration.primaryKey,
-              version: declaration.version,
-              layers: [{ records: connectorDeletedRecords }],
+            // Grouped with the stream's other scopes: one refusal per stream.
+            const key = `${t.connector}\0${t.stream}`;
+            const entry = byStream.get(key) ?? {
+              target: t,
+              declaration,
+              scopes: [],
             };
+            entry.scopes.push(scope);
+            entry.deleted = true;
+            byStream.set(key, entry);
           }
           if (!refused) throw error;
           continue;
@@ -336,7 +341,22 @@ export function createLegacyScopeStore(
         entry.scopes.push(scope);
         byStream.set(key, entry);
       }
-      for (const { target, declaration, scopes } of byStream.values()) {
+      for (const {
+        target,
+        declaration,
+        scopes,
+        deleted,
+      } of byStream.values()) {
+        if (deleted && typeof declaration !== "string") {
+          yield {
+            connector: target.connector,
+            stream: target.stream,
+            primaryKey: declaration.primaryKey,
+            version: declaration.version,
+            layers: [{ records: connectorDeletedRecords }],
+          };
+          continue;
+        }
         const canonical = scopes.filter(
           (scope) => scope.slice(scope.indexOf(".") + 1) === target.stream,
         );
