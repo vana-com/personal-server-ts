@@ -253,10 +253,10 @@ describe("a standalone legacy retirement after the switch", () => {
     const f = await reconnected({
       wrapLegacy: (ports) => ({
         ...ports,
-        retire: async (scope, fence) => {
+        retire: async (scope, fence, options) => {
           f.fake.moveHead(scope);
           f.fake.foreignTombstone(scope);
-          return ports.retire(scope, fence);
+          return ports.retire(scope, fence, options);
         },
       }),
     });
@@ -274,6 +274,65 @@ describe("a standalone legacy retirement after the switch", () => {
       expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
       expect(f.fake.blobCount(scope)).toBe(3);
     }
+  });
+
+  // The worker reads the pinned head live; the adapter then finds it absent.
+  // The shared delete worker must not queue blob keys or erase local entries
+  // for a point it never saw gone: the pass throws, and the worker blocks.
+  it("a fenced retire whose adapter sees the head absent writes no queue rows and touches no local files", async () => {
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        retire: async (scope, fence, options) => {
+          f.fake.dropHead(scope);
+          return ports.retire(scope, fence, options);
+        },
+      }),
+    });
+    // A local legacy entry per scope, as the pre-switch writes left them (the
+    // seal refuses a new legacy write, so the index rows are placed directly).
+    SCOPES.forEach((scope, id) =>
+      f.legacy.storage.entries.push({
+        id: id + 1,
+        fileId: null,
+        schemaId: null,
+        path: `${scope}/2026-01-01T00:00:00.000Z.json`,
+        scope,
+        collectedAt: "2026-01-01T00:00:00.000Z",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        sizeBytes: 1,
+        version: 1,
+        casRevision: 1,
+        dataPointId: null,
+      }),
+    );
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: { state: "blocked", reason: "legacy_head_changed" },
+      }),
+    );
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+    }
+  });
+
+  it("releases a connector's memory, verdict and loop once its retirement is done", async () => {
+    const f = await reconnected();
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    await vi.waitFor(() => expect(f.a.sync.legacyRetirer.retained()).toBe(0));
   });
 
   it("accepts a tombstone another writer put directly after the pinned head", async () => {
@@ -517,6 +576,42 @@ describe("a standalone legacy retirement after the switch", () => {
 
   // Without the streams of each scope the intent could not hold back a later
   // import of them, so the permanent fence would silently hold nothing.
+  it("writes no done verdict when the account mode stopped reading as switched during the pass", async () => {
+    let mode: "switched" | "unknown" = "switched";
+    let retired = 0;
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        mode: () => (mode === "switched" ? ports.mode() : "unknown"),
+        retire: async (scope, fence, options) => {
+          const result = await ports.retire(scope, fence, options);
+          retired += 1;
+          mode = "unknown";
+          return result;
+        },
+      }),
+    });
+    const doneWrites: string[] = [];
+    const batch = f.a.db.batch.bind(f.a.db);
+    f.a.db.batch = async (statements) => {
+      for (const { sql } of statements)
+        if (sql.includes("legacy_retirements SET state = 'done'"))
+          doneWrites.push(sql);
+      return batch(statements);
+    };
+    await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(() => expect(retired).toBe(SCOPES.length));
+    // The pass ends; its verdict is pending, never done.
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toMatchObject({
+        legacy: PENDING,
+      }),
+    );
+    await f.a.sync.legacyRetirer.close();
+    expect(doneWrites).toEqual([]);
+  });
+
   it("refuses admission when the host cannot name the streams of a scope, and writes nothing", async () => {
     const f = await reconnected({
       wrapLegacy: ({ streamsOf: _streamsOf, ...ports }) => ports,
@@ -532,7 +627,7 @@ describe("a standalone legacy retirement after the switch", () => {
 
   // Closing the sync closes the database. A pass with a storage call in flight
   // would write its verdict to a closed database, so close waits for it.
-  it("waits for a pass with a storage call in flight before the sync closes", async () => {
+  it("close waits for an in-flight legacy retirement before closing its database", async () => {
     let entered!: () => void;
     const inFlight = new Promise<void>((resolve) => (entered = resolve));
     let release!: () => void;
@@ -544,8 +639,12 @@ describe("a standalone legacy retirement after the switch", () => {
         objects: {
           ...ports.objects,
           deleteBlobVersions: async (scope, versions) => {
-            entered();
-            await released;
+            // The last scope's call is the one in flight: the pass has no
+            // scope left to stop at, so only the verdict write is still ahead.
+            if (scope === SCOPES.at(-1)) {
+              entered();
+              await released;
+            }
             const outcome = await ports.objects.deleteBlobVersions(
               scope,
               versions,
@@ -559,6 +658,15 @@ describe("a standalone legacy retirement after the switch", () => {
     await f.a.sync.legacyRetirer.request(GH);
     await inFlight;
 
+    // Rows the pass writes after close began would land on a closing database.
+    const doneWrites: string[] = [];
+    const batch = f.a.db.batch.bind(f.a.db);
+    f.a.db.batch = async (statements) => {
+      for (const { sql } of statements)
+        if (sql.includes("legacy_retirements SET state = 'done'"))
+          doneWrites.push(sql);
+      return batch(statements);
+    };
     let closed = false;
     const closing = f.a.sync.close().then(() => (closed = true));
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -567,6 +675,7 @@ describe("a standalone legacy retirement after the switch", () => {
     release();
     await closing;
     expect(storageReturned).toBe(true);
+    expect(doneWrites).toEqual([]);
   });
 
   it("refuses while the account mode is unknown, and writes nothing", async () => {

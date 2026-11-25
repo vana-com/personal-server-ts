@@ -290,6 +290,10 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
       head.deletedAt = iso();
       record(scope, head.version, head.dataHash, true);
     },
+    /** The registry no longer knows the point: reads and tombstones find no head. */
+    dropHead(scope: string) {
+      heads.delete(scope);
+    },
     head: (scope: string) => heads.get(scope) ?? null,
     isLive: (scope: string) => {
       const head = heads.get(scope);

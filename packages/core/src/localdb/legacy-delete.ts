@@ -92,7 +92,11 @@ export interface LegacyDeletePorts {
   mode(): "allow" | LegacyWriteVerdict;
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;
   /** The durable scope delete, fenced to `fence`: tombstone, blobs, local erase. */
-  retire(scope: string, fence: TombstoneFence): Promise<DeleteScopeResult>;
+  retire(
+    scope: string,
+    fence: TombstoneFence,
+    options?: { readonly pinned: boolean },
+  ): Promise<DeleteScopeResult>;
   /** Blob deletions of `scope` still queued on this device behind its tombstone. */
   pendingBlobs(scope: string): Promise<number>;
   finality: Pick<TombstoneFinalityPort, "tombstoneState">;
@@ -391,7 +395,9 @@ export async function retireLegacyScope(
   if (pin && !pinHolds(pin, head))
     return settled(blocked("legacy_head_changed"));
   if (head.state === "live") {
-    const result = await ports.retire(scope, head.fence);
+    const result = await ports.retire(scope, head.fence, {
+      pinned: pin !== undefined,
+    });
     const { gateway } = result.steps;
     // data-gateway #212: a tombstone aimed at a head that is already deleted
     // gets a distinct answer (`gateway-refusal.ts`). The scope is retired

@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 23 and seed 3598347771077218939 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 1148234] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r4-1125/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 34 and seed -7379784037885113626 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 2116215] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r5-1125/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 13:38:35)
+Starting... (2026-11-25 14:20:36)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-25 13:38:36.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 14:20:36.
 Error: Invariant NoEraseOfUnpinnedVersion is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -41,7 +41,7 @@ State 1: <Initial predicate>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 2: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
+State 2: <RRead line 127, col 3 to line 132, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -69,7 +69,7 @@ State 2: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 3: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
+State 3: <Publish line 96, col 3 to line 101, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -97,7 +97,7 @@ State 3: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 4: <ForeignTomb line 103, col 3 to line 110, col 54 of module LegacyRetire>
+State 4: <ForeignTomb line 104, col 3 to line 111, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -125,7 +125,7 @@ State 4: <ForeignTomb line 103, col 3 to line 110, col 54 of module LegacyRetire
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 5: <RInsert line 135, col 3 to line 143, col 38 of module LegacyRetire>
+State 5: <RInsert line 136, col 3 to line 144, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -153,7 +153,7 @@ State 5: <RInsert line 135, col 3 to line 143, col 38 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 6: <WRead line 147, col 3 to line 157, col 54 of module LegacyRetire>
+State 6: <WRead line 148, col 3 to line 158, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -181,7 +181,7 @@ State 6: <WRead line 147, col 3 to line 157, col 54 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 7: <WErase line 200, col 3 to line 209, col 50 of module LegacyRetire>
+State 7: <WErase line 219, col 3 to line 228, col 50 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> TRUE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -209,7 +209,7 @@ State 7: <WErase line 200, col 3 to line 209, col 50 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-26974 states generated, 10851 distinct states found, 6475 states left on queue.
+27478 states generated, 11183 distinct states found, 6716 states left on queue.
 The depth of the complete state graph search is 9.
-The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 10 and the 95th percentile is 8).
-Finished in 00s at (2026-11-25 13:38:36)
+The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 10 and the 95th percentile is 8).
+Finished in 00s at (2026-11-25 14:20:36)

@@ -534,7 +534,7 @@ export interface DeleteDataPort {
    */
   tombstone(
     scope: string,
-    fence?: { head: TombstoneFence },
+    fence?: { head: TombstoneFence; pinned?: boolean },
   ): Promise<TombstoneOutcome>;
   /**
    * Head of a gateway-reserved (`vana.system.*`) point through a read the

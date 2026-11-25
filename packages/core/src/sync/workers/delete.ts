@@ -333,7 +333,7 @@ export interface DeleteScopeOptions {
    * only over exactly this head (the one the failed tombstone replaced), so a
    * write that landed after the rollback is never deleted.
    */
-  fence?: { head: TombstoneFence };
+  fence?: { head: TombstoneFence; pinned?: boolean };
   /**
    * False records the storage work but sends no batch in this call; the
    * caller's own pass already used this cycle's storage budget.

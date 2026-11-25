@@ -1,6 +1,6 @@
 TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
-Running breadth-first search Model-Checking with fp 116 and seed -6373393856077921394 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 1156123] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
-Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r4-1125/docs/formal/legacy-retire/LegacyRetire.tla
+Running breadth-first search Model-Checking with fp 45 and seed -308923162856346104 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 2121348] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r5-1125/docs/formal/legacy-retire/LegacyRetire.tla
 Parsing file /tmp/Naturals.tla
 Parsing file /tmp/FiniteSets.tla
 Parsing file /tmp/Sequences.tla
@@ -8,9 +8,9 @@ Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 13:39:17)
+Starting... (2026-11-25 14:20:45)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-25 13:39:17.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 14:20:45.
 Error: Invariant NotBlockedByForeignTomb is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -41,35 +41,7 @@ State 1: <Initial predicate>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 2: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
-/\ isc = "none"
-/\ erased = (s1 :> FALSE @@ s2 :> FALSE)
-/\ staleAfterDone = FALSE
-/\ reqs = 0
-/\ snap = (s1 :> 0 @@ s2 :> 0)
-/\ writes = 0
-/\ cc = [control |-> "active", head |-> 0, records |-> 0]
-/\ exists = FALSE
-/\ mergedWhileOpen = FALSE
-/\ pc = (s1 :> "idle" @@ s2 :> "idle")
-/\ tombBy = (s1 :> "none" @@ s2 :> "none")
-/\ rpc = "idle"
-/\ rsnap = (s1 :> 0 @@ s2 :> 0)
-/\ pins = (s1 :> 0 @@ s2 :> 0)
-/\ freeMerged = FALSE
-/\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
-/\ lastActor = "gateway"
-/\ ver = (s1 :> 2 @@ s2 :> 1)
-/\ st = "none"
-/\ nIntents = 0
-/\ crashes = 0
-/\ tombVer = (s1 :> 0 @@ s2 :> 0)
-/\ ipc = "idle"
-/\ batches = 0
-/\ blk = (s1 :> FALSE @@ s2 :> FALSE)
-/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
-
-State 3: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
+State 2: <RRead line 127, col 3 to line 132, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -82,12 +54,12 @@ State 3: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
 /\ tombBy = (s1 :> "none" @@ s2 :> "none")
 /\ rpc = "read"
-/\ rsnap = (s1 :> 2 @@ s2 :> 1)
+/\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
 /\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "req"
-/\ ver = (s1 :> 2 @@ s2 :> 1)
+/\ ver = (s1 :> 1 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ crashes = 0
@@ -97,7 +69,7 @@ State 3: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 4: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
+State 3: <Publish line 96, col 3 to line 101, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -110,12 +82,12 @@ State 4: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
 /\ tombBy = (s1 :> "none" @@ s2 :> "none")
 /\ rpc = "read"
-/\ rsnap = (s1 :> 2 @@ s2 :> 1)
+/\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
 /\ freeMerged = FALSE
 /\ tomb = (s1 :> FALSE @@ s2 :> FALSE)
 /\ lastActor = "gateway"
-/\ ver = (s1 :> 2 @@ s2 :> 2)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ crashes = 0
@@ -125,7 +97,7 @@ State 4: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 5: <ForeignTomb line 103, col 3 to line 110, col 54 of module LegacyRetire>
+State 4: <ForeignTomb line 104, col 3 to line 111, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -136,24 +108,24 @@ State 5: <ForeignTomb line 103, col 3 to line 110, col 54 of module LegacyRetire
 /\ exists = FALSE
 /\ mergedWhileOpen = FALSE
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
-/\ tombBy = (s1 :> "none" @@ s2 :> "other")
+/\ tombBy = (s1 :> "other" @@ s2 :> "none")
 /\ rpc = "read"
-/\ rsnap = (s1 :> 2 @@ s2 :> 1)
+/\ rsnap = (s1 :> 1 @@ s2 :> 1)
 /\ pins = (s1 :> 0 @@ s2 :> 0)
 /\ freeMerged = FALSE
-/\ tomb = (s1 :> FALSE @@ s2 :> TRUE)
+/\ tomb = (s1 :> TRUE @@ s2 :> FALSE)
 /\ lastActor = "gateway"
-/\ ver = (s1 :> 2 @@ s2 :> 2)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "none"
 /\ nIntents = 0
 /\ crashes = 0
-/\ tombVer = (s1 :> 0 @@ s2 :> 3)
+/\ tombVer = (s1 :> 3 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 6: <RInsert line 135, col 3 to line 143, col 38 of module LegacyRetire>
+State 5: <RInsert line 136, col 3 to line 144, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -164,52 +136,52 @@ State 6: <RInsert line 135, col 3 to line 143, col 38 of module LegacyRetire>
 /\ exists = TRUE
 /\ mergedWhileOpen = FALSE
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
-/\ tombBy = (s1 :> "none" @@ s2 :> "other")
+/\ tombBy = (s1 :> "other" @@ s2 :> "none")
 /\ rpc = "idle"
-/\ rsnap = (s1 :> 2 @@ s2 :> 1)
-/\ pins = (s1 :> 2 @@ s2 :> 1)
+/\ rsnap = (s1 :> 1 @@ s2 :> 1)
+/\ pins = (s1 :> 1 @@ s2 :> 1)
 /\ freeMerged = FALSE
-/\ tomb = (s1 :> FALSE @@ s2 :> TRUE)
+/\ tomb = (s1 :> TRUE @@ s2 :> FALSE)
 /\ lastActor = "req"
-/\ ver = (s1 :> 2 @@ s2 :> 2)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ crashes = 0
-/\ tombVer = (s1 :> 0 @@ s2 :> 3)
+/\ tombVer = (s1 :> 3 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 7: <WRead line 147, col 3 to line 157, col 54 of module LegacyRetire>
+State 6: <WRead line 148, col 3 to line 158, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
 /\ reqs = 1
-/\ snap = (s1 :> 0 @@ s2 :> 2)
+/\ snap = (s1 :> 2 @@ s2 :> 0)
 /\ writes = 0
 /\ cc = [control |-> "active", head |-> 0, records |-> 0]
 /\ exists = TRUE
 /\ mergedWhileOpen = FALSE
 /\ pc = (s1 :> "idle" @@ s2 :> "idle")
-/\ tombBy = (s1 :> "none" @@ s2 :> "other")
+/\ tombBy = (s1 :> "other" @@ s2 :> "none")
 /\ rpc = "idle"
-/\ rsnap = (s1 :> 2 @@ s2 :> 1)
-/\ pins = (s1 :> 2 @@ s2 :> 1)
+/\ rsnap = (s1 :> 1 @@ s2 :> 1)
+/\ pins = (s1 :> 1 @@ s2 :> 1)
 /\ freeMerged = FALSE
-/\ tomb = (s1 :> FALSE @@ s2 :> TRUE)
+/\ tomb = (s1 :> TRUE @@ s2 :> FALSE)
 /\ lastActor = "worker"
-/\ ver = (s1 :> 2 @@ s2 :> 2)
+/\ ver = (s1 :> 2 @@ s2 :> 1)
 /\ st = "open"
 /\ nIntents = 1
 /\ crashes = 0
-/\ tombVer = (s1 :> 0 @@ s2 :> 3)
+/\ tombVer = (s1 :> 3 @@ s2 :> 0)
 /\ ipc = "idle"
 /\ batches = 0
-/\ blk = (s1 :> FALSE @@ s2 :> TRUE)
+/\ blk = (s1 :> TRUE @@ s2 :> FALSE)
 /\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-10722 states generated, 4714 distinct states found, 2983 states left on queue.
-The depth of the complete state graph search is 7.
+9309 states generated, 4187 distinct states found, 2680 states left on queue.
+The depth of the complete state graph search is 8.
 The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 10 and the 95th percentile is 8).
-Finished in 00s at (2026-11-25 13:39:18)
+Finished in 00s at (2026-11-25 14:20:45)

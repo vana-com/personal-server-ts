@@ -77,6 +77,8 @@ export interface LegacyRetirer {
   status(connector: string): Promise<LegacyRetireStatus | null>;
   /** Start the passes of every open intent (a restart's sweep). */
   resume(): Promise<void>;
+  /** Connectors that still hold in-memory state (a pass, a verdict, a history). */
+  retained(): number;
   /**
    * Stop scheduling and abort the passes. Resolves once every pass that was
    * running has returned, so the caller may close the database after it.
@@ -188,13 +190,20 @@ export function createLegacyRetirer(
       part = worst(part, outcome.part);
       retry ||= outcome.retry;
     }
-    if (part.state === "done")
+    // A pass that outlived `close` writes no verdict: nothing it learned
+    // before the abort says the account or the heads are still what it read.
+    if (part.state === "done") {
+      stop.signal.throwIfAborted();
+      // The mode was read at the pass's start; a host call has run since.
+      if (ports.mode() !== "switched")
+        return { part: PART_PENDING, retry: true };
       await deps.db.batch([
         {
           sql: "UPDATE legacy_retirements SET state = 'done' WHERE owner = ? AND connector = ? AND retire_id = ?",
           params: [owner, connector, intent.retireId],
         },
       ]);
+    }
     return { part, retry: retry || part.state === "pending" };
   }
 
@@ -233,6 +242,14 @@ export function createLegacyRetirer(
     let retry = false;
     try {
       const outcome = await pass(connector);
+      if (outcome.part.state === "done") {
+        // `done` is durable: status reads the row, and nothing else needs the
+        // erasure history, the verdict or the loop.
+        memories.delete(connector);
+        verdicts.delete(connector);
+        loops.delete(connector);
+        return;
+      }
       verdicts.set(connector, outcome.part);
       retry = outcome.retry;
     } catch (error) {
@@ -332,6 +349,8 @@ export function createLegacyRetirer(
       for (const { connector } of open)
         if (!loops.has(connector)) schedule(connector, 0);
     },
+    retained: () =>
+      new Set([...memories.keys(), ...verdicts.keys(), ...loops.keys()]).size,
     async close() {
       stop.abort();
       for (const loop of loops.values()) clearTimeout(loop.timer);

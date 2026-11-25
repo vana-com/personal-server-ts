@@ -1409,8 +1409,10 @@ async function bootstrapServer(
         streamsOf: legacyStreamsOfScope,
         mode: modeFrom(legacyWriteSeal),
         head: legacyHeadFrom(dataPointFeed, serverOwner),
-        retire: (scope, head) =>
-          manager.deleteScope(scope, undefined, { fence: { head } }),
+        retire: (scope, head, options) =>
+          manager.deleteScope(scope, undefined, {
+            fence: { head, pinned: options?.pinned === true },
+          }),
         pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
         finality: tombstoneFinality,
         // Done is re-derived from the gateway's history and storage's own

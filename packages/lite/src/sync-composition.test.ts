@@ -372,6 +372,7 @@ describe("PS Lite local database composition", () => {
     const intake = { begin: vi.fn().mockResolvedValue({ ok: false }) };
     const localSync = {
       intake,
+      legacyRetirer: { resume: vi.fn().mockResolvedValue(undefined) },
       cycle: vi.fn().mockResolvedValue({ connections: [] }),
       apply: vi.fn().mockResolvedValue(undefined),
       close: vi.fn(() => db.close()),
@@ -495,6 +496,53 @@ describe("PS Lite local database composition", () => {
     expect(db.close).toHaveBeenCalledTimes(1);
   });
 
+  it("resumes a persisted legacy retirement when a registered, switched Lite runtime opens without a full sync cycle", async () => {
+    const db = driver();
+    const { localSync } = facade(db);
+    const owner = await recoverServerOwner(OWNER_SIGNATURE);
+    const stateStore = namedState("resume-at-open-test");
+    const { identity, gateway } = await fixture(stateStore, owner);
+    const lite = await openLite({
+      stateStore,
+      identity,
+      gateway,
+      storage: createMemoryPsLiteStorage(),
+      localDb: { openDriver: async () => db },
+      accountStorageMode: { owner, read: () => "switched" },
+      registrationReady: () => true,
+    });
+    try {
+      expect(localSync.legacyRetirer.resume).toHaveBeenCalledTimes(1);
+      expect(localSync.cycle).not.toHaveBeenCalled();
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
+  it("does not resume a legacy retirement at open while registration is held (no write authority)", async () => {
+    const db = driver();
+    const { localSync } = facade(db);
+    const owner = await recoverServerOwner(OWNER_SIGNATURE);
+    const stateStore = namedState("resume-held-test");
+    const { identity, gateway } = await fixture(stateStore, owner);
+    const lite = await openLite({
+      stateStore,
+      identity,
+      gateway,
+      storage: createMemoryPsLiteStorage(),
+      localDb: { openDriver: async () => db },
+      accountStorageMode: { owner, read: () => "switched" },
+      registrationReady: () => false,
+    });
+    try {
+      expect(localSync.legacyRetirer.resume).not.toHaveBeenCalled();
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
   it("treats a null host driver as stream sync unavailable in this process", async () => {
     const locks = stubBrowserLocks();
     const openDriver = vi.fn().mockResolvedValue(null);
@@ -543,7 +591,12 @@ describe("PS Lite local database composition", () => {
       await legacy!.retire("notes.entries", head);
       // The tombstone is fenced to the head the stage read.
       expect(deleteScope).toHaveBeenCalledWith("notes.entries", undefined, {
-        fence: { head },
+        fence: { head, pinned: false },
+      });
+      // A retirement held to a pin says so: an absent head is not "nothing".
+      await legacy!.retire("notes.entries", head, { pinned: true });
+      expect(deleteScope).toHaveBeenLastCalledWith("notes.entries", undefined, {
+        fence: { head, pinned: true },
       });
     } finally {
       await lite.syncManager.stop();

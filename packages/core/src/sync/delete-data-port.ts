@@ -60,6 +60,22 @@ function assertFencedTombstone(
     );
 }
 
+/**
+ * A pinned fence names a live head the retirement just read. An absent head is
+ * not that head: the caller would erase local entries and queue blob keys for a
+ * point it never saw gone, so a pinned delete throws instead of reporting it.
+ * Other fenced deletes (a connector delete, a rollback re-submission) keep
+ * "not registered": their local copy goes with it.
+ */
+function assertFenceNotAbsent(
+  fence: { head: TombstoneFence; pinned?: boolean } | undefined,
+): void {
+  if (fence?.pinned)
+    throw new Error(
+      `Scope head is absent, not the one the fenced delete saw (v${fence.head.expectedVersion})`,
+    );
+}
+
 /** The terminal refusal a response body names, or null. */
 function refusalOf(
   status: number,
@@ -294,11 +310,12 @@ export function createGatewayDeleteDataPort(
     ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(
       scope: string,
-      fence?: { head: TombstoneFence },
+      fence?: { head: TombstoneFence; pinned?: boolean },
     ): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await currentHead(scope);
       if (current === null) {
+        assertFenceNotAbsent(fence);
         return { status: "not-registered", dataPointId };
       }
       if (current.deletedAt !== null) {
@@ -386,6 +403,8 @@ export function createGatewayDeleteDataPort(
         );
       }
       if (answer.kind === "outcome") {
+        if (answer.outcome.status === "not-registered")
+          assertFenceNotAbsent(fence);
         if (answer.outcome.status === "already-deleted")
           assertFencedTombstone(fence, answer.outcome.version);
         return answer.outcome;

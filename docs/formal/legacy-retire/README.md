@@ -48,7 +48,7 @@ workers. Constants: two scopes, `MaxVer = 2`, `MaxReq = 2`, `MaxB = 2`,
 
 | Config                                                                                               | Result                                                                                                                                        |
 | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Good`                                                                                               | No error. 11,685,418 states generated, 3,056,046 distinct, depth 26. All invariants above.                                                    |
+| `Good`                                                                                               | No error. 20,889,799 states generated, 4,905,606 distinct, depth 26. All invariants above.                                                    |
 | `MutNoBatchFence-NoLegacyMergeWhileOpen`                                                             | `NoLegacyMergeWhileOpen` violated, 5-state trace (the batch has no guard of its own).                                                         |
 | `MutNoPin-NoTombstoneOverMovedHead`                                                                  | `NoTombstoneOverMovedHead` violated, 6-state trace (the worker does not compare to the pin).                                                  |
 | `MutDoneBeforeErase-DoneOnlyAfterConfirm`                                                            | `DoneOnlyAfterConfirm` violated, 8-state trace (done once tombstoned, before the erase).                                                      |
@@ -57,6 +57,7 @@ workers. Constants: two scopes, `MaxVer = 2`, `MaxReq = 2`, `MaxB = 2`,
 | `MutOldPinHolds-NoEraseOfUnpinnedVersion`                                                            | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the code before the fix (see below).                                                      |
 | `Probe-NotDone`, `Probe-NotBlocked`, `Probe-NotBlockedByForeignTomb`, `Probe-NotFreeMergedAfterDone` | Each fails by design: `done`, a blocked scope, a block by a foreign tombstone, and an import of an unbound stream after `done` are reachable. |
 | `MutDoneLiftsFence-NoStaleMergeAfterDone`                                                            | `NoStaleMergeAfterDone` violated, 12-state trace: the code before the fix (see below).                                                        |
+| `MutAbsentCleans-NoEraseOfUnpinnedVersion`                                                           | `NoEraseOfUnpinnedVersion` violated, 6-state trace: the adapter before round 5 (see below).                                                   |
 | `MutAdapterCleansFirst-NoEraseOfUnpinnedVersion`                                                     | `NoEraseOfUnpinnedVersion` violated, 7-state trace: the delete adapter before round 4 (see below).                                            |
 
 ## Finding: a later tombstone passed `pinHolds` (fixed)
@@ -99,6 +100,23 @@ at `fence.head.expectedVersion + 1`. Any other version throws before any storage
 write or queue row. The worker then reads the head again, and a head that is not
 the pin's gives `legacy_head_changed`. `Good` is the fixed rule.
 
+## Finding: an absent head under a live pin led to cleanup (fixed)
+
+The same gap, for another adapter answer. The worker reads the pinned head live.
+The adapter's lookup or tombstone POST then answers "head absent" (404, a 409
+`owner_stream_head_absent`, or no feed row), and the adapter returned
+`not-registered`. The shared delete worker treats that as "nothing at the gateway"
+and queues locally indexed blob keys and erases local entries before the
+retirement worker rechecks the pin. `WSendAbsent` is the adapter's absent answer;
+`MutAbsentCleans` (the code before the fix) marks cleanup the pin never named.
+
+The repair is in `createGatewayDeleteDataPort.tombstone`: with a pinned fence (a
+retirement held to a pin; `retire(scope, fence, { pinned })`), an absent answer throws before any queue row or local erase. The worker then reads the head
+again: a head that is not the pin's gives `legacy_head_changed`, and the same head
+keeps the scope waiting. A connector delete's fence is not pinned and keeps
+"not registered": its local copy goes with it. `Good` is the fixed rule. The model lets the adapter see
+"absent" at any time while the head is live, a superset of what the gateway does.
+
 ## Where the model differs from the code
 
 - **Check and merge.** The code's preflight `importFence` and the merge batch are
@@ -116,6 +134,11 @@ the pin's gives `legacy_head_changed`. `Good` is the fixed rule.
 - **Adapter.** `WSend` joins the adapter's head read, tombstone and cleanup
   write in one step. The real adapter does them in order. The version check of
   the repair comes before every write, so no step between them is observable.
+- **Startup.** The model's worker may step whenever the intent is open. In the
+  code a restart resumes it when a registered, switched runtime opens (Lite) and
+  at each sync cycle; a read-only registration waits for the cycle.
+- **Memory.** A done intent releases its in-memory history, verdict and loop. The
+  model has no memory of that kind.
 - **Shutdown.** `close()` waits for passes in flight before the database closes
   (a test holds a storage call open). It is not a model step.
 - **Erase.** `confirmErased` makes several storage requests, checks finality and

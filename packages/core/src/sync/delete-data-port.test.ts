@@ -501,6 +501,52 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     });
   });
 
+  describe("with a pinned fence, an absent head is not reported as not registered", () => {
+    const fence = {
+      pinned: true,
+      head: {
+        expectedVersion: "4",
+        dataHash: liveRecord().dataHash,
+        metadataHash: liveRecord().metadataHash,
+      },
+    };
+
+    it("throws when the feed has no head, and sends nothing", async () => {
+      const fetchImpl = vi.fn();
+      const { port } = makePort(null, fetchImpl as unknown as typeof fetch);
+
+      await expect(port.tombstone(SCOPE, fence)).rejects.toThrow(
+        /head is absent/,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a 404", () => jsonResponse(404, { error: "Unknown data point" })],
+      [
+        "a 409 owner_stream_head_absent",
+        () => jsonResponse(409, { code: "owner_stream_head_absent" }),
+      ],
+    ])("throws on %s from the gateway", async (_name, answer) => {
+      const { port } = makePort(
+        liveRecord({ expectedVersion: "4" }),
+        vi.fn(async () => answer()) as unknown as typeof fetch,
+      );
+
+      await expect(port.tombstone(SCOPE, fence)).rejects.toThrow(
+        /head is absent/,
+      );
+    });
+
+    it("keeps not-registered for a fence that is not pinned (a connector delete)", async () => {
+      const { port } = makePort(null, vi.fn() as unknown as typeof fetch);
+
+      expect(await port.tombstone(SCOPE, { head: fence.head })).toMatchObject({
+        status: "not-registered",
+      });
+    });
+  });
+
   it("reads a 409 owner_stream_head_absent like a 404: nothing registered to tombstone, not a refusal and not a version conflict", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(409, {

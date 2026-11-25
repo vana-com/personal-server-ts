@@ -36,6 +36,7 @@
 \*   touchesCurrent  the erase also writes the current connection
 \*   oldPinHolds     the code before the fix: a tombstone satisfies any live pin
 \*   adapterCleansFirst the code before round 4: the delete adapter accepts any deleted head and cleans up before the worker's pin check
+\*   absentCleans    the code before round 5: a fenced delete whose adapter sees the head absent still queues cleanup and erases local entries
 \*   doneLiftsFence  the code before the fix: a done intent no longer fences its scopes
 EXTENDS Naturals, FiniteSets
 
@@ -184,6 +185,24 @@ WSend(s) ==
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
+\* The adapter's lookup or tombstone POST answers "head absent" although the
+\* worker just read the pinned head live (the registry lost the point, or a replica
+\* behind the writer answered). The good adapter, given a fence, throws and writes
+\* nothing: the worker reads again. `absentCleans` is the code before round 5: the
+\* adapter reports "not registered" and the shared worker queues blob keys and
+\* erases local entries (modelled as a cleanup mark no pin names).
+WSendAbsent(s) ==
+  /\ pc[s] = "decided"
+  /\ ~tomb[s]
+  /\ cleanTo' = IF Mode = "absentCleans"
+                  THEN [cleanTo EXCEPT ![s] = MaxVer + 10]
+                  ELSE cleanTo
+  /\ pc' = [pc EXCEPT ![s] = "sent"]
+  /\ lastActor' = "worker"
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, snap, blk,
+                 rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
+                 staleAfterDone, cc, writes, crashes>>
+
 WReread(s) ==
   /\ pc[s] = "sent"
   /\ IF ~PinHolds(s, ~tomb[s], ver[s], tombVer[s])
@@ -268,7 +287,7 @@ Crash ==
                  batches, freeMerged, mergedWhileOpen, staleAfterDone, cc, writes>>
 
 Next ==
-  \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WReread(s) \/ WErase(s)
+  \/ \E s \in Scopes : Publish(s) \/ ForeignTomb(s) \/ WRead(s) \/ WSend(s) \/ WSendAbsent(s) \/ WReread(s) \/ WErase(s)
   \/ CWrite \/ RRead \/ RInsert \/ WDone \/ IPre \/ IMerge \/ Crash
 
 Spec == Init /\ [][Next]_vars

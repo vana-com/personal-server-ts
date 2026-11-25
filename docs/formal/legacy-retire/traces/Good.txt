@@ -1,14 +1,14 @@
 Semantic processing of module LegacyRetire
-Starting... (2026-11-25 13:37:45)
+Starting... (2026-11-25 14:16:59)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-11-25 13:37:45.
-Progress(14) at 2026-11-25 13:37:48: 2,354,043 states generated (2,354,043 s/min), 771,102 distinct states found (771,102 ds/min), 314,225 states left on queue.
+Finished computing initial states: 1 distinct state generated at 2026-11-25 14:16:59.
+Progress(13) at 2026-11-25 14:17:02: 2,237,667 states generated (2,237,667 s/min), 730,066 distinct states found (730,066 ds/min), 345,305 states left on queue.
 Model checking completed. No error has been found.
   Estimates of the probability that TLC did not check all reachable states
   because two distinct states had the same fingerprint:
-  calculated (optimistic):  val = 1.4E-6
-  based on the actual fingerprints:  val = 1.7E-7
-11685418 states generated, 3056046 distinct states found, 0 states left on queue.
+  calculated (optimistic):  val = 4.3E-6
+  based on the actual fingerprints:  val = 3.4E-7
+20889799 states generated, 4905606 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 26.
-The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 10 and the 95th percentile is 4).
-Finished in 14s at (2026-11-25 13:38:00)
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 11 and the 95th percentile is 4).
+Finished in 22s at (2026-11-25 14:17:21)

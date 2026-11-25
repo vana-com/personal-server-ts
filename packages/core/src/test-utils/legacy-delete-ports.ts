@@ -98,7 +98,7 @@ export async function legacyPortsOver(
     streamsOf: legacyStreamsOfScope,
     mode: modeFrom(seal),
     head: legacyHeadFrom(fake.feed, owner),
-    retire: async (scope, fence) => {
+    retire: async (scope, fence, retireOptions) => {
       retired.push(scope);
       return deleteScope(
         {
@@ -116,7 +116,7 @@ export async function legacyPortsOver(
           } as never,
         },
         scope,
-        { fence: { head: fence } },
+        { fence: { head: fence, pinned: retireOptions?.pinned === true } },
       );
     },
     pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),

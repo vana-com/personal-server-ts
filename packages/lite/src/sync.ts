@@ -670,14 +670,29 @@ export async function createPsLiteSyncManager(
             streamsOf: legacyStreamsOfScope,
             mode: modeOfAccount(() => mode.read()),
             head: legacyHeadFrom(dataPointFeed, serverOwner),
-            retire: (scope, head) =>
-              syncManager.deleteScope(scope, undefined, { fence: { head } }),
+            retire: (scope, head, options) =>
+              syncManager.deleteScope(scope, undefined, {
+                fence: { head, pinned: options?.pinned === true },
+              }),
             pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
             finality: tombstoneFinality,
             versions: logErasurePorts.versions,
             objects: deleteData,
           }),
         });
+        // An open legacy retirement resumes when the runtime opens, not only
+        // in a full sync cycle. It sends deletes at the gateway, so it needs
+        // the write authority a registered runtime has: a read-only
+        // registration waits for the cycle that runs once it is admitted.
+        if (!options.registrationReady || options.registrationReady())
+          void localSync.legacyRetirer.resume().catch((error: unknown) =>
+            logger.warn(
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Could not resume the legacy retirement at open",
+            ),
+          );
       }
       return localSync;
     }
