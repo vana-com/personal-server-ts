@@ -66,14 +66,15 @@ export function createFakeChangeGateway(
   const parked = new Set<() => void>();
   const scripted = new Map<number, () => Response>();
   const rejected = new Set<string>();
+  let rejectAll = false;
 
   const json = (status: number, body: unknown) =>
     new Response(JSON.stringify(body), { status });
 
   /** A cursor the gateway reads as not a cursor, once: the 400 a format change gives. */
   function rejection(afterWire: string | undefined): Response | undefined {
-    if (afterWire === undefined || !rejected.delete(afterWire))
-      return undefined;
+    if (afterWire === undefined) return undefined;
+    if (!rejectAll && !rejected.delete(afterWire)) return undefined;
     return json(400, { error: "Invalid after: expected a change-feed cursor" });
   }
 
@@ -201,6 +202,10 @@ export function createFakeChangeGateway(
      */
     rejectCursorOnce(cursor: string) {
       rejected.add(cursor);
+    },
+    /** From now on every request that carries a cursor gets that 400, the fresh ones included. */
+    rejectEveryCursor() {
+      rejectAll = true;
     },
     /** Requests held at the gateway now. */
     held: () => parked.size,

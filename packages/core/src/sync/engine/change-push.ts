@@ -165,8 +165,14 @@ export function createRegistryChangePush(
           const answer = await Promise.race([wait, ended]);
           if (lifetime.signal.aborted) return "failed";
           cursor = answer.cursor;
-          if (sentCursor) droppedCursor = false;
-          failures = 0;
+          // An answer to a request with no cursor, after one was rejected,
+          // only says the gateway can mint cursors. The failure run ends when
+          // a request that carried one is answered, so a gateway that rejects
+          // every cursor it hands out meets a growing back-off.
+          if (sentCursor || !droppedCursor) {
+            droppedCursor = false;
+            failures = 0;
+          }
           setHealth(true);
           // The position first: the cycle a poke starts samples it.
           handlers.onPosition(answer.cursor);

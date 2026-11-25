@@ -512,4 +512,30 @@ describe("a cursor the gateway rejects", () => {
     expect(gateway.requests.length).toBeLessThan(8);
     t.stop();
   });
+  it("backs off with growing delays when the gateway rejects every fresh cursor it hands out", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5); // back-off steps exactly 1 s, 2 s, 4 s
+    const gateway = createFakeChangeGateway({ seq: 5 });
+    const t = subscribed(gateway);
+    await flush();
+    gateway.rejectEveryCursor();
+    gateway.commit();
+    await flush();
+    const cursorless = () =>
+      gateway.requests.slice(2).filter((r) => r.after === undefined).length;
+    // The rejected held cursor is retried at once without one; that answer's
+    // fresh cursor is rejected too, and the back-off starts at 1 s.
+    expect(cursorless()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(cursorless()).toBe(2);
+    // A cursorless answer does not end the failure run: the next step is 2 s.
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(cursorless()).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(cursorless()).toBe(3);
+    await vi.advanceTimersByTimeAsync(3_999);
+    expect(cursorless()).toBe(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(cursorless()).toBe(4);
+    t.stop();
+  });
 });
