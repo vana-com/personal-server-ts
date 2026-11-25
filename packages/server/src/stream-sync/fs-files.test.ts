@@ -164,6 +164,15 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(await readFile(join(root, "s/0"), "utf8")).toBe("new+tail");
   });
 
+  it("does not leave a temporary file when replacing a directory fails", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await mkdir(join(root, "fixture-folder"));
+    await expect(
+      files.write("fixture-folder", enc.encode("fixture")),
+    ).rejects.toThrow();
+    expect(await readdir(root)).toEqual(["fixture-folder"]);
+  });
+
   it("remove closes handles under the prefix and the files can be created again", async () => {
     if (process.platform !== "linux") return;
     const files = createFsStreamSyncFiles(root);

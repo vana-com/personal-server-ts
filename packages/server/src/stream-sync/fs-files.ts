@@ -271,7 +271,12 @@ export function createFsStreamSyncFiles(
       } finally {
         await handle.close();
       }
-      await rename(tmp, full);
+      try {
+        await rename(tmp, full);
+      } catch (error) {
+        await rm(tmp, { force: true }).catch(() => undefined);
+        throw error;
+      }
       await fsyncDir(dirname(full));
     },
     async read(path) {
