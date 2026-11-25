@@ -88,8 +88,12 @@ describe("a scoped caller's result is decided only by its own connections", () =
       connection("own"),
       connection("unplaced"),
     ]);
-    vi.mocked(publishLog).mockImplementation(async (_deps, id) => published(id));
-    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(fails("listing"));
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) =>
+      published(id),
+    );
+    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
+      fails("listing"),
+    );
 
     const report = await runPublish(deps, ["own"]);
 

@@ -555,8 +555,14 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
       return original(sql, params);
     }) as typeof a.db.query;
     const resumed = a.sync.deleter.resumeDeletes().then(
-      () => { answered = true; return undefined; },
-      (reason: unknown) => { answered = true; return reason; },
+      () => {
+        answered = true;
+        return undefined;
+      },
+      (reason: unknown) => {
+        answered = true;
+        return reason;
+      },
     );
     try {
       await reading;
