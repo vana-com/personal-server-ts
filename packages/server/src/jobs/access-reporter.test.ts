@@ -212,6 +212,43 @@ describe("access reporter batching", () => {
     );
   });
 
+  it("counts duplicate rejection entries only once and resends the unnamed record", async () => {
+    const send = okFetch().mockResolvedValueOnce(
+      refusal(400, {
+        rejected: [{ index: 0 }, { index: 0 }, { index: "1" }, { index: 9 }],
+      }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(logIdsOf(send.mock.calls[1])).toEqual(["log-2"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ count: 1, droppedTotal: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("does not resend an empty remainder when all records are explicitly refused", async () => {
+    const send = okFetch().mockResolvedValueOnce(
+      refusal(400, {
+        rejected: [{ index: 0 }, { index: 1 }],
+      }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ count: 2, droppedTotal: 2 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
   it("honours a per-record rejected list", async () => {
     const send = vi.fn(async () =>
       send.mock.calls.length === 1
