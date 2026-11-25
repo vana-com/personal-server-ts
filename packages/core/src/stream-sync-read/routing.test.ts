@@ -230,8 +230,16 @@ describe("live stream status projection", () => {
     const { liveStreamCounts } = await import("./service.js");
     const status = {
       connections: [
-        { connector: "fixture", ns: "first", streams: { rows: { live: true, records: 1 } } },
-        { connector: "fixture", ns: "second", streams: { rows: { live: true, records: 2 } } },
+        {
+          connector: "fixture",
+          ns: "first",
+          streams: { rows: { live: true, records: 1 } },
+        },
+        {
+          connector: "fixture",
+          ns: "second",
+          streams: { rows: { live: true, records: 2 } },
+        },
       ],
     } as unknown as Parameters<typeof liveStreamCounts>[0];
     expect(liveStreamCounts(status)).toEqual([
@@ -245,7 +253,11 @@ describe("live stream status projection", () => {
     const digest = "a".repeat(64);
     const status = {
       connections: [
-        { connector: "fixture", ns: "", streams: { rows: { live: true, records: 3, digest } } },
+        {
+          connector: "fixture",
+          ns: "",
+          streams: { rows: { live: true, records: 3, digest } },
+        },
       ],
     } as unknown as Parameters<typeof liveStreamCounts>[0];
     expect(liveStreamCounts(status)).toEqual([
