@@ -3,7 +3,14 @@ import { bytesToHex } from "@noble/hashes/utils";
 import { classifyImportRow } from "./import-snapshot.js";
 import { foldLayers, type FoldLayer } from "./legacy-fold.js";
 import { quarantineTally, type QuarantineCounts } from "./legacy-quarantine.js";
+import { ProtocolError } from "../errors/catalog.js";
 import type { SeedIntake } from "./seed.js";
+
+/** The intake refuses a connector whose connection was deleted. */
+export const isConnectionDeleted = (error: unknown) =>
+  error instanceof ProtocolError &&
+  error.code === 410 &&
+  error.errorCode === "CONNECTION_DELETED";
 
 /**
  * Feeds a legacy store that only a host can read (a browser's IndexedDB, a
@@ -53,9 +60,11 @@ export interface LegacySeedStreamReport {
    * `reason`); nothing of it was imported and
    * the next stream goes on, as the server's import refuses one stream only. */
   readonly outcome: "merged" | "staged" | "empty" | "refused";
-  /** Why the stream was refused: `invalid_record`, or `source_changed` when
-   * the store's content changed between the counting pass and the upload. */
-  readonly reason?: "invalid_record" | "source_changed";
+  /** Why the stream was refused: `invalid_record`; `source_changed` when
+   * the store's content changed between the counting pass and the upload; or
+   * `deleted` when the intake refused its connector as a deleted connection
+   * (this stream only, the next connector goes on). */
+  readonly reason?: "invalid_record" | "source_changed" | "deleted";
   /** Rows put to the intake. */
   readonly rows: number;
   /** Rows left out for want of a full identity, by reason. */
@@ -183,14 +192,38 @@ export async function seedLegacyStore(
   const total = quarantineTally();
   let rows = 0;
   const statusOf = new Map<string, Awaited<ReturnType<SeedIntake["status"]>>>();
+  const deleted = new Set<string>();
+  const refuseDeleted = (connector: string, stream: string) => {
+    deleted.add(connector);
+    statusOf.delete(connector);
+    reports.push({
+      connector,
+      stream,
+      outcome: "refused",
+      reason: "deleted",
+      rows: 0,
+      quarantine: {},
+      invalid: 0,
+    });
+  };
   for await (const stream of store.streams()) {
     options.signal?.throwIfAborted();
     const { connector, stream: name } = stream;
     // The status is read per connector, and again after a stream is put: the
     // importer runs inside `put`, so a receipt appears there.
+    if (deleted.has(connector)) {
+      refuseDeleted(connector, name);
+      continue;
+    }
     let status = statusOf.get(connector);
     if (!status) {
-      status = await intake.status(connector);
+      try {
+        status = await intake.status(connector);
+      } catch (error) {
+        if (!isConnectionDeleted(error)) throw error;
+        refuseDeleted(connector, name);
+        continue;
+      }
       statusOf.set(connector, status);
     }
     if (status.streams[name]?.state === "merged") {
@@ -299,6 +332,10 @@ export async function seedLegacyStore(
     try {
       put = await intake.put(connector, name, body());
     } catch (error) {
+      if (isConnectionDeleted(error)) {
+        refuseDeleted(connector, name);
+        continue;
+      }
       if (!(error instanceof SourceChanged)) throw error;
       // Refuses this stream only; no receipt was written, so a later run reads
       // the store again.

@@ -27,7 +27,6 @@ import type {
  *   The whole scope is excluded (not split by identity: one stream has one
  *   connector, and a mixed history cannot be told apart safely).
  * - `ambiguous_declaration`: several verified manifest versions fit.
- * - `no_primary_key`: the declaration has no primary key.
  * - `shadowed_alias`: the stream also has a canonical `<source>.<stream>`
  *   scope, which is the one read; this alias scope was not offered.
  * - `not_stream_rows`: the newest stored version is not `{records}` of plain
@@ -44,7 +43,6 @@ export type LegacyScopeExclusionReason =
   | "unknown_source"
   | "source_conflict"
   | "ambiguous_declaration"
-  | "no_primary_key"
   | "shadowed_alias"
   | "not_stream_rows";
 
@@ -66,6 +64,9 @@ export interface LegacyScopeStoreOptions {
    * hold. A scope with one target is stored under its own name. */
   readonly targets: ReadonlyMap<string, readonly LegacyScopeTarget[]>;
   readonly onExcluded?: (exclusion: LegacyScopeExclusion) => void;
+  /** Checked before each stored body or version list is read, so a stop does
+   * not wait for the scan of excluded scopes. */
+  readonly signal?: AbortSignal;
   /** Asked before a stream's stored versions are read. `final`: the host
    * already holds the stream's final receipt, so its history is not read now.
    * `leave`: the host does not want the stream this time; it is not yielded.
@@ -147,7 +148,16 @@ function listAllScopes(storage: LegacyScopeStorage): string[] {
 export function createLegacyScopeStore(
   options: LegacyScopeStoreOptions,
 ): LegacyScopeStore {
-  const { storage } = options;
+  const { storage, signal } = options;
+  /** Every storage read goes through here, so each one is a stop point. */
+  const readBody = async (scope: string, collectedAt: string) => {
+    signal?.throwIfAborted();
+    return (await storage.readEnvelope(scope, collectedAt)).data;
+  };
+  const versionsOf = (scope: string) => {
+    signal?.throwIfAborted();
+    return versionsNewestFirst(storage, scope);
+  };
   const exclude = (scope: string, reason: LegacyScopeExclusionReason) =>
     options.onExcluded?.({ scope, reason });
   const { targets } = options;
@@ -174,7 +184,9 @@ export function createLegacyScopeStore(
       const found = index.get(`${connector}\0${stream}`) ?? [];
       if (found.length === 0) return "no_declaration";
       if (found.length > 1) return "ambiguous_declaration";
-      return found[0]!.primaryKey.length === 0 ? "no_primary_key" : found[0]!;
+      // `manifestArtifact` rejects a manifest with a keyless stream whole, so a
+      // declaration always has a primary key.
+      return found[0]!;
     };
   }
 
@@ -184,12 +196,8 @@ export function createLegacyScopeStore(
       /** The source ids of a scope's newest stored version. */
       const newestSources = async (scope: string): Promise<Set<string>> => {
         const ids = new Set<string>();
-        const newest = versionsNewestFirst(storage, scope)[0];
-        if (newest)
-          sourceIdsOf(
-            (await storage.readEnvelope(scope, newest.collectedAt)).data,
-            ids,
-          );
+        const newest = versionsOf(scope)[0];
+        if (newest) sourceIdsOf(await readBody(scope, newest.collectedAt), ids);
         return ids;
       };
       /** The one target of a scope, or why there is none. A connector with no
@@ -258,7 +266,7 @@ export function createLegacyScopeStore(
         const state =
           (await options.receipt?.(target.connector, target.stream)) ?? "open";
         if (state === "leave") continue;
-        const versions = versionsNewestFirst(storage, scope);
+        const versions = versionsOf(scope);
         const newest = versions[0];
         if (!newest) continue;
         // The producer reads no history of a stream with a final receipt, and
@@ -267,21 +275,14 @@ export function createLegacyScopeStore(
         // without reading any older version.
         let sourceId: string | undefined;
         if (state !== "final") {
-          if (
-            plainRows(
-              (await storage.readEnvelope(scope, newest.collectedAt)).data,
-            ) === null
-          ) {
+          if (plainRows(await readBody(scope, newest.collectedAt)) === null) {
             exclude(scope, "not_stream_rows");
             continue;
           }
           // Every stored layer must name the one source the connector claims.
           const ids = new Set<string>();
           for (const version of versions)
-            sourceIdsOf(
-              (await storage.readEnvelope(scope, version.collectedAt)).data,
-              ids,
-            );
+            sourceIdsOf(await readBody(scope, version.collectedAt), ids);
           if (ids.size > 1) {
             exclude(scope, "source_conflict");
             continue;
@@ -294,9 +295,7 @@ export function createLegacyScopeStore(
         }
         const layers: FoldLayer[] = versions.map((version) => ({
           async *records() {
-            const rows = plainRows(
-              (await storage.readEnvelope(scope, version.collectedAt)).data,
-            );
+            const rows = plainRows(await readBody(scope, version.collectedAt));
             if (rows) yield* rows;
           },
         }));

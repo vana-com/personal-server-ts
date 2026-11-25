@@ -6,6 +6,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import {
   createLegacyScopeStore,
+  isConnectionDeleted,
   type LegacyScopeTarget,
   seedLegacyStore,
   type LegacyScopeExclusionReason,
@@ -14,7 +15,6 @@ import {
   type QuarantineCounts,
   type SeedIntake,
 } from "@opendatalabs/personal-server-ts-core/localdb";
-import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { ImportRunner } from "@opendatalabs/personal-server-ts-core/sync/account-mode";
 
@@ -107,12 +107,6 @@ function streamScopeTargets(): ReadonlyMap<
   return new Map([...table].map(([scope, ts]) => [scope, [...ts.values()]]));
 }
 
-/** `intake.status()` throws this for a connector whose connection was deleted. */
-const isConnectionDeleted = (error: unknown) =>
-  error instanceof ProtocolError &&
-  error.code === 410 &&
-  error.errorCode === "CONNECTION_DELETED";
-
 const tally = <K extends string>() => {
   const byReason = new Map<K, { n: number; rows: number }>();
   return {
@@ -148,10 +142,6 @@ export function createLiteLegacyStoreRunner(
     async run(signal) {
       const intake = await options.intake();
       const excluded = tally<LegacyScopeExclusionReason>();
-      const statusOf = new Map<
-        string,
-        Awaited<ReturnType<SeedIntake["status"]>>
-      >();
       const deleted = new Set<string>();
       const refused = tally<string>();
       const store = createLegacyScopeStore({
@@ -164,22 +154,29 @@ export function createLiteLegacyStoreRunner(
             refused.add("deleted");
             return "leave";
           }
-          let status = statusOf.get(connector);
-          if (!status) {
-            try {
-              status = await intake.status(connector);
-            } catch (error) {
-              // A deleted connector refuses its own streams only; its scope
-              // stays and the other connectors go on.
-              if (!isConnectionDeleted(error)) throw error;
-              deleted.add(connector);
-              refused.add("deleted");
-              return "leave";
-            }
-            statusOf.set(connector, status);
+          // Read fresh under the intake's own lock, so a seed upload that
+          // arrived since the last stream is seen before this one is put.
+          let status: Awaited<ReturnType<SeedIntake["status"]>>;
+          try {
+            status = await intake.status(connector);
+          } catch (error) {
+            // A deleted connector refuses its own streams only; its scope
+            // stays and the other connectors go on.
+            if (!isConnectionDeleted(error)) throw error;
+            deleted.add(connector);
+            refused.add("deleted");
+            return "leave";
           }
-          return status.streams[stream]?.state === "merged" ? "final" : "open";
+          const state = status.streams[stream]?.state;
+          if (state === "merged") return "final";
+          // An upload waiting for its target is never replaced by a legacy seed.
+          if (state === "staged") {
+            refused.add("staged_upload_pending");
+            return "leave";
+          }
+          return "open";
         },
+        signal,
       });
       // The newest stored version of each stream, to count a refused stream's
       // rows when the producer reports none.

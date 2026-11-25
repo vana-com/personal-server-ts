@@ -127,3 +127,62 @@ it("one declaration snapshot serves a whole enumeration", async () => {
   for await (const _ of store.streams());
   expect(reads).toBe(1);
 });
+
+it("a manifest with a keyless stream is rejected whole: its keyed sibling has no declaration either", async () => {
+  const mixed = JSON.stringify({
+    connector_key: "a",
+    version: "1",
+    streams: [
+      { name: "items", semantics: "mutable_state", primary_key: ["id"] },
+      { name: "loose", semantics: "mutable_state", primary_key: [] },
+    ],
+  });
+  const { streams, excluded } = await enumerate(
+    new Map([
+      ["shared.items", [layer([{ id: "1" }], "2026-11-01T00:00:00.000Z")]],
+    ]),
+    [mixed],
+    [A],
+  );
+  expect(streams).toEqual([]);
+  expect(excluded).toEqual(["no_declaration"]);
+});
+
+it("a stop between storage reads ends the scan of excluded scopes at once", async () => {
+  const other = tagged("urn:other", "1");
+  const scopes: Versions = new Map(
+    ["shared.items", "shared.two", "shared.three"].map((scope) => [
+      scope,
+      [
+        layer([other], "2026-11-01T00:00:00.000Z"),
+        layer([other], "2026-11-02T00:00:00.000Z"),
+      ],
+    ]),
+  );
+  const reads: string[] = [];
+  const controller = new AbortController();
+  const storage = storageOf(scopes) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  const read = storage.readEnvelope;
+  storage.readEnvelope = async (scope, at) => {
+    reads.push(`${scope}@${at}`);
+    controller.abort();
+    return read(scope, at);
+  };
+  const store = createLegacyScopeStore({
+    storage: storage as never,
+    manifests: () => [manifestOf("a", "items")],
+    targets: new Map(
+      ["shared.items", "shared.two", "shared.three"].map((scope) => [
+        scope,
+        [A, { ...A, connector: "a2" }],
+      ]),
+    ),
+    signal: controller.signal,
+  });
+  await expect(async () => {
+    for await (const _ of store.streams());
+  }).rejects.toThrow();
+  expect(reads).toHaveLength(1);
+});

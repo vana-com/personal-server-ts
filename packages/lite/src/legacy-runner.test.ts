@@ -42,25 +42,53 @@ function memoryStorage(scopes: Versions, reads: string[] = []) {
   } as never;
 }
 
-function recordingIntake(deleted: readonly string[] = []) {
+const gone = () =>
+  new ProtocolError(410, "CONNECTION_DELETED", "The connection was deleted");
+
+function recordingIntake(
+  deleted: readonly string[] = [],
+  extra: {
+    /** Streams holding a pending upload that waits for its target. */
+    staged?: Record<string, string>;
+    /** Connectors deleted once the run has started: status calls past the
+     * first (the runner's preflight) refuse. */
+    deletedAfterPreflight?: readonly string[];
+    /** Connectors whose `put` refuses as deleted. */
+    deletedOnPut?: readonly string[];
+  } = {},
+) {
   const receipts = new Set<string>();
   const imported: string[] = [];
+  const puts: string[] = [];
+  const statusCalls = new Map<string, number>();
   const intake: SeedIntake = {
     status: async (connector: string) => {
-      if (deleted.includes(connector))
-        throw new ProtocolError(
-          410,
-          "CONNECTION_DELETED",
-          "The connection was deleted",
-        );
+      if (deleted.includes(connector)) throw gone();
+      const calls = (statusCalls.get(connector) ?? 0) + 1;
+      statusCalls.set(connector, calls);
+      if (calls > 1 && extra.deletedAfterPreflight?.includes(connector))
+        throw gone();
       return {
         targetKnown: true,
-        streams: Object.fromEntries(
-          [...receipts].map((stream) => [stream, { state: "merged" as const }]),
-        ),
+        streams: {
+          ...Object.fromEntries(
+            Object.keys(extra.staged ?? {}).map((stream) => [
+              stream,
+              { state: "staged" as const, records: 1, invalid: 0 },
+            ]),
+          ),
+          ...Object.fromEntries(
+            [...receipts].map((stream) => [
+              stream,
+              { state: "merged" as const },
+            ]),
+          ),
+        },
       };
     },
-    put: async (_connector, stream, body) => {
+    put: async (connector, stream, body) => {
+      puts.push(`${connector}.${stream}`);
+      if (extra.deletedOnPut?.includes(connector)) throw gone();
       const decoder = new TextDecoder();
       let text = "";
       for await (const chunk of body) text += decoder.decode(chunk);
@@ -70,7 +98,7 @@ function recordingIntake(deleted: readonly string[] = []) {
       return { state: "staged", records: lines.length, invalid: 0 };
     },
   } as never;
-  return { intake, imported };
+  return { intake, imported, puts };
 }
 
 const version = (rows: unknown, collectedAt = "2026-11-01T00:00:00.000Z") => ({
@@ -262,4 +290,82 @@ it("rows stamped with the connector's own source id import", async () => {
   const { intake, imported } = recordingIntake();
   await runner(scopes, intake).run(new AbortController().signal);
   expect(imported).toEqual(["x"]);
+});
+
+it("a stream with a pending staged upload is left alone, counted, and its upload is untouched", async () => {
+  const scopes: Versions = new Map([
+    ["spotify.saved_tracks", [version([{ id: "legacy" }])]],
+    ["spotify.profile", [version([{ id: "p1" }])]],
+  ]);
+  const staged = { saved_tracks: '{"id":"host-seed"}\n' };
+  const before = JSON.stringify(staged);
+  const { intake, imported, puts } = recordingIntake([], { staged });
+  const live = runner(scopes, intake);
+  await live.run(new AbortController().signal);
+  expect(puts).toEqual(["spotify.profile"]);
+  expect(imported).toEqual(["p1"]);
+  expect(JSON.stringify(staged)).toBe(before);
+  expect(live.report()?.streams.refused).toEqual([
+    { reason: "staged_upload_pending", streams: 1, rows: 0 },
+  ]);
+  expect(scopes.has("spotify.saved_tracks")).toBe(true);
+});
+
+it("a connection deleted after preflight costs only that connector", async () => {
+  for (const extra of [
+    { deletedAfterPreflight: ["spotify"] },
+    { deletedOnPut: ["spotify"] },
+  ]) {
+    const scopes: Versions = new Map([
+      ["spotify.saved_tracks", [version([{ id: "s1" }])]],
+      ["spotify.profile", [version([{ id: "p1" }])]],
+      ["github.starred", [version([{ id: "g1" }])]],
+    ]);
+    const { intake, imported } = recordingIntake([], extra);
+    const live = runner(scopes, intake);
+    await live.run(new AbortController().signal);
+    expect(imported).toEqual(["g1"]);
+    // Rows a refused stream held when the producer read it are counted.
+    expect(live.report()?.streams).toMatchObject({
+      staged: 1,
+      refused: [{ reason: "deleted", streams: 2 }],
+    });
+  }
+});
+
+it("stop during a scan of excluded scopes reads nothing more", async () => {
+  const scopes: Versions = new Map(
+    ["a", "b", "c"].map((name) => [
+      `spotify.saved_tracks${name === "a" ? "" : name}`,
+      [
+        version(
+          [{ id: "x", $pdpp: { sourceId: "other" } }],
+          "2026-11-01T00:00:00.000Z",
+        ),
+        version(
+          [{ id: "y", $pdpp: { sourceId: "other" } }],
+          "2026-11-02T00:00:00.000Z",
+        ),
+      ],
+    ]),
+  );
+  const reads: string[] = [];
+  const controller = new AbortController();
+  const storage = memoryStorage(scopes, reads) as unknown as {
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  const read = storage.readEnvelope;
+  storage.readEnvelope = async (scope, at) => {
+    const result = await read(scope, at);
+    controller.abort();
+    return result;
+  };
+  const { intake } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: storage as never,
+    intake: async () => intake,
+    manifests: () => [manifest, githubManifest],
+  });
+  await live.run(controller.signal).catch(() => {});
+  expect(reads).toHaveLength(1);
 });
