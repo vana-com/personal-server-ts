@@ -29,7 +29,9 @@ describe("request lifetime diagnostic formatting", () => {
   it("distinguishes a typed diagnostic from generic copy with the same message", () => {
     const diagnostic = new TokenLifetimeError(37);
     expect(isWeb3SignedLifetimeError(diagnostic)).toBe(true);
-    expect(isWeb3SignedLifetimeError(new Error(diagnostic.message))).toBe(false);
+    expect(isWeb3SignedLifetimeError(new Error(diagnostic.message))).toBe(
+      false,
+    );
   });
 });
 

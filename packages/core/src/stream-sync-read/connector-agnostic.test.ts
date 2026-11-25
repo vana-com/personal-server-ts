@@ -62,7 +62,6 @@ describe("live stream count diagnostics", () => {
   });
 });
 
-
 /** Every connector key, source key and profile key the bindings name. */
 function knownNames(): Set<string> {
   const names = new Set<string>();
