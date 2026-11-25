@@ -40,6 +40,26 @@ export class GatewayRefusalError extends Error {
   }
 }
 
+/**
+ * A fenced delete cleans storage through the tombstone's version, so it may
+ * count a deleted head as its own only at the version right after the fenced
+ * head. A later tombstone sits over versions the fence never named; the caller
+ * must write nothing for it.
+ */
+function assertFencedTombstone(
+  fence: { head: TombstoneFence } | undefined,
+  version: string | null,
+): void {
+  if (!fence) return;
+  if (
+    version === null ||
+    BigInt(version) !== BigInt(fence.head.expectedVersion) + 1n
+  )
+    throw new Error(
+      `Scope is deleted at v${version ?? "?"}, not directly after the fenced head (v${fence.head.expectedVersion})`,
+    );
+}
+
 /** The terminal refusal a response body names, or null. */
 function refusalOf(
   status: number,
@@ -282,6 +302,9 @@ export function createGatewayDeleteDataPort(
         return { status: "not-registered", dataPointId };
       }
       if (current.deletedAt !== null) {
+        // A fenced delete may call a head deleted only when it is the pinned
+        // head's own tombstone: the caller cleans storage through that version.
+        assertFencedTombstone(fence, current.expectedVersion);
         return {
           status: "already-deleted",
           dataPointId,
@@ -362,7 +385,11 @@ export function createGatewayDeleteDataPort(
           await sendTombstone(scope, dataPointId, version),
         );
       }
-      if (answer.kind === "outcome") return answer.outcome;
+      if (answer.kind === "outcome") {
+        if (answer.outcome.status === "already-deleted")
+          assertFencedTombstone(fence, answer.outcome.version);
+        return answer.outcome;
+      }
       if (answer.kind === "version-conflict") {
         // A second conflict: the re-sign is once, not forever.
         throw new Error(

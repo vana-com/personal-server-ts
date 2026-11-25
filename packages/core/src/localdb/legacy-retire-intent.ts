@@ -77,7 +77,11 @@ export interface LegacyRetirer {
   status(connector: string): Promise<LegacyRetireStatus | null>;
   /** Start the passes of every open intent (a restart's sweep). */
   resume(): Promise<void>;
-  close(): void;
+  /**
+   * Stop scheduling and abort the passes. Resolves once every pass that was
+   * running has returned, so the caller may close the database after it.
+   */
+  close(): Promise<void>;
 }
 
 export type LegacyRetirerDeps = Pick<
@@ -116,6 +120,8 @@ export function createLegacyRetirer(
   const memories = new Map<string, LegacyMemory>();
   const verdicts = new Map<string, DeletePart>();
   const loops = new Map<string, Loop>();
+  /** Passes in flight: `close` waits for them before the database goes. */
+  const active = new Set<Promise<void>>();
 
   async function intentOf(connector: string): Promise<Intent | null> {
     const [row] = await deps.db.query<{
@@ -209,7 +215,11 @@ export function createLegacyRetirer(
       return;
     }
     clearTimeout(loop.timer);
-    const timer = setTimeout(() => void run(connector), delay);
+    const timer = setTimeout(() => {
+      const running = run(connector);
+      active.add(running);
+      void running.finally(() => active.delete(running));
+    }, delay);
     // A pending retry must not keep a process alive.
     (timer as { unref?: () => void }).unref?.();
     loop.timer = timer;
@@ -252,6 +262,12 @@ export function createLegacyRetirer(
     async request(connector) {
       const ports = options.ports();
       if (!ports) throw new LegacyRetireUnavailable();
+      // Without it the intent cannot name the streams its scopes feed, and the
+      // permanent import fence would hold nothing.
+      if (!ports.streamsOf)
+        throw new LegacyRetireUnavailable(
+          "this host cannot name the streams of a legacy scope",
+        );
       const mode = ports.mode();
       if (mode !== "switched")
         throw new LegacyRetireNotAdmitted(
@@ -266,7 +282,7 @@ export function createLegacyRetirer(
             scopes.push({
               scope,
               head: await ports.head(scope),
-              streams: [...(ports.streamsOf?.(connector, scope) ?? [])],
+              streams: [...ports.streamsOf(connector, scope)],
             });
         } catch (error) {
           throw new LegacyRetireUnavailable(
@@ -316,10 +332,11 @@ export function createLegacyRetirer(
       for (const { connector } of open)
         if (!loops.has(connector)) schedule(connector, 0);
     },
-    close() {
+    async close() {
       stop.abort();
       for (const loop of loops.values()) clearTimeout(loop.timer);
       loops.clear();
+      await Promise.allSettled([...active]);
     },
   };
 }

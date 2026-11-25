@@ -679,9 +679,11 @@ export function createLocalSync(
     close: () => {
       closed = true;
       stopHearingPurges();
-      legacyRetirer.close();
+      // Aborts now; resolves when no retirement pass is left on the database.
+      const retirerClosed = legacyRetirer.close();
       syncRetryTimer(); // closed (only ever turns on): clears the timer
       return (closing ??= (async () => {
+        await retirerClosed;
         await deleteStore?.close();
         await looping;
         await deps.db.close();

@@ -1,3 +1,16 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 18 and seed -5435649032227618406 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 1141868] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r4-1125/docs/formal/legacy-retire/LegacyRetire.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module LegacyRetire
+Starting... (2026-11-25 13:38:04)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-25 13:38:04.
 Error: Invariant OneIntent is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -26,8 +39,9 @@ State 1: <Initial predicate>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 2: <RRead line 123, col 3 to line 128, col 38 of module LegacyRetire>
+State 2: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -53,8 +67,9 @@ State 2: <RRead line 123, col 3 to line 128, col 38 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 3: <RInsert line 132, col 3 to line 140, col 38 of module LegacyRetire>
+State 3: <RInsert line 135, col 3 to line 143, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -80,8 +95,9 @@ State 3: <RInsert line 132, col 3 to line 140, col 38 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 4: <Crash line 243, col 3 to line 252, col 83 of module LegacyRetire>
+State 4: <Crash line 259, col 3 to line 268, col 83 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -107,7 +123,9 @@ State 4: <Crash line 243, col 3 to line 252, col 83 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-1724 states generated, 1013 distinct states found, 745 states left on queue.
+955 states generated, 695 distinct states found, 548 states left on queue.
 The depth of the complete state graph search is 6.
-The average outdegree of the complete state graph is 4 (minimum is 0, the maximum 10 and the 95th percentile is 9).
+The average outdegree of the complete state graph is 5 (minimum is 0, the maximum 10 and the 95th percentile is 9).
+Finished in 00s at (2026-11-25 13:38:04)

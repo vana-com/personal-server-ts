@@ -14,7 +14,10 @@ import {
 import { createImportLedger } from "./import-ledger.js";
 import { importLegacySource } from "./legacy-import.js";
 import type { ImportSource } from "./legacy-import-types.js";
-import { LegacyRetireNotAdmitted } from "./legacy-retire-intent.js";
+import {
+  LegacyRetireNotAdmitted,
+  LegacyRetireUnavailable,
+} from "./legacy-retire-intent.js";
 import { legacyScopesOfConnector } from "../legacy-projection/erase-connector.js";
 import { legacyPortsOver } from "../test-utils/legacy-delete-ports.js";
 import { createLegacyGatewayFake } from "../test-utils/legacy-gateway-fake.js";
@@ -240,6 +243,37 @@ describe("a standalone legacy retirement after the switch", () => {
     expect(gatewayDeletes(f.fake)).toEqual([]);
     expect(storageDeletes(f.fake)).toEqual([]);
     for (const scope of SCOPES) expect(f.fake.blobCount(scope)).toBe(3);
+  });
+
+  // The worker reads the pinned head live, then another device publishes v3
+  // and tombstones at v4 before the delete adapter reads the head. The adapter
+  // must not take v4 as "already deleted" and clean up through it: that frees
+  // v3's blob, which the pin never named. Nothing is cleaned or queued.
+  it("cleans nothing and queues nothing when the head moves between the worker's read and the adapter's read", async () => {
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        retire: async (scope, fence) => {
+          f.fake.moveHead(scope);
+          f.fake.foreignTombstone(scope);
+          return ports.retire(scope, fence);
+        },
+      }),
+    });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: { state: "blocked", reason: "legacy_head_changed" },
+      }),
+    );
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
+      expect(f.fake.blobCount(scope)).toBe(3);
+    }
   });
 
   it("accepts a tombstone another writer put directly after the pinned head", async () => {
@@ -479,6 +513,60 @@ describe("a standalone legacy retirement after the switch", () => {
     expect(await f.a.sync.legacyRetirer.status(GH)).toBeNull();
     expect(await f.a.db.query("SELECT * FROM legacy_retirements")).toEqual([]);
     expect(f.fake.requests).toEqual([]);
+  });
+
+  // Without the streams of each scope the intent could not hold back a later
+  // import of them, so the permanent fence would silently hold nothing.
+  it("refuses admission when the host cannot name the streams of a scope, and writes nothing", async () => {
+    const f = await reconnected({
+      wrapLegacy: ({ streamsOf: _streamsOf, ...ports }) => ports,
+    });
+
+    await expect(f.a.sync.legacyRetirer.request(GH)).rejects.toBeInstanceOf(
+      LegacyRetireUnavailable,
+    );
+    expect(await f.a.sync.legacyRetirer.status(GH)).toBeNull();
+    expect(await f.a.db.query("SELECT * FROM legacy_retirements")).toEqual([]);
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+  });
+
+  // Closing the sync closes the database. A pass with a storage call in flight
+  // would write its verdict to a closed database, so close waits for it.
+  it("waits for a pass with a storage call in flight before the sync closes", async () => {
+    let entered!: () => void;
+    const inFlight = new Promise<void>((resolve) => (entered = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let storageReturned = false;
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        objects: {
+          ...ports.objects,
+          deleteBlobVersions: async (scope, versions) => {
+            entered();
+            await released;
+            const outcome = await ports.objects.deleteBlobVersions(
+              scope,
+              versions,
+            );
+            storageReturned = true;
+            return outcome;
+          },
+        },
+      }),
+    });
+    await f.a.sync.legacyRetirer.request(GH);
+    await inFlight;
+
+    let closed = false;
+    const closing = f.a.sync.close().then(() => (closed = true));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(closed).toBe(false);
+
+    release();
+    await closing;
+    expect(storageReturned).toBe(true);
   });
 
   it("refuses while the account mode is unknown, and writes nothing", async () => {

@@ -35,6 +35,7 @@
 \*   newIntentOnRestart a restart makes a new intent for an open one
 \*   touchesCurrent  the erase also writes the current connection
 \*   oldPinHolds     the code before the fix: a tombstone satisfies any live pin
+\*   adapterCleansFirst the code before round 4: the delete adapter accepts any deleted head and cleans up before the worker's pin check
 \*   doneLiftsFence  the code before the fix: a done intent no longer fences its scopes
 EXTENDS Naturals, FiniteSets
 
@@ -49,6 +50,7 @@ CONSTANTS Scopes,     \* the bound legacy scopes
 VARIABLES
   ver, tomb, tombBy, tombVer,   \* gateway head per scope
   erased,                       \* blobs of the scope are gone (confirmed)
+  cleanTo,                      \* highest version storage cleanup was queued or done for (0: none)
   exists, st, pins, nIntents,   \* the intent row(s)
   pc, snap, blk,                \* worker per scope
   rpc, rsnap, reqs,             \* request
@@ -57,7 +59,7 @@ VARIABLES
   cc, writes,                   \* the current connection
   crashes, lastActor
 
-vars == <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents,
+vars == <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents,
           pc, snap, blk, rpc, rsnap, reqs, ipc, batches, isc, freeMerged,
           mergedWhileOpen, staleAfterDone, cc, writes, crashes, lastActor>>
 
@@ -76,6 +78,7 @@ Init ==
   /\ tombBy = [s \in Scopes |-> "none"]
   /\ tombVer = [s \in Scopes |-> 0]
   /\ erased = [s \in Scopes |-> FALSE]
+  /\ cleanTo = [s \in Scopes |-> 0]
   /\ exists = FALSE /\ st = "none" /\ nIntents = 0
   /\ pins = [s \in Scopes |-> 0]
   /\ pc = [s \in Scopes |-> "idle"]
@@ -92,7 +95,7 @@ Publish(s) ==
   /\ ~tomb[s] /\ ver[s] < MaxVer
   /\ ver' = [ver EXCEPT ![s] = @ + 1]
   /\ lastActor' = "gateway"
-  /\ UNCHANGED <<tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -102,7 +105,7 @@ ForeignTomb(s) ==
   /\ tombBy' = [tombBy EXCEPT ![s] = "other"]
   /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
   /\ lastActor' = "gateway"
-  /\ UNCHANGED <<ver, erased, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -112,7 +115,7 @@ CWrite ==
   /\ cc' = [cc EXCEPT !.head = @ + 1, !.records = @ + 1]
   /\ writes' = writes + 1
   /\ lastActor' = "sync"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, crashes>>
 
@@ -123,7 +126,7 @@ RRead ==
   /\ rpc = "idle" /\ reqs < MaxReq /\ \A s \in Scopes : ~tomb[s]
   /\ rpc' = "read" /\ rsnap' = ver /\ reqs' = reqs + 1
   /\ lastActor' = "req"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
                  ipc, batches, isc, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
@@ -135,7 +138,7 @@ RInsert ==
        THEN UNCHANGED <<exists, st, pins, nIntents>>
        ELSE /\ exists' = TRUE /\ st' = "open" /\ pins' = rsnap /\ nIntents' = nIntents + 1
   /\ lastActor' = "req"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, pc, snap, blk, rsnap, reqs,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, pc, snap, blk, rsnap, reqs,
                  ipc, batches, isc, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
@@ -149,19 +152,32 @@ WRead(s) ==
        ELSE /\ blk' = [blk EXCEPT ![s] = TRUE]   \* legacy_head_changed
             /\ UNCHANGED pc
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
-\* The tombstone is fenced to the head the read saw: it lands only if the head is
-\* still that one. A moved head refuses it; a deleted one answers "already deleted".
+\* The delete adapter (`createDeleteDataPort.tombstone` under `deleteScope`) reads
+\* the head itself, after the worker's read. A live head that is still the one the
+\* fence names is tombstoned (version + 1) and its blobs are queued for cleanup
+\* through that version. A head already deleted answers "already deleted", and the
+\* worker's `deleteScope` queues or performs cleanup through the tombstone's
+\* version at once. The good adapter accepts a deleted head only when its tombstone
+\* directly follows the fence; `adapterCleansFirst` is the code before the fix, which
+\* accepted any (the worker's pin check ran only after, in `WReread`). A moved live
+\* head refuses the fenced tombstone and writes nothing.
 WSend(s) ==
   /\ pc[s] = "decided"
-  /\ IF ~tomb[s] /\ ver[s] = snap[s]
-       THEN /\ tomb' = [tomb EXCEPT ![s] = TRUE]
-            /\ tombBy' = [tombBy EXCEPT ![s] = "ours"]
-            /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
-       ELSE UNCHANGED <<tomb, tombBy, tombVer>>
+  /\ IF ~tomb[s]
+       THEN IF ver[s] = snap[s]
+              THEN /\ tomb' = [tomb EXCEPT ![s] = TRUE]
+                   /\ tombBy' = [tombBy EXCEPT ![s] = "ours"]
+                   /\ tombVer' = [tombVer EXCEPT ![s] = ver[s] + 1]
+                   /\ cleanTo' = [cleanTo EXCEPT ![s] = ver[s] + 1]
+              ELSE UNCHANGED <<tomb, tombBy, tombVer, cleanTo>>
+       ELSE IF Mode = "adapterCleansFirst" \/ tombVer[s] = snap[s] + 1
+              THEN /\ cleanTo' = [cleanTo EXCEPT ![s] = tombVer[s]]
+                   /\ UNCHANGED <<tomb, tombBy, tombVer>>
+              ELSE UNCHANGED <<tomb, tombBy, tombVer, cleanTo>>
   /\ pc' = [pc EXCEPT ![s] = "sent"]
   /\ lastActor' = "worker"
   /\ UNCHANGED <<ver, erased, exists, st, pins, nIntents, snap, blk,
@@ -175,7 +191,7 @@ WReread(s) ==
        ELSE /\ UNCHANGED blk
             /\ pc' = [pc EXCEPT ![s] = IF tomb[s] THEN "tombd" ELSE "idle"]
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, snap,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, snap,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -188,7 +204,7 @@ WErase(s) ==
        THEN cc' = [cc EXCEPT !.head = @ + 1]
        ELSE UNCHANGED cc
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, exists, st, pins, nIntents, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, cleanTo, exists, st, pins, nIntents, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, writes, crashes>>
 
@@ -199,7 +215,7 @@ WDone ==
        ELSE \A s \in Scopes : erased[s]
   /\ st' = "done"
   /\ lastActor' = "worker"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, ipc, batches, isc, freeMerged, mergedWhileOpen,
                  staleAfterDone, cc, writes, crashes>>
 
@@ -219,7 +235,7 @@ IPre ==
        /\ isc' = sc
   /\ ipc' = "checked"
   /\ lastActor' = "importer"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, batches, freeMerged, mergedWhileOpen, staleAfterDone,
                  cc, writes, crashes>>
 
@@ -235,7 +251,7 @@ IMerge ==
             /\ freeMerged' = (freeMerged \/ (st = "done" /\ isc = "free"))
        ELSE UNCHANGED <<cc, mergedWhileOpen, staleAfterDone, freeMerged>>
   /\ lastActor' = "importer"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, st, pins, nIntents, pc, snap, blk,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, st, pins, nIntents, pc, snap, blk,
                  rpc, rsnap, reqs, isc, writes, crashes>>
 
 \* ---- restart -----------------------------------------------------------
@@ -248,7 +264,7 @@ Crash ==
        THEN /\ nIntents' = nIntents + 1 /\ pins' = ver /\ st' = "open"
        ELSE UNCHANGED <<nIntents, pins, st>>
   /\ lastActor' = "crash"
-  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, exists, blk, rsnap, reqs,
+  /\ UNCHANGED <<ver, tomb, tombBy, tombVer, erased, cleanTo, exists, blk, rsnap, reqs,
                  batches, freeMerged, mergedWhileOpen, staleAfterDone, cc, writes>>
 
 Next ==
@@ -286,7 +302,9 @@ NoTombstoneOverMovedHead ==
 \* (the erase frees every slot up to the tombstone, so a later one frees slots
 \* the pin never named).
 NoEraseOfUnpinnedVersion ==
-  \A s \in Scopes : erased[s] => tombVer[s] = pins[s] + 1
+  \A s \in Scopes :
+    /\ erased[s] => tombVer[s] = pins[s] + 1
+    /\ cleanTo[s] \in {0, pins[s] + 1}
 
 \* A retired scope stays refused: no batch merges a bound scope once the intent
 \* is done (a batch read before the retirement finished would bring back what it

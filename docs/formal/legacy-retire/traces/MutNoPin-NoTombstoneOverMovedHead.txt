@@ -1,3 +1,16 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 17 and seed -588841824473888956 with 4 workers on 24 cores with 3641MB heap and 64MB offheap memory [pid: 1141161] (Linux 7.0.0-38-generic amd64, Ubuntu 17.0.21.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file ~/code/personal-server-ts/.worktrees/ps-878-r4-1125/docs/formal/legacy-retire/LegacyRetire.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module LegacyRetire
+Starting... (2026-11-25 13:38:02)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-25 13:38:02.
 Error: Invariant NoTombstoneOverMovedHead is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -26,8 +39,9 @@ State 1: <Initial predicate>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 2: <RRead line 123, col 3 to line 128, col 38 of module LegacyRetire>
+State 2: <RRead line 126, col 3 to line 131, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -53,8 +67,9 @@ State 2: <RRead line 123, col 3 to line 128, col 38 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 3: <Publish line 92, col 3 to line 97, col 54 of module LegacyRetire>
+State 3: <Publish line 95, col 3 to line 100, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -80,8 +95,9 @@ State 3: <Publish line 92, col 3 to line 97, col 54 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 4: <RInsert line 132, col 3 to line 140, col 38 of module LegacyRetire>
+State 4: <RInsert line 135, col 3 to line 143, col 38 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -107,8 +123,9 @@ State 4: <RInsert line 132, col 3 to line 140, col 38 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 5: <WRead line 144, col 3 to line 154, col 54 of module LegacyRetire>
+State 5: <WRead line 147, col 3 to line 157, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -134,8 +151,9 @@ State 5: <WRead line 144, col 3 to line 154, col 54 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 0 @@ s2 :> 0)
 
-State 6: <WSend line 159, col 3 to line 169, col 54 of module LegacyRetire>
+State 6: <WSend line 169, col 3 to line 185, col 54 of module LegacyRetire>
 /\ isc = "none"
 /\ erased = (s1 :> FALSE @@ s2 :> FALSE)
 /\ staleAfterDone = FALSE
@@ -161,7 +179,9 @@ State 6: <WSend line 159, col 3 to line 169, col 54 of module LegacyRetire>
 /\ ipc = "idle"
 /\ batches = 0
 /\ blk = (s1 :> FALSE @@ s2 :> FALSE)
+/\ cleanTo = (s1 :> 3 @@ s2 :> 0)
 
-7536 states generated, 3525 distinct states found, 2377 states left on queue.
-The depth of the complete state graph search is 7.
+10354 states generated, 4636 distinct states found, 2931 states left on queue.
+The depth of the complete state graph search is 8.
 The average outdegree of the complete state graph is 3 (minimum is 0, the maximum 10 and the 95th percentile is 8).
+Finished in 00s at (2026-11-25 13:38:02)

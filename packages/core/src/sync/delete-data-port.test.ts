@@ -425,24 +425,80 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
     });
   });
 
-  it("reads a 409 owner_stream_head_already_deleted as already deleted when a fence is given too", async () => {
-    const fetchImpl = vi.fn(async () =>
-      jsonResponse(409, { code: "owner_stream_head_already_deleted" }),
-    );
-    const { port } = makePort(
-      liveRecord({ expectedVersion: "4" }),
-      fetchImpl as unknown as typeof fetch,
-    );
+  describe("with a fence, an already-deleted answer counts only at the version after the fenced head", () => {
+    const fenceAt4 = {
+      head: {
+        expectedVersion: "4",
+        dataHash: liveRecord().dataHash,
+        metadataHash: liveRecord().metadataHash,
+      },
+    };
+    const alreadyDeletedAt = (expectedVersion?: string) =>
+      vi.fn(async () =>
+        jsonResponse(409, {
+          code: "owner_stream_head_already_deleted",
+          ...(expectedVersion && { expectedVersion }),
+        }),
+      );
 
-    expect(
-      await port.tombstone(SCOPE, {
-        head: {
-          expectedVersion: "4",
-          dataHash: liveRecord().dataHash,
-          metadataHash: liveRecord().metadataHash,
-        },
-      }),
-    ).toMatchObject({ status: "already-deleted" });
+    it("reads a 409 owner_stream_head_already_deleted at v5 as already deleted", async () => {
+      const { port } = makePort(
+        liveRecord({ expectedVersion: "4" }),
+        alreadyDeletedAt("5") as unknown as typeof fetch,
+      );
+
+      expect(await port.tombstone(SCOPE, fenceAt4)).toMatchObject({
+        status: "already-deleted",
+        version: "5",
+      });
+    });
+
+    it("throws on a 409 already-deleted at a later version, so no storage is cleaned for it", async () => {
+      const { port } = makePort(
+        liveRecord({ expectedVersion: "4" }),
+        alreadyDeletedAt("6") as unknown as typeof fetch,
+      );
+
+      await expect(port.tombstone(SCOPE, fenceAt4)).rejects.toThrow(
+        /not directly after the fenced head/,
+      );
+    });
+
+    it("throws on a 409 already-deleted that names no version", async () => {
+      const { port } = makePort(
+        liveRecord({ expectedVersion: "4" }),
+        alreadyDeletedAt() as unknown as typeof fetch,
+      );
+
+      await expect(port.tombstone(SCOPE, fenceAt4)).rejects.toThrow(
+        /not directly after the fenced head/,
+      );
+    });
+
+    it("throws when the head it reads is already deleted at a later version, and sends nothing", async () => {
+      const fetchImpl = vi.fn();
+      const { port } = makePort(
+        liveRecord({ expectedVersion: "6", deletedAt: "2026-01-01T00:00:00Z" }),
+        fetchImpl as unknown as typeof fetch,
+      );
+
+      await expect(port.tombstone(SCOPE, fenceAt4)).rejects.toThrow(
+        /not directly after the fenced head/,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("accepts the head it reads already deleted at the version after the fenced head", async () => {
+      const { port } = makePort(
+        liveRecord({ expectedVersion: "5", deletedAt: "2026-01-01T00:00:00Z" }),
+        vi.fn() as unknown as typeof fetch,
+      );
+
+      expect(await port.tombstone(SCOPE, fenceAt4)).toMatchObject({
+        status: "already-deleted",
+        version: "5",
+      });
+    });
   });
 
   it("reads a 409 owner_stream_head_absent like a 404: nothing registered to tombstone, not a refusal and not a version conflict", async () => {

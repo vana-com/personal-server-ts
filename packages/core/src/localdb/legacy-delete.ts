@@ -400,7 +400,14 @@ export async function retireLegacyScope(
       gateway.status === "failed" &&
       !isGatewayAlreadyDeletedCode(gateway.code)
     ) {
-      if (!isGatewayRefusalCode(gateway.code)) return waiting;
+      if (!isGatewayRefusalCode(gateway.code)) {
+        // A fenced delete that failed may have failed because the head moved:
+        // read it again, so a head that is not the pin's blocks the scope
+        // instead of being waited on for good.
+        if (pin && !pinHolds(pin, await ports.head(scope, signal)))
+          return settled(blocked("legacy_head_changed"));
+        return waiting;
+      }
       // The gateway's answer will not change: ask once, show it, and do not
       // let it hold back a scope that is only waiting.
       deps.memory?.refused.set(scope, gateway.code);
