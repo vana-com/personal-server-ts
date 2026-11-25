@@ -256,6 +256,27 @@ describe("loadConfig", () => {
       });
     });
 
+    it.each([
+      ["null", "SERVER_PORT", "9999"],
+      ['{"server":false}', "SERVER_PORT", "9999"],
+      ['{"tunnel":5}', "TUNNEL_ENABLED", "false"],
+      ['{"devUi":"off"}', "DEV_UI_ENABLED", "false"],
+    ] as const)(
+      "reports invalid cloud config through the schema: %s",
+      async (raw, name, value) => {
+        await withTempDir(async (dir) => {
+          const configPath = join(dir, "config.json");
+          await writeFile(configPath, raw);
+          await withEnv({ CLOUD_MODE: "true", [name]: value }, async () => {
+            await expect(loadConfig({ configPath })).rejects.toMatchObject({
+              name: "ZodError",
+            });
+            expect(await readFile(configPath, "utf-8")).toBe(raw);
+          });
+        });
+      },
+    );
+
     it("SERVER_ORIGIN overrides default", async () => {
       await withTempDir(async (dir) => {
         const configPath = join(dir, "config.json");
