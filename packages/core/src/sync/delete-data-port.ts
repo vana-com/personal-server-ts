@@ -7,6 +7,7 @@ import type {
   TombstoneFence,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
+import type { StorageAdapter } from "../storage/adapters/interface.js";
 import { computeDataPointId } from "./data-point-id.js";
 import {
   isGatewayAlreadyDeletedCode,
@@ -95,6 +96,12 @@ export interface GatewayDeleteDataPortOptions {
      */
     signMessage(message: string): Promise<`0x${string}`>;
   };
+  /**
+   * Optional storage adapter override for non-Vana backends (e.g. Google Drive).
+   * When present, `deleteBlobVersions` delegates object deletion to this adapter
+   * instead of issuing a Web3Signed HTTP DELETE against `storage.endpoint`.
+   */
+  storageAdapter?: Pick<StorageAdapter, "delete" | "urlForKey">;
   /** Test seam; defaults to the global fetch. */
   fetch?: typeof fetch;
 }
@@ -388,8 +395,28 @@ export function createGatewayDeleteDataPort(
         missing: [],
         failed: [],
       };
-      // Sequential on purpose: vana-storage rate-limits DELETE per owner
+      // Sequential on purpose: storage providers rate-limit DELETE per owner
       // and the caller already bounds the batch size per pass.
+      if (options.storageAdapter) {
+        for (const version of versions) {
+          try {
+            const url = options.storageAdapter.urlForKey(`${scope}/${version}`);
+            const removed = await options.storageAdapter.delete(url);
+            if (removed) {
+              outcome.deleted.push(version);
+            } else {
+              outcome.missing.push(version);
+            }
+          } catch (err) {
+            outcome.failed.push({
+              version,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        return outcome;
+      }
+
       for (const version of versions) {
         const path = `/v1/chains/${options.storage.chainId}/blobs/${owner}/${encodeURIComponent(scope)}/${encodeURIComponent(version)}`;
         try {

@@ -97,3 +97,75 @@ export class StoredBlobConflictError extends Error {
     this.name = "StoredBlobConflictError";
   }
 }
+
+/**
+ * The user's OAuth authorization for an external storage provider (e.g. Google
+ * Drive, Dropbox) was revoked, expired without refresh, or never granted.
+ * Callers must surface a reconnect prompt rather than retrying blindly.
+ */
+export class StorageAuthRevokedError extends Error {
+  readonly code = "STORAGE_AUTH_REVOKED";
+  readonly status = 401;
+
+  constructor(
+    readonly provider: string,
+    message = `${provider} access was revoked or is unavailable`,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "StorageAuthRevokedError";
+  }
+}
+
+/**
+ * The user's external storage quota is full (e.g. Google Drive
+ * `storageQuotaExceeded`). Non-retryable until the user frees space or switches
+ * storage providers.
+ */
+export class StorageQuotaExceededError extends Error {
+  readonly code = "STORAGE_QUOTA_EXCEEDED";
+  readonly status = 403;
+
+  constructor(
+    readonly provider: string,
+    message = `${provider} storage is full`,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "StorageQuotaExceededError";
+  }
+}
+
+export type ExternalOAuthStorageProvider = "gdrive" | "dropbox";
+
+export interface StorageAccessTokenRequest {
+  provider: ExternalOAuthStorageProvider;
+  forceRefresh?: boolean;
+  signal?: AbortSignal;
+}
+
+/**
+ * Host-owned access-token broker for OAuth storage backends.
+ * Refresh tokens stay strictly in the host (Desktop OS Keychain or Web server
+ * session) and never enter the Personal Server runtime or config files.
+ */
+export interface StorageCredentialProvider {
+  getAccessToken(request: StorageAccessTokenRequest): Promise<string>;
+  /**
+   * Optional host notification fired whenever the storage provider rejects
+   * credentials after refresh (e.g. Google OAuth `invalid_grant` / 401 / 403
+   * revoked), even if a background sync worker catches the per-file error.
+   */
+  onAuthRevoked?: (
+    provider: ExternalOAuthStorageProvider,
+    reason: string,
+  ) => void;
+  /**
+   * Optional host notification fired whenever the external storage provider
+   * reports quota exhaustion (e.g. Google Drive `storageQuotaExceeded`).
+   */
+  onQuotaExceeded?: (
+    provider: ExternalOAuthStorageProvider,
+    reason: string,
+  ) => void;
+}

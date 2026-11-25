@@ -1,7 +1,11 @@
 import { isMemoryScope } from "../../policy/reserved-scopes.js";
 import { isReplicaScope } from "../../replication/namespace.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
-import type { StorageAdapter } from "../../storage/adapters/interface.js";
+import {
+  StorageAuthRevokedError,
+  StorageQuotaExceededError,
+  type StorageAdapter,
+} from "../../storage/adapters/interface.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import type { CancellableRegistration } from "../cancellable-gateway.js";
 import {
@@ -809,7 +813,9 @@ export async function uploadAll(
             error === undefined ||
               error instanceof OrphanedEntryError ||
               error instanceof DeletedScopeEntryError ||
-              error instanceof LegacyWriteRefusedError
+              error instanceof LegacyWriteRefusedError ||
+              error instanceof StorageAuthRevokedError ||
+              error instanceof StorageQuotaExceededError
               ? "success"
               : "failure",
           ),
@@ -849,6 +855,25 @@ export async function uploadAll(
         deps.logger.info(
           { path: target.path, scope: target.scope, verdict: err.verdict },
           "Stopped uploading: legacy writes are not open for this account",
+        );
+        break;
+      }
+      if (
+        err instanceof StorageAuthRevokedError ||
+        err instanceof StorageQuotaExceededError
+      ) {
+        // Account-level external storage failure (revoked OAuth or Drive full):
+        // nothing is wrong with this entry, so spend no per-entry retry budget
+        // and stop the rest of the pass until the user reconnects or frees space.
+        options?.onError?.(entry, err);
+        deps.logger.warn(
+          {
+            path: target.path,
+            scope: target.scope,
+            provider: err.provider,
+            error: err.message,
+          },
+          "Stopped uploading: external storage unavailable",
         );
         break;
       }

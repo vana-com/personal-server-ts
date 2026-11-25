@@ -4,7 +4,10 @@ import {
 } from "../../api/legacy-write-gate.js";
 import { isReplicaScope } from "../../replication/namespace.js";
 import { isPhysicalScope } from "../../stream-sync/scope-routing.js";
-import type { StorageAdapter } from "../../storage/adapters/interface.js";
+import {
+  StorageAuthRevokedError,
+  type StorageAdapter,
+} from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
   decryptWithPassword,
@@ -213,6 +216,7 @@ export async function downloadScopes(
       // Legacy storage is closed: hand the refusal to the caller as is. It is
       // neither a corrupt record nor a retry-budget failure.
       if (err instanceof LegacyWriteRefusedError) throw err;
+      if (err instanceof StorageAuthRevokedError) throw err;
       const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,
@@ -772,6 +776,19 @@ export async function downloadAll(
         logger.info(
           { verdict: err.verdict },
           "Legacy download paused: legacy storage is not accepting writes",
+        );
+        failed = true;
+        break;
+      }
+      if (err instanceof StorageAuthRevokedError) {
+        // External storage credentials were revoked (e.g. Google Drive OAuth).
+        // Every later record would fail the same way, so pause this pass and
+        // hold the cursor without spending per-record retry budget or
+        // quarantining anything; reconnecting recovers immediately on the next
+        // sync trigger.
+        logger.warn(
+          { provider: err.provider, error: err.message },
+          "Download paused: external storage authorization revoked",
         );
         failed = true;
         break;

@@ -70,8 +70,9 @@ import type {
   PendingBlobDeletionStore,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import {
-  createVanaSyncStorageAdapter,
+  createSyncStorageAdapter,
   resolveVanaStorageEndpoint,
+  type StorageCredentialProvider,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import {
   createServerSigner,
@@ -193,6 +194,8 @@ export interface PsLiteSyncOptions {
   autoStartSync?: boolean;
   /** Storage authentication origin, independent of its routing endpoint. */
   storageAudience?: string;
+  /** Host-owned short-lived access-token broker for external OAuth storage backends. */
+  storageCredentials?: StorageCredentialProvider;
   /**
    * Gateway client. The default SDK client is wrapped so the upload deadline
    * closes its in-flight registry write. A client supplied here is used as
@@ -454,11 +457,13 @@ export async function createPsLiteSyncManager(
     );
   const uploadAttemptNamespace =
     options.uploadAttemptNamespace ?? options.stateStore.namespace;
-  const storageAdapter = createVanaSyncStorageAdapter({
+  const storageAdapter = createSyncStorageAdapter({
     config: options.config,
     serverOwner,
     serverAccount: syncAccount,
     audience: options.storageAudience,
+    storageCredentials: options.storageCredentials,
+    fallbackReadToVana: options.config.storage.backend === "gdrive",
   });
   const signer =
     options.ownerSyncSigner ??
@@ -504,6 +509,9 @@ export async function createPsLiteSyncManager(
             masterKey,
             ownerSigner: boundedSigner,
             storageAudience: options.storageAudience,
+            ...(options.config.storage.backend !== "vana"
+              ? { storageAdapter }
+              : {}),
           }),
           workerFactory: options.additionsWorkerFactory,
           deleteSystemScope: async (scope) => {
@@ -542,6 +550,7 @@ export async function createPsLiteSyncManager(
       chainId: options.config.gateway.chainId,
       signMessage: (message) => syncAccount.signMessage(message),
     },
+    ...(options.config.storage.backend !== "vana" ? { storageAdapter } : {}),
   });
   const pendingBlobDeletions = createPsLitePendingBlobDeletionStore(
     options.stateStore,
