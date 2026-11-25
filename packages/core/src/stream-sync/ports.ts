@@ -215,59 +215,77 @@ export class ChangeFeedAbsentError extends Error {
   }
 }
 
+declare const changeCursorBrand: unique symbol;
+
+/**
+ * A position in the gateway's change feed. The gateway mints it and only the
+ * gateway reads inside it: it carries the database epoch beside the owner's
+ * sequence, so a position from a replaced database cannot be mistaken for one
+ * in range. A client keeps it exactly as received, compares it with `===`, and
+ * sends it back.
+ *
+ * The type is a branded `symbol`, though the value at run time is the wire
+ * string. TypeScript refuses `<`, `>`, `+`, `-`, `BigInt(...)`, and a template
+ * literal on a symbol, and a `string` or `number` would allow them. Only
+ * {@link changeCursorFromWire} makes one and {@link changeCursorToWire} sends
+ * one; no other code has a reason to look at the characters.
+ */
+export type ChangeCursor = symbol & { readonly [changeCursorBrand]: true };
+
+/** The one place a cursor is made: the string the gateway answered with. */
+export function changeCursorFromWire(wire: string): ChangeCursor {
+  return wire as unknown as ChangeCursor;
+}
+
+/** The one place a cursor is read: the request parameter that returns it. */
+export function changeCursorToWire(cursor: ChangeCursor): string {
+  return cursor as unknown as string;
+}
+
 /** The answer to one held change request. */
 export interface RegistryChangeAnswer {
   /**
-   * The owner's registry sequence now: a decimal string, compared for
-   * inequality only (it is not a count of what changed, and a restored
-   * database may lower it).
+   * Where the owner's registry is now, in the gateway's database. The next
+   * request sends it back as `after`. Compared for equality only: it is not a
+   * count of what changed, and a different database's cursor has no order
+   * against this one.
    */
-  readonly seq: string;
-  /** `seq` differs from the cursor the request carried (or it carried none). */
+  readonly cursor: ChangeCursor;
+  /** `cursor` differs from the `after` the request carried (or it carried none). */
   readonly changed: boolean;
   /**
-   * What changed after the request's `since`, read in one snapshot at `seq`.
-   * Present on, and only on, a changed answer to a request that sent `since`
-   * (a gateway that cannot read the delta answers `reset`). A changed answer
-   * to such a request without a readable delta fails the request, with one
-   * exception: when `epoch` differs from the one the request carried (or the
-   * request carried none), the answer may omit the delta. The cursor and `since` belong to another
-   * database generation then, so the caller must treat that answer as a reset
-   * (list in full) and not wait for a delta.
+   * What changed after the request's `since`, read in one snapshot at
+   * `cursor`. Present on, and only on, a changed answer to a request that sent
+   * `since` (a gateway that cannot read the delta answers `reset`). A changed
+   * answer to such a request without a readable delta fails the request. A
+   * `since` or `after` from another database epoch is answered with a reset
+   * delta by the gateway, so the client has no epoch of its own to compare.
    */
   readonly delta?: RegistryChangeDelta;
-  /**
-   * The gateway database's epoch: the generation its sequences belong to. A
-   * dev reset or a restore starts a new one, and a cursor from the old one
-   * means nothing in the new one even when its number is in range. The caller
-   * sends back the epoch it last saw; the gateway answers a different one with
-   * a reset. Absent from a gateway that predates the epoch, which is then
-   * answered as before.
-   */
-  readonly epoch?: string;
 }
 
 /**
- * The registry rows that changed in `(since, seq]`, as of one snapshot at
- * `seq`. The gateway numbers changes in commit order, per owner, with no gap,
- * so a reader that has applied everything up to `since` and applies these
- * rows holds the registry as of `seq`.
+ * The registry rows that changed in `(since, cursor]`, as of one snapshot at
+ * `cursor`. The gateway numbers changes in commit order, per owner, with no
+ * gap, so a reader that has applied everything up to `since` and applies these
+ * rows holds the registry as of `cursor`.
  *
  * `reset`: the gateway cannot say (the cursor is below the records it keeps,
- * above its counter, or more than one listing page behind): list everything.
+ * above its counter, from another database epoch, or more than one listing
+ * page behind): list everything.
  * `gone`: ids of rows the gateway removed (only a failed registration's
  * rollback does), which no scope names. `serversChanged`: the owner's server
  * registrations changed.
  */
 export type RegistryChangeDelta =
   | {
-      readonly since: string;
-      readonly seq: string;
+      readonly since: ChangeCursor;
+      readonly cursor: ChangeCursor;
       readonly reset: true;
     }
   | {
-      readonly since: string;
-      readonly seq: string;
+      readonly since: ChangeCursor;
+      readonly cursor: ChangeCursor;
       readonly reset: false;
       readonly rows: readonly {
         readonly scope: string;
@@ -285,7 +303,7 @@ export type RegistryChangeDelta =
  * standing on any connection), or the apply did not reach the delta's
  * position, or the publisher still has eligible work; nothing is settled and
  * the caller runs a cycle. `applied`: the device has applied through the
- * delta's `seq`, run the publisher, and checked its local eligibility queries
+ * delta's `cursor`, run the publisher, and checked its local eligibility queries
  * for remaining work. A reached version or aggregate receipt is insufficient.
  */
 export type DeltaApplyResult =
@@ -414,28 +432,26 @@ export interface StreamSyncRegistry {
    */
   probeChange?(signal?: AbortSignal): Promise<string | null | undefined>;
   /**
-   * One held request: answers when the owner's registry sequence differs from
+   * One held request: answers when the owner's registry cursor differs from
    * `after` (a cursor from an earlier answer; none asks for the current one),
-   * or after about `waitMs` with `changed: false`. It carries the owner's
-   * sequence, which is a position: it changes whenever anything a client can
-   * see changed. A caller that gets `changed` pulls with its ordinary reads,
-   * or applies the answer's delta when it holds everything up to its `since`,
-   * and one that gets nothing (a lost answer, a dropped
-   * connection) is repaired by the next pull. A caller may skip pulls while
-   * the same position stands (see `ChangePush`). Throws `ChangeFeedAbsentError`
-   * when the gateway has no such route, and any other error on a failed read.
-   * `signal` ends the request. `since`: the position up to which the caller
-   * holds the registry; a changed answer may then carry the rows changed after
-   * it (`RegistryChangeAnswer.delta`). `epoch`: the epoch of the answer that
-   * gave `after` and `since` their numbers (`RegistryChangeAnswer.epoch`), if
-   * the caller has seen one.
+   * or after about `waitMs` with `changed: false`. The answer's cursor is a
+   * position: it changes whenever anything a client can see changed, and when
+   * the gateway's database was replaced. A caller that gets `changed` pulls
+   * with its ordinary reads, or applies the answer's delta when it holds
+   * everything up to its `since`, and one that gets nothing (a lost answer, a
+   * dropped connection) is repaired by the next pull. A caller may skip pulls
+   * while the same position stands (see `ChangePush`). Throws
+   * `ChangeFeedAbsentError` when the gateway has no such route, and any other
+   * error on a failed read, or on an answer without a cursor. `signal` ends the
+   * request. `since`: the position up to which the caller holds the registry; a
+   * changed answer may then carry the rows changed after it
+   * (`RegistryChangeAnswer.delta`).
    */
   waitForChange?(
-    after: string | undefined,
+    after: ChangeCursor | undefined,
     waitMs: number,
     signal: AbortSignal,
-    since: string | undefined,
-    epoch?: string,
+    since: ChangeCursor | undefined,
   ): Promise<RegistryChangeAnswer>;
 }
 

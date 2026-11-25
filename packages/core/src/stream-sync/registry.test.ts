@@ -7,6 +7,12 @@ import {
   createGatewayStreamSyncRegistry,
   parseBatchPolicy,
 } from "./registry.js";
+import {
+  EPOCH_A,
+  EPOCH_B,
+  mintCursor,
+} from "./change-feed-gateway.test-helper.js";
+import { changeCursorFromWire as cursorOf } from "./ports.js";
 import { RegistryUnavailableError } from "./ports.js";
 
 const hash = (byte: string) => `0x${byte.repeat(32)}`;
@@ -665,79 +671,68 @@ describe("waitForChange", () => {
 
   it("holds a request on the change route with the owner, cursor and wait in seconds", async () => {
     const { registry, urls, signals } = waiting(
-      () => new Response(JSON.stringify({ seq: "12", changed: true })),
+      () => new Response(JSON.stringify({ cursor: "c12", changed: true })),
     );
     const controller = new AbortController();
     const answer = await registry.waitForChange!(
-      "9",
+      cursorOf("c9"),
       25_000,
       controller.signal,
       undefined,
     );
-    expect(answer).toEqual({ seq: "12", changed: true });
+    expect(answer).toEqual({ cursor: "c12", changed: true });
     const url = new URL(urls[0]!);
     expect(url.origin + url.pathname).toBe(
       "https://gateway.test/v1/data/changes",
     );
     expect(url.searchParams.get("user")).toBe(owner);
-    expect(url.searchParams.get("after")).toBe("9");
+    expect(url.searchParams.get("after")).toBe("c9");
     expect(url.searchParams.get("wait")).toBe("25");
+    expect([...url.searchParams.keys()].sort()).toEqual([
+      "after",
+      "user",
+      "wait",
+    ]);
     expect(signals[0]).toBe(controller.signal);
   });
 
-  it("sends the epoch it holds beside the cursor, and reads the epoch of the answer", async () => {
-    const epoch = "11111111-1111-4111-8111-111111111111";
-    const next = "22222222-2222-4222-8222-222222222222";
+  it("keeps the gateway's cursor exactly as it came, whatever it looks like (mutation: cursor parsed or normalized)", async () => {
+    const minted = mintCursor(EPOCH_A, 12);
     const { registry, urls } = waiting(
-      () =>
-        new Response(JSON.stringify({ seq: "12", epoch: next, changed: true })),
+      () => new Response(JSON.stringify({ cursor: minted, changed: true })),
     );
     const answer = await registry.waitForChange!(
-      "9",
+      cursorOf(minted),
       25_000,
       new AbortController().signal,
       undefined,
-      epoch,
     );
-    expect(new URL(urls[0]!).searchParams.get("epoch")).toBe(epoch);
-    expect(answer).toMatchObject({ seq: "12", changed: true, epoch: next });
+    expect(answer.cursor).toBe(minted);
+    // ...and sends it back untouched, with no epoch parameter beside it.
+    const url = new URL(urls[0]!);
+    expect(url.searchParams.get("after")).toBe(minted);
+    expect(url.searchParams.has("epoch")).toBe(false);
   });
 
-  it("sends no epoch when it holds none, and an answer without one carries none (a gateway before the epoch)", async () => {
-    const { registry, urls } = waiting(
-      () => new Response(JSON.stringify({ seq: "12", changed: true })),
-    );
-    const answer = await registry.waitForChange!(
-      "9",
-      25_000,
-      new AbortController().signal,
-      undefined,
-      undefined,
-    );
-    expect(new URL(urls[0]!).searchParams.has("epoch")).toBe(false);
-    expect(answer).not.toHaveProperty("epoch");
-  });
-
-  it.each([[7], [null], [""]])(
-    "ignores an epoch that is not a non-empty string (%j)",
-    async (epoch) => {
+  it.each([["a plain string"], ["12"], ["0"], ["not a cursor ==="]])(
+    "does not judge the cursor: %j is held as it is",
+    async (cursor) => {
       const { registry } = waiting(
-        () => new Response(JSON.stringify({ seq: "12", epoch, changed: true })),
+        () => new Response(JSON.stringify({ cursor, changed: true })),
       );
       const answer = await registry.waitForChange!(
-        "9",
+        undefined,
         25_000,
         new AbortController().signal,
         undefined,
-        "11111111-1111-4111-8111-111111111111",
       );
-      expect(answer).not.toHaveProperty("epoch");
+      expect(answer.cursor).toBe(cursor);
     },
   );
 
   it("sends no cursor when it has none", async () => {
     const { registry, urls } = waiting(
-      () => new Response(JSON.stringify({ seq: "0", changed: true })),
+      () => new Response(JSON.stringify({ cursor: "c0", changed: true })),
     );
     await registry.waitForChange!(
       undefined,
@@ -821,7 +816,7 @@ describe("waitForChange", () => {
               status: 400,
             },
           )
-        : new Response(JSON.stringify({ seq: "4", changed: true }));
+        : new Response(JSON.stringify({ cursor: "c4", changed: true }));
     });
     await expect(
       registry.waitForChange!(
@@ -838,7 +833,7 @@ describe("waitForChange", () => {
         new AbortController().signal,
         undefined,
       ),
-    ).resolves.toEqual({ seq: "4", changed: true });
+    ).resolves.toEqual({ cursor: "c4", changed: true });
     expect(urls).toHaveLength(2);
   });
 
@@ -846,7 +841,7 @@ describe("waitForChange", () => {
     let upgraded = false;
     const { registry, urls } = waiting(() =>
       upgraded
-        ? new Response(JSON.stringify({ seq: "1", changed: true }))
+        ? new Response(JSON.stringify({ cursor: "c1", changed: true }))
         : new Response("no", { status: 404 }),
     );
     await expect(
@@ -865,7 +860,7 @@ describe("waitForChange", () => {
         new AbortController().signal,
         undefined,
       ),
-    ).resolves.toEqual({ seq: "1", changed: true });
+    ).resolves.toEqual({ cursor: "c1", changed: true });
     expect(urls).toHaveLength(2);
   });
 
@@ -886,32 +881,60 @@ describe("waitForChange", () => {
     expect(urls).toHaveLength(3);
   });
 
-  it("throws on any other failure, and on an answer that is not a sequence", async () => {
+  it("throws on any other failure", async () => {
     const down = waiting(() => new Response("no", { status: 503 }));
     await expect(
       down.registry.waitForChange!(
-        "1",
+        cursorOf("c1"),
         25_000,
         new AbortController().signal,
         undefined,
       ),
     ).rejects.toThrow(/503/);
-    for (const body of [
-      {},
-      { seq: 7, changed: true },
-      { seq: "x", changed: true },
-      { seq: "7" },
-    ]) {
-      const bad = waiting(() => new Response(JSON.stringify(body)));
-      await expect(
-        bad.registry.waitForChange!(
-          "1",
-          25_000,
-          new AbortController().signal,
-          undefined,
+  });
+
+  it.each([
+    ["no fields", {}],
+    ["a number for the cursor", { cursor: 7, changed: true }],
+    ["an empty cursor", { cursor: "", changed: true }],
+    ["a null cursor", { cursor: null, changed: true }],
+    ["no changed flag", { cursor: "c7" }],
+    ["a changed flag that is not a boolean", { cursor: "c7", changed: "yes" }],
+    [
+      "the older seq and epoch shape (a gateway before the opaque cursor)",
+      { seq: "7", epoch: EPOCH_A, changed: true },
+    ],
+  ])("throws on an answer with %s", async (_name, body) => {
+    const bad = waiting(() => new Response(JSON.stringify(body)));
+    await expect(
+      bad.registry.waitForChange!(
+        cursorOf("c1"),
+        25_000,
+        new AbortController().signal,
+        undefined,
+      ),
+    ).rejects.toThrow(/change answer/);
+  });
+
+  it("a 400 on the cursor it sent is a failure that may pass, not an absent route (a numeric cursor from before the opaque one)", async () => {
+    const { registry } = waiting(
+      () =>
+        new Response(
+          JSON.stringify({
+            error: "Invalid after: expected a change-feed cursor",
+          }),
+          { status: 400 },
         ),
-      ).rejects.toThrow(/change answer/);
-    }
+    );
+    const failure = await registry.waitForChange!(
+      cursorOf("12"),
+      25_000,
+      new AbortController().signal,
+      undefined,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).not.toBe("ChangeFeedAbsentError");
+    expect((failure as Error).message).toMatch(/400/);
   });
 });
 
@@ -1185,6 +1208,9 @@ describe("waitForChange with since", () => {
     metadataHash: "0x" + "bb".repeat(32),
     deletedAt: null,
   };
+  const AFTER = mintCursor(EPOCH_A, 3);
+  const SINCE = mintCursor(EPOCH_A, 3);
+  const NEXT = mintCursor(EPOCH_A, 5);
 
   function answering(body: unknown) {
     const urls: string[] = [];
@@ -1197,30 +1223,35 @@ describe("waitForChange with since", () => {
       }) as typeof fetch,
     });
     const wait = (since?: string) =>
-      registry.waitForChange!("3", 25_000, new AbortController().signal, since);
+      registry.waitForChange!(
+        cursorOf(AFTER),
+        25_000,
+        new AbortController().signal,
+        since === undefined ? undefined : cursorOf(since),
+      );
     return { wait, urls };
   }
 
   it("sends since, and reads the delta's rows as the listing's rows (mutation: since not sent)", async () => {
     const { wait, urls } = answering({
-      seq: "5",
+      cursor: NEXT,
       changed: true,
       delta: {
-        since: "3",
+        since: SINCE,
         reset: false,
         rows: [ROW],
         gone: ["0x01"],
         serversChanged: true,
       },
     });
-    const answer = await wait("3");
-    expect(new URL(urls[0]!).searchParams.get("since")).toBe("3");
+    const answer = await wait(SINCE);
+    expect(new URL(urls[0]!).searchParams.get("since")).toBe(SINCE);
     expect(answer).toEqual({
-      seq: "5",
+      cursor: NEXT,
       changed: true,
       delta: {
-        since: "3",
-        seq: "5",
+        since: SINCE,
+        cursor: NEXT,
         reset: false,
         rows: [
           {
@@ -1240,39 +1271,40 @@ describe("waitForChange with since", () => {
     });
   });
 
-  it("a reset carries no rows", async () => {
+  it("a reset carries no rows, and is how the gateway says the database epoch changed", async () => {
+    const replaced = mintCursor(EPOCH_B, 1);
     const { wait } = answering({
-      seq: "5",
+      cursor: replaced,
       changed: true,
-      delta: { since: "3", reset: true },
+      delta: { since: SINCE, reset: true },
     });
-    expect((await wait("3")).delta).toEqual({
-      since: "3",
-      seq: "5",
+    expect((await wait(SINCE)).delta).toEqual({
+      since: SINCE,
+      cursor: replaced,
       reset: true,
     });
   });
 
   it("without since, nothing is sent and a delta in the answer is not read", async () => {
     const { wait, urls } = answering({
-      seq: "5",
+      cursor: NEXT,
       changed: true,
-      delta: { since: "3", reset: true },
+      delta: { since: SINCE, reset: true },
     });
     const answer = await wait(undefined);
     expect(new URL(urls[0]!).searchParams.has("since")).toBe(false);
-    expect(answer).toEqual({ seq: "5", changed: true });
+    expect(answer).toEqual({ cursor: NEXT, changed: true });
   });
 
   it.each([
     [
       "for another since (mutation: since not matched)",
-      { since: "2", reset: true },
+      { since: mintCursor(EPOCH_A, 2), reset: true },
     ],
     [
       "with a row whose version is not valid (mutation: rows read loosely)",
       {
-        since: "3",
+        since: SINCE,
         reset: false,
         rows: [{ ...ROW, expectedVersion: "x" }],
         gone: [],
@@ -1281,97 +1313,31 @@ describe("waitForChange with since", () => {
     ],
     [
       "without gone",
-      { since: "3", reset: false, rows: [], serversChanged: false },
+      { since: SINCE, reset: false, rows: [], serversChanged: false },
     ],
     ["not an object", "delta"],
     ["missing (mutation: a missing delta read as none)", undefined],
   ])(
     "a changed answer to a since with a delta %s fails the request, never half read",
     async (_name, delta) => {
-      const { wait } = answering({ seq: "5", changed: true, delta });
-      await expect(wait("3")).rejects.toThrow(/delta/);
+      const { wait } = answering({ cursor: NEXT, changed: true, delta });
+      await expect(wait(SINCE)).rejects.toThrow(/delta/);
     },
   );
 
-  it("a changed epoch with no readable delta still reaches the caller, which builds the reset (mutation: delta checked before epoch)", async () => {
-    const held = "11111111-1111-4111-8111-111111111111";
-    const next = "22222222-2222-4222-8222-222222222222";
-    const registry = createGatewayStreamSyncRegistry({
-      gatewayUrl: "https://gateway.test/",
-      ownerAddress: owner,
-      fetch: (async () =>
-        new Response(
-          JSON.stringify({ seq: "5", changed: true, epoch: next }),
-        )) as typeof fetch,
-    });
-    const answer = await registry.waitForChange!(
-      "3",
-      25_000,
-      new AbortController().signal,
-      "3",
-      held,
-    );
-    expect(answer).toEqual({ seq: "5", changed: true, epoch: next });
-  });
-
-  it.each([
-    ["missing", undefined],
-    ["malformed", "garbage"],
-  ])(
-    "a first epoch for a held cursor with a %s delta still reaches the caller, which builds the reset (mutation: exception only when an epoch was sent)",
-    async (_name, delta) => {
-      const first = "22222222-2222-4222-8222-222222222222";
-      const registry = createGatewayStreamSyncRegistry({
-        gatewayUrl: "https://gateway.test/",
-        ownerAddress: owner,
-        fetch: (async () =>
-          new Response(
-            JSON.stringify({ seq: "5", changed: true, epoch: first, delta }),
-          )) as typeof fetch,
-      });
-      const answer = await registry.waitForChange!(
-        "3",
-        25_000,
-        new AbortController().signal,
-        "3",
-      );
-      expect(answer).toEqual({ seq: "5", changed: true, epoch: first });
-    },
-  );
-
-  it("the same epoch with a malformed delta still fails the request", async () => {
-    const held = "11111111-1111-4111-8111-111111111111";
-    const registry = createGatewayStreamSyncRegistry({
-      gatewayUrl: "https://gateway.test/",
-      ownerAddress: owner,
-      fetch: (async () =>
-        new Response(
-          JSON.stringify({
-            seq: "5",
-            changed: true,
-            epoch: held,
-            delta: "garbage",
-          }),
-        )) as typeof fetch,
-    });
-    await expect(
-      registry.waitForChange!(
-        "3",
-        25_000,
-        new AbortController().signal,
-        "3",
-        held,
-      ),
-    ).rejects.toThrow(/delta/);
+  it("a changed answer from another epoch with no delta fails too: the gateway sends the reset itself, the client builds none", async () => {
+    const replaced = mintCursor(EPOCH_B, 1);
+    const { wait } = answering({ cursor: replaced, changed: true });
+    await expect(wait(SINCE)).rejects.toThrow(/delta/);
   });
 
   it("an unchanged answer carries no delta", async () => {
     const { wait } = answering({
-      seq: "3",
+      cursor: AFTER,
       changed: false,
-      delta: { since: "3", reset: true },
+      delta: { since: SINCE, reset: true },
     });
-    expect(await wait("3")).toEqual({ seq: "3", changed: false });
+    expect(await wait(SINCE)).toEqual({ cursor: AFTER, changed: false });
   });
 });
 

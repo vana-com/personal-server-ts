@@ -126,7 +126,7 @@ export async function applyRegistryDelta(
         local === undefined &&
         rows.log &&
         classifyStreamRow(rows.log, hashes) === "present" &&
-        BigInt(delta.seq) > BigInt(delta.since)
+        delta.cursor !== delta.since
       ) {
         logs.push({
           id,

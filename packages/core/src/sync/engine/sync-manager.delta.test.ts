@@ -41,12 +41,12 @@ const APPLIED: DeltaApplyResult = {
 
 function delta(
   since: string,
-  seq: string,
+  cursor: string,
   extra: Partial<Extract<RegistryChangeDelta, { reset: false }>> = {},
 ): RegistryChangeDelta {
   return {
     since,
-    seq,
+    cursor,
     reset: false,
     rows: [],
     gone: [],
@@ -111,8 +111,12 @@ async function settled(t: T, position = "7") {
 }
 
 /** One answer of the held request: its position, then the change. */
-async function answer(t: T, d: RegistryChangeDelta | undefined, seq: string) {
-  t.handlers().onPosition(seq);
+async function answer(
+  t: T,
+  d: RegistryChangeDelta | undefined,
+  cursor: string,
+) {
+  t.handlers().onPosition(cursor);
   t.handlers().onChange(d);
   await vi.advanceTimersByTimeAsync(0);
 }
@@ -153,7 +157,7 @@ describe("a change delta", () => {
     await t.manager.stop();
   });
 
-  it("from the held position is the whole pass: no cycle, no server read, settled at its seq (mutation: delta ignored)", async () => {
+  it("from the held position is the whole pass: no cycle, no server read, settled at its cursor (mutation: delta ignored)", async () => {
     const t = setup();
     await settled(t);
     const d = delta("7", "8");
@@ -178,7 +182,7 @@ describe("a change delta", () => {
     await t.manager.stop();
   });
 
-  it("read at a seq other than the pushed position runs the cycle (mutation: no seq check)", async () => {
+  it("read at a cursor other than the pushed position runs the cycle (mutation: no cursor check)", async () => {
     const t = setup();
     await settled(t);
     await answer(t, delta("7", "8"), "9");
@@ -193,7 +197,7 @@ describe("a change delta", () => {
     await vi.advanceTimersByTimeAsync(0);
     t.cycle.mockClear();
     t.handlers().onHealth(true);
-    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    await answer(t, { since: "7", cursor: "8", reset: true }, "8");
     expect(t.applyDelta).not.toHaveBeenCalled();
     expect(t.cycle).toHaveBeenCalledTimes(1);
     await t.manager.stop();
@@ -202,7 +206,7 @@ describe("a change delta", () => {
   it("a reset runs the cycle (mutation: reset applied)", async () => {
     const t = setup();
     await settled(t);
-    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    await answer(t, { since: "7", cursor: "8", reset: true }, "8");
     expect(t.applyDelta).not.toHaveBeenCalled();
     expect(t.cycle).toHaveBeenCalledTimes(1);
     await t.manager.stop();
@@ -295,7 +299,7 @@ describe("a change delta", () => {
           persist = resolve;
         }),
     );
-    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    await answer(t, { since: "7", cursor: "8", reset: true }, "8");
     expect(t.applyDelta).not.toHaveBeenCalled();
     expect(t.cycle).toHaveBeenCalledTimes(1);
     // The held request asks from the position the listing settles at, so a
@@ -315,7 +319,7 @@ describe("a change delta", () => {
     t.cycle.mockImplementationOnce(
       () => new Promise<void>((_resolve, reject) => (fail = reject)),
     );
-    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    await answer(t, { since: "7", cursor: "8", reset: true }, "8");
     expect(t.handlers().since?.()).toBe("8");
     fail(new Error("listing failed"));
     await vi.advanceTimersByTimeAsync(0);
@@ -343,11 +347,15 @@ describe("a change delta", () => {
     release();
     await vi.advanceTimersByTimeAsync(0);
     expect(t.cycle).toHaveBeenCalledTimes(1);
-    expect(t.applyDelta.mock.calls.map(([d]) => d.seq)).not.toContain("11");
+    expect(t.applyDelta.mock.calls.map(([d]) => d.cursor)).not.toContain("11");
     await t.manager.stop();
   });
 
-  it("overlapping answers serialize through persistence and a late older answer cannot settle (mutation: concurrent cycles or regressing position)", async () => {
+  it("overlapping answers serialize through persistence (mutation: concurrent cycles)", async () => {
+    // Positions have no order here: nothing tells a late answer from a new
+    // one. The push sends one request at a time and drops the answer of an
+    // abandoned one (change-push.test.ts), so answers reach the manager in the
+    // order the gateway gave them.
     const t = setup();
     await settled(t);
     let persist!: () => void;
@@ -368,12 +376,19 @@ describe("a change delta", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(t.cycle).toHaveBeenCalledTimes(1);
     expect(t.handlers().since?.()).toBe("9");
-    // The older request can also arrive after the newer pass finished.
-    await answer(t, delta("7", "8"), "8");
     await vi.advanceTimersByTimeAsync(60_000);
     expect(t.handlers().since?.()).toBe("9");
     expect(t.applyDelta).toHaveBeenCalledTimes(1);
     expect(t.cycle).toHaveBeenCalledTimes(1);
+    await t.manager.stop();
+  });
+
+  it("a delta that reaches the position the last clean pass started under is already held, and is skipped", async () => {
+    const t = setup();
+    await settled(t);
+    await answer(t, delta("6", "7"), "7");
+    expect(t.applyDelta).not.toHaveBeenCalled();
+    expect(t.cycle).not.toHaveBeenCalled();
     await t.manager.stop();
   });
 
@@ -393,15 +408,63 @@ describe("a change delta", () => {
     },
   );
 
-  it("a lower reset lists again without settling an older answer", async () => {
+  it("a reset from another database epoch lists again, and the pass settles at the cursor the reset arrived with", async () => {
+    // The cursors carry their epoch and have no order: "3" is not lower than
+    // "9", it is another database's position. The listing runs after the reset
+    // answered, so what it reads is that database at "3" or later.
     const t = setup();
     await settled(t, "9");
-    await answer(t, { since: "9", seq: "3", reset: true }, "3");
+    await answer(t, { since: "9", cursor: "3", reset: true }, "3");
     expect(t.cycle).toHaveBeenCalledTimes(1);
-    expect(t.handlers().since?.()).toBeUndefined();
-    t.handlers().onPosition("3");
-    await vi.advanceTimersByTimeAsync(60_000);
     expect(t.handlers().since?.()).toBe("3");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.handlers().since?.()).toBe("3");
+    await t.manager.stop();
+  });
+
+  it("a reset that arrives during a pass on the old epoch: the next request asks from the new cursor, never the old one", async () => {
+    const t = setup();
+    await settled(t, "9");
+    let release!: () => void;
+    t.applyDelta.mockImplementationOnce(
+      () =>
+        new Promise<DeltaApplyResult>((resolve) => {
+          release = () => resolve(APPLIED);
+        }),
+    );
+    await answer(t, delta("9", "10"), "10"); // a pass under the old epoch
+    expect(t.handlers().since?.()).toBe("10");
+    // The gateway's database was replaced while that pass runs.
+    await answer(t, { since: "10", cursor: "3", reset: true }, "3");
+    expect(t.handlers().since?.()).toBe("3");
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    // The old pass ended, and the follow-up lists again from the new cursor.
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.handlers().since?.()).toBe("3");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(t.cycle).toHaveBeenCalledTimes(1);
+    expect(t.handlers().since?.()).toBe("3");
+    await t.manager.stop();
+  });
+
+  it("a reset that arrives during a pass that then fails leaves no position to ask from", async () => {
+    const t = setup();
+    await settled(t, "9");
+    let fail!: (error: Error) => void;
+    t.applyDelta.mockImplementationOnce(
+      () =>
+        new Promise<DeltaApplyResult>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    t.cycle.mockRejectedValueOnce(new Error("listing failed"));
+    await answer(t, delta("9", "10"), "10");
+    await answer(t, { since: "10", cursor: "3", reset: true }, "3");
+    fail(new Error("segment fetch failed"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.handlers().since?.()).toBeUndefined();
     await t.manager.stop();
   });
 
@@ -417,7 +480,7 @@ describe("a change delta", () => {
         },
       ],
     });
-    await answer(t, { since: "7", seq: "8", reset: true }, "8");
+    await answer(t, { since: "7", cursor: "8", reset: true }, "8");
     expect(t.handlers().since?.()).toBeUndefined();
     expect(t.manager.getStatus().blocked?.reason).toBe("update_required");
     // Keep the existing policy: an unsupported format does not poll forever.

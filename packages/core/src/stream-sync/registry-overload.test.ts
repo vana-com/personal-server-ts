@@ -16,7 +16,7 @@ it("waits for Retry-After before retrying an overloaded change feed", async () =
     .mockResolvedValueOnce(
       new Response(null, { status: 429, headers: { "Retry-After": "5" } }),
     )
-    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockResolvedValueOnce(Response.json({ cursor: "1", changed: false }))
     .mockImplementation(() => new Promise(() => {}));
   const registry = createGatewayStreamSyncRegistry({
     gatewayUrl: "https://gateway.test",
@@ -215,9 +215,9 @@ it("uses ordinary failure recovery for a body-only feed delay", async () => {
   vi.spyOn(Math, "random").mockReturnValue(0.5);
   const fetch = vi
     .fn()
-    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockResolvedValueOnce(Response.json({ cursor: "1", changed: false }))
     .mockResolvedValueOnce(Response.json({ retryAfter: 60 }, { status: 503 }))
-    .mockResolvedValueOnce(Response.json({ seq: "1", changed: false }))
+    .mockResolvedValueOnce(Response.json({ cursor: "1", changed: false }))
     .mockImplementation(() => new Promise(() => {}));
   const registry = createGatewayStreamSyncRegistry({
     gatewayUrl: "https://gateway.test",

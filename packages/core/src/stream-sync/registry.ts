@@ -31,6 +31,9 @@ import {
   ChangeFeedAbsentError,
   RegistryRefusedError,
   RegistryBatchRouteMissingError,
+  changeCursorFromWire,
+  changeCursorToWire,
+  type ChangeCursor,
   type ConditionalPostResult,
   type ConditionalRegistryPost,
   type RegistryBatchPolicy,
@@ -688,14 +691,13 @@ export function createGatewayStreamSyncRegistry(
       return `${newest.changedAt}|${String(newest.id)}|${String(newest.expectedVersion)}`;
     },
 
-    async waitForChange(after, waitMs, signal, since, epoch) {
+    async waitForChange(after, waitMs, signal, since) {
       const params = new URLSearchParams({ user: options.ownerAddress });
       if (after !== undefined) {
-        params.set("after", after);
+        params.set("after", changeCursorToWire(after));
         params.set("wait", String(Math.max(0, Math.round(waitMs / 1000))));
       }
-      if (since !== undefined) params.set("since", since);
-      if (epoch !== undefined) params.set("epoch", epoch);
+      if (since !== undefined) params.set("since", changeCursorToWire(since));
       const res = await fetchImpl(
         `${base}/v1/data/changes?${params.toString()}`,
         { signal },
@@ -719,54 +721,39 @@ export function createGatewayStreamSyncRegistry(
         throw new Error(`registry change wait failed: ${res.status}`);
       }
       const body = (await res.json()) as {
-        seq?: unknown;
+        cursor?: unknown;
         changed?: unknown;
         delta?: unknown;
-        epoch?: unknown;
       };
+      // The cursor is the gateway's and means nothing here: any non-empty
+      // string is kept as it came. An answer without one (a gateway that
+      // sends the older `seq`) is no answer.
       if (
-        typeof body.seq !== "string" ||
-        !DECIMAL.test(body.seq) ||
+        typeof body.cursor !== "string" ||
+        body.cursor === "" ||
         typeof body.changed !== "boolean"
       ) {
-        throw new Error("registry change answer is not {seq, changed}");
+        throw new Error("registry change answer is not {cursor, changed}");
       }
+      const cursor = changeCursorFromWire(body.cursor);
       // A changed answer to a request that sent `since` carries its delta
-      // (rows or reset). One that does not, or carries another request's, or
+      // (rows or reset), a reset when `since` or `after` belongs to another
+      // database epoch. One that does not, or carries another request's, or
       // one this client cannot read, fails the request: the push then pokes a
       // full pull on its next answer.
-      // The epoch is read as the gateway sends it: a gateway that predates it
-      // sends none, and anything but a non-empty string is no epoch.
-      const answered =
-        typeof body.epoch === "string" && body.epoch !== ""
-          ? { epoch: body.epoch }
-          : {};
       if (!body.changed || since === undefined)
-        return { seq: body.seq, changed: body.changed, ...answered };
-      const delta = parseDelta(body.delta, since, body.seq);
-      // An epoch other than the one the caller sent, including a first epoch
-      // for a cursor held without one, is a reset the caller builds itself:
-      // its `since` means nothing in the new epoch, so no delta is needed, and
-      // a missing or unreadable one must not hide the epoch (the retry would
-      // send the stale cursor again). Any other answer stays strict.
-      if (
-        delta === undefined &&
-        answered.epoch !== undefined &&
-        answered.epoch !== epoch
-      )
-        return { seq: body.seq, changed: true, ...answered };
+        return { cursor, changed: body.changed };
+      const delta = parseDelta(body.delta, since, cursor);
       if (delta === undefined)
         throw new Error(
-          `registry change answer has no readable delta for since=${since}`,
+          `registry change answer has no readable delta for since=${changeCursorToWire(since)}`,
         );
-      return { seq: body.seq, changed: true, delta, ...answered };
+      return { cursor, changed: true, delta };
     },
 
     listOwnerRows: () => listRows(() => true),
   };
 }
-
-const DECIMAL = /^(0|[1-9]\d*)$/;
 
 /**
  * The `delta` of a changed answer, or `undefined` when there is none or it is
@@ -777,12 +764,13 @@ const DECIMAL = /^(0|[1-9]\d*)$/;
  */
 function parseDelta(
   value: unknown,
-  since: string,
-  seq: string,
+  since: ChangeCursor,
+  cursor: ChangeCursor,
 ): RegistryChangeDelta | undefined {
   const delta = asRecord(value);
-  if (!delta || delta.since !== since) return undefined;
-  if (delta.reset === true) return { since, seq, reset: true };
+  // Equality only: the gateway answers for the `since` it was sent.
+  if (!delta || delta.since !== changeCursorToWire(since)) return undefined;
+  if (delta.reset === true) return { since, cursor, reset: true };
   if (
     delta.reset !== false ||
     !Array.isArray(delta.rows) ||
@@ -803,7 +791,7 @@ function parseDelta(
   }
   return {
     since,
-    seq,
+    cursor,
     reset: false,
     rows,
     gone: delta.gone as string[],
