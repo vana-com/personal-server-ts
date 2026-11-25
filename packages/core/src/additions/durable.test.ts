@@ -35,6 +35,44 @@ import {
   findCheckpointRegistration,
   type DurableAdditionsOptions,
 } from "./durable.js";
+import {
+  InvalidTimezoneError,
+  readAdditionsSummaryJson,
+  validateTimezone,
+} from "./summary.js";
+
+it("reports an unknown display timezone without picking a fallback", () => {
+  expect(() => validateTimezone("Fixture/Not_A_Timezone")).toThrow(
+    InvalidTimezoneError,
+  );
+  expect(() => validateTimezone("Fixture/Not_A_Timezone")).toThrow(
+    "Unknown timezone: Fixture/Not_A_Timezone",
+  );
+  expect(() => validateTimezone("UTC")).not.toThrow();
+});
+
+it("refuses an impossible calendar day instead of normalizing the display", () => {
+  const fixture = {
+    version: 1,
+    coverage: "complete",
+    through: {},
+    fineSince: "2026-03-01T00:00:00.000Z",
+    daily: [],
+    buckets: [],
+    timezone: "UTC",
+    total: 1,
+    trackedSince: null,
+    partial: false,
+    scopes: [],
+  };
+  const read = (date: string) =>
+    readAdditionsSummaryJson(
+      JSON.stringify({ ...fixture, days: [{ date, added: 1 }] }),
+    );
+  expect(read("2026-02-28")?.days).toEqual([{ date: "2026-02-28", added: 1 }]);
+  expect(read("2026-02-30")).toBeNull();
+});
+
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const SOURCE = "test.conversations";
