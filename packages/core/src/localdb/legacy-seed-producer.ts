@@ -12,6 +12,10 @@ export const isConnectionDeleted = (error: unknown) =>
   error.code === 410 &&
   error.errorCode === "CONNECTION_DELETED";
 
+/** A stored envelope read that found its envelope gone. */
+export const isEnvelopeMissing = (error: unknown) =>
+  error instanceof Error && error.message.includes("Envelope not found");
+
 /**
  * Feeds a legacy store that only a host can read (a browser's IndexedDB, a
  * phone's files) into the seed intake every host already has.
@@ -208,6 +212,19 @@ export async function seedLegacyStore(
       invalid: 0,
     });
   };
+  /** The fault is a deleted connection, or an envelope gone because its
+   * connector was deleted. Only ever called with no intake lock held: it asks
+   * the intake, and the intake's request lock is not reentrant. */
+  const deletedBehind = async (error: unknown, connector: string) => {
+    if (isConnectionDeleted(error)) return true;
+    if (!isEnvelopeMissing(error)) return false;
+    try {
+      await intake.status(connector);
+    } catch (statusError) {
+      return isConnectionDeleted(statusError);
+    }
+    return false;
+  };
   for await (const stream of store.streams()) {
     options.signal?.throwIfAborted();
     const { connector, stream: name } = stream;
@@ -256,7 +273,7 @@ export async function seedLegacyStore(
       }
     } catch (error) {
       // A connector deleted while its store was read refuses its streams.
-      if (isConnectionDeleted(error)) {
+      if (await deletedBehind(error, connector)) {
         refuseDeleted(connector, name);
         continue;
       }
@@ -341,7 +358,9 @@ export async function seedLegacyStore(
       // that waits for its target.
       put = await intake.put(connector, name, body(), { keepStaged: true });
     } catch (error) {
-      if (isConnectionDeleted(error)) {
+      // `put` has released the intake's request lock by now, so the deletion
+      // check of an erased envelope cannot wait on it.
+      if (await deletedBehind(error, connector)) {
         refuseDeleted(connector, name);
         continue;
       }

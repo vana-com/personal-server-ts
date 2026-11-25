@@ -2,9 +2,10 @@ import { ProtocolError } from "../errors/catalog.js";
 import { manifestArtifact } from "../stream-sync/artifacts.js";
 import type { DataStoragePort } from "../ports/index.js";
 import type { FoldLayer } from "./legacy-fold.js";
-import type {
-  LegacySeedStore,
-  LegacySeedStream,
+import {
+  isEnvelopeMissing,
+  type LegacySeedStore,
+  type LegacySeedStream,
 } from "./legacy-seed-producer.js";
 
 /**
@@ -116,9 +117,6 @@ function connectorDeletedRecords(): never {
     "The connection was deleted",
   );
 }
-
-const isEnvelopeMissing = (error: unknown) =>
-  error instanceof Error && error.message.includes("Envelope not found");
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -300,7 +298,31 @@ export function createLegacyScopeStore(
         }
       >();
       for (const scope of listAllScopes(storage)) {
-        const target = await scopeTarget(scope);
+        let target: Target | LegacyScopeExclusionReason;
+        try {
+          target = await scopeTarget(scope);
+        } catch (error) {
+          // The newest envelope of a shared scope erased since it was listed:
+          // each candidate whose connector was deleted is refused as deleted;
+          // with none, the fault stops the scan.
+          if (!isEnvelopeMissing(error)) throw error;
+          let refused = false;
+          for (const t of targets.get(scope) ?? []) {
+            const declaration = declare(t.connector, t.stream);
+            if (typeof declaration === "string") continue;
+            if (!(await options.connectorDeleted?.(t.connector))) continue;
+            refused = true;
+            yield {
+              connector: t.connector,
+              stream: t.stream,
+              primaryKey: declaration.primaryKey,
+              version: declaration.version,
+              layers: [{ records: connectorDeletedRecords }],
+            };
+          }
+          if (!refused) throw error;
+          continue;
+        }
         if (typeof target === "string") {
           exclude(scope, target);
           continue;
@@ -382,16 +404,12 @@ export function createLegacyScopeStore(
           }
         }
         const layers: FoldLayer[] = versions.map((version) => ({
+          // A vanished envelope is not judged here: this read runs inside the
+          // seed put, under the intake's request lock, so asking the intake
+          // would wait on that lock. The producer judges it once the put has
+          // released the lock.
           async *records() {
-            let body: unknown;
-            try {
-              body = await readBody(scope, version.collectedAt);
-            } catch (error) {
-              if (await vanishedWithConnector(error, target.connector))
-                connectorDeletedRecords();
-              throw error;
-            }
-            const rows = plainRows(body);
+            const rows = plainRows(await readBody(scope, version.collectedAt));
             if (rows) yield* rows;
           },
         }));

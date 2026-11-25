@@ -7,6 +7,7 @@ import {
 import {
   createLegacyScopeStore,
   isConnectionDeleted,
+  isEnvelopeMissing,
   type LegacyScopeTarget,
   seedLegacyStore,
   type LegacyScopeExclusionReason,
@@ -243,7 +244,13 @@ export function createLiteLegacyStoreRunner(
             try {
               for await (const _ of layer.records()) rows += 1;
             } catch (error) {
-              if (!isConnectionDeleted(error)) throw error;
+              // The producer refused this stream as deleted, so an envelope
+              // gone by now is that deletion.
+              if (
+                !isConnectionDeleted(error) &&
+                !(s.reason === "deleted" && isEnvelopeMissing(error))
+              )
+                throw error;
               rows = 0;
             }
           }
