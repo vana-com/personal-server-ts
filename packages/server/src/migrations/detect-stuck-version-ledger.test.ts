@@ -89,6 +89,45 @@ describe("detect-stuck-version-ledger", () => {
     expect(ctx.logger.warn).toHaveBeenCalledTimes(1);
   });
 
+  it("reports multiple affected scopes in sorted order with only their combined pending rows", () => {
+    add("z.stuck", { version: 1 });
+    add("a.stuck", { version: 1 });
+    add("z.stuck", { version: 2 });
+    add("a.stuck", { version: 2 });
+    add("a.stuck", { version: 3 });
+    add("m.ok", { version: 1 });
+    const logger = { info: vi.fn(), warn: vi.fn() };
+
+    const result = detectStuckVersionLedger.run({
+      db,
+      storageRoot: "/tmp/unused",
+      logger,
+    });
+
+    expect(result).toEqual({
+      changed: false,
+      detail: "detected 2 scope(s) with 5 accumulated pending row(s)",
+    });
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopeCount: 2,
+        scopes: ["a.stuck", "z.stuck"],
+        pendingRows: 5,
+      }),
+      expect.any(String),
+    );
+  });
+
+  it("does not warn or attach detail when a direct run finds no stuck scope", () => {
+    add("a.ordinary", { version: 1 });
+    const logger = { info: vi.fn(), warn: vi.fn() };
+    expect(
+      detectStuckVersionLedger.run({ db, storageRoot: "/tmp/unused", logger }),
+    ).toEqual({ changed: false });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it("check() is false when nothing is stuck", () => {
     add("spotify.profile", { version: 1 });
     expect(

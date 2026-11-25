@@ -241,9 +241,9 @@ declare const changeCursorBrand: unique symbol;
  * and a `symbol` brand would have been a lie (`Symbol.keyFor(cursor)` compiled
  * and threw). The brand keeps a bare `string` or `number` from passing for a
  * cursor, and TypeScript still refuses `-`, `*` and `Symbol.keyFor` on it. It
- * cannot refuse `<`, `>`, `+`, `Number(...)`, `BigInt(...)` or `parseInt(...)`,
- * which a string allows: ESLint rejects those on cursor-named values in the
- * files that handle cursors (see `eslint.config.js`). Only
+ * allows some string operations; in the four cursor files, ESLint rejects
+ * `<`, `>`, `<=`, `>=`, `Number(...)`, `BigInt(...)`, `parseInt(...)` and
+ * `parseFloat(...)` on cursor-named values (see `eslint.config.js`). Only
  * {@link changeCursorFromWire} makes one and {@link changeCursorToWire} sends
  * one; no other code has a reason to look at the characters.
  */

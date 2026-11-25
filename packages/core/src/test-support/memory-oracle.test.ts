@@ -281,4 +281,79 @@ describe("memory-oracle temp roots", () => {
       rmSync(parent, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("rejects an empty or path-like temp-root prefix", () => {
+    withTempParent((parent) => {
+      expect(() => createTempRoot("", parent)).toThrow(
+        "Invalid temp-root prefix",
+      );
+      expect(() => createTempRoot("a/b", parent)).toThrow(
+        "Invalid temp-root prefix",
+      );
+      expect(() => createTempRoot("a\\0b", parent)).toThrow(
+        "Invalid temp-root prefix",
+      );
+      // No root was left behind by the rejected prefixes.
+      expect(readdirSync(parent)).toEqual([]);
+    });
+  });
+});
+
+describe("memory-oracle error paths", () => {
+  function withWorkloadDir<T>(runFn: (root: string) => Promise<T>): Promise<T> {
+    const temporary = join(homedir(), ".tmp");
+    mkdirSync(temporary, { recursive: true });
+    const root = mkdtempSync(join(temporary, "memory-oracle-errors-"));
+    return runFn(root).finally(() => {
+      rmSync(root, { recursive: true, force: true });
+    });
+  }
+
+  it("rejects when the workload module file does not exist", async () => {
+    await withWorkloadDir(async (root) => {
+      await expect(
+        run({
+          module: join(root, "does-not-exist.mjs"),
+          exportName: "work",
+        }),
+      ).rejects.toThrow(/memory-oracle child for work exited 1/);
+    });
+  }, 30_000);
+
+  it("rejects when the workload has no such export", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(module, "export function other() { return 1; }");
+      await expect(run({ module, exportName: "missing" })).rejects.toThrow(
+        /has no function export missing/,
+      );
+    });
+  }, 30_000);
+
+  it("rejects with the workload error when the workload throws", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        'export function boom() { throw new Error("workload exploded"); }',
+      );
+      await expect(run({ module, exportName: "boom" })).rejects.toThrow(
+        /memory-oracle child for boom exited 1: .*workload exploded/s,
+      );
+    });
+  }, 30_000);
+
+  it("rejects an unknown gc mode from the child", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(module, "export function noop() { return 0; }");
+      await expect(
+        run(
+          { module, exportName: "noop" },
+          // @ts-expect-error testing a runtime-only invalid value
+          { gc: "bogus" },
+        ),
+      ).rejects.toThrow(/unknown gc mode bogus/);
+    });
+  }, 30_000);
 });

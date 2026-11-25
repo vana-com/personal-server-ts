@@ -98,6 +98,7 @@ export function createAccessReporter(
   let sending: Promise<void> = Promise.resolve();
   // Shutdown must not wait out the backoff; a stopping reporter sends once.
   let stopping = false;
+  let wakeBackoff: (() => void) | undefined;
   // Every record this reporter never delivered, across both drop paths.
   let dropped = 0;
 
@@ -173,6 +174,10 @@ export function createAccessReporter(
       }
 
       await delay(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
+      if (stopping) {
+        drop(records, { ...detailOf(outcome), attempts: attempt });
+        return;
+      }
     }
   }
 
@@ -275,7 +280,13 @@ export function createAccessReporter(
 
   function delay(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const handle = setTimeout(resolve, ms);
+      const wake = () => {
+        clearTimeout(handle);
+        wakeBackoff = undefined;
+        resolve();
+      };
+      const handle = setTimeout(wake, ms);
+      wakeBackoff = wake;
       handle.unref?.();
     });
   }
@@ -290,6 +301,7 @@ export function createAccessReporter(
     flush,
     async stop(): Promise<void> {
       stopping = true;
+      wakeBackoff?.();
       clearFlushTimer();
       await flush();
     },

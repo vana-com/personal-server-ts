@@ -38,6 +38,26 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     return n;
   }
 
+  it("distinguishes a missing file from an existing zero-byte file", async () => {
+    const files = createFsStreamSyncFiles(root);
+    expect(await files.read("missing.bin")).toBeNull();
+    expect(await files.size("missing.bin")).toBe(0);
+    expect(await files.list("absent")).toEqual([]);
+
+    await files.write("empty.bin", new Uint8Array());
+    expect(await files.read("empty.bin")).toEqual(new Uint8Array());
+    expect(await files.size("empty.bin")).toBe(0);
+  });
+
+  it("reports an existing file passed as a listing prefix instead of returning an empty list", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.write("one.bin", enc.encode("fixture"));
+    await expect(files.list("one.bin")).rejects.toMatchObject({
+      code: "ENOTDIR",
+    });
+    expect(await files.read("one.bin")).toEqual(enc.encode("fixture"));
+  });
+
   it("keeps appended bytes readable at once, in order, across many files", async () => {
     const files = createFsStreamSyncFiles(root);
     for (let round = 0; round < 3; round += 1) {
@@ -106,6 +126,35 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(chunks).toEqual([]);
   });
 
+  it("lists nested files in sorted root-relative order", async () => {
+    const files = createFsStreamSyncFiles(root);
+    const prefix = "sample";
+    const nested = ["sample/z/leaf", "sample/a/leaf", "sample/root"];
+    for (const path of [...nested, "sample-other/stays-out"]) {
+      await files.write(path, enc.encode("sample"));
+    }
+    await mkdir(join(root, prefix, "empty"));
+
+    expect(await files.list(prefix)).toEqual([...nested].sort());
+    expect(await files.list("missing")).toEqual([]);
+  });
+
+  it("reads each byte once in order across multiple chunks", async () => {
+    const files = createFsStreamSyncFiles(root);
+    const path = "samples/chunked.bin";
+    const bytes = Uint8Array.from(
+      { length: 1024 * 1024 + 31 },
+      (_, i) => i % 251,
+    );
+    await files.write(path, bytes);
+    const observed: Buffer[] = [];
+    for await (const chunk of files.readChunks(path)) {
+      observed.push(Buffer.from(chunk));
+    }
+    expect(observed.length).toBeGreaterThan(1);
+    expect(Buffer.concat(observed).equals(Buffer.from(bytes))).toBe(true);
+  });
+
   it("write replaces a file that has an open append handle", async () => {
     const files = createFsStreamSyncFiles(root);
     await files.appendMany([{ path: "s/0", bytes: enc.encode("old") }]);
@@ -113,6 +162,15 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     await files.appendMany([{ path: "s/0", bytes: enc.encode("+tail") }]);
     await files.sync("s");
     expect(await readFile(join(root, "s/0"), "utf8")).toBe("new+tail");
+  });
+
+  it("does not leave a temporary file when replacing a directory fails", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await mkdir(join(root, "fixture-folder"));
+    await expect(
+      files.write("fixture-folder", enc.encode("fixture")),
+    ).rejects.toThrow();
+    expect(await readdir(root)).toEqual(["fixture-folder"]);
   });
 
   it("remove closes handles under the prefix and the files can be created again", async () => {
@@ -124,6 +182,37 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     await files.appendMany([{ path: "s/0", bytes: enc.encode("b") }]);
     await files.sync("s");
     expect(dec.decode((await files.read("s/0"))!)).toBe("b");
+  });
+
+  it("preserves each file's order within an interleaved append batch", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.appendMany([
+      { path: "batch/a", bytes: enc.encode("a1") },
+      { path: "batch/b", bytes: enc.encode("b1") },
+      { path: "batch/a", bytes: enc.encode("a2") },
+      { path: "batch/b", bytes: enc.encode("b2") },
+    ]);
+    await files.sync("batch");
+    expect(dec.decode((await files.read("batch/a"))!)).toBe("a1a2");
+    expect(dec.decode((await files.read("batch/b"))!)).toBe("b1b2");
+  });
+
+  it("removes a selected prefix without removing a neighbouring prefix", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.appendMany([
+      { path: "run/entry", bytes: enc.encode("first") },
+      { path: "run-extra/entry", bytes: enc.encode("keep") },
+    ]);
+    await files.remove("run");
+    await files.remove("run");
+    await files.appendMany([
+      { path: "run-extra/entry", bytes: enc.encode(" more") },
+    ]);
+    await files.sync("run-extra");
+    expect(await files.list("run")).toEqual([]);
+    expect(dec.decode((await files.read("run-extra/entry"))!)).toBe(
+      "keep more",
+    );
   });
 
   it("sync of one prefix leaves other prefixes' handles and bytes alone", async () => {

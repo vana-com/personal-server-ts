@@ -195,7 +195,15 @@ export function abortable<T>(
     const onAbort = () =>
       reject(signal.reason ?? new DOMException("aborted", "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
-    start().then(
+    let work: Promise<T>;
+    try {
+      work = start();
+    } catch (error) {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+      return;
+    }
+    work.then(
       (value) => {
         signal.removeEventListener("abort", onAbort);
         resolve(value);

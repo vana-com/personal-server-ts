@@ -5,6 +5,62 @@ import {
   alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
 } from "../legacy-projection/index.js";
+import {
+  liveStreamCounts,
+  type StreamSyncConnectionStatus,
+  type StreamSyncReadStatus,
+} from "./service.js";
+
+// The formatter consumes only these fields; no read backend is needed.
+function diagnosticStatus(
+  streams: StreamSyncConnectionStatus["streams"],
+): StreamSyncReadStatus {
+  // The formatter does not inspect control state.
+  const connection = {
+    connector: "fixture",
+    ns: "local",
+    streams,
+  } as StreamSyncConnectionStatus;
+  return { listed: true, connections: [connection], issues: [] };
+}
+
+function diagnosticHead(
+  live: boolean,
+  records: number | null,
+  digest?: string | null,
+) {
+  return {
+    live,
+    version: 1,
+    records,
+    ...(digest === undefined ? {} : { digest }),
+  } as StreamSyncConnectionStatus["streams"][string];
+}
+
+describe("live stream count diagnostics", () => {
+  it("keeps a measured zero distinct from a nonlive head", () => {
+    const status = diagnosticStatus({
+      empty: diagnosticHead(true, 0),
+      waiting: diagnosticHead(false, 7),
+    });
+
+    expect(liveStreamCounts(status)).toEqual([
+      { connector: "fixture", ns: "local", stream: "empty", records: 0 },
+      { connector: "fixture", ns: "local", stream: "waiting", records: null },
+    ]);
+  });
+
+  it("distinguishes an omitted digest from an explicitly unknown audited digest", () => {
+    const status = diagnosticStatus({
+      plain: diagnosticHead(true, 2),
+      audited: diagnosticHead(true, 2, null),
+    });
+    const [plain, audited] = liveStreamCounts(status);
+
+    expect(plain).not.toHaveProperty("digest");
+    expect(audited).toHaveProperty("digest", null);
+  });
+});
 
 /** Every connector key, source key and profile key the bindings name. */
 function knownNames(): Set<string> {

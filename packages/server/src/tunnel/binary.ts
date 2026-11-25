@@ -102,8 +102,8 @@ export async function getInstalledVersion(
 ): Promise<string | null> {
   try {
     const raw = await readFile(versionFilePath(storageRoot), "utf-8");
-    const meta: VersionMetadata = JSON.parse(raw);
-    return meta.version ?? null;
+    const meta = JSON.parse(raw) as { version?: unknown } | null;
+    return typeof meta?.version === "string" ? meta.version : null;
   } catch {
     return null;
   }

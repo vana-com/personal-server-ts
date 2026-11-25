@@ -32,8 +32,46 @@ import {
   additionsLedgerScope,
   ADDITIONS_SUMMARY_SCOPE,
   createDurableAdditions,
+  findCheckpointRegistration,
   type DurableAdditionsOptions,
 } from "./durable.js";
+import {
+  InvalidTimezoneError,
+  readAdditionsSummaryJson,
+  validateTimezone,
+} from "./summary.js";
+
+it("reports an unknown display timezone without picking a fallback", () => {
+  expect(() => validateTimezone("Fixture/Not_A_Timezone")).toThrow(
+    InvalidTimezoneError,
+  );
+  expect(() => validateTimezone("Fixture/Not_A_Timezone")).toThrow(
+    "Unknown timezone: Fixture/Not_A_Timezone",
+  );
+  expect(() => validateTimezone("UTC")).not.toThrow();
+});
+
+it("refuses an impossible calendar day instead of normalizing the display", () => {
+  const fixture = {
+    version: 1,
+    coverage: "complete",
+    through: {},
+    fineSince: "2026-03-01T00:00:00.000Z",
+    daily: [],
+    buckets: [],
+    timezone: "UTC",
+    total: 1,
+    trackedSince: null,
+    partial: false,
+    scopes: [],
+  };
+  const read = (date: string) =>
+    readAdditionsSummaryJson(
+      JSON.stringify({ ...fixture, days: [{ date, added: 1 }] }),
+    );
+  expect(read("2026-02-28")?.days).toEqual([{ date: "2026-02-28", added: 1 }]);
+  expect(read("2026-02-30")).toBeNull();
+});
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const SOURCE = "test.conversations";
@@ -43,6 +81,50 @@ const T2 = "2026-10-02T12:00:00.000Z";
 const T3 = "2026-10-03T12:00:00.000Z";
 const T4 = "2026-10-04T12:00:00.000Z";
 const QUERY = { timezone: "UTC", days: 4, now: new Date(T4) };
+
+describe("checkpoint registration matching", () => {
+  const slot = {
+    expectedVersion: "1",
+    dataHash: "0x" + "ab".repeat(32),
+    metadataHash: "0x" + "cd".repeat(32),
+    status: "confirmed",
+    addedAt: T1,
+    isTombstone: false,
+  };
+  const head = {
+    expectedVersion: slot.expectedVersion,
+    dataHash: slot.dataHash,
+    metadataHash: slot.metadataHash,
+    status: slot.status,
+    deletedAt: null,
+  };
+  const snapshot = { head, versions: [slot] };
+
+  it("matches the same recorded commitments regardless of hex letter case", () => {
+    expect(
+      findCheckpointRegistration(snapshot, "1", {
+        dataHash: "0x" + "AB".repeat(32),
+        metadataHash: "0x" + "CD".repeat(32),
+      }),
+    ).toBe(slot);
+  });
+
+  it("does not treat one matching commitment as a match for the pair", () => {
+    const unrelated = "0x" + "ef".repeat(32);
+    expect(
+      findCheckpointRegistration(snapshot, "1", {
+        dataHash: slot.dataHash,
+        metadataHash: unrelated,
+      }),
+    ).toBeUndefined();
+    expect(
+      findCheckpointRegistration(snapshot, "1", {
+        dataHash: unrelated,
+        metadataHash: slot.metadataHash,
+      }),
+    ).toBeUndefined();
+  });
+});
 const slotSchema = z.object({
   expectedVersion: z.string(),
   dataHash: z.string(),
@@ -600,6 +682,32 @@ describe("durable owner additions recovery", () => {
       total: 2,
       through: { [SOURCE]: "2" },
     });
+  });
+});
+
+describe("in-memory receipt diagnostics", () => {
+  it("rejects malformed byte receipts without losing an outstanding reservation", async () => {
+    const { AdditionsBudget, AdditionsBudgetExceeded } =
+      await import("./budget.js");
+    const budget = new AdditionsBudget(12);
+    const pending = budget.reserve(4);
+    for (const invalid of [-1, 0.5]) {
+      expect(() => pending.settle(invalid)).toThrow(AdditionsBudgetExceeded);
+      expect(budget.remaining).toBe(8);
+    }
+    pending.settle(3);
+    expect(budget.remaining).toBe(9);
+  });
+
+  it("rejects duplicate settlement without changing recorded usage", async () => {
+    const { AdditionsBudget } = await import("./budget.js");
+    const budget = new AdditionsBudget(12);
+    const pending = budget.reserve(4);
+    pending.settle(2);
+    expect(() => pending.settle(2)).toThrow(
+      "Additions reservation already settled",
+    );
+    expect(budget.remaining).toBe(10);
   });
 });
 
@@ -1529,4 +1637,58 @@ it("returns freshly verified history without crossing a deleted portable-summary
   });
   expect(cold.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
   expect((await f.readRegistry())[ADDITIONS_SUMMARY_SCOPE]).toEqual(before);
+});
+
+describe("in-process scope scheduling", () => {
+  it("lets queued work continue in order after the first task rejects", async () => {
+    const { withScopeLock } = await import("./scope-lock.js");
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const failure = new Error("synthetic first task failed");
+    const first = withScopeLock("fixture.lock-order", async () => {
+      order.push("first");
+      await gate;
+      throw failure;
+    }).catch((error: unknown) => error);
+    const second = withScopeLock("fixture.lock-order", async () => {
+      order.push("second");
+      return "next";
+    });
+    try {
+      await Promise.resolve();
+      expect(order).toEqual(["first"]);
+    } finally {
+      release();
+    }
+    await expect(first).resolves.toBe(failure);
+    await expect(second).resolves.toBe("next");
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("does not delay an independent scope behind a waiting task", async () => {
+    const { withScopeLock } = await import("./scope-lock.js");
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = withScopeLock("fixture.lock-a", async () => {
+      await gate;
+      order.push("first finished");
+    });
+    const other = withScopeLock("fixture.lock-b", async () => {
+      order.push("other started");
+    });
+    try {
+      await Promise.resolve();
+      expect(order).toEqual(["other started"]);
+    } finally {
+      release();
+    }
+    await Promise.all([first, other]);
+    expect(order).toEqual(["other started", "first finished"]);
+  });
 });

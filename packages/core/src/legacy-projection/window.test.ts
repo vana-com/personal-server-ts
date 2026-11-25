@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   alternateLegacyBindingsForScope,
+  legacyAliasScopes,
   LEGACY_SCOPE_BINDINGS,
+  legacyScopeToPdppSelection,
   projectPdppRecordsToLegacyPayload,
   requiredLegacyStreams,
 } from "./index.js";
@@ -127,6 +129,42 @@ describe("windowed legacy projection", () => {
   }
 });
 
+describe("windowed projection caller contract", () => {
+  const scope = "chatgpt.conversations";
+
+  it("exports the parent key and served stream needed to make a window", () => {
+    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const window = binding.window!;
+    const aliases = legacyAliasScopes(scope);
+    const alias = aliases.find(({ connector }) => connector === "chatgpt");
+
+    expect(alias).toMatchObject({
+      windowed: true,
+      servedStream: window.parentStream,
+      window: {
+        parentStream: window.parentStream,
+        parentKey: binding.primaryKey[window.parentStream]![0],
+        childStream: window.childStream,
+        childKey: window.childKey,
+      },
+    });
+  });
+
+  it("returns a typed error instead of falling back to another known profile", () => {
+    const profileKey = "synthetic-unregistered-profile";
+    expect(
+      projectPdppRecordsToLegacyPayload(scope, [], {
+        profileKey,
+        fetchedStreams: [],
+        now: NOW,
+      }),
+    ).toEqual({
+      ok: false,
+      error: { kind: "unsupported_profile", scope, profileKey },
+    });
+  });
+});
+
 describe("legacy projection memory guard", () => {
   // A binding that joins streams builds all of them in memory at once unless
   // it declares a window. A new multi-stream binding must either window or
@@ -180,5 +218,40 @@ describe("required legacy stream planning", () => {
     expect(requiredLegacyStreams({ pdppStreams })).toEqual([
       "synthetic-primary",
     ]);
+  });
+});
+
+describe("legacy projection binding selection", () => {
+  it("keeps an unknown scope unknown even with an explicit profile", () => {
+    const scope = "no-such-connector.synthetic_records";
+    expect(
+      legacyScopeToPdppSelection(scope, { profileKey: "github-browser" }),
+    ).toEqual({
+      ok: false,
+      error: { kind: "unknown_scope", scope },
+    });
+    expect(
+      projectPdppRecordsToLegacyPayload(scope, [], {
+        profileKey: "github-browser",
+        fetchedStreams: [],
+      }),
+    ).toEqual({ ok: false, error: { kind: "unknown_scope", scope } });
+  });
+
+  it("does not fall back to the default binding for a mismatched explicit profile", () => {
+    const scope = "chatgpt.conversations";
+    const profileKey = "github-browser";
+    expect(legacyScopeToPdppSelection(scope).ok).toBe(true);
+    const error = { kind: "unsupported_profile", scope, profileKey };
+    expect(legacyScopeToPdppSelection(scope, { profileKey })).toEqual({
+      ok: false,
+      error,
+    });
+    expect(
+      projectPdppRecordsToLegacyPayload(scope, [], {
+        profileKey,
+        fetchedStreams: [],
+      }),
+    ).toEqual({ ok: false, error });
   });
 });

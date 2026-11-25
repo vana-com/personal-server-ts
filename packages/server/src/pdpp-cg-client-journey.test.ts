@@ -56,6 +56,7 @@ import {
   bearerTokenAuthorizationStrategy,
   PdppContextClient,
   PdppClientError,
+  PdppTransportError,
 } from "./__fixtures__/cg-pdpp-client/pdpp-context-client.js";
 
 const KNOWN_SIG =
@@ -295,6 +296,46 @@ describe("Context Gateway PdppContextClient against a real integrated PS", () =>
     await expect(client.listStreams()).rejects.toBeInstanceOf(PdppClientError);
     await expect(client.listStreams()).rejects.toMatchObject({
       code: "grant_revoked",
+    });
+  });
+});
+
+describe("vendored client diagnostic values", () => {
+  it("keeps structured request diagnostics and leaves absent fields unset", () => {
+    const input = {
+      httpStatus: 400,
+      code: "invalid_cursor",
+      type: "invalid_request_error",
+      message: "Unreadable cursor",
+    } as const;
+    const bare = new PdppClientError(input);
+    expect(bare).toMatchObject({ name: "PdppClientError", ...input });
+    expect(bare.requestId).toBeUndefined();
+    expect(bare.param).toBeUndefined();
+    expect(
+      new PdppClientError({
+        ...input,
+        param: "cursor",
+        requestId: "fixture-request",
+      }),
+    ).toMatchObject({
+      ...input,
+      param: "cursor",
+      requestId: "fixture-request",
+    });
+  });
+
+  it("keeps transport diagnostics distinct from typed request failures", () => {
+    const error = new PdppTransportError({
+      httpStatus: 502,
+      message: "Unrecognized response",
+    });
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(PdppClientError);
+    expect(error).toMatchObject({
+      name: "PdppTransportError",
+      httpStatus: 502,
+      message: "Unrecognized response",
     });
   });
 });

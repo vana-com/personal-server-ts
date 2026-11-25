@@ -150,6 +150,62 @@ describe("migrateLocalState", () => {
     ).resolves.toContain('"version": 1');
   });
 
+  it("preserves the migration journal during a file-only run at a custom state path", async () => {
+    const stateDir = join(storageRoot, "custom");
+    const statePath = join(stateDir, "state.json");
+    const migrations = {
+      applied: ["2026-01-01-test-step"],
+      log: [
+        {
+          id: "2026-01-01-test-step",
+          ranAt: "2026-01-01T00:00:00.000Z",
+          changed: true,
+          detail: "test fixture",
+        },
+      ],
+    };
+    await mkdir(stateDir);
+    await writeFile(statePath, JSON.stringify({ version: 1, migrations }));
+
+    const result = await migrateLocalState({
+      storageRoot,
+      dataDir,
+      configPath,
+      syncCursorPath,
+      tokensPath,
+      statePath,
+    });
+
+    expect(result.statePath).toBe(statePath);
+    expect(result.migrations).toEqual(migrations);
+    expect(JSON.parse(await readFile(statePath, "utf-8"))).toMatchObject({
+      version: 1,
+      migrations,
+    });
+    await expect(
+      readFile(join(storageRoot, "state.json"), "utf-8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rebuilds unreadable JSON bookkeeping without inventing migration history", async () => {
+    const statePath = join(storageRoot, "state.json");
+    await writeFile(statePath, "{truncated");
+
+    const result = await migrateLocalState({
+      storageRoot,
+      dataDir,
+      configPath,
+      syncCursorPath,
+      tokensPath,
+    });
+
+    expect(result.statePath).toBe(statePath);
+    expect(result).not.toHaveProperty("migrations");
+    const state = JSON.parse(await readFile(statePath, "utf-8"));
+    expect(state).toMatchObject({ version: 1, components: { index: 1 } });
+    expect(state).not.toHaveProperty("migrations");
+  });
+
   it("runs the state-migration registry against index.db and records the detection non-destructively", async () => {
     // Seed a stuck scope: two pending (unsynced) rows.
     const db = initializeDatabase(join(storageRoot, "index.db"));

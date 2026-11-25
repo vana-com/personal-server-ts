@@ -112,10 +112,14 @@ export function runStateMigrations(
       needed = migration.check(ctx);
     } catch (err) {
       // Leave unmarked so a transient failure retries on the next boot.
-      ctx.logger?.warn(
-        { migration: migration.id, error: (err as Error).message },
-        "State migration check failed; skipping",
-      );
+      try {
+        ctx.logger?.warn(
+          { migration: migration.id, error: (err as Error).message },
+          "State migration check failed; skipping",
+        );
+      } catch {
+        // A diagnostic failure must not prevent the next migration check.
+      }
       continue;
     }
 

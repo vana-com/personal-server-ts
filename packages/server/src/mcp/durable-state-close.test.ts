@@ -378,4 +378,51 @@ describe("MCP durable state close", () => {
     expect(s.state.close()).toBe(first);
     await first;
   });
+
+  it("settles queued callbacks in order before shutdown completes", async () => {
+    const { state } = await emptyTarget();
+    const events: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const first = state.exclusive(async () => {
+      await gate;
+      events.push("first");
+    });
+    const second = state.exclusive(async () => {
+      events.push("second");
+    });
+    const closing = state.close().then(() => events.push("closed"));
+
+    release();
+    await Promise.all([first, second, closing]);
+    expect(events).toEqual(["first", "second", "closed"]);
+  });
+
+  it("does not delay a separate instance closing while a callback drains", async () => {
+    const { state: first } = await emptyTarget();
+    const { state: second } = await emptyTarget();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const pending = first.exclusive(async () => {
+      await gate;
+    });
+    let firstClosed = false;
+    const closing = first.close().then(() => {
+      firstClosed = true;
+    });
+
+    try {
+      await second.close();
+      expect(firstClosed).toBe(false);
+    } finally {
+      release();
+      await Promise.all([pending, closing]);
+    }
+    expect(firstClosed).toBe(true);
+  });
 });

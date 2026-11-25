@@ -80,6 +80,31 @@ describe("a scoped caller's result is decided only by its own connections", () =
   const deferred = (id: string) => [
     { stream: id, outcome: "deferred" as const, watermark: 1 },
   ];
+  it("keeps a settled receipt when owner discovery for an unplaced connection fails", async () => {
+    const deps = dependencies();
+    vi.mocked(knownActiveConnections).mockResolvedValue([connection("own")]);
+    vi.mocked(newConnectionsWithStreams).mockResolvedValue([]);
+    vi.mocked(connectionsWithStreams).mockResolvedValue([
+      connection("own"),
+      connection("unplaced"),
+    ]);
+    vi.mocked(publishLog).mockImplementation(async (_deps, id) =>
+      published(id),
+    );
+    vi.spyOn(deps.registry, "listOwnerRows").mockRejectedValue(
+      fails("listing"),
+    );
+
+    const report = await runPublish(deps, ["own"]);
+
+    expect(report.cycleError).toBe("listing failed");
+    expect(report.connections).toEqual([
+      { connectionId: "own", published: published("own"), error: null },
+      { connectionId: "unplaced", published: [], error: "listing failed" },
+    ]);
+    expect(publishLog).toHaveBeenCalledTimes(1);
+  });
+
   /**
    * `sibling` always defers in the early publish, so the fallback runs. `own`
    * settles there, or (`ownNeedsFallback`: a reconnect, say) defers too and is

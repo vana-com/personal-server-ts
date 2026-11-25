@@ -9,7 +9,50 @@ const unrestricted = {
 };
 
 const cases: [string, unknown, { since: string | null } | null][] = [
+  [
+    "a streams object instead of a list",
+    {
+      streams: {
+        0: { name: "sleep" },
+        1: { name: "readiness" },
+        2: { name: "activity" },
+        length: 3,
+      },
+    },
+    null,
+  ],
+  [
+    "a range object without a string since value",
+    {
+      streams: unrestricted.streams.map((stream) => ({
+        ...stream,
+        time_range: { since: 20260103 },
+      })),
+    },
+    null,
+  ],
   ["exactly the three unrestricted streams", unrestricted, { since: null }],
+  [
+    "the same unrestricted selection in another order",
+    {
+      streams: [
+        unrestricted.streams[2],
+        unrestricted.streams[0],
+        unrestricted.streams[1],
+      ],
+    },
+    { since: null },
+  ],
+  [
+    "a real leap day common to all three streams",
+    {
+      streams: unrestricted.streams.map((stream) => ({
+        name: stream.name,
+        time_range: { since: "2024-02-29" },
+      })),
+    },
+    { since: "2024-02-29" },
+  ],
   [
     "exactly the three prefixed streams with a common valid since",
     {
@@ -166,6 +209,26 @@ const cases: [string, unknown, { since: string | null } | null][] = [
         name: stream.name,
         time_range: {},
       })),
+    },
+    null,
+  ],
+  ...[null, [], "2026-01-03"].map((range): [string, unknown, null] => [
+    `a non-object range ${JSON.stringify(range)} on one otherwise valid stream`,
+    {
+      streams: unrestricted.streams.map((stream, index) =>
+        index === 0 ? { ...stream, time_range: range } : stream,
+      ),
+    },
+    null,
+  ]),
+  [
+    "a twice-prefixed stream name",
+    {
+      streams: [
+        { name: "oura.oura.sleep" },
+        { name: "readiness" },
+        { name: "activity" },
+      ],
     },
     null,
   ],

@@ -1,6 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
-import { access, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  writeFile,
+  rm,
+  stat,
+  utimes,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { loadConfig, parseConfigJson } from "./loader.js";
 import {
@@ -40,9 +48,12 @@ describe("loadConfig", () => {
   it("loads an on-disk config that starts with a UTF-8 BOM", async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, "config.json");
-      await writeFile(configPath, "\uFEFF{}", "utf-8");
+      const configuredPort = DEFAULTS.server.port + 1;
+      const raw =
+        "\uFEFF" + JSON.stringify({ server: { port: configuredPort } });
+      await writeFile(configPath, raw, "utf-8");
       const config = await loadConfig({ configPath });
-      expect(config.server.port).toBe(DEFAULTS.server.port);
+      expect(config.server.port).toBe(configuredPort);
     });
   });
 
@@ -122,9 +133,11 @@ describe("loadConfig", () => {
   it("throws for malformed JSON", async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, "config.json");
-      await writeFile(configPath, "{ invalid json }}}");
+      const malformed = "{ invalid json }}}";
+      await writeFile(configPath, malformed);
 
       await expect(loadConfig({ configPath })).rejects.toThrow(SyntaxError);
+      expect(await readFile(configPath, "utf-8")).toBe(malformed);
     });
   });
 
@@ -169,12 +182,16 @@ describe("loadConfig", () => {
       // First load writes defaults
       await loadConfig({ configPath });
       const firstWrite = await readFile(configPath, "utf-8");
+      const sentinelTime = new Date("2000-01-01T00:00:00Z");
+      await utimes(configPath, sentinelTime, sentinelTime);
+      const before = await stat(configPath);
 
-      // Second load should not rewrite (content identical)
+      // Identical bytes alone would also pass if the loader rewrote the file.
       await loadConfig({ configPath });
       const secondRead = await readFile(configPath, "utf-8");
 
       expect(secondRead).toBe(firstWrite);
+      expect((await stat(configPath)).mtimeMs).toBe(before.mtimeMs);
     });
   });
 
