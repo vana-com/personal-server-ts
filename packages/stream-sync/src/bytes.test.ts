@@ -8,6 +8,11 @@ import {
   utf8,
   utf8Length,
 } from "./bytes.js";
+import {
+  canonicalJson,
+  canonicalJsonChunks,
+  JSON_CHUNK_UNITS,
+} from "./json.js";
 
 const digits = "0123456789abcdefABCDEF".repeat(3).slice(0, 64);
 const lower = `0x${digits.toLowerCase()}`;
@@ -38,6 +43,22 @@ describe("canonicalBytes32", () => {
   });
 });
 
+describe("utf8", () => {
+  it("preserves byte-order mark, combining form and an embedded NUL", () => {
+    expect(Array.from(utf8("\uFEFFe\u0301\u0000"))).toEqual([
+      0xef, 0xbb, 0xbf, 0x65, 0xcc, 0x81, 0,
+    ]);
+  });
+
+  it("replaces unpaired UTF-16 units without losing the adjacent pair or text", () => {
+    const sample = "\uD800\uD83D\uDC1F\uDC00X";
+    expect(Array.from(utf8(sample))).toEqual([
+      0xef, 0xbf, 0xbd, 0xf0, 0x9f, 0x90, 0x9f, 0xef, 0xbf, 0xbd, 0x58,
+    ]);
+    expect(utf8Length(sample)).toBe(11);
+  });
+});
+
 describe("utf8Length", () => {
   it("counts the bytes the encoder would write", () => {
     const samples = [
@@ -52,6 +73,24 @@ describe("utf8Length", () => {
       expect(utf8Length(text)).toBe(utf8(text).length);
     }
   });
+
+  it("counts exactly at the one-, two-, three-, and four-byte boundaries", () => {
+    const cases = [
+      [0x7f, 1],
+      [0x80, 2],
+      [0x7ff, 2],
+      [0x800, 3],
+      [0xffff, 3],
+      [0x10000, 4],
+      [0x10ffff, 4],
+    ] as const;
+    for (const [point, width] of cases) {
+      expect(utf8Length(String.fromCodePoint(point))).toBe(width);
+    }
+    expect(
+      utf8Length(String.fromCodePoint(...cases.map(([point]) => point))),
+    ).toBe(19);
+  });
 });
 
 describe("toHex", () => {
@@ -59,6 +98,13 @@ describe("toHex", () => {
     const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
     expect(toHex(bytes)).toBe(Buffer.from(bytes).toString("hex"));
     expect(toHex(new Uint8Array())).toBe("");
+  });
+
+  it("formats only a subview, leaving its neighboring bytes unchanged", () => {
+    const backing = Uint8Array.of(0xf1, 0, 0xab, 0xff, 0xf2);
+    expect(toHex(backing.subarray(1, 4))).toBe("00abff");
+    expect(toHex(backing.subarray(2, 2))).toBe("");
+    expect(Array.from(backing)).toEqual([0xf1, 0, 0xab, 0xff, 0xf2]);
   });
 });
 
@@ -109,5 +155,37 @@ describe("hash port output formatting", () => {
       `0x${"00".repeat(32)}`,
     );
     expect(attempts).toBe(2);
+  });
+});
+
+describe("encoding JSON as bytes", () => {
+  it("refuses a Date object rather than silently encoding it as text", () => {
+    const value = "2026-06-01T00:00:00.000Z";
+    expect(() => utf8(canonicalJson({ label: new Date(value) }))).toThrow(
+      expect.objectContaining({
+        code: "non-canonical-value",
+        message: "only plain objects are allowed",
+      }),
+    );
+    expect(
+      new TextDecoder().decode(utf8(canonicalJson({ label: value }))),
+    ).toBe('{"label":"2026-06-01T00:00:00.000Z"}');
+  });
+
+  it("terminates a partial text iterator when a later value cannot be serialized", () => {
+    const chunks = canonicalJsonChunks([
+      "a".repeat(JSON_CHUNK_UNITS),
+      undefined,
+    ]);
+    const first = chunks.next();
+    if (first.done) throw new Error("expected an initial text chunk");
+    expect(first.value.startsWith('["a')).toBe(true);
+    expect(() => chunks.next()).toThrow(
+      expect.objectContaining({
+        code: "non-canonical-value",
+        message: "unsupported value of type undefined",
+      }),
+    );
+    expect(chunks.next().done).toBe(true);
   });
 });

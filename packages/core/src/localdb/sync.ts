@@ -409,10 +409,21 @@ export function createLocalSync(
       return;
     }
     if (takers.length === 0) return;
-    void Promise.all([Promise.all(landings), Promise.all(erasures)])
-      .then(async ([results]) => {
+    void Promise.all([
+      Promise.allSettled(landings),
+      Promise.allSettled(erasures),
+    ])
+      .then(async ([results, erased]) => {
         await idle();
-        return results.filter((p): p is PendingDelete => p !== null);
+        const rejected = [...results, ...erased].find(
+          (outcome) => outcome.status === "rejected",
+        );
+        if (rejected?.status === "rejected") throw rejected.reason;
+        return results.flatMap((outcome) =>
+          outcome.status === "fulfilled" && outcome.value !== null
+            ? [outcome.value]
+            : [],
+        );
       })
       .then(
         (pending) => takers.forEach((taker) => taker.done(pending)),

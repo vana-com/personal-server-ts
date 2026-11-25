@@ -538,4 +538,67 @@ describe("a cursor the gateway rejects", () => {
     expect(cursorless()).toBe(4);
     t.stop();
   });
+
+  it("restarts cursor-rejection back-off after a successful request with a cursor", async () => {
+    const gateway = createFakeChangeGateway({ seq: 5 });
+    const t = subscribed(gateway);
+    try {
+      await flush();
+      const first = gateway.cursor();
+      expect(gateway.requests.at(-1)!.after).toBe(first);
+      gateway.rejectCursorOnce(first);
+      const duringFailures = gateway.commit();
+      gateway.rejectCursorOnce(duringFailures);
+      await flush();
+      expect(gateway.requests.slice(-2).map((r) => r.after)).toEqual([
+        undefined,
+        duringFailures,
+      ]);
+
+      // Keep the first failure run going for two back-off steps.
+      gateway.rejectCursorOnce(duringFailures);
+      const firstBackoff = gateway.requests.length;
+      await vi.advanceTimersByTimeAsync(999);
+      expect(gateway.requests).toHaveLength(firstBackoff);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(gateway.requests.slice(firstBackoff).map((r) => r.after)).toEqual([
+        undefined,
+        duringFailures,
+      ]);
+      const secondBackoff = gateway.requests.length;
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(gateway.requests).toHaveLength(secondBackoff);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(gateway.requests.slice(secondBackoff).map((r) => r.after)).toEqual(
+        [undefined, duringFailures],
+      );
+
+      // The fresh cursor is now held. A write makes it answer successfully.
+      expect(gateway.held()).toBe(1);
+      const recovered = gateway.commit();
+      await flush();
+      expect(t.positions().at(-1)).toBe(recovered);
+      expect(gateway.requests.at(-1)!.after).toBe(recovered);
+
+      const secondRun = gateway.requests.length;
+      gateway.rejectCursorOnce(recovered);
+      const fresh = gateway.commit();
+      gateway.rejectCursorOnce(fresh);
+      await flush(); // No positive fake-clock advance: the cursorless retry is immediate.
+      expect(gateway.requests.slice(secondRun).map((r) => r.after)).toEqual([
+        undefined,
+        fresh,
+      ]);
+      const resetBackoff = gateway.requests.length;
+      await vi.advanceTimersByTimeAsync(999);
+      expect(gateway.requests).toHaveLength(resetBackoff);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(gateway.requests.slice(resetBackoff).map((r) => r.after)).toEqual([
+        undefined,
+        fresh,
+      ]);
+    } finally {
+      t.stop();
+    }
+  });
 });

@@ -497,7 +497,8 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
     await settle();
 
     // Storage answers; the loop's next look at what is owed is held open.
-    const query = a.db.query.bind(a.db);
+    const originalQuery = a.db.query;
+    const query = originalQuery.bind(a.db);
     let reading!: () => void;
     const looked = new Promise<void>((resolve) => (reading = resolve));
     let open!: () => void;
@@ -510,15 +511,75 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
       }
       return rows;
     }) as typeof a.db.query;
-    release();
-    await looked;
-    await settle();
-    expect(answered).toBe(false);
+    try {
+      release();
+      await looked;
+      await settle();
+      expect(answered).toBe(false);
+      open();
+      await resumed;
+      // Answered after the decision: nothing is owed, so no timer is armed.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      release();
+      open();
+      a.db.query = originalQuery;
+    }
+  });
 
-    open();
-    await resumed;
-    // Answered after the decision: nothing is owed, so no timer is armed.
-    expect(vi.getTimerCount()).toBe(0);
+  it("waits for sibling runs and the timer decision before surfacing an erasure failure", async () => {
+    const { a } = await collected();
+    const originalQuery = a.db.query;
+    const error = new Error("synthetic erasure failed");
+    let fail!: (error: Error) => void;
+    const failed = new Promise<void>((_, reject) => (fail = reject));
+    void failed.catch(() => undefined);
+    let finishSibling!: () => void;
+    const sibling = new Promise<void>((resolve) => (finishSibling = resolve));
+    let sawRead!: () => void;
+    const reading = new Promise<void>((resolve) => (sawRead = resolve));
+    let releaseRead!: () => void;
+    const holdRead = new Promise<void>((resolve) => (releaseRead = resolve));
+    let installed = false;
+    let answered = false;
+    const original = originalQuery.bind(a.db);
+    gap.extraRuns = () => {
+      installed = true;
+      return [failed, sibling];
+    };
+    a.db.query = (async (sql: string, params?: readonly unknown[]) => {
+      if (installed && sql.includes("FROM delete_intents LIMIT 1")) {
+        sawRead();
+        await holdRead;
+      }
+      return original(sql, params);
+    }) as typeof a.db.query;
+    const resumed = a.sync.deleter.resumeDeletes().then(
+      () => {
+        answered = true;
+        return undefined;
+      },
+      (reason: unknown) => {
+        answered = true;
+        return reason;
+      },
+    );
+    try {
+      await reading;
+      fail(error);
+      releaseRead();
+      await settle();
+      expect(answered).toBe(false);
+      finishSibling();
+      expect(await resumed).toBe(error);
+    } finally {
+      releaseRead();
+      finishSibling();
+      fail(error);
+      a.db.query = originalQuery;
+      gap.extraRuns = undefined;
+      await resumed;
+    }
   });
 
   it("leaves no rejection unhandled when a run fails while the loop's read of what is owed fails", async () => {

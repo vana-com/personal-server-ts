@@ -154,6 +154,55 @@ describe("stream-sync read names", () => {
 });
 
 describe("live stream status projection", () => {
+  it("omits connections that have no known streams", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      listed: true,
+      issues: [],
+      connections: [{ connector: "fixture-empty", ns: "", streams: {} }],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+
+    expect(liveStreamCounts(status)).toEqual([]);
+  });
+
+  it("keeps separate rows and their counts for the same stream name", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      listed: true,
+      issues: [],
+      connections: [
+        {
+          connector: "fixture-a",
+          ns: "",
+          streams: {
+            items: {
+              live: true,
+              version: 1,
+              records: 2,
+              digest: "a".repeat(64),
+            },
+          },
+        },
+        {
+          connector: "fixture-b",
+          ns: "",
+          streams: { items: { live: true, version: 1, records: 7 } },
+        },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+
+    expect(liveStreamCounts(status)).toEqual([
+      {
+        connector: "fixture-a",
+        ns: "",
+        stream: "items",
+        records: 2,
+        digest: "a".repeat(64),
+      },
+      { connector: "fixture-b", ns: "", stream: "items", records: 7 },
+    ]);
+  });
+
   it("distinguishes a live empty stream from a non-live head's cached count", async () => {
     const { liveStreamCounts } = await import("./service.js");
     const status = {
@@ -174,6 +223,45 @@ describe("live stream status projection", () => {
     expect(liveStreamCounts(status)).toEqual([
       { connector: "fixture", ns: "", stream: "empty", records: 0 },
       { connector: "fixture", ns: "", stream: "pending", records: null },
+    ]);
+  });
+
+  it("keeps streams of the same name in distinct connections", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const status = {
+      connections: [
+        {
+          connector: "fixture",
+          ns: "first",
+          streams: { rows: { live: true, records: 1 } },
+        },
+        {
+          connector: "fixture",
+          ns: "second",
+          streams: { rows: { live: true, records: 2 } },
+        },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+    expect(liveStreamCounts(status)).toEqual([
+      { connector: "fixture", ns: "first", stream: "rows", records: 1 },
+      { connector: "fixture", ns: "second", stream: "rows", records: 2 },
+    ]);
+  });
+
+  it("retains a digest for an audited complete live stream", async () => {
+    const { liveStreamCounts } = await import("./service.js");
+    const digest = "a".repeat(64);
+    const status = {
+      connections: [
+        {
+          connector: "fixture",
+          ns: "",
+          streams: { rows: { live: true, records: 3, digest } },
+        },
+      ],
+    } as unknown as Parameters<typeof liveStreamCounts>[0];
+    expect(liveStreamCounts(status)).toEqual([
+      { connector: "fixture", ns: "", stream: "rows", records: 3, digest },
     ]);
   });
 

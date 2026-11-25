@@ -215,6 +215,29 @@ describe("planBlobDeletions", () => {
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
+  it("returns an empty plan when an unregistered scope has no local rows", () => {
+    const listVersions = vi.fn(() => []);
+    expect(planBlobDeletions({ listVersions }, SCOPE, null)).toEqual({
+      keys: [],
+      range: null,
+    });
+    expect(listVersions).toHaveBeenCalledWith(SCOPE, { limit: 500, offset: 0 });
+  });
+
+  it("keeps each synthetic local key once and orders keys numerically", () => {
+    const storage = {
+      listVersions: vi.fn(() => [
+        entry({ id: 1, version: 20, dataPointId: null }),
+        entry({ id: 2, version: 3, dataPointId: null }),
+        entry({ id: 3, version: 20, dataPointId: null }),
+      ]),
+    };
+    expect(planBlobDeletions(storage, SCOPE, null)).toEqual({
+      keys: ["3", "20"],
+      range: null,
+    });
+  });
+
   it("walks every page of local versions", () => {
     // Unsynced and unmarked: every one is covered, whatever its version.
     const page = Array.from({ length: 500 }, (_, i) =>

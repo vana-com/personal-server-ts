@@ -53,3 +53,13 @@ it("distinguishes ordinary catalog labels from the platform namespace", () => {
   expect(isReservedSystemConnector("catalog")).toBe(false);
   expect(isReservedSystemScope("pdpp.catalog.records")).toBe(false);
 });
+
+it("recognizes connector-level platform scope names before a stream is named", () => {
+  expect(isReservedSystemScope("pdpp.vana-system-synthetic")).toBe(true);
+  expect(isReservedSystemScope("pdpp.vana-system-example")).toBe(true);
+});
+
+it("recognizes nested names in the ordinary memory catalog", () => {
+  expect(isMemoryScope("memory.project.notes")).toBe(true);
+  expect(isMemoryScope("memory.project.decisions")).toBe(true);
+});

@@ -7,6 +7,7 @@ import {
 import {
   handleOwnerConnectorDelete,
   handleOwnerConnectorLifetime,
+  ownerConnectorRefusal,
   type ConnectionDeletePort,
   type OwnerConnectorDeleteDeps,
 } from "./owner-connector-delete.js";
@@ -50,6 +51,27 @@ function deleteRequest(): Request {
     method: "DELETE",
   });
 }
+
+describe("ownerConnectorRefusal envelope", () => {
+  it("sends refusal JSON with a no-store cache directive", () => {
+    const reply = ownerConnectorRefusal(
+      503,
+      "FIXTURE_UNAVAILABLE",
+      "Try again soon",
+    );
+    expect(reply.status).toBe(503);
+    expect(reply.headers.get("content-type")).toBe("application/json");
+    expect(reply.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("preserves the display message and mirrors the status in the error body", async () => {
+    const message = 'Résumé: "try again"';
+    const reply = ownerConnectorRefusal(409, "FIXTURE_CONFLICT", message);
+    expect(await reply.json()).toEqual({
+      error: { code: 409, errorCode: "FIXTURE_CONFLICT", message },
+    });
+  });
+});
 
 describe("handleOwnerConnectorDelete (PS-2 W6 owner-delete)", () => {
   it("calls ConnectionDeleter.requestConnectionDelete with the connector id and answers 202 with the deleteId", async () => {

@@ -47,6 +47,11 @@ export const ACCESS_ACTIVITY_DESCRIPTOR = {
       !["read", "write", "delete", "lineage"].includes(String(data.action))
     )
       throw new Error("Invalid access activity event");
+    if (
+      typeof data.occurredAt !== "string" ||
+      !Number.isFinite(Date.parse(data.occurredAt))
+    )
+      throw new Error("Invalid access activity timestamp");
     for (const key of ["eventId", "instanceId"])
       if (
         typeof data[key] !== "string" ||

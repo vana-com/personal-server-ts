@@ -162,6 +162,42 @@ describe("createAccessLogMiddleware", () => {
     expect(entry.timestamp).toBeDefined();
   });
 
+  it.each([201, 206])(
+    "audits a successful status other than 200 (%s)",
+    async (status) => {
+      const writer = createMockWriter();
+      const res = await createApp(writer, { status }).request(
+        "/v1/data/instagram.profile",
+      );
+
+      expect(res.status).toBe(status);
+      expect(writer.write).toHaveBeenCalledOnce();
+      expect(writer.write).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scope: "instagram.profile",
+          grantId: "grant-123",
+        }),
+      );
+    },
+  );
+
+  it("uses the real-IP header only when forwarded-for is absent", async () => {
+    const writer = createMockWriter();
+    const app = createApp(writer);
+    const path = "/v1/data/instagram.profile";
+    await app.request(path, {
+      headers: { "x-real-ip": "192.0.2.2", "x-forwarded-for": "192.0.2.1" },
+    });
+    await app.request(path, { headers: { "x-real-ip": "192.0.2.2" } });
+    await app.request(path);
+
+    expect(writer.write.mock.calls.map(([entry]) => entry.ipAddress)).toEqual([
+      "192.0.2.1",
+      "192.0.2.2",
+      "unknown",
+    ]);
+  });
+
   it("401 response does not write entry", async () => {
     const writer = createMockWriter();
     const app = createApp(writer);

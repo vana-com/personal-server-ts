@@ -79,6 +79,34 @@ async function build(seal: LegacyWriteSeal) {
   return { deps, storage, provider };
 }
 
+describe("computeQuestion before inference", () => {
+  it("skips an unknown question without altering an existing registration", async () => {
+    const f = await build(fixedLegacyWriteSeal("unswitched"));
+    expect(await computeQuestion("unknown-fixture-question", f.deps)).toEqual({
+      status: "skipped",
+      reason: "unknown-question",
+    });
+    expect(f.provider.calls).toHaveLength(0);
+    expect(await f.deps.store.get("q-1")).toMatchObject({ status: "pending" });
+    expect(f.storage.findEntry({ scope: "coach.weekly" })).toBeUndefined();
+  });
+
+  it("reports an unseeded source without inference or a derivative write", async () => {
+    const f = await build(fixedLegacyWriteSeal("unswitched"));
+    const store = createInMemoryQuestionStore({
+      initial: [{ ...registration, sourceScopes: ["fixture.absent"] }],
+    });
+    const outcome = await computeQuestion("q-1", { ...f.deps, store });
+    expect(outcome.status).toBe("failed");
+    expect(f.provider.calls).toHaveLength(0);
+    expect(await store.get("q-1")).toMatchObject({
+      status: "failed",
+      errorCode: "source_missing",
+    });
+    expect(f.storage.findEntry({ scope: "coach.weekly" })).toBeUndefined();
+  });
+});
+
 describe("computeQuestion when legacy storage is closed", () => {
   // COMPUTE_SPENDS_INFERENCE_BEFORE_SEAL
   it("on a switched account fails closed as internal without asking the model", async () => {
@@ -162,4 +190,59 @@ describe("computeQuestion when inference is unavailable", () => {
       });
     });
   }
+
+  it("stores an answer after one temporary inference failure and no extra delay", async () => {
+    const f = await build(fixedLegacyWriteSeal("unswitched"));
+    const delays: number[] = [];
+    const provider = createFakeInferenceProvider({
+      respond: (_input, index) => {
+        if (index === 0)
+          throw new InferenceRequestError("temporary fixture failure", 503);
+        return {
+          content: JSON.stringify({
+            answer: "fixture answer",
+            evidence: "fixture evidence",
+          }),
+          receiptId: "fixture-receipt",
+        };
+      },
+    });
+    const outcome = await computeQuestion("q-1", {
+      ...f.deps,
+      provider,
+      retryDelaysMs: [7, 11],
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+    });
+    expect(outcome.status).toBe("ready");
+    expect(provider.calls).toHaveLength(2);
+    expect(delays).toEqual([7]);
+    expect(f.storage.findEntry({ scope: "coach.weekly" })).toBeDefined();
+  });
+
+  it("honors an explicitly empty inference retry schedule", async () => {
+    const f = await build(fixedLegacyWriteSeal("unswitched"));
+    const delays: number[] = [];
+    const provider = createFakeInferenceProvider({
+      respond: () => {
+        throw new InferenceRequestError("temporary fixture failure", 503);
+      },
+    });
+    const outcome = await computeQuestion("q-1", {
+      ...f.deps,
+      provider,
+      retryDelaysMs: [],
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+    });
+    expect(outcome.status).toBe("failed");
+    expect(provider.calls).toHaveLength(1);
+    expect(delays).toEqual([]);
+    expect(f.storage.findEntry({ scope: "coach.weekly" })).toBeUndefined();
+    expect(await f.deps.store.get("q-1")).toMatchObject({
+      errorCode: "inference_unavailable",
+    });
+  });
 });

@@ -16,6 +16,51 @@ import { endRequest } from "../../../core/src/test-utils/run-end.js";
 import { createRunEndStore } from "../../../core/src/localdb/run-end.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
+import { ACCESS_ACTIVITY_DESCRIPTOR } from "../../../core/src/logging/activity-stream.js";
+
+it("rejects an access activity descriptor with an unreadable timestamp", () => {
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    action: "read",
+    scope: "fixture.scope",
+    grantId: "fixture-grant",
+    builder: "fixture-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      ...event,
+      occurredAt: "not a timestamp",
+    }),
+  ).toThrow("Invalid access activity timestamp");
+});
+
+it.each([{ schemaVersion: 2 }, { phase: "finished" }])(
+  "reports a stable activity descriptor error for %j",
+  async (change) => {
+    const { ACCESS_ACTIVITY_DESCRIPTOR } =
+      await import("../../../core/src/logging/activity-stream.js");
+    const event = {
+      schemaVersion: 1,
+      eventId: "00000000-0000-4000-8000-000000000001",
+      instanceId: "00000000-0000-4000-8000-000000000002",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      action: "read",
+      scope: "fixture.scope",
+      grantId: "fixture-grant",
+      builder: "fixture-builder",
+      phase: "served-start",
+    };
+    expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, ...change }),
+    ).toThrow(/^Invalid access activity event$/);
+  },
+);
 
 const owner = `0x${"12".repeat(20)}` as const;
 const descriptor = {
@@ -377,6 +422,46 @@ it("rejects an empty scope in an otherwise valid access activity event", async (
   ).toThrow("Invalid access activity field");
 });
 
+it("accepts each supported access activity action", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  for (const action of ["read", "write", "delete", "lineage"] as const) {
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({
+        schemaVersion: 1,
+        eventId: "00000000-0000-4000-8000-000000000001",
+        instanceId: "00000000-0000-4000-8000-000000000002",
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        action,
+        scope: "synthetic.entries",
+        grantId: "synthetic-grant",
+        builder: "synthetic-builder",
+        phase: "served-start",
+      }),
+    ).not.toThrow();
+  }
+});
+
+it("accepts the maximum access activity scope length but not one character more", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    action: "read",
+    scope: "s".repeat(512),
+    grantId: "synthetic-grant",
+    builder: "synthetic-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, scope: event.scope + "s" }),
+  ).toThrow("Invalid access activity field");
+});
+
 it("retention deletes old activity canonically and persists its deletion watermark", async () => {
   const { createAccessActivity } =
     await import("../../../core/src/logging/activity-stream.js");
@@ -405,6 +490,48 @@ it("retention deletes old activity canonically and persists its deletion waterma
     "SELECT tombstone_wm_o FROM connections WHERE connector='vana-system-access-v1'",
   );
   expect(deleted!.tombstone_wm_o).toBeGreaterThan(f.deps.now());
+});
+
+it("rejects incomplete access activity attribution", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    action: "read",
+    scope: "synthetic.entries",
+    grantId: "synthetic-grant",
+    builder: "synthetic-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  for (const field of ["grantId", "builder"]) {
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, [field]: "" }),
+    ).toThrow("Invalid access activity field");
+  }
+});
+
+it("distinguishes unknown access activity phases from served-start", async () => {
+  const { ACCESS_ACTIVITY_DESCRIPTOR } =
+    await import("../../../core/src/logging/activity-stream.js");
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    action: "read",
+    scope: "synthetic.entries",
+    grantId: "synthetic-grant",
+    builder: "synthetic-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, phase: "served-finish" }),
+  ).toThrow("Invalid access activity event");
 });
 
 it("owner history pages tied timestamps without skips, duplicate rows or recursive audit", async () => {

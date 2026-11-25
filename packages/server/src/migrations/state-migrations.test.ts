@@ -33,6 +33,34 @@ let clock = 0;
 const now = () => `2026-07-14T00:00:${String(clock++).padStart(2, "0")}Z`;
 
 describe("runStateMigrations", () => {
+  it("continues when a failed check's warning sink also throws", () => {
+    const next = vi.fn();
+    const skipped = vi.fn();
+    const warn = vi.fn(() => {
+      throw new Error("sink failed");
+    });
+    const state = runStateMigrations(
+      { ...ctx, logger: { warn, info: vi.fn() } },
+      undefined,
+      {
+        migrations: [
+          oneShot("skipped", skipped, () => {
+            throw new Error("check failed");
+          }),
+          oneShot("next", next),
+        ],
+        now,
+      },
+    );
+    expect(warn).toHaveBeenCalledWith(
+      { migration: "skipped", error: "check failed" },
+      "State migration check failed; skipping",
+    );
+    expect(skipped).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(state.applied).toEqual(["next"]);
+  });
+
   it("tolerates a malformed prior ledger (non-array applied/log) instead of bricking boot", () => {
     // A corrupt / hand-edited state.json parses to valid JSON with wrong types.
     const malformed = {

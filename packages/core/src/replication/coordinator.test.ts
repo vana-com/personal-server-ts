@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   ProgressReport,
   ReplicaPhaseHandler,
   ReplicaWorkItem,
 } from "./coordinator.js";
-import { createReplicaCoordinator, REPLICA_STEP_BYTES } from "./coordinator.js";
+import {
+  abortable,
+  createReplicaCoordinator,
+  REPLICA_STEP_BYTES,
+} from "./coordinator.js";
 import type {
   ReplicaDependency,
   ReplicaOutcome,
@@ -505,6 +509,43 @@ describe("schedule.ts replicaEligibleAt synthetic timing", () => {
 
     expect(replicaEligibleAt(item, hint)).toBe(180);
     expect(replicaEligibleAt(item, { ...hint, hintRefreshAt: 240 })).toBe(240);
+  });
+});
+
+describe("replica scheduling numeric boundaries", () => {
+  it("stops parking on a hint at the exact long-wait cutoff", () => {
+    const waitSince = 1_000;
+    const cutoff = waitSince + 600_000;
+    const item = {
+      finalityWait: true,
+      nextEligible: waitSince + 2_000,
+      waitSince,
+      checkedBlock: "42",
+    };
+    const hint = { now: cutoff - 1, head: 42n, hintRefreshAt: cutoff + 30_000 };
+    expect(replicaEligibleAt(item, hint)).toBe(cutoff);
+    expect(replicaEligibleAt(item, { ...hint, now: cutoff })).toBe(
+      item.nextEligible,
+    );
+  });
+
+  it("caps a restored retry counter before passing it to the backoff", () => {
+    const cap = Number.MAX_SAFE_INTEGER - 1;
+    const attempts: number[] = [];
+    const result = settleReplicaWork(
+      { ...base, attempts: cap },
+      retryOutcome(),
+      T0,
+      {
+        backoff: (attempt) => {
+          attempts.push(attempt);
+          return 19;
+        },
+      },
+    );
+    expect(attempts).toEqual([cap]);
+    expect(result.state.attempts).toBe(cap);
+    expect(result.state.nextEligible).toBe(T0 + 19);
   });
 });
 
@@ -2287,5 +2328,28 @@ describe("replica timer eligibility", () => {
         hintRefreshAt: undefined,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("abortable replication I/O", () => {
+  it("removes its abort listener if the transport fails before returning a promise", async () => {
+    const { signal } = new AbortController();
+    const added = vi.spyOn(signal, "addEventListener");
+    const removed = vi.spyOn(signal, "removeEventListener");
+    const transportError = new Error("transport closed");
+
+    try {
+      await expect(
+        abortable(signal, () => {
+          throw transportError;
+        }),
+      ).rejects.toBe(transportError);
+      expect(added).toHaveBeenCalledTimes(1);
+      expect(removed).toHaveBeenCalledWith("abort", added.mock.calls[0]![1]);
+      expect(removed).toHaveBeenCalledTimes(1);
+    } finally {
+      removed.mockRestore();
+      added.mockRestore();
+    }
   });
 });

@@ -774,4 +774,23 @@ describe("in-memory grant list presentation", () => {
 
     expect(store.getBindingsForPermission(PERMISSION)).toEqual([row]);
   });
+
+  it("does not add a second presentation row when identical metadata is recorded again", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    const row = bindingRow("entry-repeat", "2026-01-01T00:00:00.000Z");
+    store.putBinding(row);
+    store.putBinding({ ...row });
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([row]);
+  });
+
+  it("keeps an earlier list snapshot stable when another row is recorded", () => {
+    const store = createInMemoryPdppGrantBindingStore();
+    const first = bindingRow("entry-a", "2026-01-01T00:00:00.000Z");
+    const second = bindingRow("entry-b", "2026-01-02T00:00:00.000Z");
+    store.putBinding(first);
+    const snapshot = store.getBindingsForPermission(PERMISSION);
+    store.putBinding(second);
+    expect(snapshot).toEqual([first]);
+    expect(store.getBindingsForPermission(PERMISSION)).toEqual([first, second]);
+  });
 });

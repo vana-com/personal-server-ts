@@ -163,6 +163,7 @@ async function importSource(
     await recoverLogTombstones(deps, connectionId);
     const op = deps.newOp();
     await deps.db.batch(TEMP_TABLES.map((sql) => ({ sql })));
+    let receiptCommitted = false;
     try {
       const { fingerprint, quarantine } = await stageImportSnapshot(
         deps.db,
@@ -381,7 +382,12 @@ async function importSource(
           : []),
         ...ledger.statements(receipt),
       ]);
-      const tombstoned = (await countTombstones()) - tombstonesBefore;
+      receiptCommitted = true;
+      // A transient read error here cannot undo the committed receipt. Retry
+      // exactly once for the result count, without re-running the write.
+      const tombstoned =
+        (await countTombstones().catch(() => countTombstones())) -
+        tombstonesBefore;
       // `already-imported` says an earlier call completed this very revision.
       // A reopened `seed_window_closed` receipt is `excluded`: it completed
       // nothing, so this call writes the first receipt that did, however few
@@ -397,6 +403,7 @@ async function importSource(
         blocked,
       };
     } catch (error) {
+      if (receiptCommitted) throw error;
       const fence = await importFence(deps, source);
       if (fence) return { kind: "refused", reason: fence };
       if (
