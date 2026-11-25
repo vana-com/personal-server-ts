@@ -405,7 +405,13 @@ export function createLocalSync(
       }
     } catch (error) {
       resumeFailed = true;
-      void idle().then(() => takers.forEach((taker) => taker.fail(error)));
+      if (takers.length > 0) {
+        // A failed read must not let resume return before the runs it started.
+        // Keep the scheduler itself free to handle unrelated work.
+        void Promise.allSettled([...landings, ...erasures])
+          .then(idle)
+          .then(() => takers.forEach((taker) => taker.fail(error)));
+      }
       return;
     }
     if (takers.length === 0) return;
