@@ -65,9 +65,17 @@ export function createFakeChangeGateway(
   const requests: FakeChangeRequest[] = [];
   const parked = new Set<() => void>();
   const scripted = new Map<number, () => Response>();
+  const rejected = new Set<string>();
 
   const json = (status: number, body: unknown) =>
     new Response(JSON.stringify(body), { status });
+
+  /** A cursor the gateway reads as not a cursor, once: the 400 a format change gives. */
+  function rejection(afterWire: string | undefined): Response | undefined {
+    if (afterWire === undefined || !rejected.delete(afterWire))
+      return undefined;
+    return json(400, { error: "Invalid after: expected a change-feed cursor" });
+  }
 
   function respond(
     after: { epoch: string; seq: number } | undefined,
@@ -121,6 +129,8 @@ export function createFakeChangeGateway(
     });
     const scriptedAnswer = scripted.get(index);
     if (scriptedAnswer) return Promise.resolve(scriptedAnswer());
+    const refused = rejection(afterWire);
+    if (refused) return Promise.resolve(refused);
     const after = afterWire === undefined ? undefined : readCursor(afterWire);
     if (afterWire !== undefined && after === undefined)
       return Promise.resolve(
@@ -145,7 +155,7 @@ export function createFakeChangeGateway(
       };
       const wake = () => {
         done();
-        resolve(respond(after, since, sinceWire));
+        resolve(rejection(afterWire) ?? respond(after, since, sinceWire));
       };
       const onAbort = () => {
         done();
@@ -184,6 +194,13 @@ export function createFakeChangeGateway(
     /** Request number `index` (from 0) gets this response, whatever it asked. */
     answerRequestWith(index: number, response: () => Response) {
       scripted.set(index, response);
+    },
+    /**
+     * The next request that carries `cursor` as `after` (a held one answers
+     * at its next wake) gets the 400 for a cursor the gateway cannot read.
+     */
+    rejectCursorOnce(cursor: string) {
+      rejected.add(cursor);
     },
     /** Requests held at the gateway now. */
     held: () => parked.size,
