@@ -294,3 +294,9 @@ export {
   type LegacySeedStream,
   type LegacySeedStreamReport,
 } from "@opendatalabs/personal-server-ts-core/localdb";
+export {
+  createLiteLegacyStoreRunner,
+  type LiteLegacyImportReport,
+  type LiteLegacyStoreRunner,
+  type LiteLegacyStoreRunnerOptions,
+} from "./legacy-runner.js";

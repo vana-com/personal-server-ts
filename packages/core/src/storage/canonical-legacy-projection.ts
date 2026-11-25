@@ -2,6 +2,7 @@ import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   ANTHROPIC_CONNECTOR_ID,
   CLAUDE_SOURCE_ID,
+  legacySourceId,
 } from "../legacy-projection/bindings.js";
 import {
   hasAlternateLegacyProfile,
@@ -58,8 +59,6 @@ export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/11";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
-const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
-const CONNECTOR_ID_PREFIX = "https://registry.pdpp.dev/connectors/";
 
 export interface CanonicalConnectionBinding {
   instance: string;
@@ -1287,17 +1286,7 @@ export function legacyConnectorKey(pdppSource: string): string {
   return pdppSource.slice(pdppSource.lastIndexOf("/") + 1);
 }
 
-/** Most connector keys match their public source; Anthropic collects Claude. */
-function canonicalSourceId(pdppSource: string): string {
-  if (
-    pdppSource === ANTHROPIC_CONNECTOR_ID ||
-    pdppSource === "https://registry.pdpp.dev/connectors/anthropic-live"
-  )
-    return CLAUDE_SOURCE_ID;
-  return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
-    ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
-    : pdppSource;
-}
+const canonicalSourceId = legacySourceId;
 
 /** Same served-set and receipt horizon as a body, without projection or blob-body reads. */
 export function canonicalLegacyCollectionHorizon(
