@@ -875,8 +875,13 @@ async function loadProgressively(
   // that reads them and the batches that apply them: a phone's memory is not
   // the place for a long tail, and a second download is its data plan.
   const ciphers = openSpool(deps.db, connectionId);
+  // Whatever way the load ends, the prepass stops scheduling reads and its
+  // workers end before the spool goes: a worker still writing would put
+  // ciphertext in a discarded session.
+  const prepassEnds: { stop?: () => Promise<void> } = {};
   try {
     return await loadProgressivelyWith(
+      prepassEnds,
       ciphers,
       deps,
       connectionId,
@@ -888,7 +893,11 @@ async function loadProgressively(
       tail,
     );
   } finally {
-    await ciphers.discard();
+    try {
+      await prepassEnds.stop?.();
+    } finally {
+      await ciphers.discard();
+    }
   }
 }
 
@@ -926,6 +935,7 @@ function cipherCache(deps: LocalSyncDeps, ciphers: Spool) {
 }
 
 async function loadProgressivelyWith(
+  prepassEnds: { stop?: () => Promise<void> },
   ciphers: Spool,
   deps: LocalSyncDeps,
   connectionId: string,
@@ -996,11 +1006,12 @@ async function loadProgressivelyWith(
   // `PARTS_IN_FLIGHT` segments are read at a time; after a failure no read
   // starts and the ones in flight end before the prepass does.
   const deletions = new Map<number, Segment["operations"]>();
+  let halted = false;
   const prepass = (async () => {
     let next = 0;
     let failure: { readonly reason: unknown } | undefined;
     const lane = async () => {
-      while (!failure && next < removing.length) {
+      while (!failure && !halted && next < removing.length) {
         const ref = removing[next++]!;
         try {
           deletions.set(ref.position, await deletionsOf(ref));
@@ -1015,6 +1026,10 @@ async function loadProgressivelyWith(
     if (failure) throw failure.reason;
   })();
   prepass.catch(() => undefined);
+  prepassEnds.stop = async () => {
+    halted = true;
+    await prepass.catch(() => undefined);
+  };
 
   // Every batch's identity: the hash and blob its stream head will name.
   const identities = [
