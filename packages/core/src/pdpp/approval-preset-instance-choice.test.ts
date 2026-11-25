@@ -184,15 +184,18 @@ describe("review finding 3 — a preset reaches the instance-choice step", () =>
     expect(result.result.instance_choice_required).toBeUndefined();
     const streams = result.result.review?.data.streams ?? [];
     expect(streams).toHaveLength(2);
-    expect(streams.find(({ name }) => name === "top_artists")?.instance_ids)
-      .toEqual(["account-b"]);
-    expect(streams.find(({ name }) => name === "profile")?.instance_ids)
-      .toEqual(["account-b"]);
+    expect(
+      streams.find(({ name }) => name === "top_artists")?.instance_ids,
+    ).toEqual(["account-b"]);
+    expect(
+      streams.find(({ name }) => name === "profile")?.instance_ids,
+    ).toEqual(["account-b"]);
   });
 
   it("asks only about the ambiguous stream when another has one eligible account", () => {
     const result = review(presetRequest("social_summary"), undefined, {
-      eligibleFor: (stream) => stream === "profile" ? ["account-a"] : ["account-a", "account-b"],
+      eligibleFor: (stream) =>
+        stream === "profile" ? ["account-a"] : ["account-a", "account-b"],
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
