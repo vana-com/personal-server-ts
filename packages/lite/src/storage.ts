@@ -843,9 +843,8 @@ export async function createPersistentPsLiteStorage(
       absent: (rows, authority) =>
         enqueue(async () => {
           authority();
-          return rows.every(
-            (row) => !state.entries.some((entry) => entry.id === row.id),
-          );
+          const currentIds = new Set(state.entries.map((entry) => entry.id));
+          return rows.every((row) => !currentIds.has(row.id));
         }),
       erase: (row, authority) =>
         legacyWriteSeal.remove(() =>
