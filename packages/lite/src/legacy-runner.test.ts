@@ -848,7 +848,11 @@ it("publishes a completed empty import with the injected finish time", async () 
   });
   expect(live.report()).toBeNull();
   await live.run(new AbortController().signal);
-  expect(live.report()).toMatchObject({ finishedAt: 123, stopped: false, rows: { legacy: 0, staged: 0 } });
+  expect(live.report()).toMatchObject({
+    finishedAt: 123,
+    stopped: false,
+    rows: { legacy: 0, staged: 0 },
+  });
   expect(puts).toEqual([]);
 });
 
