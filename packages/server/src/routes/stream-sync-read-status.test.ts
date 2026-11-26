@@ -164,6 +164,34 @@ describe("stream-sync read status route", () => {
     expect(text).not.toContain("secret-looking-detail");
   });
 
+  it("distinguishes a verified zero record count from an absent live count", async () => {
+    const response = await app(
+      port({
+        listed: false,
+        issues: [],
+        connections: [
+          {
+            connector: "conn-empty",
+            ns: "0123456789abcdef",
+            control: "active",
+            streams: {
+              empty: { live: true, complete: true, version: 2, records: 0 },
+              old: { live: false, complete: true, version: 1, records: 0 },
+            },
+          },
+        ],
+      }),
+    )();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      listed: false,
+      streams: [
+        { stream: "empty", records: 0 },
+        { stream: "old", records: null },
+      ],
+    });
+  });
+
   describe("audit", () => {
     const report = {
       finishedAt: 5,
@@ -249,6 +277,17 @@ describe("stream-sync read status route", () => {
           legacyStore: report,
         },
       });
+    });
+
+    it("honors audit=true but does not treat other nonempty values as opt-in", async () => {
+      const { get, status } = audited(() => report);
+      const invalid = await get("?audit=yes");
+      expect(status).toHaveBeenLastCalledWith(undefined);
+      expect(invalid).not.toHaveProperty("seedExclusions");
+
+      const enabled = await get("?audit=true");
+      expect(status).toHaveBeenLastCalledWith({ audit: true });
+      expect(enabled).toHaveProperty("seedExclusions");
     });
 
     it("says the legacy store has not finished a run with null", async () => {
