@@ -288,6 +288,16 @@ describe("stream-sync run intake route", () => {
     expect(await mismatch.json()).toMatchObject({ error: "owner_mismatch" });
   });
 
+  it("answers a null abort body 400 invalid_request and never aborts the run", async () => {
+    const { sync, call } = await build("route-abort-null");
+    await call("PUT", "n1", beginBody());
+    const abort = vi.spyOn(sync.intake, "abort");
+    const res = await call("POST", "n1/abort", null);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_request" });
+    expect(abort).not.toHaveBeenCalled();
+  });
+
   it("answers a scheduled begin of a deleted connection 409 connection_stopped over HTTP (review P2-3)", async () => {
     const { sync, call } = await build("route-stopped");
     const body = beginBody();
