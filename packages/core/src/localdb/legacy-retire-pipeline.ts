@@ -37,13 +37,13 @@ export interface LegacyRetirePipelinePorts {
   scopesOf(connector: string): readonly string[];
   streamsOf(connector: string, scope: string): readonly string[];
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;
-  /** Resolves void only after the exact echo; not-sent means preflight sent no DELETE. */
+  /** Accepted only after the exact echo; not-sent means preflight sent no DELETE. */
   tombstone(
     scope: string,
     head: Extract<LegacyHead, { state: "live" }>,
     authority: RetirementAuthority,
     signal?: AbortSignal,
-  ): Promise<void | "not-sent">;
+  ): Promise<"accepted" | "not-sent">;
   eraseBlob(
     scope: string,
     version: string,
@@ -59,7 +59,7 @@ interface Scope {
   head: LegacyHead;
   streams: readonly string[];
   rows: readonly RetirementRow[];
-  acknowledgement?: "unconfirmed" | "accepted" | "blocked";
+  acknowledgement: "not-sent" | "unconfirmed" | "accepted" | "blocked";
 }
 interface Manifest {
   scopes: readonly Scope[];
@@ -126,6 +126,7 @@ export function createLegacyRetirePipeline(
           head: await ports.head(scope),
           streams: [...ports.streamsOf(connector, scope)],
           rows: [],
+          acknowledgement: "not-sent",
         });
       }
       return ports.rows.capture(
@@ -192,10 +193,18 @@ export function createLegacyRetirePipeline(
       );
       if (!stored) return blocked("legacy_manifest_missing");
       const manifest = JSON.parse(stored.manifest) as Manifest;
-      if (manifest.scopes.some((scope) => scope.acknowledgement === "blocked"))
+      if (
+        manifest.scopes.some(
+          (scope) =>
+            !["not-sent", "unconfirmed", "accepted"].includes(
+              scope.acknowledgement,
+            ),
+        )
+      )
         return blocked("legacy_tombstone_unacknowledged");
-      const saveManifest = async () => {
-        check();
+      const saveManifest = async (notSent = false) => {
+        // Undoing this attempt's provisional marker grants no write authority.
+        if (!notSent) check();
         await deps.db.batch([
           {
             sql: "UPDATE legacy_retire_manifests SET manifest = ? WHERE retire_id = ?",
@@ -242,12 +251,15 @@ export function createLegacyRetirePipeline(
             );
             if (outcome === "not-sent") {
               // This attempt sent nothing; preserve any earlier ambiguous send.
-              if (previousAcknowledgement === undefined)
-                delete scope.acknowledgement;
-              else scope.acknowledgement = previousAcknowledgement;
-              await saveManifest();
+              scope.acknowledgement = previousAcknowledgement;
+              await saveManifest(true);
+              check();
               return PART_PENDING;
             }
+            if (outcome !== "accepted")
+              throw new LegacyTombstoneUnacknowledged(
+                "legacy tombstone acknowledgement missing",
+              );
           } catch (error) {
             check();
             if (error instanceof LegacyTombstoneUnacknowledged) {
@@ -289,12 +301,12 @@ export function createLegacyRetirePipeline(
             scope.scope,
             tombstone,
           );
-          if (final.finalized !== tombstone || final.rolledBack)
+          if (final.finalized !== tombstone || final.rolledBack !== null)
             return PART_PENDING;
           check();
           const history = await ports.versions.list(scope.scope, { signal });
           if (
-            !history.complete ||
+            history.complete !== true ||
             !history.versions.some(
               (v) => v.isTombstone && v.expectedVersion === tombstone,
             )

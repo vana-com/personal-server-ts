@@ -83,7 +83,7 @@ describe("retirement transport authority", () => {
         f.head,
         f.check,
       ),
-    ).rejects.toThrow("revoked");
+    ).resolves.toBe("not-sent");
     expect(f.fake.requests).toEqual([]);
   });
   it("revokes during blob signing before any HTTP request", async () => {

@@ -72,6 +72,19 @@ NotSent ==
   /\ pc' = "readForeign"
   /\ UNCHANGED <<authority, captured, rows, removed, observed, receipts, blobs, signed, requested, hooks, unauth, at, done, malformed>>
 
+\* Lookup or signing rejects before issuance; the next read may find a foreign tombstone.
+PreflightFailure ==
+  /\ pc = "send"
+  /\ ack' = IF requested THEN ack ELSE "none"
+  /\ pc' = "preflightFailed"
+  /\ UNCHANGED <<authority, captured, rows, removed, observed, receipts, blobs, signed, requested, hooks, unauth, at, done, malformed, foreign>>
+
+ForeignAfterFailure ==
+  /\ pc = "preflightFailed" /\ authority
+  /\ foreign' = TRUE
+  /\ pc' = "readForeign"
+  /\ UNCHANGED <<authority, captured, rows, removed, observed, receipts, blobs, signed, requested, hooks, unauth, at, done, ack, malformed>>
+
 ReadForeign ==
   /\ pc = "readForeign" /\ authority /\ foreign
   /\ pc' = IF requested THEN "blocked" ELSE "final"
@@ -184,6 +197,6 @@ AcknowledgedBeforeErase == (blobs # Keys \/ removed # {} \/ done) => ((ack = "ac
 UnsyncedCaptured == pc # "capture" => Old \subseteq captured
 DefiniteNotSentDoesNotIssue == (foreign /\ ack = "none") => ~requested
 NotSentPreservesAmbiguity == (foreign /\ requested) => ack = "unconfirmed"
-Next == RetryNoReply \/ NotSent \/ ReadForeign \/ JournalRequest \/ Reply \/ MalformedReply \/ Restart \/ Capture \/ Sign \/ Request \/ Finality \/ BlobStart \/ BlobSign \/ BlobRequest \/ BlobErase \/ Receipt \/ LocalStart \/ LocalErase \/ LocalSkip \/ Observe \/ Complete \/ AbsentMeansDone \/ Revoke \/ RunHook
+Next == PreflightFailure \/ ForeignAfterFailure \/ RetryNoReply \/ NotSent \/ ReadForeign \/ JournalRequest \/ Reply \/ MalformedReply \/ Restart \/ Capture \/ Sign \/ Request \/ Finality \/ BlobStart \/ BlobSign \/ BlobRequest \/ BlobErase \/ Receipt \/ LocalStart \/ LocalErase \/ LocalSkip \/ Observe \/ Complete \/ AbsentMeansDone \/ Revoke \/ RunHook
 Spec == Init /\ [][Next]_vars
 =============================================================================

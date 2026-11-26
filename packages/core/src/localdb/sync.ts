@@ -150,7 +150,7 @@ export function createLocalSync(
     readonly legacyRetire?: () => LegacyRetirePipelinePorts | undefined;
     /**
      * The host's write authority for a legacy retirement; false while a
-     * registration is held. Absent: always ready.
+     * registration is held. Absent or undefined: not ready.
      */
     readonly legacyWriteReady?: () => boolean;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;

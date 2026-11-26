@@ -19,48 +19,58 @@ export function createLegacyRetireRemote(
   const fetcher = options.fetch ?? globalThis.fetch;
   return {
     async tombstone(scope, head, authority, signal) {
-      authority();
-      const current = await options.dataPointFeed.getDataPoint({
-        ownerAddress: options.serverOwner,
-        scope,
-        signal,
-      });
-      if (
-        !current ||
-        current.deletedAt !== null ||
-        current.expectedVersion !== head.fence.expectedVersion ||
-        current.dataHash.toLowerCase() !== head.fence.dataHash.toLowerCase() ||
-        current.metadataHash.toLowerCase() !==
-          head.fence.metadataHash.toLowerCase()
-      )
-        return "not-sent";
-      authority();
-      const version = BigInt(head.fence.expectedVersion) + 1n;
-      const signature = await options.signer.signAddData({
-        ownerAddress: options.serverOwner,
-        scope,
-        dataHash: TOMBSTONE_DATA_HASH,
-        metadataHash: TOMBSTONE_METADATA_HASH,
-        expectedVersion: version,
-      });
-      authority();
-      const response = await fetcher(
-        `${options.gatewayUrl.replace(/\/+$/, "")}/v1/data/${computeDataPointId(options.serverOwner, scope)}`,
-        {
-          method: "DELETE",
+      let version: bigint;
+      let signature: string;
+      let request: Parameters<typeof fetcher>;
+      try {
+        authority();
+        const current = await options.dataPointFeed.getDataPoint({
+          ownerAddress: options.serverOwner,
+          scope,
           signal,
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Web3Signed ${signature}`,
+        });
+        if (
+          !current ||
+          current.deletedAt !== null ||
+          current.expectedVersion !== head.fence.expectedVersion ||
+          current.dataHash.toLowerCase() !==
+            head.fence.dataHash.toLowerCase() ||
+          current.metadataHash.toLowerCase() !==
+            head.fence.metadataHash.toLowerCase()
+        )
+          return "not-sent";
+        authority();
+        version = BigInt(head.fence.expectedVersion) + 1n;
+        signature = await options.signer.signAddData({
+          ownerAddress: options.serverOwner,
+          scope,
+          dataHash: TOMBSTONE_DATA_HASH,
+          metadataHash: TOMBSTONE_METADATA_HASH,
+          expectedVersion: version,
+        });
+        authority();
+        request = [
+          `${options.gatewayUrl.replace(/\/+$/, "")}/v1/data/${computeDataPointId(options.serverOwner, scope)}`,
+          {
+            method: "DELETE",
+            signal,
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Web3Signed ${signature}`,
+            },
+            body: JSON.stringify({
+              ownerAddress: options.serverOwner,
+              scope,
+              expectedVersion: String(version),
+              signature,
+            }),
           },
-          body: JSON.stringify({
-            ownerAddress: options.serverOwner,
-            scope,
-            expectedVersion: String(version),
-            signature,
-          }),
-        },
-      );
+        ];
+      } catch {
+        // Neither a lookup, signer nor authority failure issued a DELETE.
+        return "not-sent";
+      }
+      const response = await fetcher(...request);
       const body = (await response.json().catch(() => null)) as {
         code?: unknown;
         data?: { expectedVersion?: string };
@@ -77,6 +87,7 @@ export function createLegacyRetireRemote(
         throw new LegacyTombstoneUnacknowledged(
           "legacy tombstone was not acknowledged at pin + 1",
         );
+      return "accepted";
     },
     async eraseBlob(scope, version, authority, signal) {
       const base = options.storage.endpoint.replace(/\/+$/, "");

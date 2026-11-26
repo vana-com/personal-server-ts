@@ -88,8 +88,9 @@ export function createLegacyRetirer(
     readonly retryMs: { readonly first: number; readonly max: number };
     /**
      * Host write authority, checked before every issued mutation: while a
-     * registration is held, a pass sends no tombstone, writes no journal step
-     * and erases no blob. Absent: always ready.
+     * registration is held, a pass sends no tombstone, advances no journal step
+     * and erases no blob. A definite not-sent attempt may undo its provisional
+     * marker. Absent or undefined: not ready.
      */
     readonly writeReady?: () => boolean;
   },
@@ -127,7 +128,7 @@ export function createLegacyRetirer(
     if (!ports) return { part: blocked("needs_another_device"), retry: true };
     const check = () => {
       stop.signal.throwIfAborted();
-      if (ports.mode() !== "switched" || !(options.writeReady?.() ?? true))
+      if (ports.mode() !== "switched" || options.writeReady?.() !== true)
         throw new WriteNotReady();
     };
     try {
@@ -228,7 +229,7 @@ export function createLegacyRetirer(
         );
       const check = () => {
         stop.signal.throwIfAborted();
-        if (ports.mode() !== "switched" || !(options.writeReady?.() ?? true))
+        if (ports.mode() !== "switched" || options.writeReady?.() !== true)
           throw new WriteNotReady();
       };
       try {

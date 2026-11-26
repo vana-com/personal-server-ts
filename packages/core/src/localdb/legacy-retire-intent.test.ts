@@ -53,6 +53,7 @@ async function reconnected(
     ) => LegacyRetirePipelinePorts;
     dbFile?: string;
     writeReady?: () => boolean;
+    omitWriteReady?: boolean;
     /** Extra options of the fake host's ports (see `legacyPortsOver`). */
     host?: {
       onAdapterHeadRead?: () => void;
@@ -124,7 +125,9 @@ async function reconnected(
   const a = await w.device("a", {
     legacyRetire: () => options.wrapLegacy?.(pipelinePorts) ?? pipelinePorts,
     deleteRetryMs: RETRY,
-    ...(options.writeReady && { legacyWriteReady: options.writeReady }),
+    ...(!options.omitWriteReady && {
+      legacyWriteReady: options.writeReady ?? (() => true),
+    }),
     ...(options.dbFile && { dbFile: options.dbFile }),
   });
   await a.run("run-1", [{ stream: sName(0), id: "x", v: 0 }], {
@@ -184,6 +187,60 @@ const storageDeletes = (fake: Fixture["fake"]) =>
   );
 
 describe("a standalone legacy retirement after the switch", () => {
+  it("missing write readiness captures nothing and issues no effects", async () => {
+    const f = await reconnected({ omitWriteReady: true });
+    f.fake.requests.length = 0;
+    await expect(f.a.sync.legacyRetirer.request(GH)).rejects.toThrow(
+      "write authority",
+    );
+    expect(await f.a.db.query("SELECT * FROM legacy_retirements")).toEqual([]);
+    expect(f.fake.requests).toEqual([]);
+  });
+
+  for (const failure of ["head", "signer"] as const)
+    it(`a rejected ${failure} preflight followed by a foreign pin+1 tombstone settles on the next pass`, async () => {
+      const failed = new Set<string>();
+      const f: Fixture = await reconnected({
+        host:
+          failure === "head"
+            ? {
+                onAdapterHeadRead: () => {
+                  const scope = SCOPES.find((scope) => !failed.has(scope));
+                  if (scope) {
+                    failed.add(scope);
+                    f.fake.foreignTombstone(scope);
+                    throw Error("preflight lookup failed");
+                  }
+                },
+              }
+            : undefined,
+        wrapLegacy: (ports) => ({
+          ...ports,
+          tombstone: async (scope, head, check, signal) => {
+            if (failure === "signer") {
+              f.fake.signer.signAddData = async () => {
+                failed.add(scope);
+                f.fake.foreignTombstone(scope);
+                throw Error("preflight signing failed");
+              };
+            }
+            return ports.tombstone(scope, head, check, signal);
+          },
+        }),
+      });
+      placeLocalEntries(f);
+      f.fake.requests.length = 0;
+      const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+      await vi.waitFor(async () =>
+        expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+          retireId,
+          legacy: DONE,
+        }),
+      );
+      expect(gatewayDeletes(f.fake)).toEqual([]);
+      expect(failed.size).toBe(SCOPES.length);
+    });
+
   it("retires a pinned legacy scope after reconnect without changing current control, stream head or records", async () => {
     expect(SCOPES.length).toBeGreaterThan(0);
     const f = await reconnected();

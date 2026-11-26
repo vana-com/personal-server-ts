@@ -764,6 +764,8 @@ async function bootstrapServer(
   let identity: IdentityInfo | undefined;
   // Shared with canSync: registration is unknown until a lookup confirms it.
   const isServerRegistered = () => Boolean(identity?.serverId);
+  // Startup and tunnel identity lookups cannot grant retirement authority.
+  let retirementRegistrationReady = false;
 
   if (masterKeySignature && serverOwner) {
     const recoveredServerOwner = serverOwner;
@@ -1035,7 +1037,7 @@ async function bootstrapServer(
           erasure: () => logErasurePorts,
           legacyDelete: () => legacyDeletePorts,
           legacyRetire: () => legacyRetirePorts,
-          legacyWriteReady: isServerRegistered,
+          legacyWriteReady: () => retirementRegistrationReady,
         });
         localSyncDeps = deps;
         localDb = db;
@@ -1391,12 +1393,14 @@ async function bootstrapServer(
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
+        retirementRegistrationReady = false;
         try {
           const serverInfo = await gatewayClient.getServer(
             serverAccount.address,
           );
           identity!.serverId = serverInfo?.id ?? null;
-          if (isServerRegistered()) return { ok: true };
+          retirementRegistrationReady = Boolean(serverInfo?.id);
+          if (retirementRegistrationReady) return { ok: true };
           return {
             ok: false,
             reason: "unregistered",
@@ -1404,6 +1408,7 @@ async function bootstrapServer(
           };
         } catch (err) {
           identity!.serverId = null;
+          retirementRegistrationReady = false;
           logger.warn({ err }, "Could not verify server registration for sync");
           return {
             ok: false,

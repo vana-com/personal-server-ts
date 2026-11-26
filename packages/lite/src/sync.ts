@@ -581,6 +581,12 @@ export async function createPsLiteSyncManager(
     owner: serverOwner,
     read: () => "unknown" as const,
   };
+  // Only this host's registration observations may authorize retirement.
+  let registrationConfirmed = options.registrationReady?.() === true;
+  const retirementWriteReady = () =>
+    registrationConfirmed &&
+    (options.registrationReady === undefined ||
+      options.registrationReady() === true);
   let localDb: SqlDriver | null = null;
   let localSync: LocalSync | null = null;
   // Built before the database opens, so a subscriber never waits for it.
@@ -662,9 +668,7 @@ export async function createPsLiteSyncManager(
           aliasTargets: legacyAliasScopes,
           // A held registration confers no write authority, whoever asks:
           // the worker reads this before every host call.
-          ...(options.registrationReady && {
-            legacyWriteReady: options.registrationReady,
-          }),
+          legacyWriteReady: retirementWriteReady,
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
@@ -712,7 +716,7 @@ export async function createPsLiteSyncManager(
         // in a full sync cycle. It sends deletes at the gateway, so it needs
         // the write authority a registered runtime has: a read-only
         // registration waits for the cycle that runs once it is admitted.
-        if (!options.registrationReady || options.registrationReady())
+        if (retirementWriteReady())
           void localSync.legacyRetirer.resume().catch((error: unknown) =>
             logger.warn(
               {
@@ -841,7 +845,11 @@ export async function createPsLiteSyncManager(
           : undefined,
         tombstoneFinality,
         async canSync() {
-          if (options.ownerSyncSigner) return { ok: true };
+          registrationConfirmed = false;
+          if (options.ownerSyncSigner) {
+            registrationConfirmed = true;
+            return { ok: true };
+          }
           if (
             options.registrationReady &&
             !options.registrationReady() &&
@@ -852,7 +860,8 @@ export async function createPsLiteSyncManager(
             const serverInfo = await gateway.getServer(
               options.serverAccount.address,
             );
-            if (serverInfo?.id) return { ok: true };
+            registrationConfirmed = Boolean(serverInfo?.id);
+            if (registrationConfirmed) return { ok: true };
             return {
               ok: false,
               reason: "unregistered",

@@ -49,73 +49,92 @@ afterEach(async () => {
   await context?.cleanup();
   if (root) await rm(root, { recursive: true, force: true });
 });
-it("an unregistered server's retirement issues no effects, and revoking registration stops the next effect", async () => {
-  root = await mkdtemp(join(tmpdir(), "retirement-registration-"));
-  const getServer = vi.fn().mockResolvedValue(null);
-  const capture = vi.fn(async (save, check) => {
-    check();
-    return save([]);
-  });
-  const eraseBlob = vi.fn(async () => {
-    getServer.mockResolvedValue(null);
-    await canSync!();
-    return true;
-  });
-  retirementPorts = {
-    mode: () => "switched",
-    scopesOf: () => ["github.events"],
-    streamsOf: () => [],
-    head: async () => ({ state: "deleted", version: "3" }),
-    tombstone: vi.fn(),
-    eraseBlob,
-    finality: {
-      tombstoneState: async () => ({
-        finalized: "3",
-        settling: false,
-        rolledBack: null,
+it.each([false, true])(
+  "an overlapping stale positive lookup after revocation does not let the next retirement effect run (stale=%s)",
+  async (stale) => {
+    root = await mkdtemp(join(tmpdir(), "retirement-registration-"));
+    const getServer = vi.fn().mockResolvedValue(null);
+    const capture = vi.fn(async (save, check) => {
+      check();
+      return save([]);
+    });
+    const eraseBlob = vi.fn(async () => {
+      let release!: (value: { id: string }) => void;
+      let background: Promise<void> | undefined;
+      if (stale) {
+        getServer.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              release = resolve;
+            }),
+        );
+        background = context!.startBackgroundServices();
+        await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+      }
+      getServer.mockResolvedValue(null);
+      await canSync!();
+      if (stale) {
+        release({ id: "stale-positive" });
+        await background;
+      }
+      return true;
+    });
+    retirementPorts = {
+      mode: () => "switched",
+      scopesOf: () => ["github.events"],
+      streamsOf: () => [],
+      head: async () => ({ state: "deleted", version: "3" }),
+      tombstone: vi.fn(),
+      eraseBlob,
+      finality: {
+        tombstoneState: async () => ({
+          finalized: "3",
+          settling: false,
+          rolledBack: null,
+        }),
+      },
+      versions: {
+        list: async () => ({
+          complete: true,
+          versions: [
+            { expectedVersion: "1", isTombstone: false, dataHash: "hash" },
+            { expectedVersion: "2", isTombstone: false, dataHash: "hash" },
+            { expectedVersion: "3", isTombstone: true, dataHash: "hash" },
+          ],
+        }),
+      },
+      rows: { capture, erase: vi.fn(), absent: async () => true },
+    };
+    context = await createServer(
+      ServerConfigSchema.parse({
+        tunnel: { enabled: false },
+        sync: { enabled: true },
+        logging: { level: "fatal", pretty: false },
       }),
-    },
-    versions: {
-      list: async () => ({
-        complete: true,
-        versions: [
-          { expectedVersion: "1", isTombstone: false, dataHash: "hash" },
-          { expectedVersion: "2", isTombstone: false, dataHash: "hash" },
-          { expectedVersion: "3", isTombstone: true, dataHash: "hash" },
-        ],
-      }),
-    },
-    rows: { capture, erase: vi.fn(), absent: async () => true },
-  };
-  context = await createServer(
-    ServerConfigSchema.parse({
-      tunnel: { enabled: false },
-      sync: { enabled: true },
-      logging: { level: "fatal", pretty: false },
-    }),
-    {
-      serverDir: root,
-      dataDir: join(root, "data"),
-      ownerSignature: await privateKeyToAccount(
-        `0x${"11".repeat(32)}`,
-      ).signMessage({ message: "Disposable registration fixture" }),
-      gatewayClient: { getServer } as never,
-    },
-  );
-  await declareAccountMode(context, "on");
-  await openLocal!();
-  const sync = local!;
-  expect(await canSync!()).toMatchObject({ ok: false });
-  await expect(sync.legacyRetirer.request("github")).rejects.toThrow(
-    "write authority",
-  );
-  expect(capture).not.toHaveBeenCalled();
-  expect(eraseBlob).not.toHaveBeenCalled();
-  getServer.mockResolvedValue({ id: "registered" });
-  expect(await canSync!()).toEqual({ ok: true });
-  await sync.legacyRetirer.request("github");
-  await vi.waitFor(() => expect(eraseBlob).toHaveBeenCalledTimes(1));
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  expect(eraseBlob).toHaveBeenCalledTimes(1);
-  expect(retirementPorts.rows.erase).not.toHaveBeenCalled();
-});
+      {
+        serverDir: root,
+        dataDir: join(root, "data"),
+        ownerSignature: await privateKeyToAccount(
+          `0x${"11".repeat(32)}`,
+        ).signMessage({ message: "Disposable registration fixture" }),
+        gatewayClient: { getServer } as never,
+      },
+    );
+    await declareAccountMode(context, "on");
+    await openLocal!();
+    const sync = local!;
+    expect(await canSync!()).toMatchObject({ ok: false });
+    await expect(sync.legacyRetirer.request("github")).rejects.toThrow(
+      "write authority",
+    );
+    expect(capture).not.toHaveBeenCalled();
+    expect(eraseBlob).not.toHaveBeenCalled();
+    getServer.mockResolvedValue({ id: "registered" });
+    expect(await canSync!()).toEqual({ ok: true });
+    await sync.legacyRetirer.request("github");
+    await vi.waitFor(() => expect(eraseBlob).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(eraseBlob).toHaveBeenCalledTimes(1);
+    expect(retirementPorts.rows.erase).not.toHaveBeenCalled();
+  },
+);

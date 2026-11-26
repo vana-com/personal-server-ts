@@ -185,6 +185,7 @@ function fixture(rows: RetirementRows) {
     },
     tombstone: async () => {
       head = { state: "deleted", version: "3" };
+      return "accepted";
     },
     eraseBlob: async () => true,
   };
@@ -221,6 +222,53 @@ function fixture(rows: RetirementRows) {
 }
 for (const kind of ["node", "lite"])
   describe(`retirement rows on ${kind}`, () => {
+    for (const missing of ["acknowledgement", "tombstone", "rollback"] as const)
+      it(`missing ${missing} evidence issues no erase`, async () => {
+        const b = await backend(kind);
+        await b.insert(base);
+        const erase = vi.fn(b.rows.erase);
+        const f = fixture({ ...b.rows, erase });
+        f.head({
+          state: "live",
+          fence: {
+            expectedVersion: "2",
+            dataHash: "hash",
+            metadataHash: "meta",
+          },
+        });
+        const id = await f.pipeline.capture("github", f.authority);
+        if (missing === "acknowledgement") {
+          const stored = f.sql
+            .prepare("SELECT manifest FROM legacy_retire_manifests")
+            .get() as { manifest: string };
+          const manifest = JSON.parse(stored.manifest);
+          delete manifest.scopes[0].acknowledgement;
+          f.sql
+            .prepare("UPDATE legacy_retire_manifests SET manifest = ?")
+            .run(JSON.stringify(manifest));
+        } else if (missing === "tombstone") {
+          const tombstone = f.ports.tombstone;
+          f.ports.tombstone = async (...args) => {
+            await tombstone(...args);
+            return undefined as never;
+          };
+        } else {
+          f.head({ state: "deleted", version: "3" });
+          f.ports.finality.tombstoneState = async () => ({
+            finalized: "3",
+            settling: false,
+            rolledBack: undefined as never,
+          });
+        }
+        const result = await f.pipeline.advance(
+          id,
+          f.authority,
+          new AbortController().signal,
+        );
+        expect(result.state).not.toBe("done");
+        expect(erase).not.toHaveBeenCalled();
+      });
+
     it("capture reads only the bound scopes' rows", async () => {
       const b = await backend(kind);
       const bound = await b.insert(base);
@@ -451,8 +499,9 @@ for (const kind of ["node", "lite"])
       });
       const tombstone = f.ports.tombstone;
       f.ports.tombstone = async (...args) => {
-        await tombstone(...args);
+        const outcome = await tombstone(...args);
         f.revoke();
+        return outcome;
       };
       const id = await f.pipeline.capture("github", f.authority);
       await expect(

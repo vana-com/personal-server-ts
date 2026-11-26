@@ -313,3 +313,15 @@ The nine pipeline configurations were rerun with Java, TLC 2.19, four workers,
 nice 19 and the shared heavy-run lock. `PipelineGood` passes with 118 generated
 states, 103 distinct states and depth 22. All eight mutants still fail their
 configured invariants. The original intent model was unchanged in this run.
+
+### Rejected preflight
+
+`PreflightFailure` separately models a lookup or signer rejection before issuance,
+including a rejection after revocation. It restores the preceding acknowledgement
+without issuing a request; `ForeignAfterFailure` lets a subsequent pass observe a
+foreign pin+1 tombstone. An earlier ambiguous send remains unconfirmed.
+
+All nine pipeline configurations were rerun with Java, four workers, nice 19 and
+the shared heavy-run lock. `PipelineGood` passes with 126 generated states,
+107 distinct states and depth 22. Each of the eight mutants still violates its
+configured invariant. The original intent model was unchanged.
