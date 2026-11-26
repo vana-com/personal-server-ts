@@ -76,6 +76,11 @@ export function createLegacyRetireRemote(
         data?: { expectedVersion?: string };
         expectedVersion?: string;
       } | null;
+      if (
+        response.status === 409 &&
+        body?.code === "owner_stream_head_already_deleted"
+      )
+        return "not-applied";
       if (!response.ok && body && isGatewayRefusalCode(body.code))
         throw new GatewayRefusalError(
           response.status,

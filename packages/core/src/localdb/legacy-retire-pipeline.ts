@@ -37,13 +37,13 @@ export interface LegacyRetirePipelinePorts {
   scopesOf(connector: string): readonly string[];
   streamsOf(connector: string, scope: string): readonly string[];
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;
-  /** Accepted only after the exact echo; not-sent means preflight sent no DELETE. */
+  /** Exact echo accepts; not-sent skips DELETE; not-applied is a rejected DELETE. */
   tombstone(
     scope: string,
     head: Extract<LegacyHead, { state: "live" }>,
     authority: RetirementAuthority,
     signal?: AbortSignal,
-  ): Promise<"accepted" | "not-sent">;
+  ): Promise<"accepted" | "not-sent" | "not-applied">;
   eraseBlob(
     scope: string,
     version: string,
@@ -249,8 +249,8 @@ export function createLegacyRetirePipeline(
               check,
               signal,
             );
-            if (outcome === "not-sent") {
-              // This attempt sent nothing; preserve any earlier ambiguous send.
+            if (outcome === "not-sent" || outcome === "not-applied") {
+              // This attempt applied nothing; preserve any earlier ambiguous send.
               scope.acknowledgement = previousAcknowledgement;
               await saveManifest(true);
               check();

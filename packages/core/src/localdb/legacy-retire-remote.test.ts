@@ -102,3 +102,33 @@ describe("retirement transport authority", () => {
     expect(f.fake.requests).toEqual([]);
   });
 });
+
+it("reports not applied for the exact already-deleted 409 after sending DELETE", async () => {
+  const f = await fixture();
+  f.fake.state.race = "already-deleted";
+  await expect(
+    createLegacyRetireRemote(f.options).tombstone(
+      "github.events",
+      f.head,
+      f.check,
+    ),
+  ).resolves.toBe("not-applied");
+  expect(f.fake.requests.filter((r) => r.method === "DELETE")).toHaveLength(1);
+});
+
+it.each([
+  [400, "owner_stream_head_already_deleted"],
+  [409, "other_conflict"],
+  [409, "owner_stream_head_already_deleted_extra"],
+])("does not classify HTTP %s code %s as not applied", async (status, code) => {
+  const f = await fixture();
+  f.options.fetch = async () =>
+    new Response(JSON.stringify({ code }), { status });
+  await expect(
+    createLegacyRetireRemote(f.options).tombstone(
+      "github.events",
+      f.head,
+      f.check,
+    ),
+  ).rejects.toThrow();
+});
