@@ -603,7 +603,7 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     const { accessToken } = await runAuthorizationJourney();
 
     const res = await harness.app.request(
-      "/v1/streams/playlists/records?changes_since=",
+      "/v1/streams/playlists/records?changes_since=beginning",
       { headers: { Authorization: `Bearer ${accessToken}` } },
     );
     expect(res.status).toBe(200);

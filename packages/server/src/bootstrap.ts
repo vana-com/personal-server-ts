@@ -185,6 +185,7 @@ import {
   type StreamSyncRegistry,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
+  manifestDigestFinder,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
@@ -1786,7 +1787,16 @@ async function bootstrapServer(
           operatorToken: accessToken,
         }
       : undefined,
-    pdpp: pdppRecords,
+    pdpp: pdppRecords && {
+      ...pdppRecords,
+      // An owner record delete on a switched account runs under a verified
+      // connector artifact this server holds (localdb/owner-delete.ts).
+      artifactDigestFor: (connector: string, version: string | null) =>
+        manifestDigestFinder(pdppAuth?.retainedManifests ?? [])(
+          connector,
+          version,
+        ),
+    },
     pdppConnections,
     // The SAME stable delegate the download worker was given above, not a
     // second importer: both arrival routes must resolve to one importer over

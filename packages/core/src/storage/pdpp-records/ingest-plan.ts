@@ -80,9 +80,9 @@ export function planIngest(
   const existing = current(recordKey);
 
   if (envelope.op === "delete") {
-    if (semantics === "append_only") {
-      return reject("append_only streams do not support delete directives");
-    }
+    // spec-core §4 "Re-emitted append-only records": the duplicate rule
+    // "does not block `op: delete` or owner deletion"; the `append_only`
+    // row: "Explicit deletion is permitted."
     if (!existing || existing.deleted) return unchanged();
     return {
       outcome: { index, outcome: "accepted" },

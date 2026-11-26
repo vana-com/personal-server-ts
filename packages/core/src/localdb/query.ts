@@ -8,8 +8,15 @@ import {
   CursorExpiredError,
   type ChangesSinceOptions,
   type ChangesSincePage,
+  type ListSort,
+  type PdppRecordRow,
   type PdppStoredRecord,
 } from "../storage/pdpp-records/types.js";
+import {
+  compareListPositions,
+  listPosition,
+  type ListPosition,
+} from "../storage/pdpp-records/list-page.js";
 import type { ConnectionLink } from "./connection-link.js";
 
 import type { SqlReader, SqlValue } from "./driver.js";
@@ -473,6 +480,13 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
     options: ChangesSinceOptions,
   ): Promise<ChangesSincePage> => {
     const instances = [...new Set(options.instanceIds)].sort();
+    // Owner sessions: a record removed between the horizons is a tombstone,
+    // not an expired session (spec-core §4 "Visibility"; RS items 7, 20).
+    // The owner reads whole records, so an overwrite needs no h0 body: the
+    // record is returned when it was written between the horizons.
+    const removals = options.removals === true;
+    // An owner session's effective `fields`/`view` projection, if any.
+    const projected = options.fields !== undefined;
     const targets: { instance: string; id: string; generation: number }[] = [];
     for (const instance of instances) {
       const resolved = link(instance, stream);
@@ -505,6 +519,9 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       targets,
       options.fields?.slice().sort() ?? null,
       options.purpose ?? "changes",
+      options.order ?? "asc",
+      ...(options.purpose === "listing" ? [options.sort ?? null] : []),
+      options.removals === true,
     ]);
     const clock = async () => {
       const [row] = await db.query<{
@@ -569,10 +586,17 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           throw new CursorExpiredError();
         if (currentClock.floor > 0) {
           // Compaction removed the proof that a changed key was absent at the
-          // earlier horizon. Current bodies cannot establish that old visibility.
+          // earlier horizon. Current bodies cannot establish that old
+          // visibility. A whole-record owner session decides h0 visibility
+          // from the retained log (tombstones, `visibleAtSince`) and returns
+          // every record written between the horizons, so only the part
+          // between h0 and h1 is relaxed for it. A change after the session
+          // horizon still expires every session: without the earlier log a
+          // later page cannot tell which body the horizon held, and its ranked
+          // set would shift under the page offset (spec-core §4: 410).
           const uncertain = await db.query<{ seq: number }>(
             "SELECT seq FROM record_changes WHERE connection_id=? AND stream=? AND seq>? LIMIT 1",
-            [target.id, stream, since ?? horizon],
+            [target.id, stream, removals && !projected ? horizon : (since ?? horizon)],
           );
           if (uncertain.length) throw new CursorExpiredError();
         }
@@ -594,8 +618,20 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
         const missing = await db.query<{ seq: number }>(
           `SELECT later.seq FROM record_changes later WHERE later.connection_id=? AND later.stream=?
           AND ((later.seq>? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))
-          ${since === null ? "" : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"}) LIMIT 1`,
-          since === null
+          ${
+            since === null || (removals && !projected)
+              ? ""
+              : removals
+                ? // Owner session with a `fields`/`view` projection: a record
+                  // visible at h0 and written between the horizons needs its
+                  // h0 body to tell whether the projection changed, and the
+                  // local DB keeps none. Fail the session (410) instead of
+                  // returning it (spec-core §9 RS items 7, 20). A removal
+                  // needs no body: it stays a tombstone.
+                  "OR (later.op='upsert' AND later.seq>? AND later.seq<=? AND (SELECT prior.op FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=? ORDER BY prior.seq DESC LIMIT 1)='upsert')"
+                : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"
+          }) LIMIT 1`,
+          since === null || (removals && !projected)
             ? [target.id, stream, horizon, horizon]
             : [target.id, stream, horizon, horizon, since, horizon, since],
         );
@@ -603,24 +639,42 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       }
     };
     await assertExact();
-    const rows: PdppStoredRecord[] = [];
+    const rows: PdppRecordRow[] = [];
     let visibleCount = 0;
     const limit = Math.max(1, Math.min(100, options.limit));
+    // The scan runs in `(instance_id, canonical key)` order, which is the
+    // `changes_since` order (spec-core §9 RS item 21) and the ascending key
+    // list order. A listing in another order (descending, or by the frozen
+    // `sort_field`) ranks every visible position, then reads the page's
+    // bodies (spec-core §8 "Stable sort"; RS item 33).
+    // A `changes_since` session uses `(instance_id, key)` in the direction
+    // `order` selects (spec-core §8 "Stable sort"; RS item 21).
+    const listing = options.purpose === "listing";
+    const sort: ListSort = listing ? (options.sort ?? { by: "key" }) : { by: "key" };
+    const order = options.order ?? "asc";
+    const ranked =
+      order === "desc" || sort.by === "field" || (removals && !listing);
+    const positions: (ListPosition & {
+      connectionId: string;
+      pkHash: string;
+      removedAt?: number;
+    })[] = [];
     let after: [string, string, string] | undefined;
     while (targets.length > 0) {
       const current = await db.query<{
         instance: string;
+        connection_id: string;
         record_key: string;
         pk_hash: string;
         body: string;
         stamp_o: number;
       }>(
         `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
-         SELECT t.instance,r.record_key,r.pk_hash,r.body,${seenStamp("r.").o} AS stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
-         WHERE r.stream=? ${after ? "AND (r.record_key,t.instance,r.pk_hash)>(?,?,?)" : ""}
+         SELECT t.instance,r.connection_id,r.record_key,r.pk_hash,r.body,${seenStamp("r.").o} AS stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
+         WHERE r.stream=? ${after ? "AND (t.instance,r.record_key,r.pk_hash)>(?,?,?)" : ""}
          ${since === null ? "" : "AND EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq<=? AND c.seq>?)"}
          AND NOT EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq>?)
-         ORDER BY r.record_key,t.instance,r.pk_hash LIMIT 100`,
+         ORDER BY t.instance,r.record_key,r.pk_hash LIMIT 100`,
         [
           ...targets.flatMap((t) => [t.instance, t.id]),
           stream,
@@ -640,13 +694,116 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           deleted: false,
         };
         if (!options.isVisible || options.isVisible(value)) {
-          if (visibleCount++ >= offset && rows.length <= limit)
+          if (ranked) {
+            positions.push({
+              ...listPosition(value, sort),
+              connectionId: row.connection_id,
+              pkHash: row.pk_hash,
+            });
+          } else if (visibleCount >= offset && rows.length <= limit) {
             rows.push(value);
+          }
+          visibleCount++;
         }
       }
       if (current.length < 100) break;
       const last = current.at(-1)!;
-      after = [last.record_key, last.instance, last.pk_hash];
+      after = [last.instance, last.record_key, last.pk_hash];
+    }
+    if (removals && !listing && since !== null) {
+      // Tombstones: the key's last change at h1 is a removal inside the
+      // session, and its last change at h0 was an upsert, so the record was
+      // visible at h0 and is not at h1. No other key gets one, including a
+      // record created and removed between the horizons (spec-core §4).
+      const removed = await db.query<{
+        instance: string;
+        connection_id: string;
+        record_key: string;
+        pk_hash: string;
+        stamp_o: number;
+        seq: number;
+      }>(
+        `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
+         SELECT t.instance,c.connection_id,c.record_key,c.pk_hash,c.stamp_o,c.seq FROM record_changes c JOIN targets t ON t.connection_id=c.connection_id
+         WHERE c.stream=? AND c.op='remove' AND c.seq>? AND c.seq<=?
+           AND c.seq=(SELECT MAX(c2.seq) FROM record_changes c2 WHERE c2.connection_id=c.connection_id AND c2.stream=c.stream AND c2.pk_hash=c.pk_hash AND c2.seq<=?)`,
+        [
+          ...targets.flatMap((t) => [t.instance, t.id]),
+          stream,
+          since,
+          horizon,
+          horizon,
+        ],
+      );
+      const floor = (await clock()).floor;
+      const visibleAtSince = async (row: (typeof removed)[number]) => {
+        const keyed = [row.connection_id, stream, row.pk_hash];
+        const [prior] = await db.query<{ op: string }>(
+          "SELECT op FROM record_changes WHERE connection_id=? AND stream=? AND pk_hash=? AND seq<=? ORDER BY seq DESC LIMIT 1",
+          [...keyed, since],
+        );
+        if (prior) return prior.op === "upsert";
+        // No retained change at or before h0. Without compaction the key was
+        // absent then. After compaction (floor <= since, checked above) a key
+        // whose first change after h0 is this removal existed at h0; one
+        // written in between is ambiguous (created after h0, or updated), so
+        // the session cannot be answered exactly (spec-core §4: 410).
+        if (floor === 0) return false;
+        const between = await db.query<{ seq: number }>(
+          "SELECT seq FROM record_changes WHERE connection_id=? AND stream=? AND pk_hash=? AND seq>? AND seq<? LIMIT 1",
+          [...keyed, since, row.seq],
+        );
+        if (between.length) throw new CursorExpiredError();
+        return true;
+      };
+      for (const row of removed) {
+        if (!(await visibleAtSince(row))) continue;
+        positions.push({
+          sortKey: null,
+          instance: row.instance,
+          recordKey: row.record_key,
+          connectionId: row.connection_id,
+          pkHash: row.pk_hash,
+          removedAt: row.stamp_o,
+        });
+        visibleCount++;
+      }
+    }
+    if (ranked) {
+      positions.sort((a, b) => compareListPositions(a, b, order, sort));
+      for (const position of positions.slice(offset, offset + limit + 1)) {
+        if (position.removedAt !== undefined) {
+          // The removal's stamp is the deletion time (an explicit delete
+          // stamps its observation time; merge.ts `deleteRunRecords`).
+          const at = new Date(position.removedAt).toISOString();
+          rows.push({
+            instance: position.instance,
+            stream,
+            recordKey: position.recordKey,
+            version: 1,
+            deletedAt: at,
+            emittedAt: at,
+            deleted: true,
+          });
+          continue;
+        }
+        const [row] = await db.query<{ body: string; stamp_o: number }>(
+          `SELECT r.body,${seenStamp("r.").o} AS stamp_o FROM records r
+           WHERE r.connection_id=? AND r.stream=? AND r.pk_hash=?`,
+          [position.connectionId, stream, position.pkHash],
+        );
+        // The final exactness check below expires a page whose body moved.
+        if (!row) throw new CursorExpiredError();
+        rows.push({
+          instance: position.instance,
+          stream,
+          recordKey: position.recordKey,
+          data: JSON.parse(row.body),
+          emittedAt: new Date(row.stamp_o).toISOString(),
+          version: 1,
+          deleted: false,
+        });
+      }
     }
     await assertExact();
     const data = rows.slice(0, limit),
@@ -665,6 +822,7 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       data,
       hasMore,
       ...(hasMore ? { nextCursor: cursor } : { nextChangesSince: cursor }),
+      ...(listing && { total: visibleCount }),
     };
   };
 }

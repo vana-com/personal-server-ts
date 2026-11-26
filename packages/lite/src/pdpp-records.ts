@@ -71,10 +71,11 @@ export async function handleLitePdppRecordList(
     const local = await deps.localSync();
     // A connection's identity here is its connector id in the
     // identity-less namespace, the same link the Node host registers.
-    const linked = local.recordsFor((connector) => ({
-      connector,
-      namespace: "",
-    }));
+    const link = (connector: string) => ({ connector, namespace: "" });
+    const linked = local.recordsFor(link);
+    // The frozen two-horizon history serves owner lists and change sessions,
+    // as on Node (spec-core §4, §8; RS items 7, 20, 21).
+    const history = local.changesFor(link);
     const connectors = await local.declarations.connectors();
     // The port is synchronous: read each connector's streams once per request.
     const streams = new Map(
@@ -88,6 +89,7 @@ export async function handleLitePdppRecordList(
     const ports: PdppRecordListPorts = {
       accountMode: deps.accountStorageMode,
       recordQuery: linked,
+      recordHistory: (stream, options) => history(stream, options),
       declarations: liteDeclarations(connectors, streams),
       // Lite holds connector ids only, not canonical source ids. `source`
       // names a held connector exactly; any other string names no source here
@@ -129,7 +131,7 @@ function liteDeclarations(
     name: stream,
     semantics: "mutable_state",
     primaryKey: [],
-    cursorField: "",
+    // Lite holds no declared cursor_field: owner lists use key order.
     requiredFields: [],
   });
   const forInstance = (connector: string, stream: string) =>

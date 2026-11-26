@@ -4449,3 +4449,4 @@ export {
 } from "./scope-upload-batches.js";
 export * from "./pdpp-records-list.js";
 export { parseRecordQuery } from "./pdpp-record-query.js";
+export * from "./pdpp-cursor-seal.js";

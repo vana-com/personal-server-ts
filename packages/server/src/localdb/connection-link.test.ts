@@ -299,8 +299,10 @@ describe("grant reads through database HTTP ports", () => {
         (await selected.json()).data.map((r: { id: string }) => r.id),
       ).toEqual(["allowed"]);
       expect(
+        // A stream outside the grant is refused before any declaration
+        // lookup (spec-core §8 grant enforcement; RS item 32).
         (await app.request("/streams/private/records", { headers })).status,
-      ).toBe(404);
+      ).toBe(403);
       const listed = await app.request("/streams", { headers });
       expect(listed.status).toBe(200);
       expect(
@@ -350,7 +352,7 @@ describe("grant reads through database HTTP ports", () => {
       });
       const headers = { Authorization: "Bearer token" };
       const firstResponse = await app.request(
-        "/streams/selected/records?limit=1",
+        "/streams/selected/records?limit=1&order=asc",
         { headers },
       );
       expect(firstResponse.status).toBe(200);
@@ -364,7 +366,7 @@ describe("grant reads through database HTTP ports", () => {
       ).not.toContain("0-hidden");
       const second = await (
         await app.request(
-          `/streams/selected/records?limit=1&cursor=${encodeURIComponent(first.next_cursor)}`,
+          `/streams/selected/records?limit=1&order=asc&cursor=${encodeURIComponent(first.next_cursor)}`,
           { headers },
         )
       ).json();
@@ -390,7 +392,7 @@ describe("grant reads through database HTTP ports", () => {
         "UPDATE records SET stamp_o=3,body_sha256='replacement' WHERE stream='selected' AND record_key='z-visible'",
       );
       const expired = await app.request(
-        `/streams/selected/records?limit=1&cursor=${encodeURIComponent(first.next_cursor)}`,
+        `/streams/selected/records?limit=1&order=asc&cursor=${encodeURIComponent(first.next_cursor)}`,
         { headers },
       );
       expect(expired.status).toBe(410);
@@ -459,14 +461,14 @@ describe("grant reads through database HTTP ports", () => {
       isConnectionAvailable: (i) => !deleted.has(i),
     });
     try {
-      const response = await app.request(`/${blobId}`, {
+      const response = await app.request(`/${blobId}?instance_id=handle-a`, {
         headers: { Authorization: "Bearer token" },
       });
       expect(response.status).toBe(200);
       expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
       expect(
         (
-          await app.request(`/${blobId}`, {
+          await app.request(`/${blobId}?instance_id=handle-a`, {
             headers: { Authorization: "Bearer noFields" },
           })
         ).status,
@@ -474,7 +476,7 @@ describe("grant reads through database HTTP ports", () => {
       removeReference = true;
       expect(
         (
-          await app.request(`/${blobId}`, {
+          await app.request(`/${blobId}?instance_id=handle-a`, {
             method: "HEAD",
             headers: { Authorization: "Bearer token" },
           })
@@ -483,7 +485,7 @@ describe("grant reads through database HTTP ports", () => {
       deleted.add("handle-a");
       expect(
         (
-          await app.request(`/${blobId}`, {
+          await app.request(`/${blobId}?instance_id=handle-a`, {
             headers: { Authorization: "Bearer token" },
           })
         ).status,
@@ -526,10 +528,11 @@ describe("grant change history after compaction", () => {
       page = await read("selected", { ...opts, cursor: page.nextCursor });
       values.push(...page.data.map((r) => [r.recordKey, r.instance]));
     }
+    // (instance_id, canonical key) order (spec-core §9 RS item 21).
     expect(values).toEqual([
       ["", "handle-a"],
-      ["", "handle-b"],
       ["allowed", "handle-a"],
+      ["", "handle-b"],
       ["allowed", "handle-b"],
     ]);
   });
@@ -641,4 +644,259 @@ it("a relink during an exact-count list reads one target for count and page", as
   );
   const count = (body.meta as { count: { value: number } }).count.value;
   expect((body.data as unknown[]).length).toBe(count);
+});
+
+it("grant listing orders by (instance_id, key) in the requested direction, or by the frozen sort_field (RS item 33)", async () => {
+  const { db, id } = await fixture();
+  for (const [key, at] of [
+    ["b", "2026-03-01T00:00:00Z"],
+    ["c", "nope"],
+    ["d", "2026-05-01"],
+  ] as const)
+    await run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run',?,'hash')",
+      [id, "selected", key, key, JSON.stringify({ at })],
+    );
+  const read = createGrantHistory(db, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  const walk = async (options: Record<string, unknown>) => {
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await read("selected", {
+        purpose: "listing",
+        instanceIds: ["handle-a"],
+        limit: 1,
+        cursor,
+        ...options,
+      });
+      ids.push(...page.data.map((row) => row.recordKey));
+      if (!page.hasMore) return ids;
+      cursor = page.nextCursor;
+    }
+  };
+  expect(await walk({ order: "desc", sort: { by: "key" } })).toEqual([
+    "d",
+    "c",
+    "b",
+    "allowed",
+  ]);
+  expect(await walk({ order: "asc", sort: { by: "key" } })).toEqual([
+    "allowed",
+    "b",
+    "c",
+    "d",
+  ]);
+  // Dates and instants by what they denote; absent or invalid values last.
+  expect(
+    await walk({ order: "desc", sort: { by: "field", field: "at" } }),
+  ).toEqual(["d", "b", "c", "allowed"]);
+});
+
+it("owner change sessions follow the two-horizon rules on a switched account (RS items 7, 20, 21)", async () => {
+  const { db, id } = await fixture();
+  const put = (key: string, stamp: number) =>
+    run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,?,'run','{}','hash')",
+      [id, "selected", key, key, stamp],
+    );
+  const remove = (key: string) =>
+    run(db, "DELETE FROM records WHERE connection_id=? AND stream='selected' AND record_key=?", [id, key]);
+  await put("gone", 1);
+  await put("kept", 1);
+  const read = createGrantHistory(db, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  const session = (changesSince?: string, order: "asc" | "desc" = "desc") =>
+    read("selected", {
+      instanceIds: ["handle-a"],
+      limit: 100,
+      changesSince,
+      order,
+      removals: true,
+    });
+  const first = await session();
+  // `beginning`: every visible record, no tombstones, descending key order.
+  expect(first.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+    ["kept", false],
+    ["gone", false],
+    ["allowed", false],
+  ]);
+  // Visible only between the horizons: never tombstoned.
+  await put("brief", 2);
+  await remove("brief");
+  await remove("gone");
+  const next = await session(first.nextChangesSince);
+  expect(next.data).toEqual([
+    expect.objectContaining({
+      recordKey: "gone",
+      instance: "handle-a",
+      deleted: true,
+      deletedAt: new Date(1).toISOString(),
+    }),
+  ]);
+  // The session horizon is fixed at page one: a write after page one waits.
+  const paged = await read("selected", {
+    instanceIds: ["handle-a"],
+    limit: 1,
+    order: "asc",
+    removals: true,
+  });
+  await put("late", 3);
+  const rest = await read("selected", {
+    instanceIds: ["handle-a"],
+    limit: 100,
+    order: "asc",
+    removals: true,
+    cursor: paged.nextCursor,
+  });
+  expect([...paged.data, ...rest.data].map((r) => r.recordKey)).toEqual([
+    "allowed",
+    "kept",
+  ]);
+});
+
+it("an owner change session with a fields projection fails closed (410) when a record visible at h0 was written, and keeps tombstones (RS items 7, 20)", async () => {
+  const { db, id } = await fixture();
+  await run(
+    db,
+    "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run','{\"a\":1}','h1')",
+    [id, "selected", "kept", "kept"],
+  );
+  const read = createGrantHistory(db, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  const session = (changesSince?: string, fields?: string[]) =>
+    read("selected", {
+      instanceIds: ["handle-a"],
+      limit: 100,
+      changesSince,
+      removals: true,
+      ...(fields && { fields }),
+    });
+  const projectedStart = await session(undefined, ["a"]);
+  const wholeStart = await session();
+  // A removal alone: still a tombstone with a projection.
+  await run(db, "DELETE FROM records WHERE connection_id=? AND record_key='allowed'", [id]);
+  const removedOnly = await session(projectedStart.nextChangesSince, ["a"]);
+  expect(removedOnly.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+    ["allowed", true],
+  ]);
+  // A write to a record visible at h0: the h0 body is gone, so the
+  // projected session cannot compare and expires; a whole-record owner
+  // session returns the record.
+  await run(
+    db,
+    "UPDATE records SET body='{\"a\":1,\"b\":2}', body_sha256='h2', stamp_o=2 WHERE connection_id=? AND record_key='kept'",
+    [id],
+  );
+  await expect(
+    session(projectedStart.nextChangesSince, ["a"]),
+  ).rejects.toThrow(/expired/i);
+  const whole = await session(wholeStart.nextChangesSince);
+  expect(whole.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+    ["allowed", true],
+    ["kept", false],
+  ]);
+});
+
+describe("owner sessions over a compacted change log (RS items 7, 20, 21)", () => {
+  async function compacted() {
+    const { db, id } = await fixture();
+    for (const key of ["b", "c", "d", "e"])
+      await run(
+        db,
+        "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run','{}','hash')",
+        [id, "selected", key, key],
+      );
+    const compact = () =>
+      run(
+        db,
+        "DELETE FROM record_changes WHERE connection_id=? AND seq<=(SELECT MAX(seq) FROM record_changes)",
+        [id],
+      );
+    const read = createGrantHistory(db, () => ({
+      connector: "fixture",
+      namespace: "",
+    }));
+    return { db, id, compact, read };
+  }
+
+  it.each(["delete", "update"] as const)(
+    "a %s after page one of a paged whole-record session expires it (410) instead of skipping a record",
+    async (mutate) => {
+      const { db, id, compact, read } = await compacted();
+      await compact();
+      const options = {
+        instanceIds: ["handle-a"],
+        limit: 2,
+        order: "asc" as const,
+        removals: true,
+      };
+      const first = await read("selected", options);
+      expect(first.hasMore).toBe(true);
+      await run(
+        db,
+        mutate === "delete"
+          ? "DELETE FROM records WHERE connection_id=? AND record_key='allowed'"
+          : "UPDATE records SET body='{\"x\":1}', body_sha256='h2', stamp_o=2 WHERE connection_id=? AND record_key='allowed'",
+        [id],
+      );
+      await expect(
+        read("selected", { ...options, cursor: first.nextCursor }),
+      ).rejects.toThrow(/expired/i);
+    },
+  );
+
+  it("a key with no retained change at h0, written and then removed between the horizons, expires the session (no tombstone)", async () => {
+    const { db, id, compact, read } = await compacted();
+    const session = (changesSince?: string) =>
+      read("selected", {
+        instanceIds: ["handle-a"],
+        limit: 100,
+        changesSince,
+        removals: true,
+      });
+    const start = await session();
+    await compact();
+    await run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,2,'run','{}','hash')",
+      [id, "selected", "n", "n"],
+    );
+    await run(
+      db,
+      "DELETE FROM records WHERE connection_id=? AND record_key='n'",
+      [id],
+    );
+    await expect(session(start.nextChangesSince)).rejects.toThrow(/expired/i);
+  });
+
+  it("a removal whose key has no retained change at h0 and no write since is a tombstone", async () => {
+    const { db, id, compact, read } = await compacted();
+    const session = (changesSince?: string) =>
+      read("selected", {
+        instanceIds: ["handle-a"],
+        limit: 100,
+        changesSince,
+        removals: true,
+      });
+    const start = await session();
+    await compact();
+    await run(
+      db,
+      "DELETE FROM records WHERE connection_id=? AND record_key='c'",
+      [id],
+    );
+    const next = await session(start.nextChangesSince);
+    expect(next.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+      ["c", true],
+    ]);
+  });
 });

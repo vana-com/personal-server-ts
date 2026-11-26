@@ -26,6 +26,7 @@ import {
   type RetainedDeclaration,
 } from "./pdpp-import.js";
 import type { Logger } from "../logger/index.js";
+import { PdppError } from "../errors/pdpp-catalog.js";
 import type { AccountStorageModeValue } from "../api/account-storage-mode.js";
 import { createLegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import { authorityHearing } from "../test-utils/account-mode.js";
@@ -451,6 +452,67 @@ describe("createPdppImporter", () => {
       // this store never served.
       expect(outcome.status).toBe("unchanged");
       expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeUndefined();
+    });
+
+    it("treats a replicating store's append_only delete refusal as a rejection and keeps importing", async () => {
+      // A replicating store refuses an append-only delete with
+      // `append_only_delete_unsupported` (replication cannot carry it). The
+      // importer reports that envelope as rejected; it does not throw, and
+      // the next envelope imports.
+      const store = createMemoryRecordStore();
+      const importer = createPdppImporter({
+        legacyWriteSeal: fixedLegacyWriteSeal("unswitched"),
+        store: {
+          ...store,
+          ingestBatch: (envelopes, semantics, primaryKey, ...rest) => {
+            if (
+              envelopes.some(
+                (e) =>
+                  e.op === "delete" &&
+                  semantics(e.stream, e.instance) === "append_only",
+              )
+            )
+              throw new PdppError(
+                "append_only_delete_unsupported",
+                "replication cannot carry an append-only delete",
+              );
+            return store.ingestBatch(envelopes, semantics, primaryKey, ...rest);
+          },
+        },
+        declarations: [
+          {
+            ...RETAINED,
+            streams: RETAINED.streams.map((stream) => ({
+              ...stream,
+              semantics: "append_only" as const,
+            })),
+          },
+        ],
+        instanceFor: () => INSTANCE,
+        logger: silentLogger(),
+      });
+      expect(
+        (await importer.importEnvelope(envelope({ semantics: "append_only" })))
+          .status,
+      ).toBe("imported");
+      const refused = await importer.importEnvelope(
+        envelope({ op: "delete", semantics: "append_only", collectedAt: "2026-09-18T10:00:00.000Z" }),
+      );
+      expect(refused).toMatchObject({
+        status: "rejected",
+        rejection: { code: "store_rejected" },
+      });
+      expect(store.getRecord(INSTANCE, "profile", "235680975")).toBeDefined();
+      const next = await importer.importEnvelope(
+        envelope({
+          id: "999",
+          recordKey: { id: "999" },
+          semantics: "append_only",
+          collectedAt: "2026-09-19T10:00:00.000Z",
+        }),
+      );
+      expect(next.status).toBe("imported");
+      expect(store.getRecord(INSTANCE, "profile", "999")).toBeDefined();
     });
 
     it("applies a delete for a record it holds", async () => {

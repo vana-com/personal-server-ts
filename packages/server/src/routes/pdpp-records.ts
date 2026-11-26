@@ -1,10 +1,14 @@
 import { grantUsesLockedRules } from "@opendatalabs/personal-server-ts-core/pdpp";
+import type { OwnerRecordDeleteResult } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   listPdppRecords,
   resolveOwnerSource,
   localRecord,
   localRecordJson,
-  projectFields,
+  servedRecordJson,
+  ownerViewFields,
+  createCursorSeal,
+  type ServedRow,
   refuseLegacyWrite,
   type LocalRecord,
   type OwnedAccountStorageMode,
@@ -301,6 +305,23 @@ export interface PdppRecordsRouteDeps {
    * observability hole that made a missing-file read take a day to diagnose.
    */
   logger?: PdppRouteLogger;
+  /**
+   * 32-byte key that seals page cursors and `changes_since` tokens (spec-core
+   * §4; RS item 21). Hosts pass a persisted key so a stored
+   * `next_changes_since` survives a restart; without one the router draws a
+   * random key and its tokens stop opening when the process ends.
+   */
+  cursorSealKey?: Uint8Array;
+  /**
+   * Owner record delete on a switched account, written as a run that
+   * reaches every device (core localdb/owner-delete.ts). Absent: a switched
+   * account refuses DELETE with `update_required`.
+   */
+  switchedDelete?: (input: {
+    instance: string;
+    stream: string;
+    recordKey: string;
+  }) => Promise<OwnerRecordDeleteResult>;
 }
 
 export interface PdppRouteLogger {
@@ -517,6 +538,17 @@ export function resourceMetadataUrlFor(c: Context): string {
   ).toString();
 }
 
+/**
+ * The blob endpoint beside this router's mount (`<mount>/blobs`), absolute
+ * from the request origin, for the `fetch_url` a served `blob_ref` carries
+ * (spec-core §4 "Binary data", §8 "Get a blob").
+ */
+function blobBaseFor(c: Context): string {
+  const url = new URL(c.req.url);
+  const mount = url.pathname.slice(0, url.pathname.indexOf("/streams/"));
+  return `${url.origin}${mount}/blobs`;
+}
+
 function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
   const err = new PdppError(
     "authentication_error",
@@ -536,39 +568,6 @@ function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
   );
 }
 
-/**
- * Project a declared JSON Schema down to exactly the granted fields.
- *
- * A client token must not learn that a field exists outside its grant, so
- * `properties` is filtered rather than passed through, and `required` is
- * intersected. Without a declared schema this degrades to bare property names
- * — the previous behavior — rather than inventing structure.
- */
-function projectSchemaToFields(
-  schema: Record<string, unknown> | undefined,
-  fields: string[] | undefined,
-): Record<string, unknown> {
-  const allowed = new Set(fields ?? []);
-  if (!schema) {
-    return {
-      properties: Object.fromEntries([...allowed].map((f) => [f, {}])),
-    };
-  }
-
-  const properties = (schema.properties ?? {}) as Record<string, unknown>;
-  const required = Array.isArray(schema.required)
-    ? (schema.required as string[]).filter((f) => allowed.has(f))
-    : [];
-
-  return {
-    ...schema,
-    properties: Object.fromEntries(
-      Object.entries(properties).filter(([name]) => allowed.has(name)),
-    ),
-    ...(required.length > 0 ? { required } : { required: [] }),
-  };
-}
-
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   // Metadata handlers also use the guarded reader. Preserve its typed refusal
@@ -578,6 +577,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     return sendError(c, mapAndLog(deps, c.req.path, reqId, error), reqId);
   });
   const validateData = createRecordDataValidator(deps.declarations);
+  const cursorSeal = createCursorSeal(deps.cursorSealKey);
   const readsFor = deps.reads ?? (() => deps.store);
   /** The token class selects the reader; request input never does. */
   function reads(context: PdppTokenContext): RouteReadStore {
@@ -618,9 +618,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     context: PdppTokenContext,
     plan: RecordListPlan,
   ): Record<string, unknown> {
-    const { stream, scope, instanceIds, query } = plan;
+    const { stream, scope, instanceIds, query, sort } = plan;
     const { limit, clamped, order, cursor } = query;
     const fields = scope.fields;
+    const tokenKind = context.tokenKind === "owner" ? "owner" : "client";
     const meta = clamped
       ? {
           warnings: [
@@ -630,51 +631,36 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       : undefined;
 
     if (query.changesSince !== undefined) {
-      // Eligibility compares the frozen candidate grant projection; sparse
-      // request fields shape only the response. Legacy profiles retain their
-      // existing request-field eligibility. The store returns raw rows.
-      // (spec §4:
-      // a record whose only change was to an unauthorized field must not
-      // appear as "changed" at all). The store returns each row's RAW,
-      // unprojected data regardless of `fields` — response-shaping
-      // projection happens only at toRecordJson below, after
-      // recordWithinGrantTimeConstraint has already run against the real
-      // field value. This split matters: if the store projected the
-      // returned data too, a grant whose fields exclude the
+      // Eligibility compares the frozen grant projection (owner: the
+      // session's effective `fields`); sparse request fields shape only the
+      // response (spec §4: a record whose only change was to an
+      // unauthorized field must not appear as "changed" at all). The store
+      // returns each row's RAW, unprojected data regardless of `fields` —
+      // response-shaping projection happens only at servedRecordJson below,
+      // after visibility has run against the real field value. If the store
+      // projected the returned data too, a grant whose fields exclude the
       // time_constraint field would silently break that filter.
+      //
+      // Visibility is evaluated at both horizons for every token kind, so a
+      // tombstone is emitted for each record visible at h0 and not at h1, and
+      // for no other record (spec-core §4 "Visibility"; RS items 7, 20).
       const page = reads(context).changesSince(stream, {
         instanceIds,
+        // spec-core §4 "Starting a sync": `beginning` on every stream.
         changesSince:
-          grantUsesLockedRules(context.grant) && query.changesSince === "beginning"
-            ? undefined
-            : query.changesSince,
+          query.changesSince === "beginning" ? undefined : query.changesSince,
         cursor,
         limit,
-        fields: grantUsesLockedRules(context.grant)
-          ? scope.streamGrant!.fields
-          : fields,
-        ...(grantUsesLockedRules(context.grant) && {
-          expireOnErasure: true,
-          isVisible: (row: {
-            recordKey: string;
-            data: Record<string, unknown>;
-          }) =>
-            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
-        }),
-      });
-      const visible = page.data.filter((row) => {
-        if (grantUsesLockedRules(context.grant)) return true; // store compared both authorized historical states
-        if (row.deleted) {
-          return recordKeyWithinGrantResources(
-            row.recordKey,
-            scope.streamGrant,
-          );
-        }
-        return (
+        order,
+        fields:
+          context.tokenKind === "owner" ? fields : scope.streamGrant!.fields,
+        expireOnErasure: true,
+        isVisible: (row: {
+          recordKey: string;
+          data: Record<string, unknown>;
+        }) =>
           recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-          recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
-        );
+          recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
       });
       return {
         object: "list",
@@ -683,8 +669,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ...(page.nextChangesSince && {
           next_changes_since: page.nextChangesSince,
         }),
-        data: visible.map((row) =>
-          toRecordJson(stream, row, fields, grantUsesLockedRules(context.grant)),
+        data: page.data.map((row) =>
+          servedRecordJson(
+            stream,
+            toServedRow(row),
+            fields,
+            tokenKind,
+            plan.blobBase,
+          ),
         ),
         ...(clamped && { meta }),
       };
@@ -695,6 +687,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       limit,
       order,
       cursor,
+      sort,
       // Only a replica preview reader returns removal rows; only the owner
       // may see one.
       isVisible: (row) =>
@@ -708,7 +701,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       has_more: page.hasMore,
       ...(page.nextCursor && { next_cursor: page.nextCursor }),
       data: page.data.map((row) =>
-        toRecordJson(stream, row, fields, grantUsesLockedRules(context.grant)),
+        servedRecordJson(
+          stream,
+          toServedRow(row),
+          fields,
+          tokenKind,
+          plan.blobBase,
+        ),
       ),
       ...(meta && { meta }),
     };
@@ -969,6 +968,34 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
   }
 
+  /**
+   * The instances a single-record read or delete looks in (spec-core §8
+   * "Get a single record"). `instance_id` is required when the query context
+   * covers more than one instance of the stream, and a missing one is a 400
+   * before any lookup; an `instance_id` the context does not cover is 404
+   * (RS item 23).
+   */
+  function selectRecordInstances(
+    covered: string[],
+    instanceId: string | undefined,
+  ): string[] {
+    const unique = [...new Set(covered)];
+    if (instanceId === undefined) {
+      if (unique.length > 1) {
+        throw new PdppError(
+          "invalid_request",
+          "instance_id is required when the query context covers more than one instance of the stream",
+          { param: "instance_id" },
+        );
+      }
+      return unique;
+    }
+    if (!unique.includes(instanceId)) {
+      throw new PdppError("not_found", "Record not found");
+    }
+    return [instanceId];
+  }
+
   app.get("/streams", async (c) => {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
@@ -1166,45 +1193,56 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
 
       if (context!.tokenKind === "owner") {
+        // spec-core §8 "Get stream metadata", owner token: the full current
+        // metadata (RS item 14). `cursor_field` is the declared field, not
+        // the store's internal emitted-time order. `views` are the retained
+        // declaration's views for this stream, which owner reads accept as
+        // `view=<id>`. `query` and `relationships` are empty: the §5
+        // declaration format this server retains (DeclarationSnapshot in
+        // core/src/pdpp/types.ts) carries neither relationships nor query
+        // capabilities, and this RS implements no owner range filter or
+        // expansion.
         return c.json(
           {
             object: "stream_metadata",
             name: declaration!.name,
-            primary_key: declaration!.primaryKey,
-            cursor_field: declaration!.cursorField,
-            consent_time_field: declaration!.consentTimeField ?? null,
-            query: {},
-            views: [],
-            relationships: [],
-            // §8 owner metadata carries the full declared schema and
-            // selection capability. Omitting them made this a public response
-            // contract mismatch that access-behavior fixtures could not see.
             schema: declaration!.schema ?? null,
+            primary_key: declaration!.primaryKey,
+            ...(declaration!.cursorField !== undefined && {
+              cursor_field: declaration!.cursorField,
+            }),
+            consent_time_field: declaration!.consentTimeField ?? null,
             selection: declaration!.selection ?? null,
+            query: {},
+            views: declaration!.views ?? [],
+            relationships: [],
           },
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
         );
       }
 
+      // spec-core §8 "Get stream metadata", client token: a closed
+      // projection of the frozen grant only (RS item 15). The granted fields
+      // and, when frozen, `sort_field`; no `cursor_field`, primary key,
+      // selection, or current schema, so a declaration change after issuance
+      // cannot show through this endpoint.
+      const streamGrant = scope.streamGrant!;
       return c.json(
         {
           object: "stream_metadata",
-          name: declaration!.name,
-          primary_key: declaration!.primaryKey,
-          cursor_field: declaration!.cursorField,
-          consent_time_field: declaration!.consentTimeField ?? null,
+          name: streamGrant.name,
+          schema: {
+            properties: Object.fromEntries(
+              streamGrant.fields.map((field) => [field, {}]),
+            ),
+          },
+          ...(streamGrant.sort_field !== undefined && {
+            sort_field: streamGrant.sort_field,
+          }),
           query: {},
           views: [],
           relationships: [],
-          // Grant-closed: the declared schema projected to exactly the
-          // granted fields, so a client token learns record shape without
-          // learning the existence of fields it was not granted. Falls back
-          // to bare field names when the retained declaration carries no
-          // schema, rather than fabricating one.
-          schema: projectSchemaToFields(declaration!.schema, scope.fields),
-          // The frozen selection capability the grant was resolved against.
-          selection: declaration!.selection ?? null,
         },
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -1236,12 +1274,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           ownerInstances,
           requireRegisteredConnections,
           legacy: (plan) => Promise.resolve(legacyRecordList(context!, plan)),
+          cursorSeal,
         },
         {
           url: c.req.url,
           stream,
           context: context!,
           prefer: c.req.header("prefer"),
+          blobBase: blobBaseFor(c),
         },
       );
       const response = c.json(result.body, 200, {
@@ -1291,20 +1331,32 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // Silently ignoring it told a client its request was honored when a
       // narrower thing happened instead.
       const stream = c.req.param("stream");
-      const recordKey = decodeURIComponent(c.req.param("id"));
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
+      // spec-core §4 "Compound key encoding": the RS decodes a path key
+      // exactly once. Hono's `param()` has already decoded it, so a second
+      // `decodeURIComponent` read `a%2541` as `aA` (RS item 2).
+      const recordKey = c.req.param("id");
+      const tokenKind = context!.tokenKind === "owner" ? "owner" : "client";
       const scope = resolveReadScope(
         context!,
         stream,
-        declaration,
-        query.fields,
+        // Looked up after the client's field check (RS item 32).
+        () => readDeclaration(context!, stream).declaration,
+        tokenKind === "owner"
+          ? (ownerViewFields(
+              readDeclaration(context!, stream).declaration,
+              query.view,
+            ) ?? query.fields)
+          : query.fields,
       );
+      const { ownerInstanceIds } =
+        tokenKind === "owner"
+          ? readDeclaration(context!, stream)
+          : { ownerInstanceIds: [] };
 
-      const effectiveInstanceIds =
-        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
+      const effectiveInstanceIds = selectRecordInstances(
+        tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds,
+        query.instanceId,
+      );
       if (context!.tokenKind === "client") {
         requireRegisteredConnections(effectiveInstanceIds);
       }
@@ -1335,7 +1387,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             stream,
             found,
             scope.fields,
-            grantUsesLockedRules(context!.grant),
+            tokenKind,
+            blobBaseFor(c),
           ),
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -1360,16 +1413,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      const fields = scope.fields;
-
       const response = c.json(
-        toRecordJson(
+        servedRecordJson(
           stream,
-          found.deleted
-            ? found
-            : { ...found, data: projectFields(found.data, fields) },
-          undefined,
-          grantUsesLockedRules(context?.grant),
+          toServedRow(found),
+          scope.fields,
+          tokenKind,
+          blobBaseFor(c),
         ),
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -1403,22 +1453,76 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
-      parseRecordQuery(c.req.url, "deleteRecord");
+      const query = parseRecordQuery(c.req.url, "deleteRecord");
       if (context!.tokenKind !== "owner") {
         throw new PdppError(
           "authentication_error",
           "Delete requires an owner token",
         );
       }
-      const refusal = refuseRecordWrite(reqId);
-      if (refusal) return refusal;
+      // A §8 endpoint answers the unified error body (RS item 6), not the
+      // legacy-write refusal body.
+      const mode = deps.accountStorageMode?.read() ?? "unknown";
+      if (mode === "unknown")
+        throw new PdppError(
+          "ACCOUNT_MODE_UNKNOWN",
+          "The account mode is not known yet",
+        );
+      if (mode === "switched") {
+        // A switched (stream-sync) account's records travel to the owner's
+        // other devices, so a delete is written as a run through the same
+        // intake and publication a connector's explicit delete uses
+        // (core localdb/owner-delete.ts). A host without that port refuses.
+        if (!deps.switchedDelete)
+          throw new PdppError(
+            "update_required",
+            "This server cannot write a delete run for a stream-sync account",
+          );
+        const stream = c.req.param("stream");
+        const recordKey = c.req.param("id");
+        if (!deps.declarations.declares(stream)) {
+          throw new PdppError("not_found", "Stream not found");
+        }
+        const instances = selectRecordInstances(
+          ownerInstances(context!).filter((instance) =>
+            deps.declarations.forInstance(instance, stream),
+          ),
+          query.instanceId,
+        );
+        for (const instance of instances) {
+          const result = await deps.switchedDelete({
+            instance,
+            stream,
+            recordKey,
+          });
+          if (result.kind === "not_found") continue;
+          if (result.kind === "refused")
+            throw new PdppError(
+              result.retryable ? "STREAM_READ_UNAVAILABLE" : "conflict",
+              result.reason,
+            );
+          return c.body(null, 204, {
+            "Request-Id": reqId,
+            "PDPP-Version": PDPP_VERSION,
+          });
+        }
+        throw new PdppError("not_found", "Record not found");
+      }
       const stream = c.req.param("stream");
-      const recordKey = decodeURIComponent(c.req.param("id"));
+      // Decoded once, by the router (spec-core §4; RS item 2).
+      const recordKey = c.req.param("id");
       if (!deps.declarations.declares(stream)) {
         throw new PdppError("not_found", "Stream not found");
       }
 
-      const effectiveInstanceIds = ownerInstances(context!);
+      // spec-core §8 "Delete a record": `instance_id` follows the rule for a
+      // single-record read (RS item 23).
+      const effectiveInstanceIds = selectRecordInstances(
+        ownerInstances(context!).filter((instance) =>
+          deps.declarations.forInstance(instance, stream),
+        ),
+        query.instanceId,
+      );
       let deletedAny = false;
       for (const instance of effectiveInstanceIds) {
         const declaration = deps.declarations.forInstance(instance, stream);
@@ -1441,15 +1545,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         "PDPP-Version": PDPP_VERSION,
       });
     } catch (err) {
+      // A connection-state refusal uses the unified §8 error body like every
+      // other PDPP error (spec-core §8 "Errors"; RS item 6).
       if (err instanceof PdppBindingError) {
-        return c.json(
-          {
-            error: { code: err.reason, message: err.reason },
-            request_id: reqId,
-          },
-          409,
-          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-        );
+        return sendError(c, new PdppError("conflict", err.reason), reqId);
       }
       return sendError(
         c,
@@ -2264,40 +2363,27 @@ function summarizeGrantVisible(
   };
 }
 
-/**
- * One response record or tombstone. The candidate names a record by its
- * instance and key together, so it adds `instance_id` (the grant's handle,
- * which is the stored instance) and serves the minimal client tombstone. The
- * current contract's shape is unchanged.
- */
-function toRecordJson(
-  stream: string,
-  row: PdppRecordRow,
-  fields: string[] | undefined,
-  candidate = false,
-) {
-  const identity = {
-    object: "record",
-    id: row.recordKey,
-    ...(candidate && { instance_id: row.instance }),
-    stream,
-  };
-  if (row.deleted) {
-    if (candidate) return { ...identity, deleted: true };
-    return {
-      ...identity,
-      deleted: true,
-      deleted_at: row.deletedAt,
-      emitted_at: row.emittedAt,
-      ...(row.confirmation && { confirmation: row.confirmation }),
-      ...(row.status && { visibility: row.visibility, status: row.status }),
-    };
-  }
-  return {
-    ...identity,
-    data: projectFields(row.data, fields),
-    emitted_at: row.emittedAt,
-    ...(row.confirmation && { confirmation: row.confirmation }),
-    ...(row.status && { visibility: row.visibility, status: row.status }),
-  };
+/** A store row in the shape `servedRecordJson` serves (spec-core §4). */
+function toServedRow(row: PdppRecordRow): ServedRow {
+  return row.deleted
+    ? {
+        instance: row.instance,
+        recordKey: row.recordKey,
+        deleted: true,
+        deletedAt: row.deletedAt,
+        emittedAt: row.emittedAt,
+        ...(row.removal && { removal: row.removal }),
+        confirmation: row.confirmation,
+        visibility: row.visibility,
+        status: row.status,
+      }
+    : {
+        instance: row.instance,
+        recordKey: row.recordKey,
+        data: row.data,
+        emittedAt: row.emittedAt,
+        confirmation: row.confirmation,
+        visibility: row.visibility,
+        status: row.status,
+      };
 }

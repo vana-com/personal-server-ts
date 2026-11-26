@@ -1,10 +1,15 @@
 import { selectSyncChange } from "./sync-selection.js";
 import {
-  compareListRows,
+  assertListCursorSort,
+  cursorPosition,
+  compareListPositions,
+  listPosition,
   listSnapshotPage,
   compareRecordIdentity,
   decodeListCursor,
   decodeSyncPageCursor,
+  listSortTag,
+  type ListPosition,
 } from "./list-page.js";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -198,27 +203,24 @@ export function createMemoryRecordStore(): PdppRecordStore {
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    let after: PdppStoredRecord | undefined;
+    let after: ListPosition | undefined;
     let horizon = new Date(writeClock).toISOString();
     if (options.cursor) {
       const payload = decodeListCursor(options.cursor);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
+      assertListCursorSort(payload, options.sort);
       horizon = payload.horizon;
-      after = {
-        emittedAt: payload.sortValue ?? "",
-        recordKey: payload.recordKey,
-        instance: payload.instance,
-        stream,
-        data: {},
-        version: 0,
-        deleted: false,
-      };
+      after = cursorPosition(payload, options.sort);
     }
+    const compare = (a: ListPosition, b: ListPosition) =>
+      compareListPositions(a, b, options.order, options.sort);
     const snapshotKey = JSON.stringify([
       stream,
       [...new Set(options.instanceIds)].sort(),
       horizon,
+      options.order,
+      listSortTag(options.sort),
     ]);
     // One bounded cache of raw row references prevents repeated sorting for a
     // page walk. It holds no disclosure decision and is rebuilt from history
@@ -244,7 +246,9 @@ export function createMemoryRecordStore(): PdppRecordStore {
         erased: new Set(),
         rows: Array.from(snapshot.values())
           .filter((row): row is PdppStoredRecord => !row.deleted)
-          .sort(compareListRows),
+          .map((row) => ({ row, position: listPosition(row, options.sort) }))
+          .sort((a, b) => compare(a.position, b.position))
+          .map(({ row }) => row),
       };
     }
     if (listSnapshot.erasureClock !== writeClock) {
@@ -259,23 +263,22 @@ export function createMemoryRecordStore(): PdppRecordStore {
     }
     const erased = listSnapshot.erased;
     const rows = listSnapshot.rows;
-    const direction = options.order === "asc" ? 1 : -1;
-    let start = direction === 1 ? 0 : rows.length - 1;
+    // Rows are sorted in the requested order; start after the cursor's
+    // position (the first row that compares greater).
+    let start = 0;
     if (after) {
       let low = 0,
         high = rows.length;
       while (low < high) {
         const middle = Math.floor((low + high) / 2);
-        const compared = compareListRows(rows[middle], after);
-        if (compared < 0 || (direction === 1 && compared === 0))
+        if (compare(listPosition(rows[middle], options.sort), after) <= 0)
           low = middle + 1;
         else high = middle;
       }
-      start = direction === 1 ? low : low - 1;
+      start = low;
     }
     function* orderedRows(): Generator<PdppStoredRecord> {
-      for (let i = start; i >= 0 && i < rows.length; i += direction)
-        yield rows[i];
+      for (let i = start; i < rows.length; i++) yield rows[i];
     }
     return listSnapshotPage(
       orderedRows(),
@@ -296,7 +299,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
     deletedAt: string,
     streamSemantics: StreamSemantics,
   ): boolean {
-    if (streamSemantics === "append_only") return false;
+    // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+    // permitted" (§8 "Delete a record"; RS item 1). Only re-emitted
+    // duplicates are no-ops, at ingest.
+    void streamSemantics;
     const key = rowKey(instance, stream, recordKey);
     const existing = current.get(key);
     if (!existing || existing.deleted) return false;
@@ -334,7 +340,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     if (options.cursor) {
       // Continuing an already-anchored session: horizon and sinceHorizon
       // both come from the page cursor, not re-derived from changesSince.
-      const payload = decodeSyncPageCursor(options.cursor);
+      const payload = decodeSyncPageCursor(options.cursor, options.order);
       assertCursorScope(payload, stream);
       horizon = payload.horizon;
       sinceHorizon = payload.sinceHorizon;
@@ -410,7 +416,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
       if (selected) changed.push(selected);
     }
 
-    changed.sort(compareRecordIdentity);
+    // spec-core §8 "Stable sort": `(instance_id, key)` in the direction
+    // `order` selects (RS item 21).
+    const direction = options.order === "desc" ? -1 : 1;
+    changed.sort((a, b) => direction * compareRecordIdentity(a, b));
 
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
@@ -443,6 +452,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
             sinceHorizon,
             offset: offset + options.limit,
             orderKey: "code-point",
+            order: options.order ?? "asc",
           })
         : undefined,
       nextChangesSince: hasMore

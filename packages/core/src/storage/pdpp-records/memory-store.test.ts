@@ -157,7 +157,9 @@ describe("memory record store: delete + tombstones", () => {
     expect(store.getRecord("inst_1", "playlists", "pl_1")).toBeUndefined();
   });
 
-  it("rejects delete on an append_only stream", () => {
+  // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+  // permitted." §8 "Delete a record" makes no exception (RS item 1).
+  it("deletes a record on an append_only stream (owner delete)", () => {
     const store = createMemoryRecordStore();
     store.ingestBatch(
       [
@@ -179,27 +181,52 @@ describe("memory record store: delete + tombstones", () => {
       "2026-04-02T00:00:00.000Z",
       "append_only",
     );
-    expect(deleted).toBe(false);
+    expect(deleted).toBe(true);
+    expect(store.getRecord("inst_1", "messages", "msg_1")).toBeUndefined();
+    const sync = store.changesSince("messages", {
+      instanceIds: ["inst_1"],
+      limit: 10,
+    });
+    expect(sync.data).toEqual([
+      expect.objectContaining({
+        recordKey: "msg_1",
+        deleted: true,
+        deletedAt: "2026-04-02T00:00:00.000Z",
+      }),
+    ]);
   });
 
-  it("rejects an explicit delete directive for an append_only stream at ingest", () => {
+  // spec-core §4 "Re-emitted append-only records": the duplicate rule "does
+  // not block `op: delete` or owner deletion".
+  it("accepts an explicit delete directive for an append_only stream at ingest", () => {
     const store = createMemoryRecordStore();
-    const result = store.ingestBatch(
-      [
-        {
-          instance: "inst_1",
-          stream: "messages",
-          key: "msg_1",
-          data: null,
-          emitted_at: "2026-04-01T00:00:00.000Z",
-          op: "delete",
-        },
-      ],
+    const row = {
+      instance: "inst_1",
+      stream: "messages",
+      key: "msg_1",
+      emitted_at: "2026-04-01T00:00:00.000Z",
+    };
+    store.ingestBatch(
+      [{ ...row, data: { id: "msg_1" } }],
       messagesSemantics,
       messagesPk,
     );
-    expect(result.accepted).toBe(0);
-    expect(result.rejected).toHaveLength(1);
+    // A re-emitted duplicate is still a no-op.
+    expect(
+      store.ingestBatch(
+        [{ ...row, data: { id: "msg_1" } }],
+        messagesSemantics,
+        messagesPk,
+      ).results[0]?.outcome,
+    ).toBe("unchanged");
+    const result = store.ingestBatch(
+      [{ ...row, data: null, op: "delete" }],
+      messagesSemantics,
+      messagesPk,
+    );
+    expect(result.accepted).toBe(1);
+    expect(result.rejected).toHaveLength(0);
+    expect(store.getRecord("inst_1", "messages", "msg_1")).toBeUndefined();
   });
 });
 

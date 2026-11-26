@@ -64,18 +64,6 @@ const controlText = "unaffected finalized control 8b";
 const controlBytes = Buffer.from("independent control bytes 8b");
 const controlId = replicaDigest(controlBytes);
 const credential = "isolated-receiver-credential";
-function cursorVisibilityEpoch(cursor: string): string | undefined {
-  const normalized = cursor.replace(/-/g, "+").replace(/_/g, "/");
-  const binary = atob(
-    normalized + "=".repeat((4 - (normalized.length % 4)) % 4),
-  );
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  return (
-    JSON.parse(new TextDecoder().decode(bytes)) as {
-      visibilityEpoch?: string;
-    }
-  ).visibilityEpoch;
-}
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
@@ -316,14 +304,14 @@ async function fixture() {
     expect((await read("/streams/messages/records/a-control")).status).toBe(
       404,
     );
-    const response = await read(`/blobs/${encodeURIComponent(controlId)}`);
+    const response = await read(`/blobs/${encodeURIComponent(controlId)}?instance_id=conn`);
     expect(response.status).toBe(404);
   }
   async function controlWorks() {
     expect((await json("/streams/messages/records/a-control")).data.text).toBe(
       controlText,
     );
-    const response = await read(`/blobs/${encodeURIComponent(controlId)}`);
+    const response = await read(`/blobs/${encodeURIComponent(controlId)}?instance_id=conn`);
     expect(response.status).toBe(200);
     expect(Buffer.from(await response.arrayBuffer())).toEqual(controlBytes);
   }
@@ -335,7 +323,7 @@ async function fixture() {
   expect(
     (await json("/streams/messages/records/z-quarantined")).data.text,
   ).toBe(secret);
-  const binary = await read(`/blobs/${encodeURIComponent(blobId)}`);
+  const binary = await read(`/blobs/${encodeURIComponent(blobId)}?instance_id=conn`);
   expect(binary.status).toBe(200);
   expect(Buffer.from(await binary.arrayBuffer())).toEqual(blobBytes);
   await controlWorks();
@@ -343,28 +331,37 @@ async function fixture() {
   expect(list.data.map((r: { id: string }) => r.id)).toEqual(["a-control"]);
   expect(list.next_cursor).toBeTypeOf("string");
   const changes = await json(
-    "/streams/messages/records?changes_since=&limit=1",
+    "/streams/messages/records?changes_since=beginning&limit=1&order=asc",
   );
   expect(changes.data.map((r: { id: string }) => r.id)).toEqual(["a-control"]);
   expect(changes.next_cursor).toBeTypeOf("string");
-  const allChanges = await json("/streams/messages/records?changes_since=");
+  const allChanges = await json("/streams/messages/records?changes_since=beginning");
   expect(allChanges.next_changes_since).toBeTypeOf("string");
   for (const token of [
     list.next_cursor,
     changes.next_cursor,
     allChanges.next_changes_since,
   ])
-    expect(cursorVisibilityEpoch(token)).toBeTypeOf("string");
+    // HTTP tokens are sealed (RS item 21); the store token inside still
+    // binds the visibility epoch, which the 410s below exercise.
+    expect(token).toMatch(/^(pc|cs)_/);
+  // The same first page read at the store, below the HTTP seal: its own
+  // cursor must expire after quarantine too (store-level check).
+  const storeList = activeReceiver.readStore({ reader: "grant" }).listRecords(
+    "messages",
+    { instanceIds: ["conn"], limit: 1, order: "asc" },
+  );
+  expect(storeList.nextCursor).toBeTypeOf("string");
   // Every quarantine raises the connection's integrity epoch, so a saved
   // cursor expires instead of continuing over a shifted, filtered page set
   // (finding k: offset pagination skipped clean rows after a withdrawal).
   async function assertQuarantined() {
-    await expect(readView(list.next_cursor)).rejects.toThrow(/expired/);
+    await expect(readView(storeList.nextCursor)).rejects.toThrow(/expired/);
     const savedCursorStatus = 410;
     const paths = [
       ["/streams/messages/records/z-quarantined", 404],
       ["/streams/messages/records", 200],
-      ["/streams/messages/records?changes_since=", 200],
+      ["/streams/messages/records?changes_since=beginning", 200],
       // A page cursor binds the reader's view revision for this connection
       // and stream. Retraction changes that revision, so the saved page
       // cursor always expires instead of continuing past the retracted key.
@@ -375,7 +372,7 @@ async function fixture() {
       // This is the supported retained-history read; there is no invented
       // historical-revision endpoint in this API.
       [
-        `/streams/messages/records?changes_since=&limit=1&cursor=${encodeURIComponent(changes.next_cursor)}`,
+        `/streams/messages/records?changes_since=beginning&limit=1&order=asc&cursor=${encodeURIComponent(changes.next_cursor)}`,
         savedCursorStatus,
       ],
       [
@@ -415,7 +412,7 @@ async function fixture() {
       { method: "HEAD" },
       { headers: { range: "bytes=0-7" } },
     ]) {
-      const response = await read(`/blobs/${encodeURIComponent(blobId)}`, init);
+      const response = await read(`/blobs/${encodeURIComponent(blobId)}?instance_id=conn`, init);
       const bytes = Buffer.from(await response.arrayBuffer());
       expect.soft(response.status, "quarantined blob GET/HEAD/range").toBe(404);
       expect
@@ -441,7 +438,8 @@ async function fixture() {
       return fetch(
         resource!.origin +
           "/pdpp/v1/streams/messages/records/" +
-          encodeURIComponent(recordKey),
+          encodeURIComponent(recordKey) +
+          "?instance_id=conn",
         {
           method: "DELETE",
           headers: { authorization: `Bearer ${issuer.credential}` },

@@ -360,6 +360,13 @@ export interface AppDeps {
     /** This resource server's own identifier, RFC 9728 `resource` member. */
     resource: string;
     authorizationServers?: string[];
+    /** Seals RS page cursors and `changes_since` tokens (RS item 21). */
+    cursorSealKey?: Uint8Array;
+    /** A verified connector artifact digest, for an owner delete run. */
+    artifactDigestFor?: (
+      connector: string,
+      version: string | null,
+    ) => string | undefined;
   };
 }
 
@@ -565,6 +572,17 @@ export function createApp(deps: AppDeps): Hono {
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
+        cursorSealKey: deps.pdpp.cursorSealKey,
+        // spec-core §8 "Delete a record" on a switched account: a run, so the
+        // removal reaches every device (core localdb/owner-delete.ts).
+        switchedDelete:
+          localSync && connectionLink && deps.pdpp.artifactDigestFor
+            ? async (input) =>
+                (await localSync()).ownerRecordDelete(
+                  connectionLink,
+                  deps.pdpp!.artifactDigestFor!,
+                )(input)
+            : undefined,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
         instancesForSource: deps.pdpp.instancesForSource,

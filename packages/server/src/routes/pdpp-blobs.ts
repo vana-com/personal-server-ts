@@ -12,6 +12,7 @@ import {
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
+import { parseRecordQuery } from "./pdpp-record-query.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -59,6 +60,16 @@ function requestId(): string {
   return `req_${randomUUID()}`;
 }
 
+/** A §4 `blob_ref` value naming `blobId`. */
+function isBlobRefTo(value: unknown, blobId: string): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { blob_id?: unknown }).blob_id === blobId
+  );
+}
+
 function jsonError(
   c: Context,
   err: PdppError,
@@ -83,10 +94,17 @@ function jsonError(
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
-  app.onError((error, c) => {
-    if (error instanceof PdppError) return jsonError(c, error, requestId());
-    throw error;
-  });
+  // Every failure on this route answers the unified §8 error body; a fault
+  // is `api_error`, never the legacy handler's shape (RS item 6).
+  app.onError((error, c) =>
+    jsonError(
+      c,
+      error instanceof PdppError
+        ? error
+        : new PdppError("api_error", "Internal server error"),
+      requestId(),
+    ),
+  );
   // The blob endpoint is a Core RS operation, so it negotiates PDPP-Version
   // like every other one (spec-core §8; RS item 11).
   app.use(
@@ -147,6 +165,26 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const versionFailure = pdppVersionFailure(c);
     if (versionFailure) return { error: jsonError(c, versionFailure, reqId) };
 
+    // spec-core §8 "Get a blob": unknown parameters are a 400 (RS item 10),
+    // and `instance_id` is REQUIRED on every blob request: "The resource
+    // server MUST reject a blob request without it with 400
+    // `invalid_request`" (RS items 18, 23).
+    let instanceId: string;
+    try {
+      const query = parseRecordQuery(c.req.url, "getBlob");
+      if (query.instanceId === undefined) {
+        throw new PdppError(
+          "invalid_request",
+          "instance_id is required on every blob request",
+          { param: "instance_id" },
+        );
+      }
+      instanceId = query.instanceId;
+    } catch (error) {
+      if (!(error instanceof PdppError)) throw error;
+      return { error: jsonError(c, error, reqId) };
+    }
+
     // DELETE removes the grant's record references and claim rows. Check its
     // connection before blob metadata so callers still get the K7 refusal.
     if (context.tokenKind !== "owner") {
@@ -172,7 +210,11 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const authorizedMeta = () => {
       const meta = store.getBlobMeta(blobId);
       if (!meta) return undefined;
-      const references = store.findBlobReferences(blobId);
+      // A blob_id is unique only within one instance: only references in
+      // the selected instance count (spec-core §8 "Get a blob").
+      const references = store
+        .findBlobReferences(blobId)
+        .filter((reference) => reference.instance === instanceId);
       if (context.tokenKind === "owner") {
         if (!context.subjectId) return undefined;
         const currentInstances = deps.instancesForSubject?.(context.subjectId);
@@ -210,7 +252,6 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
           !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
         )
           continue;
-        if (!scope.fields?.includes("blob_ref")) continue;
         const record = store.getRecord(
           reference.instance,
           reference.stream,
@@ -220,6 +261,18 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
           !record ||
           record.deleted ||
           !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+        )
+          continue;
+        // spec-core §8 "Get a blob" check 3: the field that holds the
+        // reference is in the grant's authorized projection. The field is
+        // found by its blob_ref shape (`{ blob_id, ... }`), not by the name
+        // `blob_ref` (RS item 18).
+        const granted = new Set(scope.fields ?? []);
+        if (
+          !Object.entries(record.data).some(
+            ([field, value]) =>
+              granted.has(field) && isBlobRefTo(value, blobId),
+          )
         )
           continue;
         return meta;

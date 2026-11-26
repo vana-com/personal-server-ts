@@ -452,8 +452,19 @@ export async function assertAppRead(
   assert.equal(record.object, "record");
   assert.equal(record.id, "visible");
   assert.equal(record.stream, "messages");
+  // The RS adds `fetch_url`, carrying the record's instance, to a served
+  // blob_ref (spec-core §4 "Binary data"); the rest is the stored value.
+  const data = record.data as Record<string, unknown>;
+  const { fetch_url: fetchUrl, ...servedRef } = data.blob_ref as {
+    fetch_url?: unknown;
+  };
+  assert.equal(
+    fetchUrl,
+    `${origin}/pdpp/v1/blobs/${encodeURIComponent(blob.blobId)}?instance_id=${encodeURIComponent(record.instance_id as string)}`,
+    "blob fetch_url",
+  );
   assert.deepEqual(
-    record.data,
+    { ...data, blob_ref: servedRef },
     expected,
     "exact authorized projection; schema-required hidden fields must stay absent",
   );
@@ -468,7 +479,7 @@ export async function assertAppRead(
     ["visible"],
     "time window and connection scope",
   );
-  assert.deepEqual(records[0].data, expected);
+  assert.deepEqual(records[0].data, data);
   for (const id of ["other-only", "outside", "until-boundary"])
     await json(
       await api(origin, `/streams/messages/records/${id}`, token),
@@ -481,12 +492,13 @@ export async function assertAppRead(
       "/streams/messages/records/visible?fields=private_note",
       token,
     ),
-    400,
+    // spec-core §4 "Effective projection": 403 field_not_granted (RS 31).
+    403,
     "hidden field request",
   );
   const response = await api(
     origin,
-    `/blobs/${encodeURIComponent(blob.blobId)}`,
+    `/blobs/${encodeURIComponent(blob.blobId)}?instance_id=conn`,
     token,
   );
   assert.equal(response.status, 200, "authorized blob");
@@ -540,7 +552,7 @@ export async function assertTokenDenied(
   for (const path of [
     "/streams/messages/records",
     "/streams/messages/records/visible",
-    `/blobs/${encodeURIComponent(blobId)}`,
+    `/blobs/${encodeURIComponent(blobId)}?instance_id=conn`,
   ])
     await json(
       await api(origin, path, token),
@@ -904,7 +916,7 @@ async function main() {
           await json(
             await api(
               origin,
-              `/blobs/${encodeURIComponent(blob.blobId)}`,
+              `/blobs/${encodeURIComponent(blob.blobId)}?instance_id=conn`,
               consent.token,
             ),
             404,

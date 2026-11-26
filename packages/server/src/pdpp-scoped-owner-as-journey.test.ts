@@ -700,9 +700,9 @@ describe("scoped owner tokens in the AS consent path", () => {
 
     for (const path of [
       "/v1/streams/sleep/records",
-      "/v1/streams/sleep/records?changes_since=0",
+      "/v1/streams/sleep/records?changes_since=beginning",
       "/v1/streams/sleep/records/sleep-1",
-      "/v1/blobs/sha256:missing",
+      "/v1/blobs/sha256:missing?instance_id=x",
     ]) {
       const response = await ctx!.app.request(path, {
         headers: { authorization: `Bearer ${accessToken}` },
@@ -831,11 +831,11 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(beforeDelete.body.data).toEqual({ id: "sleep-1", score: 44 });
 
     const baselineA = await ctx!.app.request(
-      "/v1/streams/sleep/records?changes_since=",
+      "/v1/streams/sleep/records?changes_since=beginning",
       { headers: { authorization: `Bearer ${grantA.accessToken}` } },
     );
     const baselineB = await ctx!.app.request(
-      "/v1/streams/sleep/records?changes_since=",
+      "/v1/streams/sleep/records?changes_since=beginning",
       { headers: { authorization: `Bearer ${grantB.accessToken}` } },
     );
     expect(baselineA.status).toBe(200);

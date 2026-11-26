@@ -60,6 +60,7 @@ import type {
 } from "../storage/pdpp-records/index.js";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
+import { PdppError } from "../errors/pdpp-catalog.js";
 import {
   LegacyWriteRefusedError,
   UPDATE_REQUIRED_MESSAGE,
@@ -674,6 +675,15 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
         ),
       );
     } catch (err) {
+      // A replicating store refuses an append-only delete (replication cannot
+      // carry it). That is this envelope's rejection, as before the store
+      // accepted such deletes, not an importer failure.
+      if (
+        err instanceof PdppError &&
+        err.code === "append_only_delete_unsupported"
+      ) {
+        return reject("store_rejected", err.message);
+      }
       if (!(err instanceof LegacyWriteRefusedError)) throw err;
       if (err.verdict === "switched") {
         return reject("legacy_write_refused", UPDATE_REQUIRED_MESSAGE);
