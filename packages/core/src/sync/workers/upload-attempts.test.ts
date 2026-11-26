@@ -55,6 +55,19 @@ describe("portable core config", () => {
     }
   });
 
+  it("leaves explicitly empty paths for the host to validate, rather than replacing them with a default", () => {
+    expect(expandHomePath("")).toBe("");
+    expect(resolveRootPath("")).toBe("");
+    expect(resolveRootPath(undefined)).toBe(DEFAULT_ROOT_PATH);
+  });
+
+  it("does not expand environment syntax or normalize a foreign host path in core", () => {
+    for (const path of ["$HOME/collector", "%USERPROFILE%/collector", "C:\\Users\\fixture\\..\\collector"]) {
+      expect(expandHomePath(path)).toBe(path);
+      expect(resolveRootPath(path)).toBe(path);
+    }
+  });
+
   it("keeps the default root, child paths, and compatibility aliases aligned", () => {
     expect(resolveRootPath()).toBe(DEFAULT_ROOT_PATH);
     expect(DEFAULT_CONFIG_PATH).toBe(`${DEFAULT_ROOT_PATH}/config.json`);
