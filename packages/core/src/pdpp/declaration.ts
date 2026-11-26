@@ -20,6 +20,7 @@ import { isIP } from "node:net";
 import type {
   DeclarationSnapshot,
   DeclaredDisplay,
+  DeclaredFieldDisplay,
   SourceKind,
 } from "./types.js";
 import { MAX_DECLARATION_BYTES } from "./declaration-limits.js";
@@ -475,6 +476,10 @@ function readDeclaredDisplay(
   const detailText = detailMap
     ? defaultVersion(detailMap, defaultLanguage)
     : detail;
+  const fieldDisplay = readDeclaredFieldDisplay(
+    (value as { fields?: unknown }).fields,
+    defaultLanguage,
+  );
   const display: DeclaredDisplay = {
     ...(typeof labelText === "string" &&
       labelText.length > 0 && { label: labelText }),
@@ -482,8 +487,44 @@ function readDeclaredDisplay(
       detailText.length > 0 && { detail: detailText }),
     ...(labelMap && { label_map: labelMap }),
     ...(detailMap && { detail_map: detailMap }),
+    ...(fieldDisplay && { fields: fieldDisplay }),
   };
   return Object.keys(display).length > 0 ? { display } : undefined;
+}
+
+/**
+ * §5 `streams[].display.fields`, projected like `label` / `detail`: each
+ * entry's plain member holds the plain string or the default-language version
+ * of a map, and the map is kept for the AS's language choice. Key validity is
+ * checked in `parseDeclaration`, where the stream's field list is known.
+ */
+function readDeclaredFieldDisplay(
+  value: unknown,
+  defaultLanguage: string | undefined,
+): Record<string, DeclaredFieldDisplay> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return undefined;
+  const out: Record<string, DeclaredFieldDisplay> = {};
+  for (const [field, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const { label, meaning } = raw as { label?: unknown; meaning?: unknown };
+    const labelMap = asLanguageMap(label);
+    const meaningMap = asLanguageMap(meaning);
+    const labelText = labelMap ? defaultVersion(labelMap, defaultLanguage) : label;
+    const meaningText = meaningMap
+      ? defaultVersion(meaningMap, defaultLanguage)
+      : meaning;
+    const entry: DeclaredFieldDisplay = {
+      ...(typeof labelText === "string" &&
+        labelText.length > 0 && { label: labelText }),
+      ...(labelMap && { label_map: labelMap }),
+      ...(typeof meaningText === "string" &&
+        meaningText.length > 0 && { meaning: meaningText }),
+      ...(meaningMap && { meaning_map: meaningMap }),
+    };
+    if (Object.keys(entry).length > 0) out[field] = entry;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** A value that passed `validateDisplayLanguages` as a language map. */
@@ -864,6 +905,64 @@ export function parseDeclaration(
       };
     }
 
+    // §5 `streams[].consent_time_content_may_exceed`: "The AS MUST reject a
+    // non-boolean value." (AS item 27.)
+    if (
+      s.consent_time_content_may_exceed !== undefined &&
+      typeof s.consent_time_content_may_exceed !== "boolean"
+    ) {
+      return {
+        ok: false,
+        failure: {
+          code: "invalid_document",
+          message: `stream '${s.name}' declares a non-boolean consent_time_content_may_exceed`,
+        },
+      };
+    }
+
+    // §5 `display.fields`: "Each key MUST name a top-level field declared in
+    // `streams[].schema`, and the AS MUST reject a declaration with any other
+    // key." An entry that is not an object has no `label` / `meaning` to read.
+    const rawFieldDisplay =
+      typeof s.display === "object" && s.display !== null
+        ? (s.display as { fields?: unknown }).fields
+        : undefined;
+    if (rawFieldDisplay !== undefined) {
+      if (
+        typeof rawFieldDisplay !== "object" ||
+        rawFieldDisplay === null ||
+        Array.isArray(rawFieldDisplay)
+      ) {
+        return {
+          ok: false,
+          failure: {
+            code: "invalid_document",
+            message: `stream '${s.name}' display.fields is not an object`,
+          },
+        };
+      }
+      for (const [key, entry] of Object.entries(
+        rawFieldDisplay as Record<string, unknown>,
+      )) {
+        if (!fields.includes(key))
+          return {
+            ok: false,
+            failure: {
+              code: "invalid_document",
+              message: `stream '${s.name}' display.fields names '${key}', which its schema does not declare`,
+            },
+          };
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+          return {
+            ok: false,
+            failure: {
+              code: "invalid_document",
+              message: `stream '${s.name}' display.fields.${key} is not an object`,
+            },
+          };
+      }
+    }
+
     // §5: meta-validate the embedded schema before accepting the declaration.
     // Only when one is present — the internal flat shape carries a field list
     // and no schema, and §5's obligation is about the schema a normative
@@ -944,6 +1043,9 @@ export function parseDeclaration(
       }),
       ...(typeof s.consent_time_field === "string" && {
         consent_time_field: s.consent_time_field,
+      }),
+      ...(typeof s.consent_time_content_may_exceed === "boolean" && {
+        consent_time_content_may_exceed: s.consent_time_content_may_exceed,
       }),
       ...(typeof s.cursor_field === "string" && {
         cursor_field: s.cursor_field,

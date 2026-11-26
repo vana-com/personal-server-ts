@@ -80,7 +80,27 @@ export interface ReviewStream {
   display_detail?: string;
   instance_ids: string[];
   fields: string[];
-  time_constraint?: { field: string; since?: string; until?: string };
+  time_constraint?: {
+    field: string;
+    /** AS item 27/28: the frozen schema format of `field`. Locked rules only. */
+    type?: "date" | "date-time";
+    since?: string;
+    until?: string;
+    /**
+     * AS item 28: the field's declared meaning
+     * (`streams[].display.fields.<field>.meaning`) in the language the review
+     * chose. Absent when the declaration states none; the surface then uses
+     * its own words. Also listed in `display_values` (AS item 34).
+     */
+    meaning?: string;
+  };
+  /**
+   * AS item 28 / §5: the declaration's `consent_time_content_may_exceed`
+   * (default false), sent on every time-bounded stream of a locked-rule
+   * review so the surface can disclose that matched records can contain data
+   * from outside the bounds.
+   */
+  consent_time_content_may_exceed?: boolean;
   resources?: string[];
   /**
    * v0.2 consent-flow control. `optional` means the owner may remove this
@@ -403,7 +423,7 @@ export interface BuildReviewInput {
  */
 function chooseDisplayValues(
   snapshot: DeclarationSnapshot,
-  streamNames: string[],
+  streams: StreamGrant[],
   priority: string[],
   streamDescriptions: Record<string, string> | undefined,
 ): DisplayValueShown[] {
@@ -416,7 +436,8 @@ function chooseDisplayValues(
     shown.push({ id, ...chosen });
   };
   add("display.name", snapshot.display?.name_map ?? snapshot.display?.name);
-  for (const name of streamNames) {
+  for (const stream of streams) {
+    const name = stream.name;
     const declared = snapshot.streams.find((d) => d.name === name);
     // A deployment-supplied description overrides the declaration's and is
     // not declaration text, so it carries no language.
@@ -436,6 +457,17 @@ function chooseDisplayValues(
       `streams[${name}].display.detail`,
       declared?.display?.detail_map ?? declared?.display?.detail,
     );
+    // AS item 28: a time-bounded stream shows the declared meaning of its
+    // consent time field, so that meaning is a display value shown on final
+    // review and is bound like the others (AS item 34).
+    const timeField = stream.time_constraint?.field;
+    if (timeField !== undefined) {
+      const entry = declared?.display?.fields?.[timeField];
+      add(
+        `streams[${name}].display.fields.${timeField}.meaning`,
+        entry?.meaning_map ?? entry?.meaning,
+      );
+    }
   }
   return shown;
 }
@@ -468,7 +500,7 @@ export function buildConsentReview(
   const displayValues = locked
     ? chooseDisplayValues(
         snapshot,
-        resolvedStreams.map((s) => s.name),
+        resolvedStreams,
         input.languagePriority ?? [],
         input.streamDescriptions,
       )
@@ -541,7 +573,24 @@ export function buildConsentReview(
           ...(detail && { display_detail: detail }),
           instance_ids: s.instance_ids,
           fields: s.fields,
-          ...(s.time_constraint && { time_constraint: s.time_constraint }),
+          ...(s.time_constraint && {
+            time_constraint: {
+              ...s.time_constraint,
+              ...(locked &&
+                shownValue(
+                  `streams[${s.name}].display.fields.${s.time_constraint.field}.meaning`,
+                ) !== undefined && {
+                  meaning: shownValue(
+                    `streams[${s.name}].display.fields.${s.time_constraint.field}.meaning`,
+                  ),
+                }),
+            },
+          }),
+          ...(locked &&
+            s.time_constraint && {
+              consent_time_content_may_exceed:
+                declared?.consent_time_content_may_exceed === true,
+            }),
           ...(s.resources && { resources: s.resources }),
           ...(asked && {
             necessity: asked.necessity,

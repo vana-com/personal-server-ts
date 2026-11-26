@@ -330,6 +330,22 @@ export interface DeclaredDisplay {
    */
   label_map?: LanguageMap;
   detail_map?: LanguageMap;
+  /**
+   * §5 `display.fields`: per-field consent text keyed by top-level field
+   * name. Each key names a declared field (checked at acceptance). `label` /
+   * `meaning` hold the plain or default-language version; the `_map` members
+   * keep an authored language map so the AS can choose per AS item 34.
+   */
+  fields?: Record<string, DeclaredFieldDisplay>;
+}
+
+/** One §5 `streams[].display.fields` entry. */
+export interface DeclaredFieldDisplay {
+  label?: string;
+  label_map?: LanguageMap;
+  /** What the value records, e.g. "The day Oura assigns, in your local time". */
+  meaning?: string;
+  meaning_map?: LanguageMap;
 }
 
 export interface DeclaredStream {
@@ -372,6 +388,12 @@ export interface DeclaredStream {
    * (§6 "Note on `time_range`").
    */
   consent_time_field?: string;
+  /**
+   * §5 `streams[].consent_time_content_may_exceed` (default false): a record
+   * can contain data from outside its own `consent_time_field` value. Absent
+   * means the declaration did not set it, which reads as false.
+   */
+  consent_time_content_may_exceed?: boolean;
   /** §5 `cursor_field`: the declared ordering field, when the stream has one. */
   cursor_field?: string;
   /** Arity of the primary key; `resources` entries are validated against it. */
