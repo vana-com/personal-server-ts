@@ -38,7 +38,10 @@ import {
   createStreamDeclarationRegistry,
   type PdppReplicaReads,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import { pdppAuthRoutes } from "../packages/server/src/routes/pdpp-auth.js";
+import {
+  pdppAuthRoutes,
+  pdppIssuerIdentifier,
+} from "../packages/server/src/routes/pdpp-auth.js";
 import { pdppRecordsRoutes } from "../packages/server/src/routes/pdpp-records.js";
 import { pdppWellKnownRoutes } from "../packages/server/src/routes/pdpp-well-known.js";
 import { pdppBlobsRoutes } from "../packages/server/src/routes/pdpp-blobs.js";
@@ -255,7 +258,7 @@ export async function openReplicaResourceServer(
     pdppWellKnownRoutes({
       resource: server.origin,
       coreQueryBase: "/pdpp/v1",
-      authorizationServers: [options.issuerOrigin],
+      authorizationServers: [pdppIssuerIdentifier(options.issuerOrigin)],
       selfExportSupported: false,
     }),
   );

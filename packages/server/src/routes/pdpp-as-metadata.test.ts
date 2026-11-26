@@ -100,7 +100,7 @@ describe("PDPP AS metadata", () => {
         "/pdpp/v1/.well-known/oauth-authorization-server",
       );
       const body = (await response.json()) as Record<string, unknown>;
-      expect(body.issuer).toBe("https://ps.example.com");
+      expect(body.issuer).toBe("https://ps.example.com/pdpp/v1");
       expect(body.token_endpoint).toBe("https://ps.example.com/pdpp/v1/token");
       expect(body.introspection_endpoint).toBe(
         "https://ps.example.com/pdpp/v1/introspect",
@@ -167,7 +167,7 @@ describe("PDPP AS metadata: RFC 8414 discovery location", () => {
       );
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.issuer).toBe("https://ps.example.com");
+      expect(body.issuer).toBe("https://ps.example.com/pdpp/v1");
       expect(body.introspection_endpoint).toBe(
         "https://ps.example.com/pdpp/v1/introspect",
       );
@@ -183,7 +183,9 @@ describe("PDPP AS metadata: RFC 8414 discovery location", () => {
         "/pdpp/v1/.well-known/oauth-authorization-server",
       );
       expect(res.status).toBe(200);
-      expect((await res.json()).issuer).toBe("https://ps.example.com");
+      expect((await res.json()).issuer).toBe(
+        "https://ps.example.com/pdpp/v1",
+      );
     } finally {
       cleanup();
     }
@@ -212,4 +214,50 @@ it("hides the candidate type unless the deployment opts into its profile", async
   } finally {
     cleanup();
   }
+});
+
+/**
+ * RFC 8414 §3 from the advertised issuer: a client that reads `issuer`
+ * (or the RFC 9728 `authorization_servers` entry) and inserts the well-known
+ * segment between host and path must reach THIS document, never the MCP AS
+ * document at the bare well-known.
+ */
+describe("PDPP AS metadata: issuer round-trips through RFC 8414", () => {
+  function rfc8414MetadataPath(issuer: string): string {
+    const url = new URL(issuer);
+    const path = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+    return `/.well-known/oauth-authorization-server${path}`;
+  }
+
+  it("derives the PDPP document from the advertised issuer, and that document names the same issuer", async () => {
+    const { app, cleanup } = harness();
+    try {
+      const first = await (
+        await app.request("/pdpp/v1/.well-known/oauth-authorization-server")
+      ).json();
+      const derived = rfc8414MetadataPath(first.issuer);
+      expect(derived).toBe("/.well-known/oauth-authorization-server/pdpp/v1");
+      const res = await app.request(derived);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // RFC 8414 §3.3: the issuer in the document equals the one used.
+      expect(body.issuer).toBe(first.issuer);
+      expect(body.authorization_endpoint).toBe(
+        `${first.issuer}/authorize`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not double the path when the configured origin already names the issuer", async () => {
+    const app = new Hono();
+    app.get(
+      "/m",
+      pdppAsMetadataHandler("https://ps.example.com/pdpp/v1/"),
+    );
+    const body = await (await app.request("/m")).json();
+    expect(body.issuer).toBe("https://ps.example.com/pdpp/v1");
+    expect(body.token_endpoint).toBe("https://ps.example.com/pdpp/v1/token");
+  });
 });

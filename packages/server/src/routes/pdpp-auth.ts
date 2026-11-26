@@ -420,6 +420,23 @@ function scopedOwnerFailureResponse(c: Context, failure: ApprovalFailure) {
  * late (a bound port unknown at construction). It is resolved per request so
  * the document never advertises a stale origin.
  */
+/**
+ * The PDPP AS issuer identifier for the origin the AS is mounted on:
+ * `<origin>/pdpp/v1`.
+ *
+ * RFC 8414 §3 derives the metadata URL from the issuer by inserting
+ * `/.well-known/oauth-authorization-server` between host and path. With the
+ * bare origin as issuer that rule lands on the MCP AS document, which owns the
+ * bare well-known; with `/pdpp/v1` as the issuer path it lands on
+ * `/.well-known/oauth-authorization-server/pdpp/v1`, this AS's document. The
+ * issuer is also the base every endpoint extends, so both stay consistent.
+ * An origin that already ends in `/pdpp/v1` is returned unchanged.
+ */
+export function pdppIssuerIdentifier(origin: string): string {
+  const trimmed = origin.replace(/\/+$/, "");
+  return trimmed.endsWith("/pdpp/v1") ? trimmed : `${trimmed}/pdpp/v1`;
+}
+
 export function pdppAsMetadataHandler(
   issuerSource: PdppAuthRouteDeps["issuer"],
   protocolProfile: PdppAuthRouteDeps["protocolProfile"] = "current",
@@ -435,10 +452,12 @@ export function pdppAsMetadataHandler(
         "this deployment does not publish PDPP authorization-server metadata",
       );
     }
-    const base = `${issuer.replace(/\/$/, "")}/pdpp/v1`;
+    const base = pdppIssuerIdentifier(issuer);
     return c.json(
       {
-        issuer,
+        // RFC 8414 §2/§3: the issuer whose path-inserted well-known URL is
+        // this document (see `pdppIssuerIdentifier`).
+        issuer: base,
         authorization_endpoint: `${base}/authorize`,
         token_endpoint: `${base}/token`,
         introspection_endpoint: `${base}/introspect`,

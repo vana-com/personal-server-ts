@@ -64,7 +64,7 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { CanonicalLegacyReadStore } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
-import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
+import { pdppIssuerIdentifier, type PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
 import {
   createSqliteRecordStore,
   PdppBindingError,
@@ -486,8 +486,11 @@ export function createPdppRecordsDeps(
     // corruption or metadata-only rows) rather than trusting the disk blindly.
     readBlobBytes: async (blobId) => store.getBlobBytes(blobId),
     resource: options.resource,
-    // Co-located: this server is its own authorization server.
-    authorizationServers: [options.resource],
+    // Co-located: this server is its own authorization server. RFC 9728
+    // `authorization_servers` lists issuer identifiers, and the PDPP AS
+    // issuer is `<origin>/pdpp/v1` (RFC 8414 path insertion then finds the
+    // PDPP document, not the MCP one at the bare well-known).
+    authorizationServers: [pdppIssuerIdentifier(options.resource)],
     cursorSealKey: cursorSealKeyFor(options.db, logger),
   };
 }

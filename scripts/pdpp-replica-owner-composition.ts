@@ -43,6 +43,7 @@ import {
 import {
   pdppAuthRoutes,
   pdppAsMetadataHandler,
+  pdppIssuerIdentifier,
   type PdppAuthRouteDeps,
 } from "../packages/server/src/routes/pdpp-auth.js";
 import { pdppWellKnownRoutes } from "../packages/server/src/routes/pdpp-well-known.js";
@@ -607,7 +608,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
     pdppWellKnownRoutes({
       resource: options.origin,
       coreQueryBase: "/pdpp/v1",
-      authorizationServers: [options.origin],
+      authorizationServers: [pdppIssuerIdentifier(options.origin)],
       selfExportSupported: false,
     }),
   );

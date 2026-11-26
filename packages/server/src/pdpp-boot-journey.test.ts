@@ -408,6 +408,32 @@ describe("PDPP boot journey: real createServer", () => {
   });
 
   /**
+   * RFC 9728 → RFC 8414 discovery end to end: the `authorization_servers`
+   * entry is the PDPP issuer, and inserting the well-known segment into it
+   * lands on the PDPP AS document — not on the MCP AS document the bare
+   * `/.well-known/oauth-authorization-server` belongs to.
+   */
+  it("discovers the PDPP AS from protected-resource metadata via RFC 8414", async () => {
+    ctx = await boot();
+    const resource = (await (
+      await ctx.app.request("/.well-known/oauth-protected-resource")
+    ).json()) as { authorization_servers: string[] };
+    expect(resource.authorization_servers).toHaveLength(1);
+    const issuer = new URL(resource.authorization_servers[0]);
+    expect(issuer.pathname).toBe("/pdpp/v1");
+    const res = await ctx.app.request(
+      `/.well-known/oauth-authorization-server${issuer.pathname}`,
+    );
+    expect(res.status).toBe(200);
+    const metadata = (await res.json()) as Record<string, unknown>;
+    expect(metadata.issuer).toBe(resource.authorization_servers[0]);
+    expect(metadata.token_endpoint).toBe(`${issuer.href}/token`);
+    expect(metadata.authorization_details_types_supported).toContain(
+      "https://pdpp.dev/data-access",
+    );
+  });
+
+  /**
    * SECURITY BLOCKER — open redirect / authorization-code exfiltration.
    *
    * `POST /pdpp/v1/authorize` checks only that `redirect_uri` is PRESENT

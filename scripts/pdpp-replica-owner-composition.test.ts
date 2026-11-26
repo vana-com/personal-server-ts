@@ -608,7 +608,8 @@ it("uses one configured issuer, exact registered callback and PKCE; never proxie
   const metadata = await (
     await host.app.request("/.well-known/oauth-authorization-server/pdpp/v1")
   ).json();
-  expect(metadata.issuer).toBe(origin);
+  // RFC 8414: the issuer's path-inserted well-known URL is this document.
+  expect(metadata.issuer).toBe(origin + "/pdpp/v1");
   expect(metadata.token_endpoint).toBe(origin + "/pdpp/v1/token");
   expect(metadata.code_challenge_methods_supported).toEqual(["S256"]);
   expect(

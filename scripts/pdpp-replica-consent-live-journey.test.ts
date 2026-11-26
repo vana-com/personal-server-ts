@@ -1044,7 +1044,9 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         await fetch(`${rs.origin}/.well-known/oauth-protected-resource`),
         200,
       );
-      expect(metadata.authorization_servers).toEqual([issuer.origin]);
+      expect(metadata.authorization_servers).toEqual([
+        `${issuer.origin}/pdpp/v1`,
+      ]);
       expect(metadata.resource).toBe(rs.origin);
       expect(metadata.pdpp_core_query_base).toBe("/pdpp/v1");
     }));
