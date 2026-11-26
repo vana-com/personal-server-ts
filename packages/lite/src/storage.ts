@@ -829,10 +829,14 @@ export async function createPersistentPsLiteStorage(
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
     retirementRows: {
-      capture: async (save, authority) => {
+      capture: async (save, authority, scopes) => {
+        if (scopes.length === 0) return save([]);
+        const boundScopes = new Set(scopes);
         const rows = await enqueue(async () => {
           authority();
-          return state.entries.map((row) => ({ ...row }));
+          return state.entries
+            .filter((row) => boundScopes.has(row.scope))
+            .map((row) => ({ ...row }));
         });
         return save(rows);
       },

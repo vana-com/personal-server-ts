@@ -22,6 +22,7 @@ export interface RetirementRows {
   capture<T>(
     save: (rows: readonly IndexEntry[]) => Promise<T>,
     authority: RetirementAuthority,
+    scopes: readonly string[],
   ): Promise<T>;
   erase(row: IndexEntry, authority: RetirementAuthority): Promise<void>;
   absent(
@@ -124,43 +125,47 @@ export function createLegacyRetirePipeline(
           rows: [],
         });
       }
-      return ports.rows.capture(async (rows) => {
-        authority();
-        const manifest: Manifest = {
-          scopes: scopes.map((scope) => ({
-            ...scope,
-            rows: rows.filter(
-              (row) =>
-                row.scope === scope.scope && capturedAtPin(row, scope.head),
-            ),
-          })),
-        };
-        const id = deps.newOp();
-        authority();
-        await deps.db.batch([
-          {
-            sql: "INSERT OR IGNORE INTO legacy_retirements (owner, connector, retire_id, state, scopes, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
-            params: [
-              owner,
-              connector,
-              id,
-              JSON.stringify(
-                manifest.scopes.map(({ scope, head, streams }) => ({
-                  scope,
-                  head,
-                  streams,
-                })),
+      return ports.rows.capture(
+        async (rows) => {
+          authority();
+          const manifest: Manifest = {
+            scopes: scopes.map((scope) => ({
+              ...scope,
+              rows: rows.filter(
+                (row) =>
+                  row.scope === scope.scope && capturedAtPin(row, scope.head),
               ),
-              deps.now(),
-            ],
-          },
-          {
-            sql: "INSERT OR IGNORE INTO legacy_retire_manifests (retire_id, manifest) SELECT ?, ? WHERE EXISTS (SELECT 1 FROM legacy_retirements WHERE retire_id = ?)",
-            params: [id, JSON.stringify(manifest), id],
-          },
-        ]);
-        return (await existing(connector))!.retire_id;
-      }, authority);
+            })),
+          };
+          const id = deps.newOp();
+          authority();
+          await deps.db.batch([
+            {
+              sql: "INSERT OR IGNORE INTO legacy_retirements (owner, connector, retire_id, state, scopes, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
+              params: [
+                owner,
+                connector,
+                id,
+                JSON.stringify(
+                  manifest.scopes.map(({ scope, head, streams }) => ({
+                    scope,
+                    head,
+                    streams,
+                  })),
+                ),
+                deps.now(),
+              ],
+            },
+            {
+              sql: "INSERT OR IGNORE INTO legacy_retire_manifests (retire_id, manifest) SELECT ?, ? WHERE EXISTS (SELECT 1 FROM legacy_retirements WHERE retire_id = ?)",
+              params: [id, JSON.stringify(manifest), id],
+            },
+          ]);
+          return (await existing(connector))!.retire_id;
+        },
+        authority,
+        scopes.map(({ scope }) => scope),
+      );
     },
     async advance(
       retireId: string,

@@ -62,6 +62,8 @@ async function backend(kind: string, beforeRemoval?: () => Promise<void>) {
       await import("@opendatalabs/vana-sdk/browser");
     return {
       rows: storage.retirementRows,
+      transactions: vi.spyOn(persistence, "write"),
+      scopeReads: undefined,
       reopen: async () =>
         (
           await createOpenPersistentPsLiteStorage(
@@ -90,7 +92,10 @@ async function backend(kind: string, beforeRemoval?: () => Promise<void>) {
     db.close();
     rmSync(dataDir, { recursive: true, force: true });
   });
+  const scopeReads = vi.spyOn(index, "findByScope");
   return {
+    transactions: vi.spyOn(db, "transaction"),
+    scopeReads,
     rows: createLegacyRetireRows(db, index, { dataDir }, seal),
     reopen: async () => {
       db.close();
@@ -216,6 +221,48 @@ function fixture(rows: RetirementRows) {
 }
 for (const kind of ["node", "lite"])
   describe(`retirement rows on ${kind}`, () => {
+    it("capture reads only the bound scopes' rows", async () => {
+      const b = await backend(kind);
+      const bound = await b.insert(base);
+      const unrelated = await b.insert({ ...base, scope: "unrelated.history" });
+      // Lite keeps the inserted object in its flat snapshot. Reading scope
+      // to filter is fine; cloning unrelated row contents is not.
+      const readContents = vi.fn(() => unrelated.createdAt);
+      if (kind === "lite") {
+        const createdAt = unrelated.createdAt;
+        readContents.mockImplementation(() => createdAt);
+        Object.defineProperty(unrelated, "createdAt", {
+          enumerable: true,
+          get: readContents,
+        });
+      }
+      const save = vi.fn(async (rows: readonly IndexEntry[]) => rows);
+      expect(await b.rows.capture(save, () => {}, [base.scope])).toEqual([
+        bound,
+      ]);
+      expect(save).toHaveBeenCalledOnce();
+      expect(readContents).not.toHaveBeenCalled();
+      if (b.scopeReads) {
+        expect(b.scopeReads).toHaveBeenCalled();
+        expect(
+          b.scopeReads.mock.calls.every(
+            ([options]) => options.scope === base.scope,
+          ),
+        ).toBe(true);
+      }
+    });
+    it("capture with no bound scopes opens no write transaction", async () => {
+      const b = await backend(kind);
+      await b.insert(base);
+      b.transactions.mockClear();
+      const authority = vi.fn();
+      const save = vi.fn(async (rows: readonly IndexEntry[]) => rows);
+      expect(await b.rows.capture(save, authority, [])).toEqual([]);
+      expect(save).toHaveBeenCalledExactlyOnceWith([]);
+      expect(b.transactions).not.toHaveBeenCalled();
+      // With no rows, Lite must also skip its queued snapshot callback.
+      expect(authority).not.toHaveBeenCalled();
+    });
     it("keeps a stamped re-add out of the immutable manifest across resume", async () => {
       const b = await backend(kind);
       await b.insert({ ...base, afterTombstoneVersion: 3 });
@@ -226,7 +273,9 @@ for (const kind of ["node", "lite"])
         await f.pipeline.advance(id, f.authority, new AbortController().signal),
       ).toEqual({ state: "done" });
       expect(
-        await b.rows.capture(async (rows) => rows.length, f.authority),
+        await b.rows.capture(async (rows) => rows.length, f.authority, [
+          base.scope,
+        ]),
       ).toBe(1);
       expect(await f.pipeline.capture("github", f.authority)).toBe(id);
     });
@@ -257,6 +306,7 @@ for (const kind of ["node", "lite"])
         await b.rows.capture(
           async (rows) => rows.map((r) => r.id),
           f.authority,
+          [base.scope],
         ),
       ).toEqual([replacement.id]);
       expect(await b.read(replacement)).toMatchObject({ scope: base.scope });
@@ -284,6 +334,7 @@ for (const kind of ["node", "lite"])
       const remaining = await b.rows.capture(
         async (rows) => rows.map((row) => row.id),
         f.authority,
+        [base.scope],
       );
       expect(remaining).toHaveLength(1);
       expect([first.id, second.id]).toContain(remaining[0]);
@@ -317,6 +368,7 @@ for (const kind of ["node", "lite"])
         await b.rows.capture(
           async (rows) => rows.length,
           () => {},
+          [base.scope],
         ),
       ).toBe(1);
     });

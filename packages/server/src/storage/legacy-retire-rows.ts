@@ -13,11 +13,12 @@ export function createLegacyRetireRows(
 ): RetirementRows {
   const immediate = <T>(run: () => T): T => db.transaction(run).immediate();
   return {
-    async capture(save, authority) {
+    async capture(save, authority, scopes) {
+      if (scopes.length === 0) return save([]);
       // Snapshot is taken in the same IMMEDIATE owner as index publication.
       const rows = immediate(() => {
         authority();
-        return index.listIndexedScopes().flatMap((scope) => {
+        return scopes.flatMap((scope) => {
           const rows = [];
           for (let offset = 0; ; offset += 200) {
             const page = index.findByScope({ scope, limit: 200, offset });

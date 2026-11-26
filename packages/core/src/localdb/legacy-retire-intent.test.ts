@@ -80,9 +80,13 @@ async function reconnected(
           }),
         },
     rows: {
-      capture: async (save, check) => {
+      capture: async (save, check, scopes) => {
         check();
-        return save(legacy.storage.entries.map((row) => ({ ...row })));
+        return save(
+          legacy.storage.entries
+            .filter((row) => scopes.includes(row.scope))
+            .map((row) => ({ ...row })),
+        );
       },
       absent: async (rows, check) => {
         check();
