@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
+import { ReplicaPendingCapacityError } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 
 const emittedAt = "2026-10-20T10:00:00.000Z";
 const binding = { method: "collector", generation: 1 };
@@ -16,6 +18,14 @@ const envelope = (instance = "account-a", content = "hello") => ({
 });
 const semantics = () => "mutable_state" as const;
 const primaryKey = () => ["id"];
+const declaration = {
+  digest: `sha256:${"a".repeat(64)}`,
+  version: "1.0.0",
+  stream: "messages",
+  semantics: "mutable_state" as const,
+  primaryKey: ["id"],
+  schemaDigest: `sha256:${"b".repeat(64)}`,
+};
 
 /** The own-write log of a replication-enabled store, oldest first. */
 function ownWrites(db: Database.Database) {
@@ -97,6 +107,301 @@ describe("own-write log (replication enabled)", () => {
         blobIds: [],
       },
     ]);
+  });
+
+  it("refuses only new accepted work at capacity and rolls back the canonical row", () => {
+    store.replication.activatePendingBudget({
+      operations: 2,
+      logicalBytes: 100_000,
+    });
+    store.replication.beginBaseline({
+      owner: "owner",
+      declarations: [
+        {
+          sourceId: "https://source.invalid/declaration",
+          binding: declaration,
+        },
+      ],
+    });
+    const first = store.ingestBatch(
+      [envelope()],
+      semantics,
+      primaryKey,
+      binding,
+    );
+    expect(first.accepted).toBe(1);
+    const duplicate = store.ingestBatch(
+      [envelope()],
+      semantics,
+      primaryKey,
+      binding,
+    );
+    expect(duplicate.unchanged).toBe(1);
+    const operationsBefore = db
+      .prepare(
+        "SELECT operations,logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+      )
+      .get();
+    const clocksBefore = {
+      canonical: db.prepare("SELECT value FROM pdpp_write_clock").get(),
+      arrival: db.prepare("SELECT value FROM pdpp_record_arrival_clock").get(),
+      replica: db
+        .prepare("SELECT counter FROM pdpp_replica_clock WHERE id=1")
+        .get(),
+    };
+    expect(() =>
+      store.ingestBatch(
+        [envelope("account-a", "new accepted value")],
+        semantics,
+        primaryKey,
+        binding,
+      ),
+    ).toThrow(ReplicaPendingCapacityError);
+    expect(store.getRecord("account-a", "messages", "same-key")).toMatchObject({
+      data: { content: "hello" },
+    });
+    expect(
+      db
+        .prepare(
+          "SELECT operations,logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual(operationsBefore);
+    expect({
+      canonical: db.prepare("SELECT value FROM pdpp_write_clock").get(),
+      arrival: db.prepare("SELECT value FROM pdpp_record_arrival_clock").get(),
+      replica: db
+        .prepare("SELECT counter FROM pdpp_replica_clock WHERE id=1")
+        .get(),
+    }).toEqual(clocksBefore);
+    expect(ownWrites(db)).toHaveLength(1);
+  });
+
+  it("releases only the exact finalized identities and makes duplicate acknowledgment harmless", () => {
+    store.replication.activatePendingBudget({
+      operations: 2,
+      logicalBytes: 100_000,
+    });
+    store.replication.beginBaseline({
+      owner: "owner",
+      declarations: [
+        {
+          sourceId: "https://source.invalid/declaration",
+          binding: declaration,
+        },
+      ],
+    });
+    store.ingestBatch([envelope()], semantics, primaryKey, binding);
+    const operations = (
+      db
+        .prepare(
+          "SELECT operation_json FROM pdpp_replica_operations ORDER BY sequence",
+        )
+        .all() as { operation_json: string }[]
+    ).map((row) => JSON.parse(row.operation_json));
+    const first = operations[0].revision;
+    const second = operations[1].revision;
+    const finalized = {
+      batch: "batch-one",
+      slot: "writer-scope/1",
+      scope: "writer-scope",
+      version: 1,
+      commitment: `0x${"a".repeat(64)}`,
+      operations: [
+        { writerId: first.writerId, operationId: first.operationId },
+      ],
+    };
+    db.transaction(() =>
+      store.replication.acknowledgePublished(null, finalized),
+    ).immediate();
+    expect(() =>
+      db
+        .transaction(() =>
+          store.replication.acknowledgePublished(null, {
+            ...finalized,
+            operations: [
+              { writerId: second.writerId, operationId: second.operationId },
+            ],
+          }),
+        )
+        .immediate(),
+    ).toThrow("replica publication witness changed");
+    db.transaction(() =>
+      store.replication.acknowledgePublished(null, finalized),
+    ).immediate();
+    expect(
+      db
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 1 });
+    expect(
+      store.ingestBatch(
+        [envelope("account-a", "second")],
+        semantics,
+        primaryKey,
+        binding,
+      ).accepted,
+    ).toBe(1);
+    expect(() =>
+      store.ingestBatch(
+        [envelope("account-a", "third")],
+        semantics,
+        primaryKey,
+        binding,
+      ),
+    ).toThrow(ReplicaPendingCapacityError);
+    db.transaction(() =>
+      store.replication.acknowledgePublished(null, {
+        ...finalized,
+        batch: "batch-two",
+        slot: "writer-scope/2",
+        version: 2,
+        operations: [
+          { writerId: second.writerId, operationId: second.operationId },
+        ],
+      }),
+    ).immediate();
+    expect(
+      db
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 1 });
+  });
+
+  it("charges one shared pending blob until its last exact operation reference settles", () => {
+    store.replication.activatePendingBudget({
+      operations: 8,
+      logicalBytes: 100_000,
+    });
+    store.replication.beginBaseline({
+      owner: "owner",
+      declarations: [
+        {
+          sourceId: "https://source.invalid/declaration",
+          binding: declaration,
+        },
+      ],
+    });
+    const blob = store.storeBlobBytesForInstance({
+      instance: "account-a",
+      method: "collector",
+      generation: 1,
+      bytes: new Uint8Array([1, 2, 3, 4, 5]),
+      mimeType: "application/octet-stream",
+    });
+    const blobEnvelope = (key: string) => ({
+      instance: "account-a",
+      stream: "messages",
+      key,
+      data: {
+        id: key,
+        blob_ref: { blob_id: blob.blobId, mime_type: blob.mimeType },
+      },
+      emitted_at: emittedAt,
+    });
+    expect(
+      store.ingestBatch(
+        [blobEnvelope("blob-one")],
+        semantics,
+        primaryKey,
+        binding,
+      ).accepted,
+    ).toBe(1);
+    expect(
+      store.ingestBatch(
+        [blobEnvelope("blob-two")],
+        semantics,
+        primaryKey,
+        binding,
+      ).accepted,
+    ).toBe(1);
+    const operations = (
+      db
+        .prepare(
+          "SELECT operation_json FROM pdpp_replica_operations ORDER BY sequence",
+        )
+        .all() as { operation_json: string }[]
+    ).map((row) => JSON.parse(row.operation_json));
+    const claim = operations.find(
+      (operation) => operation.kind === "blob-claim",
+    );
+    const upserts = operations.filter(
+      (operation) => operation.kind === "upsert",
+    );
+    expect(upserts).toHaveLength(2);
+    expect(
+      db
+        .prepare(
+          "SELECT size_bytes,references_count FROM pdpp_replica_pending_blobs WHERE blob_id=?",
+        )
+        .get(blob.blobId),
+    ).toEqual({ size_bytes: 5, references_count: 3 });
+    const before = db
+      .prepare(
+        "SELECT logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+      )
+      .get() as { logical_bytes: number };
+    const finalized = {
+      batch: "shared-blob-first-settlement",
+      slot: "writer-scope/1",
+      scope: "writer-scope",
+      version: 1,
+      commitment: `0x${"c".repeat(64)}`,
+      operations: [claim, upserts[0]].map((operation) => ({
+        writerId: operation.revision.writerId,
+        operationId: operation.revision.operationId,
+      })),
+    };
+    db.transaction(() =>
+      store.replication.acknowledgePublished(null, finalized),
+    ).immediate();
+    const middle = db
+      .prepare(
+        "SELECT logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+      )
+      .get() as { logical_bytes: number };
+    expect(before.logical_bytes - middle.logical_bytes).toBe(
+      Buffer.byteLength(canonicalJson(claim)) +
+        Buffer.byteLength(canonicalJson(upserts[0])),
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT size_bytes,references_count FROM pdpp_replica_pending_blobs WHERE blob_id=?",
+        )
+        .get(blob.blobId),
+    ).toEqual({ size_bytes: 5, references_count: 1 });
+    db.transaction(() =>
+      store.replication.acknowledgePublished(null, {
+        ...finalized,
+        batch: "shared-blob-last-settlement",
+        slot: "writer-scope/2",
+        version: 2,
+        operations: [
+          {
+            writerId: upserts[1].revision.writerId,
+            operationId: upserts[1].revision.operationId,
+          },
+        ],
+      }),
+    ).immediate();
+    expect(
+      db
+        .prepare("SELECT * FROM pdpp_replica_pending_blobs WHERE blob_id=?")
+        .get(blob.blobId),
+    ).toBeUndefined();
+    const after = db
+      .prepare(
+        "SELECT logical_bytes FROM pdpp_replica_pending_budget WHERE id=1",
+      )
+      .get() as { logical_bytes: number };
+    expect(middle.logical_bytes - after.logical_bytes).toBe(
+      Buffer.byteLength(canonicalJson(upserts[1])) + blob.sizeBytes,
+    );
   });
 
   it("suppresses duplicates, append-only conflicts, schema rejects, and unclaimed blobs", () => {

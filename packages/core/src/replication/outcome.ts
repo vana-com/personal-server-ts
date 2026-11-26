@@ -65,6 +65,7 @@ export type ReplicaProblem =
   | "registration_unconfirmed"
   | "head_unavailable"
   | "publish_failed"
+  | "publication_blocked"
   | "download_failed"
   | "resource_busy"
   | "commitment_mismatch"
@@ -83,6 +84,7 @@ export interface ReplicaCause {
   name: string;
   code?: string;
   cause?: ReplicaCause;
+  blockers?: { address: string; name: string; reason: string }[];
 }
 
 const MAX_CAUSE_DEPTH = 4;
@@ -94,11 +96,32 @@ export function replicaCause(error: unknown, depth = 1): ReplicaCause {
     return { name: error === null ? "null" : typeof error };
   const code = (error as { code?: unknown }).code;
   const cause = error.cause;
+  const rawBlockers = (error as { blockers?: unknown }).blockers;
+  const blockers = Array.isArray(rawBlockers)
+    ? rawBlockers.slice(0, 16).flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const blocker = value as Record<string, unknown>;
+        if (
+          typeof blocker.address !== "string" ||
+          typeof blocker.name !== "string" ||
+          typeof blocker.reason !== "string"
+        )
+          return [];
+        return [
+          {
+            address: safe(blocker.address),
+            name: blocker.name.slice(0, 128),
+            reason: safe(blocker.reason),
+          },
+        ];
+      })
+    : undefined;
   return {
     name: safe(error.name) || "Error",
     ...((typeof code === "string" || typeof code === "number") && {
       code: safe(String(code)),
     }),
+    ...(blockers && blockers.length > 0 && { blockers }),
     ...(cause !== undefined &&
       depth < MAX_CAUSE_DEPTH && { cause: replicaCause(cause, depth + 1) }),
   };
@@ -229,7 +252,15 @@ export function retryFromError(
 ): Extract<ReplicaPhaseOutcome, { tag: "retry" }> {
   return {
     tag: "retry",
-    problem: error instanceof ReplicaProblemError ? error.problem : fallback,
+    problem:
+      error instanceof ReplicaProblemError
+        ? error.problem
+        : [
+              "replica_publication_blocked",
+              "replica_publication_capability_unavailable",
+            ].includes((error as { code?: unknown } | null)?.code as string)
+          ? "publication_blocked"
+          : fallback,
     cause: replicaCause(error),
   };
 }

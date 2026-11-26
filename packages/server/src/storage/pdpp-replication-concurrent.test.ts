@@ -19,6 +19,7 @@ import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/r
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { ReplicaPendingCapacityError } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 
 const sourceId = "https://source.invalid/declaration";
 const at = "2026-10-20T00:00:00.000Z";
@@ -140,6 +141,49 @@ describe("flag off: the top-level transaction is main's", () => {
 });
 
 describe("replication on: derived state follows other connections", () => {
+  it("two SQLite connections cannot spend the same last pending operation slot", async () => {
+    const path = file();
+    const aDb = open(path);
+    const a = createReplicaRecordStore(aDb);
+    register(a);
+    a.replication.activatePendingBudget({
+      operations: 2,
+      logicalBytes: 100_000,
+    });
+    a.replication.beginBaseline({
+      owner: "owner",
+      declarations: bindings.map((b) => ({ sourceId, binding: b })),
+    });
+    const bDb = open(path);
+    const b = createReplicaRecordStore(bDb);
+    b.replication.activatePendingBudget({
+      operations: 2,
+      logicalBytes: 100_000,
+    });
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => ingest(a, "writer-a")),
+      Promise.resolve().then(() => ingest(b, "writer-b")),
+    ]);
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    const refused = results.find((result) => result.status === "rejected");
+    expect(refused).toMatchObject({
+      status: "rejected",
+      reason: expect.any(ReplicaPendingCapacityError),
+    });
+    expect(
+      aDb
+        .prepare(
+          "SELECT operations FROM pdpp_replica_pending_budget WHERE id=1",
+        )
+        .get(),
+    ).toEqual({ operations: 2 });
+    expect(
+      aDb.prepare("SELECT count(*) AS n FROM pdpp_replica_operations").get(),
+    ).toEqual({ n: 2 });
+  });
+
   it("lists a stream another connection created, without a restart", () => {
     const path = file();
     const aDb = open(path);

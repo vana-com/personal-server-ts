@@ -12,6 +12,7 @@ import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/
 import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
 import type { ReplicaEngineConfig } from "@opendatalabs/personal-server-ts-core/replication/engine";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import type { ReplicaPendingBudgetLimits } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 import type { ReplicationTimers } from "@opendatalabs/personal-server-ts-core/replication/host-driver";
 import {
   planReplicationHost,
@@ -30,6 +31,7 @@ import {
   type BoundedStorageAdapter,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createLiteCanonicalStore } from "./canonical-store.js";
+import type { LiteCanonicalPersistence } from "./canonical-persistence.js";
 import {
   createLiteReplicaEngine,
   type LiteReplicaEngine,
@@ -116,6 +118,8 @@ export interface LiteReplicationInput {
   onError?: (error: unknown) => void;
   /** Engine options for tests (e.g. `now`). */
   engine?: Partial<ReplicaEngineConfig>;
+  /** Testable logical quota, activated only while this network host is live. */
+  pendingBudget?: ReplicaPendingBudgetLimits;
 }
 
 export type LiteReplication =
@@ -207,6 +211,35 @@ export async function createLiteReplication(
       ...input.engine,
     },
   });
+  const canonicalPersistence: LiteCanonicalPersistence = {
+    transaction: (work) =>
+      input.persistence.transaction((tx) =>
+        work({
+          get: (key) => tx.get(key),
+          put: (key, value) => tx.put(key, value),
+          delete: (key) => tx.delete(key),
+          scan: (prefix, after) => tx.scan(prefix, after),
+          attachBlob: (id, expected) => tx.attachBlob(id, expected),
+          blob: (id) => tx.blob(id),
+          replicaEvidence: {
+            all: (statement, params) => tx.sql.all(statement, params),
+          },
+        }),
+      ),
+    stageBlob: (descriptor, chunks) =>
+      input.persistence.stageBlob(descriptor, chunks),
+    readBlob: (blobId) => input.persistence.readBlob(blobId),
+  };
+  const canonical = createLiteCanonicalStore({
+    persistence: canonicalPersistence,
+    enabled: true,
+    ...trusted,
+    pendingBudget: input.pendingBudget,
+    localCommitted: () => runtime.localWrite(),
+  });
+  // Canonical mode may be enabled for imports without a network engine. This
+  // host alone turns on the owner-local outbound budget before rotation.
+  await canonical.activatePendingBudget(input.pendingBudget);
   const rotation = input.rotateWriterIdentity
     ? await rotateAtBoot(engine)
     : "not_requested";
@@ -221,13 +254,7 @@ export async function createLiteReplication(
   return {
     state: "started",
     engine,
-    canonical: createLiteCanonicalStore({
-      persistence: input.persistence,
-      enabled: true,
-      ...trusted,
-      // A committed own write steps soon, not at the next wake (Node: #517).
-      localCommitted: () => runtime.localWrite(),
-    }),
+    canonical,
     rotation,
     runtime,
   };

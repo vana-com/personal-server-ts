@@ -27,11 +27,7 @@ import type {
   ReplicaOperation,
   ReplicaEnvelope,
 } from "../packages/core/src/replication/envelope.js";
-import { createReplicaEvidenceAdapter } from "../packages/core/src/replication/evidence.js";
-import {
-  createDpv2ReplicaTransport,
-  createReplicaFinalityHints,
-} from "../packages/core/src/replication/dpv2.js";
+import { createReplicationNetworkPorts } from "../packages/core/src/replication/host-ports.js";
 import {
   replicaFragmentKey,
   replicaManifestKey,
@@ -350,28 +346,15 @@ export async function openReplicaRuntime(init: Init) {
     serverOwner: init.owner,
     serverAccount: account,
   });
-  const transport = createDpv2ReplicaTransport({
-    finality: createReplicaFinalityHints({
-      rpc: createPublicClient({
-        transport: http(rpcUrl, { timeout: 25_000, retryCount: 0 }),
-      }),
-    }),
+  const { transport } = createReplicationNetworkPorts({
+    config,
     owner: init.owner,
     masterKey: new Uint8Array(init.master),
     storage,
     gateway: createGatewayClient(gatewayUrl),
     signer: createServerSigner(account, config.gateway),
     feed: createGatewayDataPointFeed({ gatewayUrl, fetch: boundedFetch }),
-    evidence: createReplicaEvidenceAdapter({
-      owner: init.owner,
-      gatewayUrl,
-      chainId: 14800,
-      registry,
-      fetch: boundedFetch,
-      rpc: createPublicClient({
-        transport: http(rpcUrl, { timeout: 25_000, retryCount: 0 }),
-      }),
-    }),
+    compatibilityFetch: boundedFetch,
   });
   db.exec(
     "CREATE TABLE IF NOT EXISTS harness_evidence (slot TEXT PRIMARY KEY, json TEXT NOT NULL)",

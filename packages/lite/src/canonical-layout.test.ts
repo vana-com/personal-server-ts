@@ -6,12 +6,16 @@ import {
   registration,
   upsert,
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
-import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import {
+  canonicalJson,
+  type ReplicaOperation,
+} from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   createLiteCanonicalStore,
   type LiteOperationDraft,
 } from "./canonical-store.js";
 import { createFakeCanonicalPersistence } from "./test-support/canonical-persistence.js";
+import { ReplicaPendingCapacityError } from "@opendatalabs/personal-server-ts-core/replication/pending-budget";
 
 const draft = (op: ReplicaOperation): LiteOperationDraft => {
   const { revision: _, ...value } = op;
@@ -34,7 +38,7 @@ const LAYOUT = [
 function device() {
   const adapter = createFakeCanonicalPersistence();
   let next = 0;
-  const make = () =>
+  const make = (pendingBudget?: { operations: number; logicalBytes: number }) =>
     createLiteCanonicalStore({
       persistence: adapter.port,
       enabled: true,
@@ -47,6 +51,7 @@ function device() {
       authenticateReplica: (credential) =>
         credential === "replica" ? identity.owner : undefined,
       newId: () => `id-${++next}`,
+      pendingBudget,
     });
   return { adapter, make };
 }
@@ -145,6 +150,224 @@ async function transcript() {
 }
 
 describe("Lite canonical outbox", () => {
+  it("charges a shared blob once and keeps it until the last exact reference settles", async () => {
+    const { adapter, make } = device();
+    const store = make({ operations: 4, logicalBytes: 100_000 });
+    await store.activatePendingBudget();
+    await store.provisionConnection(identity.connectionId, {
+      sourceId: identity.sourceId,
+      methodId: identity.methodId,
+    });
+    const bytes = new TextEncoder().encode("shared blob");
+    const hash = `sha256:${sha256(bytes).slice(2)}`;
+    const descriptor = {
+      blobId: hash,
+      sha256: hash,
+      mimeType: "text/plain",
+      sizeBytes: bytes.length,
+    };
+    const stagingId = await store.stageBlob(
+      descriptor,
+      (async function* () {
+        yield bytes;
+      })(),
+    );
+    const withBlob = (id: string): LiteOperationDraft => ({
+      ...record(id, id),
+      data: { id, blob_ref: { blob_id: hash } },
+      blobs: [descriptor],
+    });
+    const claim: LiteOperationDraft = {
+      ...identity,
+      kind: "blob-claim",
+      blob: descriptor,
+    };
+    await store.commitLocal(
+      "first-blob",
+      [draft(registration), claim, withBlob("first")],
+      [{ stagingId, descriptor }],
+    );
+    await store.commitLocal("second-blob", [withBlob("second")]);
+    const entries = (await store.readOutboxPage(0)).entries;
+    const operations = entries.map(({ operation }) => operation);
+    const upserts = operations.filter((op) => op.kind === "upsert");
+    const retainedClaim = operations.find((op) => op.kind === "blob-claim")!;
+    expect(upserts).toHaveLength(2);
+    const pendingBlobEntry = [...adapter.disk.rows.entries()].find(([key]) =>
+      key.startsWith("pending-budget/blobs/"),
+    );
+    expect(JSON.parse(pendingBlobEntry![1])).toEqual({
+      sizeBytes: bytes.length,
+      references: 3,
+    });
+    const firstWitness = {
+      batch: "blob-reference-one",
+      slot: "writer-scope/1",
+      scope: "writer-scope",
+      version: 1,
+      commitment: `0x${"b".repeat(64)}`,
+      operations: [retainedClaim, upserts[0]!].map((operation) => ({
+        writerId: operation.revision.writerId,
+        operationId: operation.revision.operationId,
+      })),
+    };
+    const before = JSON.parse(
+      adapter.disk.rows.get("pending-budget/state")!,
+    ) as { logicalBytes: number; operations: number };
+    await store.acknowledgePublished(null, firstWitness);
+    const middle = JSON.parse(
+      adapter.disk.rows.get("pending-budget/state")!,
+    ) as { logicalBytes: number; operations: number };
+    expect(before.logicalBytes - middle.logicalBytes).toBe(
+      new TextEncoder().encode(canonicalJson(retainedClaim)).length +
+        new TextEncoder().encode(canonicalJson(upserts[0])).length,
+    );
+    expect(middle.operations).toBe(2);
+    expect(
+      JSON.parse(
+        [...adapter.disk.rows.entries()].find(([key]) =>
+          key.startsWith("pending-budget/blobs/"),
+        )![1],
+      ),
+    ).toEqual({ sizeBytes: bytes.length, references: 1 });
+    await store.acknowledgePublished(null, {
+      ...firstWitness,
+      batch: "blob-reference-two",
+      slot: "writer-scope/2",
+      version: 2,
+      operations: [
+        {
+          writerId: upserts[1]!.revision.writerId,
+          operationId: upserts[1]!.revision.operationId,
+        },
+      ],
+    });
+    const after = JSON.parse(
+      adapter.disk.rows.get("pending-budget/state")!,
+    ) as { logicalBytes: number; operations: number };
+    expect(middle.logicalBytes - after.logicalBytes).toBe(
+      new TextEncoder().encode(canonicalJson(upserts[1])).length + bytes.length,
+    );
+    expect(after.operations).toBe(1);
+    expect(
+      [...adapter.disk.rows.keys()].some((key) =>
+        key.startsWith("pending-budget/blobs/"),
+      ),
+    ).toBe(false);
+  });
+
+  it("releases only exact finalized operation identities and keeps acknowledgments idempotent", async () => {
+    const { make } = device();
+    const store = make({ operations: 2, logicalBytes: 100_000 });
+    await store.activatePendingBudget();
+    await store.provisionConnection(identity.connectionId, {
+      sourceId: identity.sourceId,
+      methodId: identity.methodId,
+    });
+    await store.commitLocal("register", [draft(registration)]);
+    await store.commitLocal("record", [record("k0", "zero")]);
+    const page = await store.readOutboxPage(0);
+    expect(page.entries).toHaveLength(2);
+    const [first, second] = page.entries.map(({ operation }) => ({
+      writerId: operation.revision.writerId,
+      operationId: operation.revision.operationId,
+    }));
+    const finalized = {
+      batch: "finalized-batch",
+      slot: "writer-scope/1",
+      scope: "writer-scope",
+      version: 1,
+      commitment: `0x${"a".repeat(64)}`,
+      operations: [first!],
+    };
+    await store.acknowledgePublished(null, finalized);
+    await store.acknowledgePublished(null, finalized);
+    expect((await store.readOutboxPage(0)).entries).toHaveLength(2);
+    await expect(
+      store.commitLocal("after-one-ack", [record("k1", "one")]),
+    ).resolves.toBeDefined();
+    await expect(
+      store.commitLocal("at-capacity", [record("k2", "two")]),
+    ).rejects.toThrow("capacity exceeded");
+    await store.acknowledgePublished(null, {
+      ...finalized,
+      batch: "second-finalized-batch",
+      slot: "writer-scope/2",
+      version: 2,
+      operations: [second!],
+    });
+    await expect(
+      store.commitLocal("after-both-acks", [record("k2", "two")]),
+    ).resolves.toBeDefined();
+  });
+
+  it("admits only accepted local operations and rolls back a full-budget write", async () => {
+    const { adapter, make } = device();
+    const store = make({ operations: 2, logicalBytes: 100_000 });
+    await store.activatePendingBudget();
+    await store.provisionConnection(identity.connectionId, {
+      sourceId: identity.sourceId,
+      methodId: identity.methodId,
+    });
+    const registrationReceipt = await store.commitLocal("register", [
+      draft(registration),
+    ]);
+    const firstReceipt = await store.commitLocal("first", [
+      record("k0", "zero"),
+    ]);
+    await expect(
+      store.commitLocal("register", [draft(registration)]),
+    ).resolves.toEqual(registrationReceipt);
+    await expect(
+      store.commitLocal("noop", [record("k0", "zero")]),
+    ).resolves.toMatchObject({ operationCount: 0 });
+    const clockBeforeRefusal = adapter.disk.rows.get("clock");
+    const receiptsBeforeRefusal = [...adapter.disk.rows.entries()]
+      .filter(([key]) => key.startsWith("local/"))
+      .sort(([left], [right]) => left.localeCompare(right));
+    await expect(
+      store.commitLocal("over-limit", [record("k1", "one")]),
+    ).rejects.toBeInstanceOf(ReplicaPendingCapacityError);
+    const page = await store.readOutboxPage(0);
+    expect(page.entries).toHaveLength(2);
+    expect(page.nextAfterSequence).toBe(firstReceipt.sequence);
+    expect(adapter.disk.rows.get("clock")).toBe(clockBeforeRefusal);
+    expect(
+      [...adapter.disk.rows.entries()]
+        .filter(([key]) => key.startsWith("local/"))
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ).toEqual(receiptsBeforeRefusal);
+    await expect(
+      store.commitLocal("over-limit", [record("k1", "one")]),
+    ).rejects.toBeInstanceOf(ReplicaPendingCapacityError);
+  });
+
+  it("serializes concurrent Lite transactions competing for the last slot", async () => {
+    const { make } = device();
+    const first = make({ operations: 2, logicalBytes: 100_000 });
+    await first.activatePendingBudget();
+    await first.provisionConnection(identity.connectionId, {
+      sourceId: identity.sourceId,
+      methodId: identity.methodId,
+    });
+    await first.commitLocal("register", [draft(registration)]);
+    const second = make({ operations: 2, logicalBytes: 100_000 });
+    const results = await Promise.allSettled([
+      first.commitLocal("writer-a", [record("a", "a")]),
+      second.commitLocal("writer-b", [record("b", "b")]),
+    ]);
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      results.find((result) => result.status === "rejected"),
+    ).toMatchObject({
+      status: "rejected",
+      reason: expect.any(ReplicaPendingCapacityError),
+    });
+    expect((await first.readOutboxPage(0)).entries).toHaveLength(2);
+  });
+
   it("returns byte-identical publisher pages for a fixed write sequence", async () => {
     const { out, kept } = await transcript();
     const pages = JSON.stringify(out);

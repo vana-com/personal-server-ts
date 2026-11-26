@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { retireReplication } from "./pdpp-replication-door.js";
@@ -37,6 +38,7 @@ import {
   fragmentReplicaPayload,
   replicaDigest,
   replicaFragmentKey,
+  replicaMetadataHash,
   replicaScope,
   prepareReplicaManifest,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
@@ -65,6 +67,7 @@ import { assembleReplicaStream } from "@opendatalabs/personal-server-ts-core/rep
 import { canonicalJson } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaStagingStore } from "./pdpp-replica-staging.js";
 import { ReplicaFramingUnsupported } from "@opendatalabs/personal-server-ts-core/replication/outcome";
+import { ReplicaPublicationBlockedError } from "@opendatalabs/personal-server-ts-core/replication/compatibility";
 import { defaultReplicaBackoff } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import {
   MAX_BLOB_UPLOAD_BYTES,
@@ -93,7 +96,8 @@ const slotParts = (slot: string) => {
   const cut = slot.lastIndexOf("/");
   return { scope: slot.slice(0, cut), version: Number(slot.slice(cut + 1)) };
 };
-const isFragmentKey = (key: string) => key.includes("/fragments/");
+const isFragmentKey = (key: string) =>
+  key.includes("/fragments/") || key.includes("/fragments-");
 /** The batch id inside a fragment or manifest plaintext. */
 function batchOfPlaintext(bytes: Uint8Array) {
   const data = (
@@ -107,8 +111,8 @@ function batchOfPlaintext(bytes: Uint8Array) {
 /**
  * Storage cap + DPv2 version guard, plus independent Gateway head and
  * finalized chain stores. Registry state is per slot (`<scope>/<version>`).
- * Storage keys are exact: manifests at `<scope>/<version>`, fragments at
- * `<scope>/fragments/<sha256>`.
+ * Storage keys are exact: manifests at `<scope>/<version>`, with fragments at
+ * either the historical slash or current dash address.
  */
 function network(realCrypto = false, cap = 8192) {
   const blobs = new Map<string, Uint8Array>();
@@ -151,6 +155,7 @@ function network(realCrypto = false, cap = 8192) {
   const puts: { key: string; bytes: Uint8Array }[] = [];
   const gets: string[] = [];
   const registrations: string[] = [];
+  const replicaAuthorizations: unknown[] = [];
   const failPut = new Set<string>();
   const failGet = new Set<string>();
   let loseRegistrationResponse = false;
@@ -188,44 +193,68 @@ function network(realCrypto = false, cap = 8192) {
     expect(msg.expectedVersion).toBeGreaterThan(0n);
     return "0x1234" as const;
   });
+  const gateway: Pick<GatewayClient, "registerDataPoint"> = {
+    async registerDataPoint(input) {
+      const slot = slotKey(input.scope, input.expectedVersion);
+      registrations.push(slot);
+      const max = Math.max(
+        latest(head, input.scope),
+        latest(chain, input.scope),
+      );
+      if (Number(input.expectedVersion) <= max)
+        throw new Error(
+          `Gateway error: 409 Stale expectedVersion; stored value ${max}`,
+        );
+      if (Number(input.expectedVersion) !== max + 1)
+        throw new Error(
+          `Gateway error: 409 Gap in version sequence; next valid version is ${max + 1}`,
+        );
+      const row = {
+        owner: input.ownerAddress,
+        scope: input.scope,
+        version: input.expectedVersion,
+        dataHash: input.dataHash,
+        metadataHash: input.metadataHash,
+        deleted: false,
+      };
+      head.set(slot, row);
+      if (!pending.has(slot)) chain.set(slot, chainRow(slot, row));
+      if (loseRegistrationResponse) {
+        loseRegistrationResponse = false;
+        throw new Error("response lost after commit");
+      }
+      return { dataPointId: slot } as never;
+    },
+  };
   const adapter = createDpv2ReplicaTransport({
     owner,
     masterKey: new Uint8Array(32).fill(5),
     storage,
-    signer: { signAddData },
-    gateway: {
-      async registerDataPoint(input) {
-        const slot = slotKey(input.scope, input.expectedVersion);
-        registrations.push(slot);
-        const max = Math.max(
-          latest(head, input.scope),
-          latest(chain, input.scope),
-        );
-        if (Number(input.expectedVersion) <= max)
-          throw new Error(
-            `Gateway error: 409 Stale expectedVersion; stored value ${max}`,
-          );
-        if (Number(input.expectedVersion) !== max + 1)
-          throw new Error(
-            `Gateway error: 409 Gap in version sequence; next valid version is ${max + 1}`,
-          );
-        const row = {
-          owner: input.ownerAddress,
-          scope: input.scope,
-          version: input.expectedVersion,
-          dataHash: input.dataHash,
-          metadataHash: input.metadataHash,
-          deleted: false,
-        };
-        head.set(slot, row);
-        if (!pending.has(slot)) chain.set(slot, chainRow(slot, row));
-        if (loseRegistrationResponse) {
-          loseRegistrationResponse = false;
-          throw new Error("response lost after commit");
-        }
-        return { dataPointId: slot } as never;
-      },
+    compatibilityRoster: async () => ({
+      complete: true,
+      epoch: 1,
+      devices: [
+        {
+          address: owner,
+          registrationId: owner,
+          revokedAt: null,
+          readerFormats: ["fragments-v2"],
+          capabilityValid: true,
+        },
+      ],
+    }),
+    signer: {
+      address: owner as `0x${string}`,
+      signAddData,
+      signMessage: async () => "0x1234" as `0x${string}`,
     },
+    gatewayOrigin: "http://localhost:3000",
+    chainId: 31337n,
+    registerReplicaDataPoint: async (input) => {
+      replicaAuthorizations.push(input.replicaAuthorization);
+      return gateway.registerDataPoint(input as never);
+    },
+    gateway,
     feed: {
       async listDataPointsByOwner(_owner, cursor) {
         const scopes = [
@@ -301,6 +330,7 @@ function network(realCrypto = false, cap = 8192) {
     puts,
     gets,
     registrations,
+    replicaAuthorizations,
     signAddData,
     failPut,
     failGet,
@@ -483,6 +513,9 @@ function fragmentsOut(d: ReturnType<typeof device>) {
     encrypted: Buffer;
     state: string;
     attempts: number;
+    outcome: string | null;
+    reason: string | null;
+    cause_json: string | null;
   }[];
 }
 function importWork(d: ReturnType<typeof device>) {
@@ -599,13 +632,14 @@ it("does not resubmit a registration while accepted evidence is temporarily hidd
   let hidden: Parameters<ReplicaTransportPort["register"]>[0] | undefined;
   net.port.register = async (manifest) => {
     calls.push(slotKey(manifest.scope, manifest.version));
-    await originalRegister(manifest);
+    await originalRegister.call(net.port, manifest);
     hidden = manifest;
     const slot = slotKey(manifest.scope, manifest.version);
     net.head.delete(slot);
     net.chain.delete(slot);
   };
 
+  a.put("accepted registration with temporarily hidden evidence", "first");
   await a.cycle();
   const slot = outbox(a)[0]!.slot;
   expect(calls).toEqual([slot]);
@@ -833,6 +867,85 @@ it("S3 keeps an uploaded batch ahead of later operations while a fragment retrie
   expect(net.registrations).toEqual([]);
 });
 
+it("keeps accepted operations pending and names old readers when publication is blocked", async () => {
+  const net = network();
+  const a = device(net);
+  net.port.assertPublicationCompatible = async () => {
+    throw new ReplicaPublicationBlockedError([
+      {
+        address: "0x0000000000000000000000000000000000000002",
+        name: "offline old reader",
+        reason: "reader_format_unsupported",
+      },
+    ]);
+  };
+  a.put("accepted locally", "pending-record");
+  await a.cycle();
+
+  expect(a.get("pending-record")).toEqual({
+    id: "pending-record",
+    text: "accepted locally",
+  });
+  expect(outbox(a)).toHaveLength(1);
+  expect(outbox(a)[0]!.state).toBe("ready");
+  expect(fragmentsOut(a)).toMatchObject([
+    { state: "ready", outcome: "retry", reason: "publication_blocked" },
+  ]);
+  expect(JSON.parse(String(fragmentsOut(a)[0]!.cause_json))).toMatchObject({
+    blockers: [
+      {
+        address: "0x0000000000000000000000000000000000000002",
+        name: "offline old reader",
+      },
+    ],
+  });
+  expect(net.puts).toEqual([]);
+  expect(net.registrations).toEqual([]);
+});
+
+it("retries the retained operation after revocation removes the old reader", async () => {
+  const net = network();
+  const a = device(net);
+  let blocked = true;
+  net.port.assertPublicationCompatible = async () => {
+    if (blocked)
+      throw new ReplicaPublicationBlockedError([
+        {
+          address: "0x0000000000000000000000000000000000000002",
+          name: "offline old reader",
+          reason: "reader_format_unsupported",
+        },
+      ]);
+    return { epoch: 8, format: "fragments-v2" };
+  };
+  a.put("accepted locally", "retry-after-revoke");
+  await a.cycle();
+  expect(a.get("retry-after-revoke")).toEqual({
+    id: "retry-after-revoke",
+    text: "accepted locally",
+  });
+  expect(outbox(a)).toHaveLength(1);
+  expect(net.puts).toEqual([]);
+
+  blocked = false;
+  await cycles([a], 100);
+  expect(net.registrations.length).toBeGreaterThan(0);
+  expect(net.replicaAuthorizations.length).toBeGreaterThan(0);
+  expect(net.replicaAuthorizations.at(-1)).toMatchObject({
+    owner,
+    server: owner,
+    registrationId: owner,
+    expectedEpoch: "1",
+    writeFormat: "fragments-v2",
+    scope: a.scope,
+  });
+  expect(outbox(a).length).toBeGreaterThan(0);
+  expect(a.get("retry-after-revoke")).toEqual({
+    id: "retry-after-revoke",
+    text: "accepted locally",
+  });
+});
+
 it("reports a pending predecessor and re-registers that same slot after authoritative absence", async () => {
   const net = network();
   const a = device(net, {
@@ -843,7 +956,7 @@ it("reports a pending predecessor and re-registers that same slot after authorit
   const calls: string[] = [];
   net.port.register = async (manifest) => {
     calls.push(slotKey(manifest.scope, manifest.version));
-    await originalRegister(manifest);
+    await originalRegister.call(net.port, manifest);
   };
 
   net.beforePut((key) => net.pending.add(key));
@@ -1047,15 +1160,16 @@ it("aborts later outbound writes when the door closes after a fragment upload", 
   const a = device(net);
   const originalPutFragment = net.port.putFragment;
   net.port.putFragment = async (fragment) => {
-    await originalPutFragment(fragment);
+    await originalPutFragment.call(net.port, fragment);
     retireReplication(a.db);
   };
   const manifestPut = vi.spyOn(net.port, "put");
   const register = vi.spyOn(net.port, "register");
 
+  a.put("close after an accepted fragment upload", "first");
   await a.cycle();
 
-  expect(net.puts.some(({ key }) => key.includes("/fragments/"))).toBe(true);
+  expect(net.puts.some(({ key }) => isFragmentKey(key))).toBe(true);
   expect(manifestPut).not.toHaveBeenCalled();
   expect(register).not.toHaveBeenCalled();
   expect(outbox(a)[0]?.state).toBe("ready");
@@ -1066,7 +1180,7 @@ it("does not let a stale outbound receipt overwrite a newer quarantine", async (
   const a = device(net);
   const originalPutFragment = net.port.putFragment;
   net.port.putFragment = async (fragment) => {
-    await originalPutFragment(fragment);
+    await originalPutFragment.call(net.port, fragment);
     a.db
       .prepare(
         "UPDATE pdpp_transport_fragments_out SET state='quarantined',outcome='quarantine',reason='fragment_mismatch' WHERE digest=?",
@@ -1074,6 +1188,7 @@ it("does not let a stale outbound receipt overwrite a newer quarantine", async (
       .run(fragment.digest);
   };
 
+  a.put("fragment upload races a newer quarantine", "first");
   await a.cycle();
 
   expect(fragmentsOut(a)[0]).toMatchObject({
@@ -1965,7 +2080,9 @@ it("E1 rejects declared totals before fetching fragments or retaining evidence",
     resource_limits_version: REPLICA_LIMITS_VERSION,
   });
   expect(
-    net.gets.filter((key) => key.startsWith(`${scope}/fragments/`)),
+    net.gets.filter(
+      (key) => key.startsWith(`${scope}/`) && key.includes("fragments"),
+    ),
   ).toHaveLength(0);
   expect(
     (
@@ -2439,7 +2556,9 @@ it("E1 rejects declared aggregate ciphertext over its limit before fragment GET"
       .get(slot),
   ).toEqual({ outcome: "unsupported", reason: "resource_unsupported" });
   expect(
-    net.gets.filter((key) => key.startsWith(`${scope}/fragments/`)),
+    net.gets.filter(
+      (key) => key.startsWith(`${scope}/`) && key.includes("fragments"),
+    ),
   ).toHaveLength(0);
   expect(
     (
@@ -2916,6 +3035,175 @@ it("rejects a validly encrypted manifest whose plaintext/metadata commitment dif
   const row = inbox(b).find((r) => r.slot === slot);
   expect(row?.manifest_json).toBeNull();
   expect(row?.reason).toBe("commitment_mismatch");
+});
+
+it("keeps a malformed v2 manifest refused after one capability retry and restart", async () => {
+  const net = network();
+  const sender = device(net, { preexisting: "record" });
+  await cycles([sender], 3);
+  const { scope, slot } = outbox(sender)[0]!;
+  const wrapper = JSON.parse(
+    new TextDecoder().decode(
+      await net.port.decrypt(scope, net.blobs.get(slot)!),
+    ),
+  );
+  expect(wrapper.data.manifest.version).toBe(2);
+  wrapper.data.manifest.untrustedExtra = true;
+  const plaintext = new TextEncoder().encode(canonicalJson(wrapper));
+  const encrypted = await net.port.encrypt(scope, plaintext);
+  const commitment = {
+    owner,
+    scope,
+    version: "1",
+    dataHash: keccak256(plaintext),
+    metadataHash: replicaMetadataHash(
+      scope,
+      wrapper.collectedAt,
+      encrypted.length,
+    ),
+    deleted: false,
+  };
+  net.blobs.set(slot, encrypted);
+  net.head.set(slot, commitment);
+  net.chain.set(slot, net.chainRow(slot, commitment));
+
+  const receiver = device(net);
+  await receiver.cycle();
+  const getsAfterFirstCycle = net.gets.filter((key) => key === slot).length;
+  await receiver.cycle();
+  expect(inbox(receiver).find((row) => row.slot === slot)).toMatchObject({
+    state: "quarantined",
+    reason: "manifest_invalid",
+    manifest_json: null,
+  });
+  expect(
+    receiver.db
+      .prepare(
+        "SELECT readmission_capability,quarantine_history FROM pdpp_transport_manifests_in WHERE slot=?",
+      )
+      .get(slot),
+  ).toEqual({
+    readmission_capability: "manifest-v2",
+    quarantine_history: '["manifest_invalid"]',
+  });
+  const readsBeforeRestart = net.gets.filter((key) => key === slot).length;
+  expect(readsBeforeRestart - getsAfterFirstCycle).toBe(1);
+  expect(fragmentsIn(receiver).filter((row) => row.slot === slot)).toEqual([]);
+  expect(
+    receiver.db
+      .prepare(
+        "SELECT count(*) AS count FROM pdpp_transport_imported WHERE writer=? AND batch=?",
+      )
+      .get(wrapper.data.manifest.writer, wrapper.data.manifest.batch),
+  ).toEqual({ count: 0 });
+  receiver.reopen();
+  const report = await receiver.step();
+  expect(report.quarantines).toContainEqual({
+    id: slot,
+    phase: "download",
+    proof: { reason: "manifest_invalid", key: slot },
+  });
+  expect(net.gets.filter((key) => key === slot)).toHaveLength(
+    readsBeforeRestart,
+  );
+});
+
+it("readmits a retained refusal and imports its record and blob batch once", async () => {
+  const net = network();
+  const sender = device(net, { chunk: 1000 });
+  const bytes = new Uint8Array(17_000);
+  for (let index = 0; index < bytes.length; index++) bytes[index] = index % 251;
+  const blob = sender.store.storeBlobBytesForInstance({
+    instance: "conn",
+    method: "export",
+    generation: 1,
+    bytes,
+    mimeType: "application/octet-stream",
+  });
+  sender.store.ingestBatch(
+    [
+      {
+        instance: "conn",
+        stream: "messages",
+        key: "upgraded-binary",
+        emitted_at: at,
+        data: {
+          id: "upgraded-binary",
+          blob_ref: {
+            blob_id: blob.blobId,
+            mime_type: blob.mimeType,
+            size_bytes: bytes.length,
+          },
+        },
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "export", generation: 1 },
+  );
+  await cycles([sender], 6);
+  const manifest = outbox(sender).at(-1)!;
+  const inner = JSON.parse(new TextDecoder().decode(manifest.plaintext));
+  expect(inner.data.manifest.version).toBe(2);
+
+  const receiver = device(net);
+  receiver.declarations([]);
+  net.failGet.add(manifest.slot);
+  await receiver.cycle();
+  receiver.db
+    .prepare(
+      `UPDATE pdpp_transport_manifests_in
+       SET state='quarantined',outcome='quarantine',reason='manifest_invalid',error='manifest_invalid',manifest_json=NULL
+       WHERE slot=?`,
+    )
+    .run(manifest.slot);
+  net.failGet.delete(manifest.slot);
+  receiver.reopen();
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await cycles([receiver], 1);
+    if (importWork(receiver).some((work) => work.outcome === "wait")) break;
+  }
+  expect(receiver.get("upgraded-binary")).toBeUndefined();
+  expect(inbox(receiver).find((row) => row.slot === manifest.slot)?.state).toBe(
+    "imported",
+  );
+  const retainedCopies = receiver.db
+    .prepare("SELECT state FROM pdpp_replica_copies")
+    .all() as { state: string }[];
+  expect(retainedCopies.length).toBeGreaterThan(0);
+  expect(retainedCopies.every((row) => row.state !== "quarantined")).toBe(true);
+  receiver.declarations(expected.declarations);
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await cycles([receiver], 1);
+    if (receiver.get("upgraded-binary")) break;
+  }
+  expect(receiver.get("upgraded-binary")).toEqual(
+    sender.get("upgraded-binary"),
+  );
+  expect(
+    Buffer.from(receiver.store.getBlobBytes(blob.blobId)!).equals(
+      Buffer.from(bytes),
+    ),
+  ).toBe(true);
+  expect(
+    receiver.db
+      .prepare(
+        "SELECT count(*) AS count FROM pdpp_transport_imported WHERE writer=? AND batch=?",
+      )
+      .get(inner.data.manifest.writer, inner.data.manifest.batch),
+  ).toEqual({ count: 1 });
+  expect(inbox(receiver).find((row) => row.slot === manifest.slot)?.state).toBe(
+    "imported",
+  );
+  await cycles([receiver], 2);
+  expect(
+    receiver.db
+      .prepare(
+        "SELECT count(*) AS count FROM pdpp_transport_imported WHERE writer=? AND batch=?",
+      )
+      .get(inner.data.manifest.writer, inner.data.manifest.batch),
+  ).toEqual({ count: 1 });
 });
 
 it("a cloned writer cannot replace a published slot", async () => {
