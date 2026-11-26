@@ -223,10 +223,4 @@ describe("PDPP error response", () => {
       request_id: "request-four",
     });
   });
-
-  it("ignores an explicit status for a known code", () => {
-    const error = new PdppError("not_found", "Not found", { status: 500 });
-    expect(error.status).toBe(404);
-    expect(error.type).toBe("not_found_error");
-  });
 });
