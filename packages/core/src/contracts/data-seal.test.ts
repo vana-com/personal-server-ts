@@ -102,6 +102,38 @@ describe("conditional ingest never falls back to a two-step write", () => {
     expect(wrote).toBe(false);
   });
 
+  it("returns the atomic writer's path without calling either legacy step", async () => {
+    const storage = twoStepStorage(new Error("legacy index should not run"));
+    const writeResult = {
+      path: "fixtures/atomic.json",
+      relativePath: "fixtures/atomic.json",
+      sizeBytes: 12,
+    };
+    let writes = 0;
+    storage.writeEnvelope = async () => {
+      throw new Error("legacy blob writer should not run");
+    };
+    storage.commitEnvelope = async (_envelope, _entry, precondition) => {
+      writes += 1;
+      expect(precondition).toEqual({ kind: "match", version: 1 });
+      return { ok: true, writeResult };
+    };
+    await expect(conditional(storage)).resolves.toMatchObject({
+      ok: true,
+      writeResult,
+    });
+    expect(writes).toBe(1);
+  });
+
+  it("keeps the closed-mode refusal returned by the atomic writer", async () => {
+    const storage = twoStepStorage(new Error("legacy index should not run"));
+    const refusal = legacyWriteRefusedErrorFor("unknown");
+    storage.commitEnvelope = async () => {
+      throw refusal;
+    };
+    await expect(conditional(storage)).rejects.toBe(refusal);
+  });
+
   it("returns the authoritative 412 rather than attempting a fallback write", async () => {
     const storage = twoStepStorage(new Error("index should not be called"));
     let wrote = false;
