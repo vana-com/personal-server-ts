@@ -333,10 +333,16 @@ describe("tunnel/binary", () => {
 
     it("does not publish a binary or metadata on a successful HTTP response without a body", async () => {
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValue(new Response(null, { status: 200 }));
       try {
-        await expect(ensureFrpcBinary(tempDir, { log: () => {} })).rejects.toThrow("No response body received");
-        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(
+          ensureFrpcBinary(tempDir, { log: () => {} }),
+        ).rejects.toThrow("No response body received");
+        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
         expect(await getInstalledVersion(tempDir)).toBeNull();
       } finally {
         globalThis.fetch = originalFetch;
@@ -353,11 +359,21 @@ describe("tunnel/binary", () => {
           else controller.error(failure);
         },
       });
-      globalThis.fetch = vi.fn().mockResolvedValue(new Response(partial, { status: 200 }));
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValue(new Response(partial, { status: 200 }));
       try {
-        await expect(ensureFrpcBinary(tempDir, { log: () => {} })).rejects.toThrow(failure.message);
-        await expect(access(join(tempDir, "bin", `_frpc_download.${getPlatformInfo().ext}`))).rejects.toMatchObject({ code: "ENOENT" });
-        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(
+          ensureFrpcBinary(tempDir, { log: () => {} }),
+        ).rejects.toThrow(failure.message);
+        await expect(
+          access(
+            join(tempDir, "bin", `_frpc_download.${getPlatformInfo().ext}`),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
         expect(await getInstalledVersion(tempDir)).toBeNull();
       } finally {
         globalThis.fetch = originalFetch;

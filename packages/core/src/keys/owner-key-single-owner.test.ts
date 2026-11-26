@@ -26,7 +26,11 @@ import { publicKeyToAddress } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { ServerSigningUnavailableError } from "../errors/catalog.js";
 import { createPublicOnlyAccount } from "./public-only-account.js";
-import { recoverOwnerAddress, signOwnerMasterKey, streamMasterKey } from "./owner-master-key.js";
+import {
+  recoverOwnerAddress,
+  signOwnerMasterKey,
+  streamMasterKey,
+} from "./owner-master-key.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const SOURCE_EXT = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -248,14 +252,21 @@ describe("owner key failures", () => {
   it("propagates a wallet refusal without producing fallback key material", async () => {
     const declined = new Error("synthetic wallet refusal");
     let prompts = 0;
-    await expect(signOwnerMasterKey({
-      signMessage: () => { prompts += 1; throw declined; },
-    })).rejects.toBe(declined);
+    await expect(
+      signOwnerMasterKey({
+        signMessage: () => {
+          prompts += 1;
+          throw declined;
+        },
+      }),
+    ).rejects.toBe(declined);
     expect(prompts).toBe(1);
   });
 
   it("cannot recover an owner or derive a stream key from a truncated signature", async () => {
-    await expect(Promise.resolve().then(() => recoverOwnerAddress("0x01"))).rejects.toThrow();
+    await expect(
+      Promise.resolve().then(() => recoverOwnerAddress("0x01")),
+    ).rejects.toThrow();
     expect(() => streamMasterKey(new Uint8Array([1]))).toThrow();
   });
 });
