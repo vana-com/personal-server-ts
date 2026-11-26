@@ -105,6 +105,27 @@ describe("canonical import source page bounds", () => {
     );
   });
 
+  it("carries opaque continuation cursors into the next canonical import page", async () => {
+    const cursor = "fixture:+/next";
+    const page = vi.fn<CanonicalImportPageReader["page"]>();
+    page.mockResolvedValueOnce({ rows: [{ id: 1 }], next: cursor });
+    page.mockResolvedValueOnce({ rows: [{ id: 2 }], next: null });
+
+    const item = await candidate(page);
+    const records = [];
+    for await (const record of item.records()) records.push(record);
+    expect(records).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(page.mock.calls.map((call) => call[2])).toEqual([null, cursor]);
+  });
+
+  it("finishes an empty terminal canonical import page without fetching another", async () => {
+    const page = vi.fn(async () => ({ rows: [], next: null }));
+    const item = await candidate(page);
+    const step = await item.records()[Symbol.asyncIterator]().next();
+    expect(step.done).toBe(true);
+    expect(page).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses a cursor on an empty page instead of looping to a second page", async () => {
     const page = vi.fn(async () => ({ rows: [], next: "would-repeat" }));
     const item = await candidate(page);
