@@ -108,11 +108,12 @@ export interface PdppErrorBody {
 
 /**
  * A PDPP §8 error. `status` is derived from `code` per the spec's Errors
- * table; callers should not need to pass it explicitly, but MAY override it
- * via `options.status` for a future code this catalog doesn't yet know.
- * An unknown code with no explicit status fails loudly (RangeError)
- * instead of silently producing an error with no status or type; an
- * unknown code with an explicit status is emitted with type "api_error".
+ * table; a known code always uses the catalog status and ignores
+ * `options.status`. A future code this catalog doesn't yet know needs
+ * `options.status`, an integer from 400 to 599. Without it, or with any
+ * other value, the constructor fails loudly (RangeError) instead of
+ * silently producing an error with no status or type. It is emitted with
+ * type "api_error".
  */
 export class PdppError extends Error {
   public readonly status: number;
@@ -132,15 +133,21 @@ export class PdppError extends Error {
     const status = known ? STATUS_BY_CODE[code] : undefined;
     const type = known ? TYPE_BY_CODE[code] : undefined;
     if (status === undefined || type === undefined) {
-      if (options?.status === undefined) {
+      const given = options?.status;
+      if (
+        given === undefined ||
+        !Number.isInteger(given) ||
+        given < 400 ||
+        given > 599
+      ) {
         throw new RangeError(
-          `Unknown PdppErrorCode "${code}": pass an explicit status override`,
+          `Unknown PdppErrorCode "${code}": pass an integer status from 400 to 599`,
         );
       }
-      this.status = options.status;
+      this.status = given;
       this.type = "api_error";
     } else {
-      this.status = options?.status ?? status;
+      this.status = status;
       this.type = type;
     }
     this.param = options?.param;
