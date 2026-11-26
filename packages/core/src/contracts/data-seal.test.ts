@@ -77,6 +77,43 @@ describe("persisted-write diagnostic", () => {
   });
 });
 
+describe("conditional ingest never falls back to a two-step write", () => {
+  const conditional = (storage: ReturnType<typeof twoStepStorage>) =>
+    ingestDataContract({
+      storage,
+      scopeParam: "notes.entries",
+      body: { items: [] },
+      collectedAt: "2026-11-09T00:00:00.000Z",
+      status: "stored",
+      precondition: { kind: "match", version: 1 },
+    });
+
+  it("refuses an unsupported conditional write before any blob or index call", async () => {
+    const storage = twoStepStorage(new Error("index should not be called"));
+    storage.commitEnvelope = undefined;
+    let wrote = false;
+    storage.writeEnvelope = async () => { wrote = true; throw new Error("blob should not be called"); };
+    await expect(conditional(storage)).rejects.toThrow("Conditional legacy writes require atomic storage support");
+    expect(wrote).toBe(false);
+  });
+
+  it("returns the authoritative 412 rather than attempting a fallback write", async () => {
+    const storage = twoStepStorage(new Error("index should not be called"));
+    let wrote = false;
+    storage.writeEnvelope = async () => { wrote = true; throw new Error("blob should not be called"); };
+    storage.commitEnvelope = async (_envelope, _entry, precondition) => {
+      expect(precondition).toEqual({ kind: "match", version: 1 });
+      return { ok: false, currentVersion: 2, currentProducer: null };
+    };
+    await expect(conditional(storage)).resolves.toMatchObject({
+      ok: false,
+      status: 412,
+      body: { error: "PRECONDITION_FAILED", current_version: 2, current_producer: null },
+    });
+    expect(wrote).toBe(false);
+  });
+});
+
 describe("two-step ingest index outcomes", () => {
   it("commits exactly one index row on the ordinary successful path", async () => {
     const storage = twoStepStorage(new Error("fixture should not be used"));
