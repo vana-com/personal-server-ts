@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { LegacyTombstoneUnacknowledged } from "./legacy-retire-pipeline.js";
 import { createLegacyRetireRemote } from "./legacy-retire-remote.js";
 import {
   createLegacyGatewayFake,
@@ -101,4 +102,59 @@ describe("retirement transport authority", () => {
     ).rejects.toThrow("revoked");
     expect(f.fake.requests).toEqual([]);
   });
+});
+
+it("reports not applied for the exact already-deleted 409 after sending DELETE", async () => {
+  const f = await fixture();
+  f.fake.state.race = "already-deleted";
+  await expect(
+    createLegacyRetireRemote(f.options).tombstone(
+      "github.events",
+      f.head,
+      f.check,
+    ),
+  ).resolves.toBe("not-applied");
+  expect(f.fake.requests.filter((r) => r.method === "DELETE")).toHaveLength(1);
+});
+
+it.each([
+  [400, "owner_stream_head_already_deleted"],
+  [409, "other_conflict"],
+  [409, "owner_stream_head_already_deleted_extra"],
+])("does not classify HTTP %s code %s as not applied", async (status, code) => {
+  const f = await fixture();
+  f.options.fetch = async () =>
+    new Response(JSON.stringify({ code }), { status });
+  await expect(
+    createLegacyRetireRemote(f.options).tombstone(
+      "github.events",
+      f.head,
+      f.check,
+    ),
+  ).rejects.toThrow();
+});
+
+it("propagates an aborted reply body without classifying it as malformed", async () => {
+  const f = await fixture();
+  const abort = new DOMException("reply body aborted", "AbortError");
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(abort);
+      },
+    }),
+    { status: 200 },
+  );
+  const text = vi.spyOn(response, "text");
+  f.options.fetch = async () => response;
+  const attempt = createLegacyRetireRemote(f.options).tombstone(
+    "github.events",
+    f.head,
+    f.check,
+  );
+  await expect(attempt).rejects.not.toBeInstanceOf(
+    LegacyTombstoneUnacknowledged,
+  );
+  await expect(attempt).rejects.toBe(abort);
+  expect(text).toHaveBeenCalledOnce();
 });

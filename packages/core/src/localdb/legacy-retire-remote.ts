@@ -71,11 +71,22 @@ export function createLegacyRetireRemote(
         return "not-sent";
       }
       const response = await fetcher(...request);
-      const body = (await response.json().catch(() => null)) as {
+      const text = await response.text();
+      let body: {
         code?: unknown;
         data?: { expectedVersion?: string };
         expectedVersion?: string;
       } | null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = null;
+      }
+      if (
+        response.status === 409 &&
+        body?.code === "owner_stream_head_already_deleted"
+      )
+        return "not-applied";
       if (!response.ok && body && isGatewayRefusalCode(body.code))
         throw new GatewayRefusalError(
           response.status,
