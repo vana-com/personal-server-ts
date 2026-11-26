@@ -11,6 +11,8 @@ import {
   verifyWeb3Signed,
 } from "@opendatalabs/vana-sdk/browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as ManagerModule from "@opendatalabs/personal-server-ts-core/sync/manager";
+import { createSyncManager } from "@opendatalabs/personal-server-ts-core/sync/manager";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   createDataFileEnvelope,
@@ -34,6 +36,22 @@ import {
   createPsLiteUploadAttemptStore,
   createPsLiteSyncManager,
 } from "./sync.js";
+
+// Delegates to the real manager; lets a test reach the `canSync` that PS Lite
+// hands it.
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/sync/manager",
+  async (original) => {
+    const actual = await original<typeof ManagerModule>();
+    return {
+      ...actual,
+      createSyncManager: vi.fn(
+        (...args: Parameters<typeof actual.createSyncManager>) =>
+          actual.createSyncManager(...args),
+      ),
+    };
+  },
+);
 
 const OWNER_SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b" as const;
@@ -403,6 +421,32 @@ describe("PS Lite sync", () => {
         await manager.stop();
       }
       expect(getServer).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not answer ok from a registration lookup that a newer one superseded", async () => {
+      const lookups: Array<(server: { id: string } | null) => void> = [];
+      const getServer = vi.fn(
+        () =>
+          new Promise<{ id: string } | null>((resolve) => {
+            lookups.push(resolve);
+          }),
+      );
+      const manager = await managerOver(getServer);
+      try {
+        const options = vi.mocked(createSyncManager).mock.lastCall![2]!;
+        const older = options.canSync!();
+        const newer = options.canSync!();
+        await vi.waitFor(() => expect(lookups).toHaveLength(2));
+        lookups[1]!(null);
+        expect(await newer).toMatchObject({
+          ok: false,
+          reason: "unregistered",
+        });
+        lookups[0]!({ id: "server-1" });
+        expect(await older).toMatchObject({ ok: false });
+      } finally {
+        await manager.stop();
+      }
     });
   });
 
