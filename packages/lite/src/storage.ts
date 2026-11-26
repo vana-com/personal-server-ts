@@ -1,3 +1,4 @@
+import type { RetirementRows } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   DataStoragePort,
   DataVersionWriter,
@@ -103,6 +104,7 @@ export interface PsLiteStorageCapabilities {
 /** Persistent Lite storage with its public backend capability report. */
 export interface PsLiteStoragePort extends DataStoragePort {
   readonly capabilities: PsLiteStorageCapabilities;
+  readonly retirementRows?: RetirementRows;
   /**
    * The seal every legacy write of this storage runs inside, and every
    * removal under its shared lock. Given at construction; see
@@ -582,7 +584,7 @@ export async function createPersistentPsLiteStorage(
   persistenceAdapter: PsLitePersistenceAdapter | undefined,
   dataFileStore: PsLiteDataFileStore | undefined,
   legacyWriteSeal: LegacyWriteSeal,
-): Promise<PsLiteStoragePort> {
+): Promise<PsLiteStoragePort & { readonly retirementRows: RetirementRows }> {
   const persistence = persistenceAdapter ?? createIndexedDbPsLitePersistence();
   let state = normalizeState(await persistence.read());
   const fallbackEnvelopes = new Map(
@@ -821,9 +823,66 @@ export async function createPersistentPsLiteStorage(
     return sortEntries(scopeGroups.groups.get(scope) ?? []);
   }
 
-  const storagePort: PsLiteStoragePort = {
+  const storagePort: PsLiteStoragePort & {
+    readonly retirementRows: RetirementRows;
+  } = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
+    retirementRows: {
+      capture: async (save, authority, scopes) => {
+        if (scopes.length === 0) return save([]);
+        const boundScopes = new Set(scopes);
+        const rows = await enqueue(async () => {
+          authority();
+          return state.entries
+            .filter((row) => boundScopes.has(row.scope))
+            .map((row) => ({ ...row }));
+        });
+        return save(rows);
+      },
+      absent: (rows, authority) =>
+        enqueue(async () => {
+          authority();
+          const currentIds = new Set(state.entries.map((entry) => entry.id));
+          return rows.every((row) => !currentIds.has(row.id));
+        }),
+      erase: (row, authority) =>
+        legacyWriteSeal.remove(() =>
+          withPathLock(row.path, async () => {
+            const found = await enqueue(async () => {
+              authority();
+              return state.entries.some(
+                (entry) =>
+                  entry.id === row.id &&
+                  entry.path === row.path &&
+                  entry.scope === row.scope &&
+                  entry.collectedAt === row.collectedAt,
+              );
+            });
+            if (!found) return;
+            // Keep the row on failure so restart retries every artifact.
+            const tree = blockTreePath(row.scope, row.collectedAt);
+            authority();
+            await fileStore.deleteEnvelope(row.path);
+            authority();
+            await fallbackStore.deleteEnvelope(row.path);
+            authority();
+            await fileStore.deleteBlockTree?.(tree);
+            authority();
+            await fallbackStore.deleteBlockTree?.(tree);
+            await enqueue(async () => {
+              authority();
+              readyBlockManifests.delete(
+                blockManifestPath(row.scope, row.collectedAt),
+              );
+              await publish({
+                ...state,
+                entries: state.entries.filter((entry) => entry.id !== row.id),
+              });
+            });
+          }),
+        ),
+    },
     legacyWriteSeal,
     ...createStorageReadMethods(() => state.entries, entriesForScope),
 

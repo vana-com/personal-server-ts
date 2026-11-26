@@ -281,6 +281,19 @@ export function createLegacyGatewayFake(options: LegacyGatewayFakeOptions) {
       blobs.add(blobKey(scope, head.version));
       record(scope, head.version, head.dataHash);
     },
+    /** Another writer tombstones the head: the next version, no blob, kept in the history. */
+    foreignTombstone(scope: string) {
+      const head = heads.get(scope)!;
+      head.version += 1;
+      head.dataHash = TOMBSTONE_DATA_HASH;
+      head.metadataHash = TOMBSTONE_METADATA_HASH;
+      head.deletedAt = iso();
+      record(scope, head.version, head.dataHash, true);
+    },
+    /** The registry no longer knows the point: reads and tombstones find no head. */
+    dropHead(scope: string) {
+      heads.delete(scope);
+    },
     head: (scope: string) => heads.get(scope) ?? null,
     isLive: (scope: string) => {
       const head = heads.get(scope);

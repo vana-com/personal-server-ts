@@ -621,6 +621,12 @@ export async function createIndexedDbPsLiteRuntime(
             (await syncRuntime!.getLocalSync()).deleter.deleteStatusSnapshot(
               connector,
             ),
+          requestLegacyRetire: async (connector) =>
+            (await syncRuntime!.getLocalSync()).legacyRetirer.request(
+              connector,
+            ),
+          legacyRetireStatus: async (connector) =>
+            (await syncRuntime!.getLocalSync()).legacyRetirer.status(connector),
         }
       : null,
     diagnostics,

@@ -1,3 +1,4 @@
+import type { LegacyRetirePipelinePorts } from "./legacy-retire-pipeline.js";
 import { createAccessActivity } from "../logging/activity-stream.js";
 import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
@@ -53,6 +54,10 @@ import {
   type AliasTargets,
 } from "./resolve.js";
 import type { LegacyDeletePorts } from "./legacy-delete.js";
+import {
+  createLegacyRetirer,
+  type LegacyRetirer,
+} from "./legacy-retire-intent.js";
 import { onConnectionPurged } from "./purge.js";
 import { ELIGIBLE_CHANGE, PENDING_RUN } from "./publication-work.js";
 import { createRunEndStore } from "./run-end.js";
@@ -67,6 +72,11 @@ export interface LocalSync {
   readonly intake: RunIntake;
   readonly accessActivity: ReturnType<typeof createAccessActivity>;
   readonly deleter: ConnectionDeleter;
+  /**
+   * Retires a connector's legacy copy alone, behind its own intent
+   * (`legacy-retire-intent.ts`): the connection and its stream are not touched.
+   */
+  readonly legacyRetirer: LegacyRetirer;
   readonly resolver: LocalResolver;
   readonly listing: LocalListing;
   readonly query: RecordQuery;
@@ -136,6 +146,13 @@ export function createLocalSync(
      * delete status says another device must.
      */
     readonly legacyDelete?: () => LegacyDeletePorts | undefined;
+    /** Standalone retirement, composed from its own transport and row leaves. */
+    readonly legacyRetire?: () => LegacyRetirePipelinePorts | undefined;
+    /**
+     * The host's write authority for a legacy retirement; false while a
+     * registration is held. Absent or undefined: not ready.
+     */
+    readonly legacyWriteReady?: () => boolean;
     readonly deleting?: (connector: string) => boolean | Promise<boolean>;
     readonly currentLease?: () => string | null;
     /** Waits between resumes of a delete that keeps failing (tests shorten). */
@@ -522,6 +539,11 @@ export function createLocalSync(
     },
     erasureOwed: () => deletes().erasureOwed(),
   };
+  const legacyRetirer = createLegacyRetirer(deps, {
+    ports: () => options.legacyRetire?.(),
+    ...(options.legacyWriteReady && { writeReady: options.legacyWriteReady }),
+    retryMs: { first: retryFirst, max: retryMax },
+  });
   const listingDeps = {
     ...deps,
     aliasScopes: options.aliasScopes,
@@ -546,6 +568,7 @@ export function createLocalSync(
     },
     accessActivity,
     deleter,
+    legacyRetirer,
     resolver: createLocalResolver(deps, {
       query,
       aliasQuery: query,
@@ -603,6 +626,13 @@ export function createLocalSync(
     blobs: createBlobStore(deps),
     async cycle(scope) {
       await kickDeletes();
+      // A restart resumes an open legacy retirement from its intent row.
+      await legacyRetirer.resume().catch((error: unknown) => {
+        deps.logger.warn(
+          { error },
+          "stream sync: the legacy retirement sweep failed",
+        );
+      });
       let allApplied = true;
       const report = await runCycle(deps, scope, undefined, (outcome) => {
         if (outcome.kind !== "applied") allApplied = false;
@@ -669,8 +699,11 @@ export function createLocalSync(
     close: () => {
       closed = true;
       stopHearingPurges();
+      // Aborts now; resolves when no retirement pass is left on the database.
+      const retirerClosed = legacyRetirer.close();
       syncRetryTimer(); // closed (only ever turns on): clears the timer
       return (closing ??= (async () => {
+        await retirerClosed;
         await deleteStore?.close();
         await looping;
         await deps.db.close();

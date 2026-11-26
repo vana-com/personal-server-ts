@@ -5,6 +5,24 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "./bootstrap.js";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 
+import type * as SyncModule from "@opendatalabs/personal-server-ts-core/sync";
+
+let canSync: NonNullable<
+  Parameters<typeof SyncModule.createSyncManager>[2]
+>["canSync"];
+vi.mock("@opendatalabs/personal-server-ts-core/sync", async (original) => {
+  const actual = await original<typeof SyncModule>();
+  return {
+    ...actual,
+    createSyncManager: (
+      ...args: Parameters<typeof actual.createSyncManager>
+    ) => {
+      canSync = args[2]?.canSync;
+      return actual.createSyncManager(...args);
+    },
+  };
+});
+
 const tunnelMocks = vi.hoisted(() => ({
   reserve: vi.fn((): string => "https://0xabc.server.test"),
   connect: vi.fn(async (): Promise<string> => "https://0xabc.server.test"),
@@ -100,6 +118,37 @@ describe("bootstrap tunnel gating (BUI-611)", () => {
     expect(tunnelMocks.connect).toHaveBeenCalledTimes(1);
     expect(ctx.tunnelUrl).toBe("https://0xabc.server.test");
     await ctx.cleanup();
+  });
+
+  it("a transient sync lookup failure after confirmed registration does not change tunnel startup or identity.serverId", async () => {
+    const getServer = vi.fn().mockResolvedValue({ id: "srv-1" });
+    const config = ServerConfigSchema.parse({
+      tunnel: { enabled: true },
+      sync: { enabled: true },
+    });
+    const ctx = await createServer(config, {
+      serverDir: tempDir,
+      dataDir: join(tempDir, "data"),
+      gatewayClient: makeGateway(getServer),
+    });
+    try {
+      await ctx.startBackgroundServices();
+      expect(ctx.isServerRegistered()).toBe(true);
+      getServer.mockRejectedValue(new Error("transient lookup failure"));
+      expect(await canSync!()).toMatchObject({
+        ok: false,
+        reason: "registration_check_failed",
+      });
+      expect(ctx.isServerRegistered()).toBe(true);
+      // The next startup lookup also fails, so tunnel setup must use the
+      // registration already confirmed before the sync lookup failed.
+      tunnelMocks.connect.mockClear();
+      await ctx.startBackgroundServices();
+      expect(tunnelMocks.connect).toHaveBeenCalledTimes(1);
+      expect(ctx.isServerRegistered()).toBe(true);
+    } finally {
+      await ctx.cleanup();
+    }
   });
 
   it("defers frpc until the registration poll sees the server", async () => {

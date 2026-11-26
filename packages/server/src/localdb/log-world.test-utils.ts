@@ -1,3 +1,4 @@
+import type { LegacyRetirePipelinePorts } from "../../../core/src/localdb/legacy-retire-pipeline.js";
 // A shared world for log-protocol tests: one fake gateway and one blob store,
 // and any number of devices of one owner, each with its own real SQLite and the
 // real publish and apply drivers (see log-protocol.test.ts).
@@ -172,7 +173,10 @@ export async function world(options: {
       /** The host's ports for erasing a deleted connection's log objects. */
       erasure?: () => LogErasurePorts | undefined;
       /** The host's ports for retiring a deleted connection's legacy copy. */
+      legacyRetire?: () => LegacyRetirePipelinePorts | undefined;
       legacyDelete?: () => LegacyDeletePorts | undefined;
+      /** The host's write authority for a legacy retirement. */
+      legacyWriteReady?: () => boolean;
       /** Waits between retries of a delete or erasure (shortened for tests). */
       deleteRetryMs?: { first: number; max: number };
       /**
@@ -289,7 +293,11 @@ export async function world(options: {
     };
     const syncOptions = {
       ...(hooks.erasure ? { erasure: hooks.erasure } : {}),
+      ...(hooks.legacyRetire ? { legacyRetire: hooks.legacyRetire } : {}),
       ...(hooks.legacyDelete ? { legacyDelete: hooks.legacyDelete } : {}),
+      ...(hooks.legacyWriteReady
+        ? { legacyWriteReady: hooks.legacyWriteReady }
+        : {}),
       ...(hooks.deleteRetryMs ? { deleteRetryMs: hooks.deleteRetryMs } : {}),
       // A digest `<connector>@<version>` names a connector version; a bare
       // connector name is version 1.

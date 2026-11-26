@@ -5,7 +5,6 @@ import {
   createIndexedDbPsLitePersistence,
   type PsLiteDataFileStore,
   type PsLitePersistenceAdapter,
-  type PsLiteStoragePort,
 } from "../storage.js";
 import type { PsLiteStorageAdapter } from "../runtime.js";
 
@@ -20,7 +19,7 @@ export function createOpenPersistentPsLiteStorage(
   persistence: PsLitePersistenceAdapter = createIndexedDbPsLitePersistence(),
   dataFileStore?: PsLiteDataFileStore,
   legacyWriteSeal: LegacyWriteSeal = openLegacyWriteSealForTests(),
-): Promise<PsLiteStoragePort> {
+) {
   return createPersistentPsLiteStorage(
     adapter,
     persistence,

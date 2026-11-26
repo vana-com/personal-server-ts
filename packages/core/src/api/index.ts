@@ -122,6 +122,10 @@ import {
   updateRequiredResponse,
 } from "./legacy-write-gate.js";
 import type { StorageModeRead } from "./owner-connector-delete.js";
+export {
+  handleOwnerLegacyRetire,
+  handleOwnerLegacyRetireStatus,
+} from "./owner-legacy-retire.js";
 import { switchedDeleteRefusalResponse } from "./switched-delete-refusal.js";
 import type { LegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import {

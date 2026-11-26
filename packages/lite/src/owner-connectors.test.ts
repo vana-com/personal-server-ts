@@ -29,6 +29,11 @@ async function runtimeWith(opts: {
       c: string,
     ) => Promise<{ deleteId: string; fenced: boolean }>;
     readConnectionLifetime?: (c: string) => Promise<string>;
+    requestLegacyRetire?: (c: string) => Promise<{ retireId: string }>;
+    legacyRetireStatus?: (c: string) => Promise<{
+      retireId: string;
+      legacy: { state: "pending" };
+    } | null>;
   } | null;
 }) {
   const accessLogStore = createMemoryPsLiteAccessLogStore();
@@ -254,5 +259,48 @@ describe("PS-Lite DELETE /v1/owner/connectors/:connectorId", () => {
         error: { code: status, errorCode, message: expect.any(String) },
       });
     }
+  });
+});
+
+describe("PS-Lite /v1/owner/connectors/:connectorId/legacy", () => {
+  const calls: string[] = [];
+  const connectionDelete = {
+    requestConnectionDelete: async (c: string) => {
+      calls.push(`delete:${c}`);
+      return { deleteId: `delete-${c}`, fenced: true };
+    },
+    requestLegacyRetire: async (c: string) => {
+      calls.push(`legacy:${c}`);
+      return { retireId: `retire-${c}` };
+    },
+    legacyRetireStatus: async (c: string) => ({
+      retireId: `retire-${c}`,
+      legacy: { state: "pending" as const },
+    }),
+  };
+
+  it("retires the legacy copy only and reads its status", async () => {
+    const runtime = await runtimeWith({ switched: true, connectionDelete });
+    const response = await del(runtime, "/v1/owner/connectors/github/legacy");
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({
+      retireId: "retire-github",
+      legacy: { state: "pending" },
+    });
+    expect(calls).toEqual(["legacy:github"]);
+    const status = await runtime.fetch(
+      new Request("http://localhost/v1/owner/connectors/github/legacy", {
+        headers: ownerAuth,
+      }),
+    );
+    expect(status.status).toBe(200);
+  });
+
+  it("refuses an unswitched account", async () => {
+    const response = await del(
+      await runtimeWith({ switched: false, connectionDelete }),
+      "/v1/owner/connectors/github/legacy",
+    );
+    expect(response.status).toBe(409);
   });
 });
