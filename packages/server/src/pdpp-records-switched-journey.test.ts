@@ -132,7 +132,7 @@ describe("PDPP records on a switched Node server", () => {
       const response = await read(
         context,
         scoped,
-        `?limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        `?limit=2&order=asc${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
       );
       expect(response.status, await response.clone().text()).toBe(200);
       const body = await response.json();

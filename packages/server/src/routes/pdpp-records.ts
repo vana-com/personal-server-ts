@@ -5,6 +5,7 @@ import {
   localRecord,
   localRecordJson,
   servedRecordJson,
+  ownerViewFields,
   createCursorSeal,
   type ServedRow,
   refuseLegacyWrite,
@@ -526,6 +527,17 @@ export function resourceMetadataUrlFor(c: Context): string {
   ).toString();
 }
 
+/**
+ * The blob endpoint beside this router's mount (`<mount>/blobs`), absolute
+ * from the request origin, for the `fetch_url` a served `blob_ref` carries
+ * (spec-core §4 "Binary data", §8 "Get a blob").
+ */
+function blobBaseFor(c: Context): string {
+  const url = new URL(c.req.url);
+  const mount = url.pathname.slice(0, url.pathname.indexOf("/streams/"));
+  return `${url.origin}${mount}/blobs`;
+}
+
 function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
   const err = new PdppError(
     "authentication_error",
@@ -628,6 +640,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           query.changesSince === "beginning" ? undefined : query.changesSince,
         cursor,
         limit,
+        order,
         fields:
           context.tokenKind === "owner" ? fields : scope.streamGrant!.fields,
         expireOnErasure: true,
@@ -646,7 +659,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           next_changes_since: page.nextChangesSince,
         }),
         data: page.data.map((row) =>
-          servedRecordJson(stream, toServedRow(row), fields, tokenKind),
+          servedRecordJson(
+            stream,
+            toServedRow(row),
+            fields,
+            tokenKind,
+            plan.blobBase,
+          ),
         ),
         ...(clamped && { meta }),
       };
@@ -671,7 +690,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       has_more: page.hasMore,
       ...(page.nextCursor && { next_cursor: page.nextCursor }),
       data: page.data.map((row) =>
-        servedRecordJson(stream, toServedRow(row), fields, tokenKind),
+        servedRecordJson(
+          stream,
+          toServedRow(row),
+          fields,
+          tokenKind,
+          plan.blobBase,
+        ),
       ),
       ...(meta && { meta }),
     };
@@ -1159,10 +1184,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       if (context!.tokenKind === "owner") {
         // spec-core §8 "Get stream metadata", owner token: the full current
         // metadata (RS item 14). `cursor_field` is the declared field, not
-        // the store's internal emitted-time order. `query`, `views` and
-        // `relationships` report this RS's real current capabilities: it
-        // implements no owner range filter, expansion or view read, and the
-        // retained declaration carries no relationships, so each is empty.
+        // the store's internal emitted-time order. `views` are the retained
+        // declaration's views for this stream, which owner reads accept as
+        // `view=<id>`. `query` and `relationships` are empty: the §5
+        // declaration format this server retains (DeclarationSnapshot in
+        // core/src/pdpp/types.ts) carries neither relationships nor query
+        // capabilities, and this RS implements no owner range filter or
+        // expansion.
         return c.json(
           {
             object: "stream_metadata",
@@ -1175,7 +1203,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             consent_time_field: declaration!.consentTimeField ?? null,
             selection: declaration!.selection ?? null,
             query: {},
-            views: [],
+            views: declaration!.views ?? [],
             relationships: [],
           },
           200,
@@ -1242,6 +1270,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           stream,
           context: context!,
           prefer: c.req.header("prefer"),
+          blobBase: blobBaseFor(c),
         },
       );
       const response = c.json(result.body, 200, {
@@ -1301,7 +1330,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         stream,
         // Looked up after the client's field check (RS item 32).
         () => readDeclaration(context!, stream).declaration,
-        query.fields,
+        tokenKind === "owner"
+          ? (ownerViewFields(
+              readDeclaration(context!, stream).declaration,
+              query.view,
+            ) ?? query.fields)
+          : query.fields,
       );
       const { ownerInstanceIds } =
         tokenKind === "owner"
@@ -1338,7 +1372,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         }
         if (!found) throw new PdppError("not_found", "Record not found");
         const response = c.json(
-          localRecordJson(stream, found, scope.fields, tokenKind),
+          localRecordJson(
+            stream,
+            found,
+            scope.fields,
+            tokenKind,
+            blobBaseFor(c),
+          ),
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
         );
@@ -1363,7 +1403,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
 
       const response = c.json(
-        servedRecordJson(stream, toServedRow(found), scope.fields, tokenKind),
+        servedRecordJson(
+          stream,
+          toServedRow(found),
+          scope.fields,
+          tokenKind,
+          blobBaseFor(c),
+        ),
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
@@ -1403,8 +1449,25 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           "Delete requires an owner token",
         );
       }
-      const refusal = refuseRecordWrite(reqId);
-      if (refusal) return refusal;
+      // A §8 endpoint answers the unified error body (RS item 6), not the
+      // legacy-write refusal body. A switched (stream-sync) account cannot
+      // delete one record here: its records come from connector runs and
+      // are published to the owner's other devices, and the local database
+      // offers no per-record owner delete outside a run (`deleteRunRecords`
+      // in core/src/localdb/merge.ts). Deleting only locally would be undone
+      // by the next sync, so the RS refuses instead of pretending.
+      switch (deps.accountStorageMode?.read() ?? "unknown") {
+        case "switched":
+          throw new PdppError(
+            "update_required",
+            "This account uses stream sync; delete the record at its source or with the connector",
+          );
+        case "unknown":
+          throw new PdppError(
+            "ACCOUNT_MODE_UNKNOWN",
+            "The account mode is not known yet",
+          );
+      }
       const stream = c.req.param("stream");
       // Decoded once, by the router (spec-core §4; RS item 2).
       const recordKey = c.req.param("id");

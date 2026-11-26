@@ -74,6 +74,8 @@ export interface ChangesSinceCursorPayload extends IntegrityBinding {
    * Checkpoints carry no position and need none.
    */
   orderKey?: "code-point";
+  /** Page cursors only: the session's direction. Absent: ascending. */
+  order?: "asc" | "desc";
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

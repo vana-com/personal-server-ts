@@ -2014,7 +2014,7 @@ export function createSqliteRecordStore(
     let offset = 0;
 
     if (options.cursor) {
-      const payload = decodeSyncPageCursor(options.cursor);
+      const payload = decodeSyncPageCursor(options.cursor, options.order);
       assertCursorScope(payload, stream);
       horizon = parseHorizon(payload.horizon);
       sinceHorizon =
@@ -2102,7 +2102,10 @@ export function createSqliteRecordStore(
       if (selected) changed.push(selected);
     }
 
-    changed.sort(compareRecordIdentity);
+    // spec-core §8 "Stable sort": `(instance_id, key)` in the direction
+    // `order` selects (RS item 21).
+    const direction = options.order === "desc" ? -1 : 1;
+    changed.sort((a, b) => direction * compareRecordIdentity(a, b));
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
     if (options.expireOnErasure && horizon < readWriteClock()) {
@@ -2133,6 +2136,7 @@ export function createSqliteRecordStore(
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
             orderKey: "code-point",
+            order: options.order ?? "asc",
           })
         : undefined,
       nextChangesSince: hasMore

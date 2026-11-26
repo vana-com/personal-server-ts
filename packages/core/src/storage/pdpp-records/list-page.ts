@@ -140,10 +140,14 @@ export function compareListPositions(
  */
 export function decodeSyncPageCursor(
   cursor: string,
+  order?: "asc" | "desc",
 ): ChangesSinceCursorPayload {
   const payload = decodeCursor(cursor);
   if (payload.kind !== "changes_since") throw new InvalidCursorError();
   if (payload.orderKey !== "code-point") throw new CursorExpiredError();
+  // The offset counts in one direction; a page cursor never changes it.
+  if ((payload.order ?? "asc") !== (order ?? "asc"))
+    throw new InvalidCursorError();
   return payload;
 }
 

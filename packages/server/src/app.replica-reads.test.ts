@@ -146,8 +146,28 @@ function host({
       },
     };
   });
-  const changesFor = vi.fn((_link: ConnectionLink) => {
-    throw new Error("changesFor must not run without a connection link");
+  // Owner lists read the frozen history too (§8 "Stable sort"). The fake
+  // serves the same host-local rows through the link it is given.
+  const changesFor = vi.fn((link: ConnectionLink) => {
+    if (!connectionLink)
+      throw new Error("changesFor must not run without a connection link");
+    return async (name: string, options: { instanceIds: string[] }) => ({
+      data: options.instanceIds.flatMap((id) => {
+        const target = link(id, name);
+        return target?.connector === method && target.namespace === ""
+          ? localRows.map((row) => ({
+              instance: id,
+              stream: name,
+              recordKey: row.recordKey,
+              data: JSON.parse(row.body),
+              version: 1,
+              emittedAt: new Date(row.emittedAt).toISOString(),
+              deleted: false as const,
+            }))
+          : [];
+      }),
+      hasMore: false,
+    });
   });
   const localSync = vi.fn(
     async () => ({ recordsFor, changesFor }) as unknown as LocalSync,

@@ -337,7 +337,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     if (options.cursor) {
       // Continuing an already-anchored session: horizon and sinceHorizon
       // both come from the page cursor, not re-derived from changesSince.
-      const payload = decodeSyncPageCursor(options.cursor);
+      const payload = decodeSyncPageCursor(options.cursor, options.order);
       assertCursorScope(payload, stream);
       horizon = payload.horizon;
       sinceHorizon = payload.sinceHorizon;
@@ -413,7 +413,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
       if (selected) changed.push(selected);
     }
 
-    changed.sort(compareRecordIdentity);
+    // spec-core §8 "Stable sort": `(instance_id, key)` in the direction
+    // `order` selects (RS item 21).
+    const direction = options.order === "desc" ? -1 : 1;
+    changed.sort((a, b) => direction * compareRecordIdentity(a, b));
 
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
@@ -446,6 +449,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
             sinceHorizon,
             offset: offset + options.limit,
             orderKey: "code-point",
+            order: options.order ?? "asc",
           })
         : undefined,
       nextChangesSince: hasMore

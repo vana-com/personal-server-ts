@@ -1276,7 +1276,7 @@ describe("P10c and method authority over HTTP", () => {
     const page1 = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=beginning&limit=1",
+      "/v1/streams/events/records?changes_since=beginning&limit=1&order=asc",
     );
     expect(page1.status).toBe(200);
     expect(page1.body.data.map((r: any) => r.id)).toEqual(["a1"]);
@@ -1287,7 +1287,7 @@ describe("P10c and method authority over HTTP", () => {
     const page2 = await read(
       ctx!,
       token,
-      `/v1/streams/events/records?changes_since=beginning&limit=1&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
+      `/v1/streams/events/records?changes_since=beginning&limit=1&order=asc&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
     );
     expect(page2.status).toBe(200);
     expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2"]);
@@ -1297,7 +1297,7 @@ describe("P10c and method authority over HTTP", () => {
     const nextSession = await read(
       ctx!,
       token,
-      `/v1/streams/events/records?changes_since=${encodeURIComponent(page2.body.next_changes_since)}&limit=10`,
+      `/v1/streams/events/records?changes_since=${encodeURIComponent(page2.body.next_changes_since)}&limit=10&order=asc`,
     );
     expect(nextSession.status).toBe(200);
     expect(nextSession.body.data.map((r: any) => r.id)).toEqual(["a3"]);

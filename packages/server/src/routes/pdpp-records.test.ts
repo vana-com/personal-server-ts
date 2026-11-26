@@ -189,51 +189,17 @@ describe("PS-2 D.8 local record routes", () => {
         404,
       );
 
+      // An owner change session reads the frozen two-horizon history, not
+      // the raw change sequence (spec-core §4; RS items 7, 20, 21). Without
+      // a history port it is unavailable rather than served out of order.
       const changed = await app.request(path + "?changes_since=beginning&limit=2", {
         headers,
       });
-      const changeBody = await changed.json();
-      expect(changed.status).toBe(200);
-      expect(changeBody.data.map((row: { id: string }) => row.id)).toEqual([
-        "b",
-        "a",
-      ]);
-      expect(changeBody.data[1].emitted_at).toBe(
-        new Date(stamp + 1000).toISOString(),
+      expect(changed.status).toBe(503);
+      expect((await changed.json()).error.code).toBe(
+        "STREAM_HISTORY_UNAVAILABLE",
       );
-      expect(changeBody.next_cursor).toMatch(/^pc_/);
-      // Only the terminal page carries next_changes_since (RS item 8).
-      expect(changeBody.next_changes_since).toBeUndefined();
-      expect(changesSince).toHaveBeenCalledWith({
-        connectionId: "inst_1",
-        stream: "playlists",
-        cursor: 0,
-        limit: 2,
-      });
-      const rest = await app.request(
-        path +
-          "?changes_since=beginning&limit=2&cursor=" +
-          encodeURIComponent(changeBody.next_cursor),
-        { headers },
-      );
-      const restBody = await rest.json();
-      expect(restBody.data.map((row: { id: string }) => row.id)).toEqual(["c"]);
-      expect(restBody.next_changes_since).toMatch(/^cs_/);
-      db.prepare(
-        "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op, stamp_o, stamp_r, origin) VALUES ('inst_1', 'playlists', 'removed', 'removed', 'remove', 0, 'fixture', 'local')",
-      ).run();
-      const removal = await app.request(
-        path +
-          "?changes_since=" +
-          encodeURIComponent(restBody.next_changes_since),
-        { headers },
-      );
-      const removed = (await removal.json()).data[0];
-      expect(removed.id).toBe("removed");
-      expect(removed.deleted).toBe(true);
-      expect(removed.removal).toBe("deleted");
-      expect(removed.instance_id).toBe("inst_1");
-      expect(removed.emitted_at).toBeNull();
+      expect(changesSince).not.toHaveBeenCalled();
       for (const cursor of ["", "-1", "1x", "cs_bogus"]) {
         const invalid = await app.request(path + "?changes_since=" + cursor, {
           headers,
@@ -241,8 +207,8 @@ describe("PS-2 D.8 local record routes", () => {
         expect(invalid.status).toBe(400);
         expect((await invalid.json()).error.code).toBe("invalid_cursor");
       }
-      db.prepare("DELETE FROM record_changes WHERE seq <= 2").run();
-      const expired = await app.request(path + "?changes_since=beginning", {
+      // A raw sequence token from before sealing expires (410).
+      const expired = await app.request(path + "?changes_since=3", {
         headers,
       });
       expect(expired.status).toBe(410);
@@ -1107,7 +1073,15 @@ describe("pdpp records routes: tombstones", () => {
           });
           expect(post.status).toBe(426);
           expect(removed.status).toBe(post.status);
-          expect(await removed.json()).toEqual(await post.json());
+          // DELETE is a §8 endpoint: the unified error body (RS item 6).
+          expect(await removed.json()).toEqual({
+            error: {
+              type: "invalid_request_error",
+              code: "update_required",
+              message: expect.any(String),
+              request_id: expect.stringMatching(/^req_/),
+            },
+          });
           expect(removed.headers.get("Request-Id")).toMatch(/^req_/);
           expect(removed.headers.get("PDPP-Version")).toBe(PDPP_VERSION);
           expect(deleteRecord).not.toHaveBeenCalled();

@@ -135,9 +135,18 @@ export interface ChangesSinceOptions {
   cursor?: string;
   limit: number;
   fields?: string[];
-  /** `listing` purpose only: the list order (spec-core §8 "Stable sort"). */
+  /**
+   * The direction of the order: the list order for `listing`, and
+   * `(instance_id, key)` for a change session (spec-core §8 "Stable sort").
+   */
   order?: "asc" | "desc";
+  /** `listing` purpose only: the list order. */
   sort?: ListSort;
+  /**
+   * Owner change sessions: a record removed between the horizons is served
+   * as a tombstone (when it was visible at h0) instead of expiring.
+   */
+  removals?: boolean;
 }
 
 export interface ChangesSincePage {
@@ -146,6 +155,8 @@ export interface ChangesSincePage {
   nextCursor?: string;
   /** Present only on the terminal page. */
   nextChangesSince?: string;
+  /** `listing` only, where a backend counts it: every visible record. */
+  total?: number;
 }
 
 export interface StreamListing {

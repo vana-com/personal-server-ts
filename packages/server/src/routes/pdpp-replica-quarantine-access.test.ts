@@ -331,7 +331,7 @@ async function fixture() {
   expect(list.data.map((r: { id: string }) => r.id)).toEqual(["a-control"]);
   expect(list.next_cursor).toBeTypeOf("string");
   const changes = await json(
-    "/streams/messages/records?changes_since=beginning&limit=1",
+    "/streams/messages/records?changes_since=beginning&limit=1&order=asc",
   );
   expect(changes.data.map((r: { id: string }) => r.id)).toEqual(["a-control"]);
   expect(changes.next_cursor).toBeTypeOf("string");
@@ -345,10 +345,18 @@ async function fixture() {
     // HTTP tokens are sealed (RS item 21); the store token inside still
     // binds the visibility epoch, which the 410s below exercise.
     expect(token).toMatch(/^(pc|cs)_/);
+  // The same first page read at the store, below the HTTP seal: its own
+  // cursor must expire after quarantine too (store-level check).
+  const storeList = activeReceiver.readStore({ reader: "grant" }).listRecords(
+    "messages",
+    { instanceIds: ["conn"], limit: 1, order: "asc" },
+  );
+  expect(storeList.nextCursor).toBeTypeOf("string");
   // Every quarantine raises the connection's integrity epoch, so a saved
   // cursor expires instead of continuing over a shifted, filtered page set
   // (finding k: offset pagination skipped clean rows after a withdrawal).
   async function assertQuarantined() {
+    await expect(readView(storeList.nextCursor)).rejects.toThrow(/expired/);
     const savedCursorStatus = 410;
     const paths = [
       ["/streams/messages/records/z-quarantined", 404],
@@ -364,7 +372,7 @@ async function fixture() {
       // This is the supported retained-history read; there is no invented
       // historical-revision endpoint in this API.
       [
-        `/streams/messages/records?changes_since=beginning&limit=1&cursor=${encodeURIComponent(changes.next_cursor)}`,
+        `/streams/messages/records?changes_since=beginning&limit=1&order=asc&cursor=${encodeURIComponent(changes.next_cursor)}`,
         savedCursorStatus,
       ],
       [

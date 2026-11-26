@@ -45,7 +45,13 @@ export function parseRecordQuery(
         { param: key },
       );
     }
-    if (!allowed.includes(key)) {
+    // spec-core §8: `view` is an owner-token current-capability read;
+    // client-token record requests reject it (below, as unsupported).
+    const ownerView =
+      key === "view" &&
+      tokenKind === "owner" &&
+      (endpoint === "listRecords" || endpoint === "getRecord");
+    if (!allowed.includes(key) && !ownerView) {
       const ownerExpand =
         tokenKind === "owner" &&
         (endpoint === "listRecords" || endpoint === "getRecord") &&
@@ -78,6 +84,21 @@ export function parseRecordQuery(
       { param: "limit" },
     );
   }
+  if (params.has("view") && params.has("fields")) {
+    throw new PdppError(
+      "invalid_request",
+      "Parameters 'view' and 'fields' are mutually exclusive",
+      { param: "view" },
+    );
+  }
+  const rawFields = params.get("fields");
+  const fieldNames = rawFields?.split(",").map((f) => f.trim());
+  // An empty name is malformed, not a field outside the grant.
+  if (fieldNames?.some((f) => f === "")) {
+    throw new PdppError("invalid_request", "fields names must not be empty", {
+      param: "fields",
+    });
+  }
   const order = params.get("order") ?? "desc";
   if (order !== "asc" && order !== "desc") {
     throw new PdppError("invalid_request", "order must be 'asc' or 'desc'", {
@@ -88,10 +109,8 @@ export function parseRecordQuery(
     limit: Math.min(limit, 100),
     clamped: limit > 100,
     order: order as "asc" | "desc",
-    fields: params
-      .get("fields")
-      ?.split(",")
-      .map((f) => f.trim()),
+    fields: fieldNames,
+    view: params.get("view") ?? undefined,
     cursor: params.get("cursor") ?? undefined,
     changesSince: params.get("changes_since") ?? undefined,
     source: params.get("source") ?? undefined,

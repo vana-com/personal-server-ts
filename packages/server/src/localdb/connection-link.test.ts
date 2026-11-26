@@ -695,3 +695,68 @@ it("grant listing orders by (instance_id, key) in the requested direction, or by
     await walk({ order: "desc", sort: { by: "field", field: "at" } }),
   ).toEqual(["d", "b", "c", "allowed"]);
 });
+
+it("owner change sessions follow the two-horizon rules on a switched account (RS items 7, 20, 21)", async () => {
+  const { db, id } = await fixture();
+  const put = (key: string, stamp: number) =>
+    run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,?,'run','{}','hash')",
+      [id, "selected", key, key, stamp],
+    );
+  const remove = (key: string) =>
+    run(db, "DELETE FROM records WHERE connection_id=? AND stream='selected' AND record_key=?", [id, key]);
+  await put("gone", 1);
+  await put("kept", 1);
+  const read = createGrantHistory(db, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  const session = (changesSince?: string, order: "asc" | "desc" = "desc") =>
+    read("selected", {
+      instanceIds: ["handle-a"],
+      limit: 100,
+      changesSince,
+      order,
+      removals: true,
+    });
+  const first = await session();
+  // `beginning`: every visible record, no tombstones, descending key order.
+  expect(first.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+    ["kept", false],
+    ["gone", false],
+    ["allowed", false],
+  ]);
+  // Visible only between the horizons: never tombstoned.
+  await put("brief", 2);
+  await remove("brief");
+  await remove("gone");
+  const next = await session(first.nextChangesSince);
+  expect(next.data).toEqual([
+    expect.objectContaining({
+      recordKey: "gone",
+      instance: "handle-a",
+      deleted: true,
+      deletedAt: new Date(1).toISOString(),
+    }),
+  ]);
+  // The session horizon is fixed at page one: a write after page one waits.
+  const paged = await read("selected", {
+    instanceIds: ["handle-a"],
+    limit: 1,
+    order: "asc",
+    removals: true,
+  });
+  await put("late", 3);
+  const rest = await read("selected", {
+    instanceIds: ["handle-a"],
+    limit: 100,
+    order: "asc",
+    removals: true,
+    cursor: paged.nextCursor,
+  });
+  expect([...paged.data, ...rest.data].map((r) => r.recordKey)).toEqual([
+    "allowed",
+    "kept",
+  ]);
+});

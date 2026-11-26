@@ -53,6 +53,12 @@ export interface StreamDeclaration {
    * supports so a client knows which selections are even expressible.
    */
   selection?: Record<string, unknown>;
+  /**
+   * The retained declaration's views that name fields of this stream, each
+   * narrowed to those fields. Owner metadata reports them and owner reads
+   * accept `view=<id>` (spec-core §8; RS item 14).
+   */
+  views?: { id: string; fields: string[] }[];
 }
 
 /**

@@ -17,10 +17,16 @@ import {
   recordWithinGrantTimeConstraint,
   resolveReadScope,
 } from "../storage/pdpp-records/enforcement.js";
+import {
+  redactResourceRefs,
+  withBlobFetchUrls,
+} from "../storage/pdpp-records/served-values.js";
 import type {
   ChangesSinceOptions,
   ChangesSincePage,
   ListSort,
+  PdppRecordRow,
+  PdppStoredRecord,
 } from "../storage/pdpp-records/types.js";
 import { PDPP_VERSION } from "../pdpp-version.js";
 import { createCursorSeal, type CursorSeal } from "./pdpp-cursor-seal.js";
@@ -36,6 +42,8 @@ export interface LocalRecord {
   readonly data: Record<string, unknown>;
   readonly emittedAt: string | null;
   readonly deleted?: boolean;
+  /** Tombstones from the change history: the removal time. */
+  readonly deletedAt?: string;
 }
 
 export function localRecord(
@@ -59,15 +67,27 @@ export function localRecordJson(
   row: LocalRecord,
   fields: string[] | undefined,
   tokenKind: "owner" | "client",
+  blobBase?: string,
 ) {
-  // RecordQuery exposes the removal sequence, not a deletion timestamp, so
-  // an owner tombstone from this backend carries null deletion times.
   return servedRecordJson(
     stream,
-    { ...row, deletedAt: row.deleted ? null : undefined },
+    { ...row, deletedAt: row.deleted ? (row.deletedAt ?? null) : undefined },
     fields,
     tokenKind,
+    blobBase,
   );
+}
+
+/** Projected `data` with references rewritten as §4 requires (RS 18, 23). */
+function servedData(
+  row: ServedRow,
+  fields: string[] | undefined,
+  blobBase: string | undefined,
+): Record<string, unknown> {
+  const projected = redactResourceRefs(projectFields(row.data ?? {}, fields));
+  return blobBase === undefined
+    ? projected
+    : withBlobFetchUrls(projected, row.instance, blobBase);
 }
 
 /** A stored row as a §8 response record or tombstone needs it. */
@@ -102,6 +122,8 @@ export function servedRecordJson(
   row: ServedRow,
   fields: string[] | undefined,
   tokenKind: "owner" | "client",
+  /** Base URL of this RS's blob endpoint; adds `fetch_url` when given. */
+  blobBase?: string,
 ): Record<string, unknown> {
   const identity = {
     object: "record",
@@ -133,7 +155,7 @@ export function servedRecordJson(
   }
   return {
     ...identity,
-    data: projectFields(row.data ?? {}, fields),
+    data: servedData(row, fields, blobBase),
     ...(owner && { emitted_at: row.emittedAt ?? null }),
     ...preview,
   };
@@ -167,17 +189,6 @@ export function localListCursors(
   }
 }
 
-function localSequence(value: string): number {
-  const number = value === "beginning" ? 0 : Number(value);
-  if (
-    (value !== "beginning" && !/^(0|[1-9][0-9]*)$/.test(value)) ||
-    !Number.isSafeInteger(number)
-  ) {
-    throw new PdppError("invalid_cursor", "Change cursor must be a sequence");
-  }
-  return number;
-}
-
 /** Only authorized connection ids enter the query; projection follows filtering. */
 export async function localRecordPage(
   query: RecordQuery,
@@ -207,100 +218,52 @@ export async function localRecordPage(
   const visible = (row: LocalRecord) =>
     recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
     (row.deleted || recordWithinGrantTimeConstraint(row.data, streamGrant));
+  const toLocal = (row: PdppRecordRow): LocalRecord => ({
+    instance: row.instance,
+    recordKey: row.recordKey,
+    data: row.deleted ? {} : row.data,
+    emittedAt: row.emittedAt,
+    deleted: row.deleted,
+    ...(row.deleted && { deletedAt: row.deletedAt }),
+  });
   if (input.changesSince !== undefined) {
-    if (!owner) {
-      if (!history)
-        throw new PdppError(
-          "STREAM_HISTORY_UNAVAILABLE",
-          "Grant-safe stream change history is unavailable",
-        );
-      const page = await history(stream, {
-        instanceIds: instances,
-        // spec-core §4 "Starting a sync": `beginning` is an empty horizon on
-        // every stream, for every grant (RS item 7).
-        changesSince:
-          input.changesSince === "beginning" ? undefined : input.changesSince,
-        cursor: input.cursor,
-        limit: input.limit,
-        fields: eligibilityFields,
-        expireOnErasure: candidate,
-        isVisible: (row) =>
-          recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
-          recordWithinGrantTimeConstraint(row.data, streamGrant),
-      });
-      return {
-        data: page.data.map((row) => ({
-          instance: row.instance,
-          recordKey: row.recordKey,
-          data: row.deleted ? {} : row.data,
-          emittedAt: row.emittedAt,
-          deleted: row.deleted,
-        })),
-        hasMore: page.hasMore,
-        nextCursor: page.nextCursor ?? null,
-        nextChangesSince: page.nextChangesSince,
-      };
-    }
-    const since = localSequence(input.changesSince);
-    const after =
-      input.cursor === undefined ? since : localSequence(input.cursor);
-    if (after < since) {
+    // Both token kinds read the frozen two-horizon history: one horizon for
+    // every page of the session, a tombstone only for a record visible at
+    // h0 and not at h1 (owner), `(instance_id, key)` in the `order`
+    // direction (spec-core §4 "Visibility", §8; RS items 7, 20, 21).
+    if (!history)
       throw new PdppError(
-        "invalid_cursor",
-        "Change cursor precedes changes_since",
+        "STREAM_HISTORY_UNAVAILABLE",
+        "Stream change history is unavailable",
       );
-    }
-    const changes: {
-      seq: number;
-      row: LocalRecord | null;
-    }[] = [];
-    let more = false;
-    for (const instance of instances) {
-      const page = await query.changesSince({
-        connectionId: instance,
-        stream,
-        cursor: after,
-        limit: input.limit,
-      });
-      if (page === "gone") {
-        throw new PdppError(
-          "cursor_expired",
-          "changes_since cursor has expired",
-        );
-      }
-      more ||= page.nextCursor !== null;
-      for (const change of page.changes) {
-        changes.push({
-          seq: change.seq,
-          row:
-            change.op === "remove"
-              ? {
-                  instance,
-                  recordKey: change.recordKey,
-                  data: {},
-                  emittedAt: null,
-                  deleted: true,
-                }
-              : change.record === null
-                ? null
-                : localRecord(instance, change.record),
-        });
-      }
-    }
-    changes.sort((a, b) => a.seq - b.seq);
-    const page = changes.slice(0, input.limit);
-    const hasMore = more || changes.length > input.limit;
-    const last = page.at(-1)?.seq ?? after;
+    const page = await history(stream, {
+      instanceIds: instances,
+      // spec-core §4 "Starting a sync": `beginning` is an empty horizon on
+      // every stream, for every grant (RS item 7).
+      changesSince:
+        input.changesSince === "beginning" ? undefined : input.changesSince,
+      cursor: input.cursor,
+      limit: input.limit,
+      order: input.order,
+      fields: eligibilityFields,
+      expireOnErasure: candidate || owner,
+      ...(owner
+        ? { removals: true }
+        : {
+            isVisible: (row: PdppStoredRecord) =>
+              recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+              recordWithinGrantTimeConstraint(row.data, streamGrant),
+          }),
+    });
     return {
-      data: page.flatMap(({ row }) => (row && visible(row) ? [row] : [])),
-      hasMore,
-      nextCursor: hasMore ? String(last) : null,
-      // spec-core §4: "A non-terminal page MUST NOT include it" (RS item 8).
-      ...(!hasMore && { nextChangesSince: String(last) }),
+      data: page.data.map(toLocal),
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor ?? null,
+      nextChangesSince: page.nextChangesSince,
     };
   }
 
-  if (!owner) {
+  if (!owner || (history && sort !== undefined)) {
     if (!history)
       throw new PdppError(
         "STREAM_HISTORY_UNAVAILABLE",
@@ -308,6 +271,8 @@ export async function localRecordPage(
       );
     // Reuse the query module's frozen, visibility-filtered initial snapshot.
     // Hidden identities never consume a page or escape in a list cursor.
+    // An owner list reads it too, so it follows the current `cursor_field`
+    // (spec-core §8 "Stable sort").
     const page = await history(stream, {
       purpose: "listing",
       instanceIds: instances,
@@ -316,25 +281,22 @@ export async function localRecordPage(
       order: input.order,
       sort,
       fields: eligibilityFields,
-      isVisible: (row) =>
-        visible({
-          instance: row.instance,
-          recordKey: row.recordKey,
-          data: row.data,
-          emittedAt: row.emittedAt,
-          deleted: false,
-        }),
+      ...(!owner && {
+        isVisible: (row: PdppStoredRecord) =>
+          visible({
+            instance: row.instance,
+            recordKey: row.recordKey,
+            data: row.data,
+            emittedAt: row.emittedAt,
+            deleted: false,
+          }),
+      }),
     });
     return {
-      data: page.data.map((row) => ({
-        instance: row.instance,
-        recordKey: row.recordKey,
-        data: row.deleted ? {} : row.data,
-        emittedAt: row.emittedAt,
-        deleted: row.deleted,
-      })),
+      data: page.data.map(toLocal),
       hasMore: page.hasMore,
       nextCursor: page.nextCursor ?? null,
+      ...(withTotal && page.total !== undefined && { total: page.total }),
     };
   }
 
@@ -424,8 +386,10 @@ export interface RecordListPlan {
   readonly scope: ReturnType<typeof resolveReadScope>;
   /** Connections this read may touch: authorized, owned and declaring the stream. */
   readonly instanceIds: string[];
-  /** Client list order; absent for an owner read (emitted order). */
+  /** List order (spec-core §8 "Stable sort"). */
   readonly sort?: ListSort;
+  /** This RS's blob endpoint, for `fetch_url`. */
+  readonly blobBase?: string;
 }
 
 /**
@@ -480,6 +444,8 @@ export async function listPdppRecords(
     readonly context: PdppTokenContext;
     /** The request's `Prefer` header, where it may ask for a `count`. */
     readonly prefer?: string | null;
+    /** This RS's blob endpoint, for `fetch_url`; absent where none is served. */
+    readonly blobBase?: string;
   },
 ): Promise<RecordListResult> {
   const { context, stream } = input;
@@ -511,11 +477,17 @@ export async function listPdppRecords(
     stream,
     requested.source,
   );
+  const requestedFields = owner
+    ? ownerViewFields(
+        typeof declaration === "function" ? declaration() : declaration,
+        requested.view,
+      ) ?? requested.fields
+    : requested.fields;
   const scope = resolveReadScope(
     context,
     stream,
     declaration,
-    requested.fields,
+    requestedFields,
   );
   const instanceIds = owner ? ownerInstanceIds : scope.instanceIds;
   if (!owner) ports.requireRegisteredConnections?.(instanceIds);
@@ -543,7 +515,9 @@ export async function listPdppRecords(
         ]
       : ["grant", context.grant?.grant_id ?? null],
     stream,
-    requested.fields ?? null,
+    // For a `view`, the binding includes the resolved field set (§8).
+    requested.view ?? null,
+    requestedFields ?? null,
     requested.order,
     requested.source ?? null,
   ];
@@ -578,8 +552,16 @@ export async function listPdppRecords(
   // spec-core §8 "Stable sort": a client list uses the grant's frozen
   // `sort_field` when present, else `(instance_id, canonical key)` in the
   // direction `order` selects (§9 RS items 2, 33).
+  // An owner list uses the current declared `cursor_field`, then
+  // `(instance_id, key)`, values that are not valid RFC 3339 last (§8).
+  const ownerCursorField =
+    owner && typeof declaration !== "function"
+      ? declaration?.cursorField
+      : undefined;
   const sort: ListSort | undefined = owner
-    ? undefined
+    ? ownerCursorField
+      ? { by: "field", field: ownerCursorField }
+      : { by: "key" }
     : scope.streamGrant?.sort_field
       ? { by: "field", field: scope.streamGrant.sort_field }
       : { by: "key" };
@@ -634,6 +616,7 @@ export async function listPdppRecords(
             row,
             scope.fields,
             owner ? "owner" : "client",
+            input.blobBase,
           ),
         ),
         ...((count || warnings.length > 0) && {
@@ -655,9 +638,37 @@ export async function listPdppRecords(
   return {
     feed: query.changesSince === undefined,
     body: await sealBody(
-      await ports.legacy({ query, stream, context, scope, instanceIds, sort }),
+      await ports.legacy({
+        query,
+        stream,
+        context,
+        scope,
+        instanceIds,
+        sort,
+        blobBase: input.blobBase,
+      }),
     ),
   };
+}
+
+/**
+ * The fields an owner `view=<id>` resolves to: the view's fields of this
+ * stream plus its schema-required fields (spec-core §4 "Absent and null
+ * fields"; §8 "List records" `view`). Undefined without a view. An unknown
+ * view is a 400.
+ */
+export function ownerViewFields(
+  declaration: StreamDeclaration | undefined,
+  view: string | undefined,
+): string[] | undefined {
+  if (view === undefined) return undefined;
+  const found = declaration?.views?.find((candidate) => candidate.id === view);
+  if (!found) {
+    throw new PdppError("invalid_request", `Unknown view '${view}'`, {
+      param: "view",
+    });
+  }
+  return [...new Set([...found.fields, ...(declaration?.requiredFields ?? [])])];
 }
 
 let fallbackSeal: CursorSeal | undefined;

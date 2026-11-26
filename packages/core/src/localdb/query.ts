@@ -9,6 +9,7 @@ import {
   type ChangesSinceOptions,
   type ChangesSincePage,
   type ListSort,
+  type PdppRecordRow,
   type PdppStoredRecord,
 } from "../storage/pdpp-records/types.js";
 import {
@@ -479,6 +480,11 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
     options: ChangesSinceOptions,
   ): Promise<ChangesSincePage> => {
     const instances = [...new Set(options.instanceIds)].sort();
+    // Owner sessions: a record removed between the horizons is a tombstone,
+    // not an expired session (spec-core §4 "Visibility"; RS items 7, 20).
+    // The owner reads whole records, so an overwrite needs no h0 body: the
+    // record is returned when it was written between the horizons.
+    const removals = options.removals === true;
     const targets: { instance: string; id: string; generation: number }[] = [];
     for (const instance of instances) {
       const resolved = link(instance, stream);
@@ -511,9 +517,9 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       targets,
       options.fields?.slice().sort() ?? null,
       options.purpose ?? "changes",
-      ...(options.purpose === "listing"
-        ? [options.order ?? "asc", options.sort ?? null]
-        : []),
+      options.order ?? "asc",
+      ...(options.purpose === "listing" ? [options.sort ?? null] : []),
+      options.removals === true,
     ]);
     const clock = async () => {
       const [row] = await db.query<{
@@ -603,8 +609,8 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
         const missing = await db.query<{ seq: number }>(
           `SELECT later.seq FROM record_changes later WHERE later.connection_id=? AND later.stream=?
           AND ((later.seq>? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))
-          ${since === null ? "" : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"}) LIMIT 1`,
-          since === null
+          ${since === null || removals ? "" : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"}) LIMIT 1`,
+          since === null || removals
             ? [target.id, stream, horizon, horizon]
             : [target.id, stream, horizon, horizon, since, horizon, since],
         );
@@ -612,7 +618,7 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       }
     };
     await assertExact();
-    const rows: PdppStoredRecord[] = [];
+    const rows: PdppRecordRow[] = [];
     let visibleCount = 0;
     const limit = Math.max(1, Math.min(100, options.limit));
     // The scan runs in `(instance_id, canonical key)` order, which is the
@@ -620,13 +626,17 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
     // list order. A listing in another order (descending, or by the frozen
     // `sort_field`) ranks every visible position, then reads the page's
     // bodies (spec-core §8 "Stable sort"; RS item 33).
-    const sort: ListSort = options.sort ?? { by: "key" };
+    // A `changes_since` session uses `(instance_id, key)` in the direction
+    // `order` selects (spec-core §8 "Stable sort"; RS item 21).
+    const listing = options.purpose === "listing";
+    const sort: ListSort = listing ? (options.sort ?? { by: "key" }) : { by: "key" };
+    const order = options.order ?? "asc";
     const ranked =
-      options.purpose === "listing" &&
-      (options.order === "desc" || sort.by === "field");
+      order === "desc" || sort.by === "field" || (removals && !listing);
     const positions: (ListPosition & {
       connectionId: string;
       pkHash: string;
+      removedAt?: number;
     })[] = [];
     let after: [string, string, string] | undefined;
     while (targets.length > 0) {
@@ -679,11 +689,62 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       const last = current.at(-1)!;
       after = [last.instance, last.record_key, last.pk_hash];
     }
-    if (ranked) {
-      positions.sort((a, b) =>
-        compareListPositions(a, b, options.order ?? "asc", sort),
+    if (removals && !listing && since !== null) {
+      // Tombstones: the key's last change at h1 is a removal inside the
+      // session, and its last change at h0 was an upsert, so the record was
+      // visible at h0 and is not at h1. No other key gets one, including a
+      // record created and removed between the horizons (spec-core §4).
+      const removed = await db.query<{
+        instance: string;
+        connection_id: string;
+        record_key: string;
+        pk_hash: string;
+        stamp_o: number;
+      }>(
+        `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
+         SELECT t.instance,c.connection_id,c.record_key,c.pk_hash,c.stamp_o FROM record_changes c JOIN targets t ON t.connection_id=c.connection_id
+         WHERE c.stream=? AND c.op='remove' AND c.seq>? AND c.seq<=?
+           AND c.seq=(SELECT MAX(c2.seq) FROM record_changes c2 WHERE c2.connection_id=c.connection_id AND c2.stream=c.stream AND c2.pk_hash=c.pk_hash AND c2.seq<=?)
+           AND (SELECT c3.op FROM record_changes c3 WHERE c3.connection_id=c.connection_id AND c3.stream=c.stream AND c3.pk_hash=c.pk_hash AND c3.seq<=? ORDER BY c3.seq DESC LIMIT 1)='upsert'`,
+        [
+          ...targets.flatMap((t) => [t.instance, t.id]),
+          stream,
+          since,
+          horizon,
+          horizon,
+          since,
+        ],
       );
+      for (const row of removed) {
+        positions.push({
+          sortKey: null,
+          instance: row.instance,
+          recordKey: row.record_key,
+          connectionId: row.connection_id,
+          pkHash: row.pk_hash,
+          removedAt: row.stamp_o,
+        });
+        visibleCount++;
+      }
+    }
+    if (ranked) {
+      positions.sort((a, b) => compareListPositions(a, b, order, sort));
       for (const position of positions.slice(offset, offset + limit + 1)) {
+        if (position.removedAt !== undefined) {
+          // The removal's stamp is the deletion time (an explicit delete
+          // stamps its observation time; merge.ts `deleteRunRecords`).
+          const at = new Date(position.removedAt).toISOString();
+          rows.push({
+            instance: position.instance,
+            stream,
+            recordKey: position.recordKey,
+            version: 1,
+            deletedAt: at,
+            emittedAt: at,
+            deleted: true,
+          });
+          continue;
+        }
         const [row] = await db.query<{ body: string; stamp_o: number }>(
           `SELECT r.body,${seenStamp("r.").o} AS stamp_o FROM records r
            WHERE r.connection_id=? AND r.stream=? AND r.pk_hash=?`,
@@ -719,6 +780,7 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       data,
       hasMore,
       ...(hasMore ? { nextCursor: cursor } : { nextChangesSince: cursor }),
+      ...(listing && { total: visibleCount }),
     };
   };
 }

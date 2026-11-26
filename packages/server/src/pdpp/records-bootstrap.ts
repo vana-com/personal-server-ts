@@ -30,7 +30,13 @@ import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/local
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -486,38 +492,92 @@ export function createPdppRecordsDeps(
  * The key that seals page cursors and `changes_since` tokens (spec-core §4;
  * §9 RS item 21), kept in a file beside the records database so a client's
  * stored `next_changes_since` survives a restart. Not a database table: a
- * new table would change the schema older builds open. Owner-only file mode;
- * whoever can read it can already read the database. An in-memory database
- * gets a fresh key, and so does a host where the file cannot be written.
+ * new table would change the schema older builds open.
+ *
+ * - Absent: created with a fresh key, owner-only (0600), exclusively, so a
+ *   concurrent opener reads the winner's key.
+ * - Group- or world-accessible: repaired to 0600 and logged; when the repair
+ *   fails the file is not used (the key may have been read by others) and
+ *   this process seals with a key of its own.
+ * - Wrong length or unreadable as a key: replaced once, atomically (write a
+ *   temporary file, then rename), so the next boot reads the same new key
+ *   instead of drawing another one.
+ *
+ * An in-memory database gets a fresh key. Whoever can read the file can
+ * already read the database it sits beside.
  */
 export function cursorSealKeyFor(
-  db: Database,
+  db: Pick<Database, "name">,
   logger: Pick<Logger, "warn">,
 ): Uint8Array {
-  const file = db.name && db.name !== ":memory:" ? `${db.name}.pdpp-cursor-key` : undefined;
+  const file =
+    db.name && db.name !== ":memory:"
+      ? `${db.name}.pdpp-cursor-key`
+      : undefined;
   if (!file) return randomBytes(32);
-  try {
+  const readValid = (): Buffer | undefined => {
     const existing = readFileSync(file);
-    if (existing.byteLength === 32) return existing;
+    return existing.byteLength === 32 ? existing : undefined;
+  };
+  let mode: number | undefined;
+  try {
+    mode = statSync(file).mode;
   } catch {
     // Absent: created below.
   }
-  const key = randomBytes(32);
-  try {
-    writeFileSync(file, key, { mode: 0o600, flag: "wx" });
-    return key;
-  } catch {
+  if (mode === undefined) {
+    const key = randomBytes(32);
     try {
-      // Another opener won the race: use its key.
-      const existing = readFileSync(file);
-      if (existing.byteLength === 32) return existing;
+      writeFileSync(file, key, { mode: 0o600, flag: "wx" });
+      return key;
     } catch {
-      // Fall through.
+      // Another opener won the race: use its key (checked below).
+      try {
+        mode = statSync(file).mode;
+      } catch {
+        logger.warn(
+          "PDPP cursor key file cannot be created; sync tokens will not survive a restart",
+        );
+        return key;
+      }
     }
   }
-  logger.warn(
-    "PDPP cursor key file is unavailable; sync tokens will not survive a restart",
-  );
+  if ((mode & 0o077) !== 0) {
+    try {
+      chmodSync(file, 0o600);
+      logger.warn(
+        { file },
+        "PDPP cursor key file was readable by others; its mode is now 0600",
+      );
+    } catch {
+      logger.warn(
+        { file },
+        "PDPP cursor key file is readable by others and cannot be repaired; it is not used",
+      );
+      return randomBytes(32);
+    }
+  }
+  try {
+    const existing = readValid();
+    if (existing) return existing;
+  } catch {
+    // Unreadable: replaced below.
+  }
+  const key = randomBytes(32);
+  const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(temporary, key, { mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+    logger.warn(
+      { file },
+      "PDPP cursor key file was corrupt and has been replaced; outstanding tokens are invalid",
+    );
+  } catch {
+    logger.warn(
+      { file },
+      "PDPP cursor key file is corrupt and cannot be replaced; sync tokens will not survive a restart",
+    );
+  }
   return key;
 }
 
@@ -677,5 +737,14 @@ function toStreamDeclarations(
     // owner consented against.
     ...(stream.schema && { schema: stream.schema }),
     ...(stream.selection && { selection: stream.selection }),
+    // §8 owner metadata reports current views. The retained snapshot's
+    // views are source-level field lists; each applies to a stream through
+    // the fields the stream declares, as at issuance (selection.ts).
+    views: (snapshot.views ?? [])
+      .map((view) => ({
+        id: view.name,
+        fields: view.fields.filter((field) => stream.fields.includes(field)),
+      }))
+      .filter((view) => view.fields.length > 0),
   }));
 }

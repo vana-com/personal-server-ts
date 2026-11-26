@@ -92,7 +92,7 @@ describe("GET /v1/streams/:stream/records on the Lite runtime", () => {
   it("serves page two with the browser Buffer shim", async () => {
     const runtime = await liteRuntime(await switchedStore());
     vi.stubGlobal("Buffer", BrowserBuffer);
-    const path = `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`;
+    const path = `/v1/streams/posts/records?limit=2&order=asc&source=${CONNECTOR}`;
     const first = await liteGet(runtime, path);
     expect(first.status, await first.clone().text()).toBe(200);
     const page = await first.json();
@@ -115,7 +115,7 @@ describe("GET /v1/streams/:stream/records on the Lite runtime", () => {
     const runtime = await liteRuntime(await switchedStore());
     const res = await liteGet(
       runtime,
-      `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`,
+      `/v1/streams/posts/records?limit=2&order=asc&source=${CONNECTOR}`,
     );
     expect(res.status, await res.clone().text()).toBe(200);
     const body = await res.json();
@@ -158,7 +158,7 @@ describe("Node and Lite serve identical pages for one store", () => {
     let liteCursor: string | undefined;
     let nodeCursor: string | undefined;
     const seen: string[] = [];
-    const base = `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`;
+    const base = `/v1/streams/posts/records?limit=2&order=asc&source=${CONNECTOR}`;
     const at = (cursor: string | undefined) =>
       cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base;
     for (let page = 0; page < 5; page++) {
@@ -218,6 +218,14 @@ describe("PDPP-Version negotiation on both hosts", () => {
         },
       });
     }) as LocalSync["recordsFor"];
+    // Owner lists read the frozen history (spec-core §8 "Stable sort").
+    counted.changesFor = ((link: Parameters<LocalSync["changesFor"]>[0]) => {
+      const history = base.changesFor(link);
+      return (...args: Parameters<typeof history>) => {
+        calls.queries++;
+        return history(...args);
+      };
+    }) as LocalSync["changesFor"];
     return { local: counted, calls };
   }
 

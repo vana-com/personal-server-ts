@@ -210,7 +210,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       instancesForSubject: () => ["inst_1"], // does not include inst_other
     });
-    const res = await app.request("/blob_1?instance_id=inst_1", {
+    const res = await app.request("/blob_1?instance_id=inst_other", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
@@ -447,7 +447,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_private?instance_id=inst_1", {
+    const res = await app.request("/blob_private?instance_id=inst_private", {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(res.status).toBe(404);
@@ -860,7 +860,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       readBlobBytes: async () => new Uint8Array(3),
     });
 
-    const res = await app.request("/blob_other?instance_id=inst_1", {
+    const res = await app.request("/blob_other?instance_id=inst_other", {
       headers: { Authorization: "Bearer owner-tok" },
     });
 
@@ -960,12 +960,16 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_shared_private?instance_id=inst_1", {
-      headers: { Authorization: "Bearer client-tok" },
-    });
-    expect(res.status).toBe(404);
-    const body = await res.json();
-    expect(body.error.code).toBe("blob_not_found");
+    // Each instance that holds a reference, so the grant check decides.
+    for (const instance of ["inst_private_a", "inst_private_b"]) {
+      const res = await app.request(
+        `/blob_shared_private?instance_id=${instance}`,
+        { headers: { Authorization: "Bearer client-tok" } },
+      );
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("blob_not_found");
+    }
   });
 
   it("denies a blob whose only visible reference has been deleted, even when an unauthorized instance's reference still exists", async () => {

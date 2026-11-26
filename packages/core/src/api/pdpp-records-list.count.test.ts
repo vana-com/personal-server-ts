@@ -155,8 +155,12 @@ describe("local record list count", () => {
       ...seeded({ a: 3 }, {}),
       changesSince: async () => ({ changes: [], nextCursor: null }),
     };
+    // A change session reads the frozen history port.
     const page = await list(
-      ports(query, ["a"]),
+      {
+        ...ports(query, ["a"]),
+        recordHistory: async () => ({ data: [], hasMore: false }),
+      },
       "changes_since=beginning",
       "count=exact",
     );

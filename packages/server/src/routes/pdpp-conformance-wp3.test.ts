@@ -102,6 +102,16 @@ const tokens: Record<string, PdppTokenContext> = {
     subjectId: "owner",
     instanceIds: [A, B],
   },
+  refs: {
+    active: true,
+    tokenKind: "client",
+    subjectId: "sub",
+    clientId: "c1",
+    grant: grant(
+      [{ ...twoInstances, instance_ids: [A], fields: ["id", "name", "target", "media"] }],
+      "g6",
+    ),
+  },
 };
 
 type Backend = "memory" | "sqlite";
@@ -119,6 +129,7 @@ function setup(backend: Backend, wrap?: (s: PdppRecordStore) => PdppRecordStore)
       requiredFields: ["id"],
       schema: { properties: { id: {}, name: {}, at: {}, secret: {} } },
       selection: { fields: true },
+      views: [{ id: "basic", fields: ["id", "name"] }],
     },
   ]);
   const ingest = (
@@ -273,7 +284,18 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
       expect(body.next_changes_since).toBeUndefined();
       url = `/streams/s/records?changes_since=beginning&limit=1&cursor=${encodeURIComponent(body.next_cursor)}`;
     }
+    // Default `order` is descending (spec-core §8 "Stable sort").
     expect(pages.flatMap((p) => p.data).map((r) => `${r.instance_id}/${r.id}`)).toEqual([
+      "inst_b/k3",
+      "inst_b/k0",
+      "inst_a/k2",
+      "inst_a/k1",
+    ]);
+    const ascending = await walk(
+      get,
+      "/streams/s/records?changes_since=beginning&limit=1&order=asc",
+    );
+    expect(ascending.records.map((r) => `${r.instance_id}/${r.id}`)).toEqual([
       "inst_a/k1",
       "inst_a/k2",
       "inst_b/k0",
@@ -528,7 +550,7 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
       cursor_field: "at",
       schema: { properties: { id: {}, name: {}, at: {}, secret: {} } },
       query: {},
-      views: [],
+      views: [{ id: "basic", fields: ["id", "name"] }],
       relationships: [],
     });
   });
@@ -551,5 +573,153 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
         request_id: expect.stringMatching(/^req_/),
       },
     });
+  });
+
+  it("RS 23: every resource_ref is served redacted for client and owner, on list, get and changes_since, and the field is kept", async () => {
+    const { ingest, get, del } = setup(backend);
+    ingest([
+      // A target in an ungranted stream, and one in another source.
+      { instance: A, id: "t1", name: "n", target: { source_id: "src", stream: "other", record_id: "x1" } },
+      { instance: A, id: "t2", name: "n", target: { source_id: "elsewhere", stream: "s", record_id: ["a", "b"] } },
+      // A target inside the grant: still redacted (no resolution here).
+      { instance: A, id: "t3", name: "n", target: { source_id: "src", stream: "s", record_id: "t1" } },
+    ]);
+    const redacted = (stream: string, source = "src") => ({
+      source_id: source,
+      stream,
+      redacted: true,
+    });
+    const expected = {
+      t1: redacted("other"),
+      t2: redacted("s", "elsewhere"),
+      t3: redacted("s"),
+    };
+    for (const token of ["refs", "owner"]) {
+      const list = await (await get("/streams/s/records", token)).json();
+      for (const record of list.data)
+        expect(record.data.target).toEqual(expected[record.id as keyof typeof expected]);
+      const one = await (
+        await get(`/streams/s/records/t1?instance_id=${A}`, token)
+      ).json();
+      expect(one.data.target).toEqual(redacted("other"));
+      const sync = await (
+        await get("/streams/s/records?changes_since=beginning", token)
+      ).json();
+      expect(JSON.stringify(sync)).not.toContain("record_id");
+    }
+    const start = await (
+      await get("/streams/s/records?changes_since=beginning", "refs")
+    ).json();
+    // A target deletion, and a change to the hidden record_id only: neither
+    // changes the served form, so neither re-returns the referrer.
+    expect((await del(`/streams/s/records/t1?instance_id=${A}`)).status).toBe(204);
+    ingest([
+      { instance: A, id: "t3", name: "n", target: { source_id: "src", stream: "s", record_id: "zzz" } },
+    ]);
+    const next = await (
+      await get(
+        `/streams/s/records?changes_since=${encodeURIComponent(start.next_changes_since)}`,
+        "refs",
+      )
+    ).json();
+    expect(next.data).toEqual([
+      { object: "record", id: "t1", instance_id: A, stream: "s", deleted: true },
+    ]);
+  });
+
+  it("RS 18: a served blob_ref carries a fetch_url with its instance_id", async () => {
+    const { ingest, get } = setup(backend);
+    ingest([
+      { instance: A, id: "m1", name: "n", media: { blob_id: "sha256:abc", mime_type: "image/png" } },
+    ]);
+    for (const token of ["refs", "owner"]) {
+      const body = await (await get("/streams/s/records", token)).json();
+      const media = body.data.find((r: { id: string }) => r.id === "m1").data.media;
+      expect(media).toMatchObject({ blob_id: "sha256:abc", mime_type: "image/png" });
+      expect(media.fetch_url).toBe(
+        `http://localhost/v1/blobs/${encodeURIComponent("sha256:abc")}?instance_id=${A}`,
+      );
+    }
+  });
+
+  it("RS 1 (§8 Stable sort): owner lists use the current cursor_field, then (instance_id, key), invalid values last", async () => {
+    const { ingest, get } = setup(backend);
+    ingest(seed);
+    const desc = await walk(get, "/streams/s/records?limit=1", "owner");
+    expect(desc.records.map((r) => r.id)).toEqual(["k1", "k3", "k2", "k0"]);
+    const asc = await walk(get, "/streams/s/records?limit=1&order=asc", "owner");
+    expect(asc.records.map((r) => r.id)).toEqual(["k2", "k3", "k1", "k0"]);
+  });
+
+  it("RS 14: owner metadata reports the declared views, and owner reads accept view; clients cannot", async () => {
+    const { ingest, get } = setup(backend);
+    ingest(seed);
+    const meta = await (await get("/streams/s", "owner")).json();
+    expect(meta.views).toEqual([{ id: "basic", fields: ["id", "name"] }]);
+    const viewed = await (await get("/streams/s/records?view=basic", "owner")).json();
+    for (const record of viewed.data)
+      expect(Object.keys(record.data).sort()).toEqual(["id", "name"]);
+    for (const [path, token] of [
+      ["/streams/s/records?view=basic", "client"],
+      ["/streams/s/records?view=nope", "owner"],
+      ["/streams/s/records?view=basic&fields=id", "owner"],
+    ] as const) {
+      const res = await get(path, token);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error.code).toBe("invalid_request");
+    }
+  });
+
+  it("RS 10: an empty fields name is 400 invalid_request, not field_not_granted", async () => {
+    const { get } = setup(backend);
+    for (const query of ["fields=", "fields=id,,name"]) {
+      const res = await get(`/streams/s/records?${query}`);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatchObject({
+        code: "invalid_request",
+        param: "fields",
+      });
+    }
+  });
+});
+
+describe("RS 6: owner DELETE refusals by account mode use the unified §8 body", () => {
+  it.each([
+    ["switched", 426, "update_required", "invalid_request_error"],
+    ["unknown", 503, "ACCOUNT_MODE_UNKNOWN", "api_error"],
+  ] as const)("%s account", async (mode, status, code, type) => {
+    const app = new Hono();
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        accountStorageMode: { owner: "owner", read: () => mode },
+        store: createMemoryRecordStore(),
+        auth: createFixtureAuthorizationService(tokens),
+        declarations: createStreamDeclarationRegistry([
+          {
+            name: "s",
+            semantics: "mutable_state",
+            primaryKey: ["id"],
+            requiredFields: ["id"],
+          },
+        ]),
+        instancesForSubject: () => [A],
+      }),
+    );
+    const res = await app.request(`/v1/streams/s/records/k1?instance_id=${A}`, {
+      method: "DELETE",
+      headers: { Authorization: "Bearer owner" },
+    });
+    expect(res.status).toBe(status);
+    const body = await res.json();
+    expect(body).toEqual({
+      error: {
+        type,
+        code,
+        message: expect.any(String),
+        request_id: expect.stringMatching(/^req_/),
+      },
+    });
+    expect(res.headers.get("Request-Id")).toBe(body.error.request_id);
   });
 });
