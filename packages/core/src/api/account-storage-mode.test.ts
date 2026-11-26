@@ -316,3 +316,25 @@ describe("legacy refusal wire contracts", () => {
     expect(switched.response.headers.get("retry-after")).toBe(null);
   });
 });
+
+describe("legacy mode verdict adaptation", () => {
+  it("returns no refusal for the explicit unswitched mode", () => {
+    const read = vi.fn(() => "unswitched" as const);
+    expect(refuseLegacyWrite({ read })).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("infers the verdict when a caller wraps a legacy refusal response directly", async () => {
+    const { LegacyWriteRefusedError, updateRequiredResponse } =
+      await import("./legacy-write-gate.js");
+    const switched = updateRequiredResponse();
+    const paused = accountModeUnknownResponse();
+    const switchedError = new LegacyWriteRefusedError(switched);
+    const pausedError = new LegacyWriteRefusedError(paused);
+
+    expect(switchedError.verdict).toBe("switched");
+    expect(switchedError.response).toBe(switched);
+    expect(pausedError.verdict).toBe("unknown");
+    expect(pausedError.response).toBe(paused);
+  });
+});
