@@ -15,6 +15,51 @@ import { previewEnvelopeValue } from "./storage-utils.js";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 
 describe("createOpenPersistentPsLiteStorage", () => {
+  it("makes one index pass per retirement absence check", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const writes = vi.spyOn(persistence, "write");
+    const storage = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+    );
+    for (let i = 0; i < 4; i++) {
+      await storage.insertEntry({
+        scope: "notes.profile",
+        path: `data/${i}.json`,
+        collectedAt: "2026-05-08T00:00:00.000Z",
+        sizeBytes: 1,
+        fileId: null,
+      });
+    }
+    const entries = writes.mock.calls.at(-1)![0].entries;
+    const absentRows = entries.map((entry) => ({
+      ...entry,
+      id: entry.id + 100,
+    }));
+    let idReads = 0;
+    for (const entry of entries) {
+      const id = entry.id;
+      Object.defineProperty(entry, "id", {
+        get: () => {
+          idReads++;
+          return id;
+        },
+      });
+    }
+    const authority = vi.fn();
+    for (let check = 0; check < 2; check++) {
+      idReads = 0;
+      expect(await storage.retirementRows.absent(absentRows, authority)).toBe(
+        true,
+      );
+      expect(idReads).toBe(entries.length);
+    }
+    expect(authority).toHaveBeenCalledTimes(2);
+    expect(await storage.retirementRows.absent([entries[0]], authority)).toBe(
+      false,
+    );
+  });
+
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
     const envelope = createDataFileEnvelope(
       "chatgpt.conversations",

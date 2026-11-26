@@ -760,4 +760,22 @@ END`,
        ON record_changes(connection_id, stream, seq)
        WHERE op = 'remove' AND explicit_delete = 1 AND pk_values IS NULL`,
   ],
+  [
+    // A standalone legacy retirement (`legacy-retire-intent.ts`): the owner's
+    // request to retire a connector's legacy copy, with the gateway heads of
+    // its bound legacy scopes as the request read them (`scopes`, JSON). One
+    // row per connector: a repeat or a restart resumes it, and it never
+    // widens. `open` fences the legacy import of the whole connector (and
+    // nothing else: it is not a `delete_intents` row); `done` is set only on a
+    // confirmed erasure and keeps fencing the bound scopes it lists, for good.
+    `CREATE TABLE legacy_retirements (
+      owner TEXT NOT NULL, connector TEXT NOT NULL, retire_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('open','done')),
+      scopes TEXT NOT NULL, created_at INTEGER NOT NULL,
+      PRIMARY KEY (owner, connector)) WITHOUT ROWID`,
+  ],
+  [
+    `CREATE TABLE legacy_retire_manifests (retire_id TEXT PRIMARY KEY, manifest TEXT NOT NULL) WITHOUT ROWID`,
+    `CREATE TABLE legacy_retire_receipts (retire_id TEXT NOT NULL, scope TEXT NOT NULL, version TEXT NOT NULL, PRIMARY KEY (retire_id, scope, version)) WITHOUT ROWID`,
+  ],
 ];

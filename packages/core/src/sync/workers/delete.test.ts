@@ -971,6 +971,33 @@ describe("deleteScope erases only the fence captured before the remote await", (
       afterTombstoneVersion,
     });
 
+  it("ordinary DELETE captures a mixed old and stamped re-add set, preserving a later replacement", async () => {
+    const storage = createMemoryDataStorage();
+    indexed(storage, "p/old.json", "2026-08-01T00:00:00.000Z", null);
+    indexed(storage, "p/readd.json", "2026-08-02T00:00:00.000Z", 4);
+    const deleteData = makeDeleteData({
+      tombstone: vi.fn(async () => {
+        const old = storage.entries.find(
+          (entry) => entry.path === "p/old.json",
+        )!;
+        storage.entries.splice(storage.entries.indexOf(old), 1);
+        indexed(storage, "p/old.json", "2026-08-01T00:00:00.000Z", 4);
+        return {
+          status: "already-deleted",
+          dataPointId: DATA_POINT_ID,
+          version: "4",
+          deletedAt: DELETED_AT,
+        };
+      }),
+    });
+    const result = await deleteScope(
+      { storage, serverOwner: OWNER, deleteData, logger: makeLogger() },
+      SCOPE,
+    );
+    expect(result.steps.local).toEqual({ status: "ok", deletedCount: 1 });
+    expect(storage.entries.map((entry) => entry.path)).toEqual(["p/old.json"]);
+  });
+
   it("a fresh owner delete erases captured unsynced re-adds without extending the old remote blob fence", async () => {
     const storage = createMemoryDataStorage();
     indexed(storage, "p/readd.json", "2026-08-02T00:00:00.000Z", 4);

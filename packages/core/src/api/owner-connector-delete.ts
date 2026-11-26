@@ -70,6 +70,7 @@ import {
   InvalidConnectionLifetime,
 } from "../localdb/delete-lifetime.js";
 import type { ConnectionDeleteStatus } from "../localdb/delete-status.js";
+import type { LegacyRetireStatus } from "../localdb/legacy-retire-intent.js";
 
 /**
  * What the route needs of the account's storage mode: the read shape of
@@ -98,6 +99,16 @@ export interface ConnectionDeletePort {
    * answer, which waits for the fences only and not for a registry.
    */
   deleteStatusSnapshot?(connector: string): Promise<ConnectionDeleteStatus>;
+  /**
+   * `DELETE /v1/owner/connectors/:id/legacy` (`owner-legacy-retire.ts`):
+   * persist the legacy-only retirement, or find the one that exists. Rejects
+   * `LegacyRetireNotAdmitted` and `LegacyRetireUnavailable`.
+   */
+  requestLegacyRetire?(
+    connector: string,
+  ): Promise<{ readonly retireId: string }>;
+  /** What is left of it; `null` when the connector has none. */
+  legacyRetireStatus?(connector: string): Promise<LegacyRetireStatus | null>;
 }
 
 export interface OwnerConnectorDeleteDeps {
@@ -129,6 +140,16 @@ export function ownerConnectorRefusal(
   );
 }
 
+export function jsonNoStore(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
+  });
+}
+
 function accepted(
   deleteId: string,
   fenced: boolean,
@@ -157,7 +178,7 @@ function isConnectorKey(connectorId: string): boolean {
  * What the two routes refuse before they ask the writer: the owner, a bad id,
  * the storage mode, a missing writer. `null` when the request may go on.
  */
-async function refusalBeforeWriter(
+export async function refusalBeforeWriter(
   request: Request,
   connectorId: string | null,
   deps: OwnerConnectorDeleteDeps,
@@ -188,7 +209,7 @@ async function refusalBeforeWriter(
   return null;
 }
 
-const unavailable = () =>
+export const unavailable = () =>
   ownerConnectorRefusal(
     503,
     "STREAM_SYNC_UNAVAILABLE",

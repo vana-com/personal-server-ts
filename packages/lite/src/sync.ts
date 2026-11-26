@@ -1,8 +1,11 @@
+import type { PsLiteStoragePort } from "./storage.js";
+import { createLegacyRetireRemote } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createPsLiteSeedStaging } from "./seed-staging.js";
 import {
   LEGACY_SCOPE_BINDINGS,
   legacyAliasScopes,
   legacyScopesOfConnector,
+  legacyStreamsOfScope,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import type {
   OwnedAccountStorageMode,
@@ -176,7 +179,7 @@ export interface PsLiteSyncOptions {
    */
   streamSyncFlags?: string;
   stateStore: PsLiteStateStore;
-  storage: DataStoragePort;
+  storage: DataStoragePort & Pick<PsLiteStoragePort, "retirementRows">;
   ownerAddress?: `0x${string}`;
   ownerSignature: `0x${string}`;
   serverAccount: ServerAccount;
@@ -578,6 +581,25 @@ export async function createPsLiteSyncManager(
     owner: serverOwner,
     read: () => "unknown" as const,
   };
+  // Only this host's registration observations may authorize retirement.
+  let registrationConfirmed = false;
+  let registrationGeneration = 0;
+  function setRegistrationConfirmed(confirmed: boolean, generation: number) {
+    if (generation === registrationGeneration)
+      registrationConfirmed = confirmed;
+  }
+  async function checkRegistration(): Promise<boolean> {
+    const generation = ++registrationGeneration;
+    setRegistrationConfirmed(false, generation);
+    const serverInfo = await gateway.getServer(options.serverAccount.address);
+    const confirmed = Boolean(serverInfo?.id);
+    setRegistrationConfirmed(confirmed, generation);
+    return confirmed;
+  }
+  const retirementWriteReady = () =>
+    registrationConfirmed &&
+    (options.registrationReady === undefined ||
+      options.registrationReady() === true);
   let localDb: SqlDriver | null = null;
   let localSync: LocalSync | null = null;
   // Built before the database opens, so a subscriber never waits for it.
@@ -657,13 +679,40 @@ export async function createPsLiteSyncManager(
         localSync = createLocalSync(localSyncDeps, {
           aliasScopes: () => LEGACY_SCOPE_BINDINGS.keys(),
           aliasTargets: legacyAliasScopes,
+          // A held registration confers no write authority, whoever asks:
+          // the worker reads this before every host call.
+          legacyWriteReady: retirementWriteReady,
           resolveArtifact: options.streamSyncDeclarations ?? (() => null),
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
           erasure: () => logErasurePorts,
-          // The legacy copy of a deleted connection is retired at the gateway
-          // and in storage by this runtime's own scope delete: the manager is
-          // read when the stage runs, not when the database opens.
+          // Standalone retirement owns its transport, receipts and row leaves.
+          legacyRetire: () => {
+            const rows = options.storage.retirementRows;
+            if (!rows) return undefined;
+            return {
+              scopesOf: legacyScopesOfConnector,
+              streamsOf: legacyStreamsOfScope,
+              mode: modeOfAccount(() => mode.read()),
+              head: legacyHeadFrom(dataPointFeed, serverOwner),
+              finality: tombstoneFinality,
+              versions: logErasurePorts.versions,
+              rows,
+              ...createLegacyRetireRemote({
+                gatewayUrl: options.config.gateway.url,
+                dataPointFeed,
+                serverOwner,
+                signer,
+                storage: {
+                  endpoint: resolveVanaStorageEndpoint(options.config),
+                  audience: options.storageAudience,
+                  chainId: options.config.gateway.chainId,
+                  signMessage: (message) => syncAccount.signMessage(message),
+                },
+              }),
+            };
+          },
+          // Ordinary connector DELETE retains the scope-delete worker.
           legacyDelete: () => ({
             scopesOf: legacyScopesOfConnector,
             mode: modeOfAccount(() => mode.read()),
@@ -676,6 +725,19 @@ export async function createPsLiteSyncManager(
             objects: deleteData,
           }),
         });
+        // An open legacy retirement resumes when the runtime opens, not only
+        // in a full sync cycle. It sends deletes at the gateway, so it needs
+        // the write authority a registered runtime has: a read-only
+        // registration waits for the cycle that runs once it is admitted.
+        if (retirementWriteReady())
+          void localSync.legacyRetirer.resume().catch((error: unknown) =>
+            logger.warn(
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Could not resume the legacy retirement at open",
+            ),
+          );
       }
       return localSync;
     }
@@ -716,7 +778,25 @@ export async function createPsLiteSyncManager(
       requireDatabaseMode();
       return sync;
     }
-    if (mode.read() === "switched") await openDatabase();
+    if (mode.read() === "switched") {
+      const sync = await openDatabase();
+      // Local reads do not wait for the gateway. Retirement stays closed until
+      // this runtime verifies registration, then resumes without a sync cycle.
+      if (options.registrationReady?.() === true) {
+        void (async () => {
+          if (options.ownerSyncSigner)
+            setRegistrationConfirmed(true, ++registrationGeneration);
+          else await checkRegistration();
+          if (!closed && retirementWriteReady())
+            await sync?.legacyRetirer.resume();
+        })().catch((error: unknown) => {
+          logger.warn(
+            { error: String(error) },
+            "Could not verify server registration before retirement",
+          );
+        });
+      }
+    }
     const streamSyncSeed = createSeedIntake(
       createLocalSeed({
         getDeps: async () => {
@@ -796,7 +876,11 @@ export async function createPsLiteSyncManager(
           : undefined,
         tombstoneFinality,
         async canSync() {
-          if (options.ownerSyncSigner) return { ok: true };
+          setRegistrationConfirmed(false, ++registrationGeneration);
+          if (options.ownerSyncSigner) {
+            setRegistrationConfirmed(true, ++registrationGeneration);
+            return { ok: true };
+          }
           if (
             options.registrationReady &&
             !options.registrationReady() &&
@@ -804,10 +888,7 @@ export async function createPsLiteSyncManager(
           )
             return { ok: true };
           try {
-            const serverInfo = await gateway.getServer(
-              options.serverAccount.address,
-            );
-            if (serverInfo?.id) return { ok: true };
+            if (await checkRegistration()) return { ok: true };
             return {
               ok: false,
               reason: "unregistered",

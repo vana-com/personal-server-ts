@@ -1,4 +1,9 @@
 import {
+  createLegacyRetireRemote,
+  type LegacyRetirePipelinePorts,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { createLegacyRetireRows } from "./storage/legacy-retire-rows.js";
+import {
   createViewChanges,
   inventoryVersionLister,
   legacyHeadFrom,
@@ -87,7 +92,10 @@ import {
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { McpScopeRequestApprovalUrlHook } from "@opendatalabs/personal-server-ts-core/mcp";
 import { mcpGrantDefaultExpiry } from "@opendatalabs/personal-server-ts-core/mcp";
-import { legacyScopesOfConnector } from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
+  legacyScopesOfConnector,
+  legacyStreamsOfScope,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   createGatewayClient,
@@ -754,6 +762,10 @@ async function bootstrapServer(
   let serverAccount: ServerAccount | undefined;
   let serverSigner: ServerSigner | undefined;
   let identity: IdentityInfo | undefined;
+  // Shared with canSync: registration is unknown until a lookup confirms it.
+  const isServerRegistered = () => Boolean(identity?.serverId);
+  // Startup and tunnel identity lookups cannot grant retirement authority.
+  let retirementRegistrationReady = false;
 
   if (masterKeySignature && serverOwner) {
     const recoveredServerOwner = serverOwner;
@@ -946,6 +958,7 @@ async function bootstrapServer(
    * manager exists; absent where sync is off or the server cannot delete.
    */
   let legacyDeletePorts: LegacyDeletePorts | undefined;
+  let legacyRetirePorts: LegacyRetirePipelinePorts | undefined;
   async function getLocalSync(): Promise<LocalSync> {
     requireStreamMode();
     if (localSync) return localSync;
@@ -1023,6 +1036,8 @@ async function bootstrapServer(
           // (see `logErasurePorts`); the ports are read when an erasure runs.
           erasure: () => logErasurePorts,
           legacyDelete: () => legacyDeletePorts,
+          legacyRetire: () => legacyRetirePorts,
+          legacyWriteReady: () => retirementRegistrationReady,
         });
         localSyncDeps = deps;
         localDb = db;
@@ -1378,18 +1393,21 @@ async function bootstrapServer(
       tombstoneFinality,
       transferMode: isEnclave ? "download-only" : "upload-download",
       async canSync() {
+        retirementRegistrationReady = false;
         try {
           const serverInfo = await gatewayClient.getServer(
             serverAccount.address,
           );
           identity!.serverId = serverInfo?.id ?? null;
-          if (serverInfo?.id) return { ok: true };
+          retirementRegistrationReady = Boolean(serverInfo?.id);
+          if (retirementRegistrationReady) return { ok: true };
           return {
             ok: false,
             reason: "unregistered",
             message: "Register this Personal Server before syncing.",
           };
         } catch (err) {
+          retirementRegistrationReady = false;
           logger.warn({ err }, "Could not verify server registration for sync");
           return {
             ok: false,
@@ -1415,6 +1433,33 @@ async function bootstrapServer(
         objects: deleteData,
       };
     }
+    if (legacyDeletePorts && tombstoneFinality && logErasurePorts)
+      legacyRetirePorts = {
+        scopesOf: legacyScopesOfConnector,
+        streamsOf: legacyStreamsOfScope,
+        mode: modeFrom(legacyWriteSeal),
+        head: legacyHeadFrom(dataPointFeed, serverOwner),
+        finality: tombstoneFinality,
+        versions: logErasurePorts.versions,
+        rows: createLegacyRetireRows(
+          db,
+          indexManager,
+          hierarchyOptions,
+          legacyWriteSeal,
+        ),
+        ...createLegacyRetireRemote({
+          gatewayUrl: config.gateway.url,
+          dataPointFeed,
+          serverOwner,
+          signer: serverSigner,
+          fetch: outboundFetch,
+          storage: {
+            endpoint: resolveVanaStorageEndpoint(config),
+            chainId: config.gateway.chainId,
+            signMessage: (message) => serverAccount.signMessage(message),
+          },
+        }),
+      };
     syncManager.start();
     logger.info("Sync engine started");
   } else if (config.sync.enabled) {
@@ -1877,6 +1922,10 @@ async function bootstrapServer(
             (await localSyncSource()).deleter.deleteStatus(connector),
           deleteStatusSnapshot: async (connector) =>
             (await localSyncSource()).deleter.deleteStatusSnapshot(connector),
+          requestLegacyRetire: async (connector) =>
+            (await localSyncSource()).legacyRetirer.request(connector),
+          legacyRetireStatus: async (connector) =>
+            (await localSyncSource()).legacyRetirer.status(connector),
         }
       : null,
     // Shutdown stops admission before the database closes.
@@ -1966,7 +2015,7 @@ async function bootstrapServer(
     getLocalSync: localSyncSource,
     tunnelManager,
     tunnelUrl: undefined,
-    isServerRegistered: () => Boolean(identity?.serverId),
+    isServerRegistered,
     localApprovalPort,
     getLocalApprovalOrigin: () => effectiveLocalApprovalOrigin,
     setLocalApprovalOrigin: (origin?: string) => {

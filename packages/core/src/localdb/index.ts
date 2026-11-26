@@ -76,6 +76,13 @@ export {
   type LegacyOutcome,
 } from "./legacy-delete.js";
 export {
+  createLegacyRetirer,
+  LegacyRetireNotAdmitted,
+  LegacyRetireUnavailable,
+  type LegacyRetirer,
+  type LegacyRetireStatus,
+} from "./legacy-retire-intent.js";
+export {
   eraseDeletedConnectionLogs,
   inventoryVersionLister,
   retainedPiecesIn,
@@ -163,3 +170,11 @@ export {
   systemStreamIdentity,
   type SystemStreamDescriptor,
 } from "./system-stream-descriptor.js";
+
+export { createLegacyRetireRemote } from "./legacy-retire-remote.js";
+export {
+  createLegacyRetirePipeline,
+  type LegacyRetirePipelinePorts,
+  type RetirementRows,
+  type RetirementAuthority,
+} from "./legacy-retire-pipeline.js";

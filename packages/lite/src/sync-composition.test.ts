@@ -1,3 +1,6 @@
+import type { PsLiteStoragePort } from "./storage.js";
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
+import { createMemoryPsLitePersistence } from "./test-support/memory.js";
 import type * as LocalDbModule from "@opendatalabs/personal-server-ts-core/localdb";
 import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import "fake-indexeddb/auto";
@@ -372,6 +375,7 @@ describe("PS Lite local database composition", () => {
     const intake = { begin: vi.fn().mockResolvedValue({ ok: false }) };
     const localSync = {
       intake,
+      legacyRetirer: { resume: vi.fn().mockResolvedValue(undefined) },
       cycle: vi.fn().mockResolvedValue({ connections: [] }),
       apply: vi.fn().mockResolvedValue(undefined),
       close: vi.fn(() => db.close()),
@@ -383,13 +387,14 @@ describe("PS Lite local database composition", () => {
   async function setup(
     localDb: LiteLocalDbOptions,
     readMode: () => "switched" | "unswitched" | "unknown" = () => "switched",
+    storage = createMemoryPsLiteStorage(),
   ) {
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const stateStore = namedState("indexeddb:localdb-composition/state");
     const { identity, gateway } = await fixture(stateStore, owner);
     const lite = await openLite({
       stateStore,
-      storage: createMemoryPsLiteStorage(),
+      storage,
       identity,
       gateway,
       localDb,
@@ -495,6 +500,53 @@ describe("PS Lite local database composition", () => {
     expect(db.close).toHaveBeenCalledTimes(1);
   });
 
+  it("resumes a persisted legacy retirement when a registered, switched Lite runtime opens without a full sync cycle", async () => {
+    const db = driver();
+    const { localSync } = facade(db);
+    const owner = await recoverServerOwner(OWNER_SIGNATURE);
+    const stateStore = namedState("resume-at-open-test");
+    const { identity, gateway } = await fixture(stateStore, owner);
+    const lite = await openLite({
+      stateStore,
+      identity,
+      gateway,
+      storage: createMemoryPsLiteStorage(),
+      localDb: { openDriver: async () => db },
+      accountStorageMode: { owner, read: () => "switched" },
+      registrationReady: () => true,
+    });
+    try {
+      expect(localSync.legacyRetirer.resume).toHaveBeenCalledTimes(1);
+      expect(localSync.cycle).not.toHaveBeenCalled();
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
+  it("does not resume a legacy retirement at open while registration is held (no write authority)", async () => {
+    const db = driver();
+    const { localSync } = facade(db);
+    const owner = await recoverServerOwner(OWNER_SIGNATURE);
+    const stateStore = namedState("resume-held-test");
+    const { identity, gateway } = await fixture(stateStore, owner);
+    const lite = await openLite({
+      stateStore,
+      identity,
+      gateway,
+      storage: createMemoryPsLiteStorage(),
+      localDb: { openDriver: async () => db },
+      accountStorageMode: { owner, read: () => "switched" },
+      registrationReady: () => false,
+    });
+    try {
+      expect(localSync.legacyRetirer.resume).not.toHaveBeenCalled();
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
   it("treats a null host driver as stream sync unavailable in this process", async () => {
     const locks = stubBrowserLocks();
     const openDriver = vi.fn().mockResolvedValue(null);
@@ -519,10 +571,40 @@ describe("PS Lite local database composition", () => {
     }
   });
 
+  it("keeps custom storage without retirementRows usable and retirement unavailable", async () => {
+    const db = driver();
+    facade(db);
+    const storage: PsLiteStoragePort = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+    );
+    const { retirementRows: _retirementRows, ...custom } = storage;
+    const { lite } = await setup(
+      { openDriver: vi.fn().mockResolvedValue(db) },
+      undefined,
+      custom,
+    );
+    try {
+      expect(lite.localSync).not.toBeNull();
+      const options = vi.mocked(createLocalSync).mock.calls[0]![1];
+      expect(options.legacyRetire?.()).toBeUndefined();
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
   it("gives the local sync the erasure and legacy-delete ports of Lite's own delete path", async () => {
     const db = driver();
     facade(db);
-    const { lite } = await setup({ openDriver: vi.fn().mockResolvedValue(db) });
+    const { lite } = await setup(
+      { openDriver: vi.fn().mockResolvedValue(db) },
+      undefined,
+      await createOpenPersistentPsLiteStorage(
+        { kind: "custom" },
+        createMemoryPsLitePersistence(),
+      ),
+    );
     try {
       const options = vi.mocked(createLocalSync).mock.calls[0]![1];
       // A Web or phone delete erases storage objects and retires the legacy
@@ -541,10 +623,14 @@ describe("PS Lite local database composition", () => {
         metadataHash: "0xbb",
       };
       await legacy!.retire("notes.entries", head);
-      // The tombstone is fenced to the head the stage read.
+      // Ordinary connector deletion retains its main-branch fence contract.
       expect(deleteScope).toHaveBeenCalledWith("notes.entries", undefined, {
         fence: { head },
       });
+      const retirement = options.legacyRetire?.();
+      expect(retirement?.rows.capture).toEqual(expect.any(Function));
+      expect(retirement?.tombstone).toEqual(expect.any(Function));
+      expect(retirement?.eraseBlob).toEqual(expect.any(Function));
     } finally {
       await lite.syncManager.stop();
       await lite.closeStreamSync();

@@ -90,6 +90,10 @@ const dropRetainedPiecesSchema = [
   { sql: "DROP TABLE IF EXISTS retained_log_pieces" },
   { sql: "DROP TABLE IF EXISTS enumerated_logs" },
   { sql: "DROP TABLE IF EXISTS delete_tombstones" },
+  // The standalone legacy retirement's intent table.
+  { sql: "DROP TABLE IF EXISTS legacy_retirements" },
+  { sql: "DROP TABLE IF EXISTS legacy_retire_manifests" },
+  { sql: "DROP TABLE IF EXISTS legacy_retire_receipts" },
 ];
 const drivers: SqlDriver[] = [];
 afterEach(async () => {

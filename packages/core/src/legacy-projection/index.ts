@@ -48,6 +48,7 @@ export { classifyAsTestDebris } from "./test-debris.js";
 export {
   eraseLegacyScopesOf,
   legacyScopesOfConnector,
+  legacyStreamsOfScope,
 } from "./erase-connector.js";
 export type {
   LegacyProjectionWindow,
