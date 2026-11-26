@@ -228,6 +228,27 @@ describe("the write gate and the read selector share one answer", () => {
     }
   });
 
+  it.each([
+    { mode: "unknown" as const, status: 503, code: "ACCOUNT_MODE_UNKNOWN" },
+    { mode: "switched" as const, status: 426, code: "update_required" },
+  ])("refuses a $mode write before consuming a malformed body", async ({ mode, status, code }) => {
+    const request = new Request("https://ps.example/notes.entries", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "vana-stream-sync-client": "true",
+      },
+      body: "{",
+    });
+    const response = await handlePersonalServerDataRequest(
+      request,
+      dataDeps({ accountStorageMode: fixedOwnedAccountStorageMode(mode, OWNER_A) }),
+    );
+    expect(response.status).toBe(status);
+    expect((await response.json()).error.errorCode).toBe(code);
+    expect(request.bodyUsed).toBe(false);
+  });
+
   // GATE_AND_SELECTOR_DISAGREE
   it("refuses a legacy write with a retryable 503 when the mode is unknown", async () => {
     const write = await handlePersonalServerDataRequest(
