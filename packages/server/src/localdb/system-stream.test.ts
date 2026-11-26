@@ -1010,3 +1010,37 @@ it("publishes idle activity on the timer without waking for each record", async 
     vi.useRealTimers();
   }
 });
+
+it.each([
+  [{ timestamp: "not a timestamp" }, "Invalid access activity timestamp"],
+  [{ builder: "" }, "Invalid access activity field"],
+] as const)(
+  "refuses malformed writer input %j without leaving a partial event",
+  async (change, error) => {
+    const { createAccessActivity } =
+      await import("../../../core/src/logging/activity-stream.js");
+    const f = await fixture();
+    const activity = createAccessActivity(f.deps);
+    const entry = {
+      logId: crypto.randomUUID(),
+      grantId: "fixture-grant",
+      builder: owner,
+      action: "read" as const,
+      scope: "fixture.items",
+      timestamp: "2026-06-01T00:00:00.000Z",
+    };
+
+    await expect(activity.write({ ...entry, ...change })).rejects.toThrow(
+      error,
+    );
+    expect(await f.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+    expect(await f.db.query("SELECT * FROM system_stream_projection")).toEqual(
+      [],
+    );
+
+    await activity.write(entry);
+    expect(
+      await f.db.query("SELECT count(*) AS n FROM system_stream_outbox"),
+    ).toEqual([{ n: 1 }]);
+  },
+);
