@@ -248,3 +248,31 @@ describe("createAccessLogMiddleware", () => {
     expect(writer.write).toHaveBeenCalledOnce();
   });
 });
+
+describe("access log response and writer boundaries", () => {
+  it("does not record a redirect even when auth and grant context both exist", async () => {
+    const writer = createMockWriter();
+    const res = await createApp(writer, { status: 302 }).request(
+      "/v1/data/instagram.profile",
+    );
+
+    expect(res.status).toBe(302);
+    expect(writer.write).not.toHaveBeenCalled();
+  });
+
+  it("records the next successful read after the writer rejects once", async () => {
+    const writer = createMockWriter();
+    writer.write.mockRejectedValueOnce(
+      new Error("synthetic temporary write error"),
+    );
+    const app = createApp(writer);
+
+    expect((await app.request("/v1/data/instagram.profile")).status).toBe(200);
+    expect((await app.request("/v1/data/instagram.posts")).status).toBe(200);
+    expect(writer.write).toHaveBeenCalledTimes(2);
+    expect(writer.write.mock.calls[1][0]).toMatchObject({
+      scope: "instagram.posts",
+      grantId: "grant-123",
+    });
+  });
+});
