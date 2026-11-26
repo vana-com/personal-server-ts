@@ -2,6 +2,36 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AccessLogEntry } from "./access-log.js";
 
+/**
+ * Row-shape guard: a log line is valid JSON but not necessarily an
+ * AccessLogEntry (e.g. the single line `null`). Trusting the parsed
+ * value as-is lets a wrong-shape row reach the timestamp sort, where
+ * reading `.timestamp` throws a TypeError. Skip such rows, exactly
+ * like malformed JSON lines.
+ */
+function isAccessLogEntry(value: unknown): value is AccessLogEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const row = value as Record<string, unknown>;
+  for (const field of [
+    "logId",
+    "grantId",
+    "builder",
+    "action",
+    "scope",
+    "timestamp",
+    "ipAddress",
+    "userAgent",
+  ] as const) {
+    if (typeof row[field] !== "string") {
+      return false;
+    }
+  }
+  // A timestamp string alone is not enough: it must parse to a real date.
+  return !Number.isNaN(new Date(row.timestamp as string).getTime());
+}
+
 export interface AccessLogReadResult {
   logs: AccessLogEntry[];
   total: number;
@@ -52,8 +82,10 @@ export function createAccessLogReader(logsDir: string): AccessLogReader {
 
         for (const line of lines) {
           try {
-            const entry = JSON.parse(line) as AccessLogEntry;
-            allEntries.push(entry);
+            const entry: unknown = JSON.parse(line);
+            if (isAccessLogEntry(entry)) {
+              allEntries.push(entry);
+            }
           } catch {
             // Skip malformed lines
           }
