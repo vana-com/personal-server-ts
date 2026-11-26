@@ -35,58 +35,64 @@ export function createSyncStorageAdapter(
 ): BoundedStorageAdapter {
   const backend = params.config.storage.backend;
 
-  // Every `StorageBackend` value is named here; an unnamed one has no adapter
-  // and must not fall through to Vana Hosted Storage.
-  if (backend === "local" || backend === "vana") {
-    return createVanaSyncStorageAdapter({
-      config: params.config,
-      serverOwner: params.serverOwner,
-      serverAccount: params.serverAccount,
-      reads: params.reads,
-      audience: params.audience,
-      fetch: params.fetch,
-    });
-  }
-
-  if (backend === "gdrive") {
-    const gdriveConfig = params.config.storage.config.gdrive;
-    if (!gdriveConfig?.folderId) {
-      throw new Error(
-        "Google Drive storage backend requires storage.config.gdrive.folderId",
+  // Every `StorageBackend` value is mapped here. Only `gdrive` has its own
+  // adapter; the others use the hosted (Vana) adapter, as before this switch
+  // was explicit. A new schema value fails typecheck until it is mapped.
+  switch (backend) {
+    case "local":
+    case "vana":
+    case "ipfs":
+    case "dropbox":
+      return createVanaSyncStorageAdapter({
+        config: params.config,
+        serverOwner: params.serverOwner,
+        serverAccount: params.serverAccount,
+        reads: params.reads,
+        audience: params.audience,
+        fetch: params.fetch,
+      });
+    case "gdrive": {
+      const gdriveConfig = params.config.storage.config.gdrive;
+      if (!gdriveConfig?.folderId) {
+        throw new Error(
+          "Google Drive storage backend requires storage.config.gdrive.folderId",
+        );
+      }
+      if (!params.storageCredentials) {
+        throw new Error(
+          "Google Drive storage backend requires a host storageCredentials provider",
+        );
+      }
+      const chainId = params.config.gateway.chainId;
+      const primary = createGoogleDriveStorageAdapter({
+        folderId: gdriveConfig.folderId,
+        credentials: params.storageCredentials,
+        chainId,
+        apiBaseUrl: gdriveConfig.apiBaseUrl,
+        fetch: params.fetch,
+      });
+      if (!params.fallbackReadToVana) {
+        return primary;
+      }
+      const vanaFallback = createVanaSyncStorageAdapter({
+        config: params.config,
+        serverOwner: params.serverOwner,
+        serverAccount: params.serverAccount,
+        reads: params.reads,
+        audience: params.audience,
+        fetch: params.fetch,
+      });
+      return withVanaReadFallback(
+        primary,
+        vanaFallback,
+        `gdrive://${gdriveConfig.folderId}/chains/${chainId}/`,
       );
     }
-    if (!params.storageCredentials) {
-      throw new Error(
-        "Google Drive storage backend requires a host storageCredentials provider",
-      );
+    default: {
+      const unmapped: never = backend;
+      throw new Error(`Unknown storage backend "${String(unmapped)}"`);
     }
-    const chainId = params.config.gateway.chainId;
-    const primary = createGoogleDriveStorageAdapter({
-      folderId: gdriveConfig.folderId,
-      credentials: params.storageCredentials,
-      chainId,
-      apiBaseUrl: gdriveConfig.apiBaseUrl,
-      fetch: params.fetch,
-    });
-    if (!params.fallbackReadToVana) {
-      return primary;
-    }
-    const vanaFallback = createVanaSyncStorageAdapter({
-      config: params.config,
-      serverOwner: params.serverOwner,
-      serverAccount: params.serverAccount,
-      reads: params.reads,
-      audience: params.audience,
-      fetch: params.fetch,
-    });
-    return withVanaReadFallback(
-      primary,
-      vanaFallback,
-      `gdrive://${gdriveConfig.folderId}/chains/${chainId}/`,
-    );
   }
-
-  throw new Error(`No sync storage adapter for storage backend "${backend}"`);
 }
 
 function withVanaReadFallback(

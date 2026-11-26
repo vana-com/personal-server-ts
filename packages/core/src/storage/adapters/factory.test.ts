@@ -37,20 +37,20 @@ describe("createSyncStorageAdapter backend selection", () => {
     vanaCtor.mockClear();
   });
 
-  it.each(["local", "vana"])("%s uses Vana Hosted Storage", (backend) => {
-    createSyncStorageAdapter(paramsFor(backend));
-    expect(vanaCtor).toHaveBeenCalledTimes(1);
-    expect(gdriveCtor).not.toHaveBeenCalled();
-  });
-
-  it.each(["ipfs", "dropbox", "not-a-backend"])(
-    "%s has no adapter: it throws and constructs neither adapter",
+  it.each(["local", "vana", "ipfs", "dropbox"])(
+    "%s uses Vana Hosted Storage",
     (backend) => {
-      expect(() => createSyncStorageAdapter(paramsFor(backend))).toThrow(
-        /storage backend/i,
-      );
-      expect(vanaCtor).not.toHaveBeenCalled();
+      createSyncStorageAdapter(paramsFor(backend));
+      expect(vanaCtor).toHaveBeenCalledTimes(1);
       expect(gdriveCtor).not.toHaveBeenCalled();
     },
   );
+
+  it("a value outside the schema throws and constructs neither adapter", () => {
+    expect(() => createSyncStorageAdapter(paramsFor("not-a-backend"))).toThrow(
+      /storage backend/i,
+    );
+    expect(vanaCtor).not.toHaveBeenCalled();
+    expect(gdriveCtor).not.toHaveBeenCalled();
+  });
 });
