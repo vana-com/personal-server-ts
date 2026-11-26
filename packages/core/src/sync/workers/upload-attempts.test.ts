@@ -1,4 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  DEFAULT_CONFIG_PATH,
+  DEFAULT_DATA_DIR,
+  DEFAULT_ROOT_PATH,
+  DEFAULT_SERVER_DIR,
+  DEFAULT_VANA_DIR,
+  expandHomePath,
+  resolveRootPath,
+} from "../../config/index.js";
 
 import type { UploadWorkerDeps } from "./upload.js";
 import { uploadAll } from "./upload.js";
@@ -31,6 +40,24 @@ import {
   deriveScopeKey,
   encryptWithPassword,
 } from "@opendatalabs/vana-sdk/browser";
+
+// Config regressions share this registered check selector.
+describe("portable core config", () => {
+  it("defers host path expansion and resolution to the runtime", () => {
+    for (const input of ["~", "~/alternate/data", "./portable", "/absolute/path"]) {
+      expect(expandHomePath(input)).toBe(input);
+      expect(resolveRootPath(input)).toBe(input);
+    }
+  });
+
+  it("keeps the default root, child paths, and compatibility aliases aligned", () => {
+    expect(resolveRootPath()).toBe(DEFAULT_ROOT_PATH);
+    expect(DEFAULT_CONFIG_PATH).toBe(`${DEFAULT_ROOT_PATH}/config.json`);
+    expect(DEFAULT_DATA_DIR).toBe(`${DEFAULT_ROOT_PATH}/data`);
+    expect(DEFAULT_SERVER_DIR).toBe(DEFAULT_ROOT_PATH);
+    expect(DEFAULT_VANA_DIR).toBe(DEFAULT_ROOT_PATH);
+  });
+});
 
 const OWNER = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf12";
 const DATA_POINT_ID = `0x${"de".repeat(32)}`;
