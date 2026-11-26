@@ -206,6 +206,19 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
     expect(t.readFile).not.toHaveBeenCalled();
   });
 
+  it("does not read listing status when the mode moved during local acquisition", async () => {
+    const t = setup({ holdLocal: true });
+    const pending = t.app.request("/status", { headers });
+    try {
+      await vi.waitFor(() => expect(t.localEntered).toHaveBeenCalledTimes(1));
+      t.flip();
+    } finally {
+      t.releaseLocal();
+    }
+    await stopped(await pending);
+    expect(t.localSync.listing.status).not.toHaveBeenCalled();
+  });
+
   it("answers no counts when the mode moved while status was read", async () => {
     const t = setup({ holdStatus: true });
     const pending = t.app.request("/status", { headers });
