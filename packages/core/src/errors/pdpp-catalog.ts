@@ -108,9 +108,11 @@ export interface PdppErrorBody {
 
 /**
  * A PDPP §8 error. `status` is derived from `code` per the spec's Errors
- * table; callers should not need to pass it explicitly, but MAY override for
- * a future code this catalog doesn't yet know (fails loudly instead of
- * silently defaulting to 500 for a real, known code).
+ * table; callers should not need to pass it explicitly, but MAY override it
+ * via `options.status` for a future code this catalog doesn't yet know.
+ * An unknown code with no explicit status fails loudly (RangeError)
+ * instead of silently producing an error with no status or type; an
+ * unknown code with an explicit status is emitted with type "api_error".
  */
 export class PdppError extends Error {
   public readonly status: number;
@@ -121,13 +123,25 @@ export class PdppError extends Error {
   constructor(
     code: PdppErrorCode,
     message: string,
-    options?: { param?: string },
+    options?: { param?: string; status?: number },
   ) {
     super(message);
     this.name = "PdppError";
     this.code = code;
-    this.status = STATUS_BY_CODE[code];
-    this.type = TYPE_BY_CODE[code];
+    const status = STATUS_BY_CODE[code];
+    const type = TYPE_BY_CODE[code];
+    if (status === undefined || type === undefined) {
+      if (options?.status === undefined) {
+        throw new RangeError(
+          `Unknown PdppErrorCode "${code}": pass an explicit status override`,
+        );
+      }
+      this.status = options.status;
+      this.type = "api_error";
+    } else {
+      this.status = options?.status ?? status;
+      this.type = type;
+    }
     this.param = options?.param;
   }
 
