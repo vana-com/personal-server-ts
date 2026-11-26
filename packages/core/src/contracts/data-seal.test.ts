@@ -4,7 +4,11 @@
  * refusal (426 or 503), not an "incomplete write" it would log as a fault.
  */
 import { describe, expect, it } from "vitest";
-import { IngestPersistedError, ingestDataContract } from "./data.js";
+import {
+  IngestPersistedError,
+  ingestDataContract,
+  readDataContract,
+} from "./data.js";
 import {
   LegacyWriteRefusedError,
   legacyWriteRefusedErrorFor,
@@ -155,6 +159,62 @@ describe("conditional ingest never falls back to a two-step write", () => {
       },
     });
     expect(wrote).toBe(false);
+  });
+});
+
+describe("reading a version whose backing file cannot be opened", () => {
+  const scopeParam = "notes.entries";
+  const collectedAt = "2026-11-09T00:00:00.000Z";
+  async function indexedStorage() {
+    const storage = createMemoryDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
+    const result = await ingestDataContract({
+      storage,
+      scopeParam,
+      collectedAt,
+      body: { items: [] },
+      status: "stored",
+    });
+    expect(result.ok).toBe(true);
+    return storage;
+  }
+
+  it.each(["ENOENT", "ENOTDIR"])(
+    "returns a distinct missing-file response for an indexed version on %s",
+    async (code) => {
+      const storage = await indexedStorage();
+      const readEnvelope = storage.readEnvelope;
+      storage.readEnvelope = async () => {
+        throw Object.assign(new Error("fixture backing file unavailable"), {
+          code,
+        });
+      };
+      await expect(
+        readDataContract({ storage, scopeParam }),
+      ).resolves.toMatchObject({
+        ok: false,
+        status: 404,
+        body: { error: "DATA_FILE_MISSING" },
+      });
+      storage.readEnvelope = readEnvelope;
+      await expect(
+        readDataContract({ storage, scopeParam }),
+      ).resolves.toMatchObject({ ok: true });
+    },
+  );
+
+  it("does not present a genuine storage error as missing data", async () => {
+    const storage = await indexedStorage();
+    const failure = Object.assign(new Error("fixture I/O failed"), {
+      code: "EIO",
+    });
+    storage.readEnvelope = async () => {
+      throw failure;
+    };
+    await expect(readDataContract({ storage, scopeParam })).rejects.toBe(
+      failure,
+    );
   });
 });
 
