@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { loadOrCreateServerAccount } from "../keys/server-account.js";
 import { TunnelManager } from "./manager.js";
+import { CLAIM_TTL_SECONDS } from "./auth.js";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
@@ -215,6 +216,74 @@ describe("tunnel/manager", () => {
       it("connect without reserve rejects", async () => {
         await expect(manager.connect()).rejects.toThrow("Tunnel not reserved");
         expect(spawnMock).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("refresh", () => {
+      async function createExecutable(): Promise<string> {
+        const binaryPath = join(tempDir, "frpc");
+        await writeFile(binaryPath, "#!/bin/sh\n");
+        await chmod(binaryPath, 0o755);
+        return binaryPath;
+      }
+
+      async function createStartConfig() {
+        const owner = createTestWallet(0);
+        const serverKeypair = loadOrCreateServerAccount(
+          join(tempDir, "key.json"),
+        );
+        return {
+          walletAddress: serverKeypair.address,
+          ownerAddress: owner.address,
+          serverKeypair,
+          runId: "run-1",
+          serverAddr: "frpc.server.vana.org",
+          serverPort: 7000,
+          localPort: 8080,
+        };
+      }
+
+      it("does not spawn a new frpc process after stop() while a refresh is awaiting a fresh config", async () => {
+        vi.useFakeTimers();
+        try {
+          const proc = new FakeChildProcess();
+          spawnMock.mockReturnValue(proc);
+
+          const starting = manager.start(
+            await createStartConfig(),
+            await createExecutable(),
+          );
+          await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+          proc.stdout.emit("data", Buffer.from("start proxy success\n"));
+          const publicUrl = await starting;
+          expect(manager.getStatus()).toMatchObject({
+            status: "connected",
+            publicUrl,
+          });
+
+          // Fire the scheduled refresh without flushing microtasks, so the
+          // refresh suspends at `await writeFreshConfig(...)`.
+          vi.advanceTimersByTime(CLAIM_TTL_SECONDS * 0.8 * 1000);
+
+          // Stop while the refresh is in flight; the process exits on SIGTERM.
+          const stopping = manager.stop();
+          proc.emit("exit", 0);
+          await stopping;
+          expect(manager.getStatus()).toMatchObject({ status: "stopped" });
+
+          // Let the suspended refresh continuation run to completion.
+          await vi.advanceTimersByTimeAsync(11_000);
+
+          expect(spawnMock).toHaveBeenCalledTimes(1);
+          expect(manager.getStatus()).toMatchObject({ status: "stopped" });
+
+          // No refresh was rescheduled by the stopped refresh either.
+          vi.advanceTimersByTime(CLAIM_TTL_SECONDS * 0.8 * 1000 * 2);
+          await vi.advanceTimersByTimeAsync(0);
+          expect(spawnMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.useRealTimers();
+        }
       });
     });
   });

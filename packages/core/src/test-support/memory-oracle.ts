@@ -19,7 +19,8 @@
  * - The workload's resolved value must be JSON-serializable; it is returned as
  *   `result`. Anything the caller needs later must go to disk, not the heap.
  * - A workload that throws, or a child that dies (for example on a heap
- *   ceiling), rejects `run` with the child's stderr tail.
+ *   ceiling), rejects `run` with the child's stderr tail. A report line
+ *   that is not JSON, or is not shaped like a report, rejects `run` too.
  * - Linux only: reads `VmHWM` and `VmRSS` from `/proc/self/status` and resets
  *   `VmHWM` through `/proc/self/clear_refs` (needs kernel 4.0+).
  * - Garbage lag: Buffer churn is reclaimed only after a GC, and V8 lets external
@@ -322,7 +323,34 @@ function spawnChild(workload: Workload, gc: GcMode): Promise<ChildReport> {
         );
         return;
       }
-      resolve(JSON.parse(line.slice(LINE_PREFIX.length)) as ChildReport);
+      const payload = line.slice(LINE_PREFIX.length);
+      let report: unknown;
+      try {
+        report = JSON.parse(payload);
+      } catch (error) {
+        reject(
+          new Error(
+            `memory-oracle child for ${workload.exportName || "load-only"} ` +
+              `wrote an unreadable report: ${(error as Error).message}`,
+          ),
+        );
+        return;
+      }
+      if (
+        typeof report !== "object" ||
+        report === null ||
+        !Number.isFinite((report as ChildReport).hwmBytes) ||
+        !Number.isFinite((report as ChildReport).startBytes)
+      ) {
+        reject(
+          new Error(
+            `memory-oracle child for ${workload.exportName || "load-only"} ` +
+              `wrote a malformed report: ${payload.slice(0, 200)}`,
+          ),
+        );
+        return;
+      }
+      resolve(report as ChildReport);
     });
   });
 }

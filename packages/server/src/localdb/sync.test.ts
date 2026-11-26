@@ -19,6 +19,8 @@ const ports = vi.hoisted(() => ({
   replace: vi.fn(() => false),
   listing: vi.fn(),
   resolver: vi.fn(),
+  startErasures: vi.fn<() => Promise<readonly Promise<void>[]>>(async () => []),
+  retryOwed: vi.fn<() => Promise<boolean>>(async () => false),
 }));
 vi.mock("../../../core/src/localdb/cycle.js", () => ({
   runCycle: ports.cycle,
@@ -35,6 +37,10 @@ vi.mock("../../../core/src/localdb/delete.js", () => ({
     requestConnectionDelete: vi.fn(),
     resumeDeletes: vi.fn(async () => []),
     erasureOwed: () => false,
+    startDeletes: vi.fn(async () => []),
+    startErasures: ports.startErasures,
+    retryOwed: ports.retryOwed,
+    close: vi.fn(async () => {}),
     resumeErasures: vi.fn(async () => false),
     noteSettled: vi.fn(),
     noteSweepOwed: vi.fn(),
@@ -129,6 +135,40 @@ describe("local sync intake adapter", () => {
       stream: "items",
       data: { id: `r${first + i}` },
     }));
+
+  it("drains started erasures before resume rejects on a retry-state read error", async () => {
+    const problem = new Error("synthetic retry state unavailable");
+    let release!: () => void;
+    const erasure = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    ports.startErasures.mockResolvedValueOnce([erasure]);
+    ports.retryOwed.mockRejectedValueOnce(problem);
+    const { db, sync } = await setup();
+    let settled = false;
+    const resumed = sync.deleter.resumeDeletes().then(
+      () => {
+        settled = true;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(ports.startErasures).toHaveBeenCalledTimes(1);
+      expect(ports.retryOwed).toHaveBeenCalledTimes(1);
+      expect(settled).toBe(false);
+      release();
+      expect(await resumed).toBe(problem);
+    } finally {
+      release();
+      await resumed;
+      drivers.splice(drivers.indexOf(db), 1);
+      await sync.close();
+    }
+  });
 
   it("forwards the host name enumerator to both resolver and pending listing dependency", async () => {
     const aliasScopes = () => new Set(["fixture.alias"]).keys();

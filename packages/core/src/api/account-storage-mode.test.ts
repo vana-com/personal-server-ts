@@ -14,6 +14,10 @@ import {
   type PersonalServerDataApiDeps,
 } from "./index.js";
 import { accountModeUnknownResponse } from "./account-storage-mode.js";
+import {
+  legacyWriteRefusedErrorFor,
+  refuseLegacyWrite,
+} from "./legacy-write-gate.js";
 import { accountStorageModeOf } from "../sync/account-mode/index.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import {
@@ -281,5 +285,34 @@ describe("a read of an unswitched account", () => {
       });
     }
     expect(transcript).toMatchSnapshot();
+  });
+});
+
+describe("legacy refusal wire contracts", () => {
+  it("preserves the legacy and current response shapes for a switched account", async () => {
+    const refusal = refuseLegacyWrite({ read: () => "switched" });
+    expect(refusal?.status).toBe(426);
+    expect(refusal?.headers.get("cache-control")).toBe("no-store");
+    expect(refusal?.headers.get("upgrade")).toBe("vana-stream-sync");
+    const body = await refusal!.json();
+    expect(body.error.errorCode).toBe("update_required");
+    expect(body.error.code).toBe(426);
+    expect(body.errorCode).toBe(body.error.errorCode);
+    expect(body.message).toBe(body.error.message);
+  });
+
+  it("carries retryability and the unchanged wire response across the thrown refusal", async () => {
+    const paused = legacyWriteRefusedErrorFor("unknown");
+    const switched = legacyWriteRefusedErrorFor("switched");
+
+    expect(paused.verdict).toBe("unknown");
+    expect(paused.response.status).toBe(503);
+    expect(paused.response.headers.get("retry-after")).toBe("5");
+    expect((await paused.response.json()).error.errorCode).toBe(
+      "ACCOUNT_MODE_UNKNOWN",
+    );
+    expect(switched.verdict).toBe("switched");
+    expect(switched.response.status).toBe(426);
+    expect(switched.response.headers.get("retry-after")).toBe(null);
   });
 });

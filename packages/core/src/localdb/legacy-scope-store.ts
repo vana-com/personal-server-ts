@@ -40,6 +40,8 @@ import {
  * names (`source.id`); a target's own `sourceId` is the fallback for a
  * manifest that names none.
  *
+ * - `unreadable_scope`: a stored envelope required to admit this scope could not be read.
+ *
  * Versions are the layers, newest first. Reads are lazy and one version at a
  * time; the storage is only read, never written.
  */
@@ -51,7 +53,8 @@ export type LegacyScopeExclusionReason =
   | "source_conflict"
   | "ambiguous_declaration"
   | "shadowed_alias"
-  | "not_stream_rows";
+  | "not_stream_rows"
+  | "unreadable_scope";
 
 export interface LegacyScopeExclusion {
   readonly scope: string;
@@ -201,6 +204,23 @@ export function createLegacyScopeStore(
     signal?.throwIfAborted();
     return (await storage.readEnvelope(scope, collectedAt)).data;
   };
+  // Admission reads may exclude a whole scope. Keep layer reads strict:
+  // a failure once folding has begun must never masquerade as partial success.
+  const unreadable = Symbol("unreadable legacy scope");
+  const admissionBody = async (
+    scope: string,
+    collectedAt: string,
+  ): Promise<{ body: unknown } | typeof unreadable> => {
+    try {
+      return { body: await readBody(scope, collectedAt) };
+    } catch (error) {
+      signal?.throwIfAborted();
+      // An envelope erased since it was listed is the caller's to judge
+      // (a deleted connector is refused, anything else stops the scan).
+      if (isEnvelopeMissing(error)) throw error;
+      return unreadable;
+    }
+  };
   const versionsOf = (scope: string) => {
     signal?.throwIfAborted();
     return versionsNewestFirst(storage, scope);
@@ -259,10 +279,16 @@ export function createLegacyScopeStore(
           : (declaration.sourceId ?? t.sourceId);
       };
       /** The source ids of a scope's newest stored version. */
-      const newestSources = async (scope: string): Promise<Set<string>> => {
+      const newestSources = async (
+        scope: string,
+      ): Promise<Set<string> | typeof unreadable> => {
         const ids = new Set<string>();
         const newest = versionsOf(scope)[0];
-        if (newest) sourceIdsOf(await readBody(scope, newest.collectedAt), ids);
+        if (newest) {
+          const read = await admissionBody(scope, newest.collectedAt);
+          if (read === unreadable) return unreadable;
+          sourceIdsOf(read.body, ids);
+        }
         return ids;
       };
       /** The one target of a scope, or why there is none. A connector with no
@@ -280,6 +306,7 @@ export function createLegacyScopeStore(
         if (declared.length === 0) return "no_declaration";
         if (declared.length === 1) return declared[0]!;
         const ids = await newestSources(scope);
+        if (ids === unreadable) return "unreadable_scope";
         if (ids.size === 0) return "ambiguous_connector";
         if (ids.size > 1) return "source_conflict";
         const [id] = ids;
@@ -341,7 +368,7 @@ export function createLegacyScopeStore(
         entry.scopes.push(scope);
         byStream.set(key, entry);
       }
-      for (const {
+      streams: for (const {
         target,
         declaration,
         scopes,
@@ -385,19 +412,26 @@ export function createLegacyScopeStore(
         let sourceId: string | undefined;
         if (state !== "final") {
           try {
-            if (
-              plainRows(
-                await readBody(scope, newest.collectedAt),
-                target.stream,
-              ) === null
-            ) {
+            const latest = await admissionBody(scope, newest.collectedAt);
+            if (latest === unreadable) {
+              exclude(scope, "unreadable_scope");
+              continue;
+            }
+            if (plainRows(latest.body, target.stream) === null) {
               exclude(scope, "not_stream_rows");
               continue;
             }
             // Every stored layer must name the one source the connector claims.
             const ids = new Set<string>();
-            for (const version of versions)
-              sourceIdsOf(await readBody(scope, version.collectedAt), ids);
+            sourceIdsOf(latest.body, ids);
+            for (const version of versions.slice(1)) {
+              const read = await admissionBody(scope, version.collectedAt);
+              if (read === unreadable) {
+                exclude(scope, "unreadable_scope");
+                continue streams;
+              }
+              sourceIdsOf(read.body, ids);
+            }
             if (ids.size > 1) {
               exclude(scope, "source_conflict");
               continue;

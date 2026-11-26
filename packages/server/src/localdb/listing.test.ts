@@ -209,6 +209,7 @@ describe("local listing #597", () => {
           connector: "sample",
           ns: "",
           control: "absent",
+          generation: 1,
           streams: {
             items: {
               tombstoned: false,

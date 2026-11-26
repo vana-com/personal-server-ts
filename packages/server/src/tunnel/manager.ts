@@ -64,6 +64,12 @@ export class TunnelManager {
   private binaryPath: string | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private refreshing = false;
+  /**
+   * Incremented by stop(). A refresh already in flight compares the value
+   * it captured at entry and aborts instead of spawning a replacement
+   * process or rescheduling itself after a stop.
+   */
+  private generation = 0;
 
   constructor(storageRoot: string) {
     this.storageRoot = storageRoot;
@@ -146,6 +152,9 @@ export class TunnelManager {
    */
   async stop(): Promise<void> {
     this.clearRefreshTimer();
+    // Fence any refresh already in flight: it must not spawn a child or
+    // reschedule itself after this stop.
+    this.generation++;
 
     if (!this.process) {
       return;
@@ -394,22 +403,31 @@ export class TunnelManager {
   private async refreshClaim(): Promise<void> {
     if (!this.config || !this.binaryPath) return;
 
+    const generation = this.generation;
     const subdomain = this.config.walletAddress.toLowerCase();
 
     try {
       const configPath = await this.writeFreshConfig(subdomain);
+      // stop() may have run while the fresh config was being written.
+      if (generation !== this.generation) return;
 
       // Stop old process (suppress status change during restart)
       this.refreshing = true;
       await this.killProcess();
       this.refreshing = false;
+      // stop() may have run while the old process was shutting down.
+      if (generation !== this.generation) return;
 
       this.status = "starting";
       await this.spawnProcess(configPath);
+      // stop() may have run while the replacement process was starting.
+      if (generation !== this.generation) return;
 
       this.scheduleRefresh();
     } catch {
       this.refreshing = false;
+      // A stop during the refresh must not schedule a retry.
+      if (generation !== this.generation) return;
       // Retry sooner on failure
       this.refreshTimer = setTimeout(
         () => void this.refreshClaim(),
