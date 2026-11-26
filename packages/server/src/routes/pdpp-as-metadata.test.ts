@@ -26,7 +26,6 @@ import {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
-  PDPP_API_VERSION,
   AuthorizationSessionStore,
   openPdppAuthStore,
   PdppTokenService,
@@ -107,7 +106,8 @@ describe("PDPP AS metadata", () => {
       expect(body.revocation_endpoint).toBe(
         "https://ps.example.com/pdpp/v1/revoke",
       );
-      expect(body.pdpp_api_version).toBe(PDPP_API_VERSION);
+      // AS endpoints are not versioned by PDPP-Version (spec-core §8).
+      expect(body).not.toHaveProperty("pdpp_api_version");
     } finally {
       cleanup();
     }

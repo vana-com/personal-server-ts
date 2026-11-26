@@ -1270,3 +1270,59 @@ describe.each(backends)(
     });
   },
 );
+
+describe("pdpp blobs: PDPP-Version (spec-core §8, RS item 11)", () => {
+  function ownerBlobApp() {
+    const store = backends[0]!.createStore();
+    store.putBlobMeta({ blobId: "blob_1", mimeType: "image/jpeg", sizeBytes: 10, sha256: "abc" });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    return pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1", instanceIds: ["inst_1"] },
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_1"],
+      readBlobBytes: async () => new Uint8Array(10),
+    });
+  }
+
+  it("echoes the selected 0.1 contract on a blob response", async () => {
+    const res = await ownerBlobApp().request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok", "PDPP-Version": "0.1" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("PDPP-Version")).toBe("0.1");
+  });
+
+  it("refuses an unsupported version without disclosing the blob or echoing a version", async () => {
+    const res = await ownerBlobApp().request("/blob_1", {
+      headers: { Authorization: "Bearer owner-tok", "PDPP-Version": "2026-04-06" },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("unsupported_version");
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+    expect(res.headers.get("Content-Type")).toMatch(/json/);
+  });
+
+  it("answers 401 for a missing token even when the version is invalid", async () => {
+    const res = await ownerBlobApp().request("/blob_1", {
+      headers: { "PDPP-Version": '"0.1"' },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+});

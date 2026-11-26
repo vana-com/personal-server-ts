@@ -1,6 +1,5 @@
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
-  assertSupportedPdppVersion,
   listPdppRecords,
   resolveOwnerSource,
   localRecord,
@@ -23,6 +22,11 @@ import {
   type createSqliteRecordStore,
 } from "../storage/pdpp-records-sqlite-store.js";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
+import {
+  pdppVersionFailure,
+  pdppVersionMiddleware,
+  versionedHeaders,
+} from "./pdpp-version-negotiation.js";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type {
   PdppAuthorizationService,
@@ -481,10 +485,7 @@ function sendError(c: Context, err: PdppError, reqId: string) {
   // bare 401 with no `WWW-Authenticate` and no pointer to the metadata it
   // needed in order to re-authorize. Attaching it here rather than at each
   // call site means a future 401 path cannot forget it.
-  const headers: Record<string, string> = {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-  };
+  const headers = versionedHeaders(c, { "Request-Id": reqId }, PDPP_VERSION);
   if (err instanceof PdppAuthorizationUnavailableError) {
     headers["Retry-After"] = String(err.retryAfterSeconds);
   }
@@ -521,11 +522,18 @@ function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
     "authentication_error",
     "Missing or invalid access token",
   );
-  return c.json(err.toJSON(reqId), 401, {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-    "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`,
-  });
+  return c.json(
+    err.toJSON(reqId),
+    401,
+    versionedHeaders(
+      c,
+      {
+        "Request-Id": reqId,
+        "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`,
+      },
+      PDPP_VERSION,
+    ),
+  );
 }
 
 /**
@@ -844,18 +852,21 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
     }
 
+    const versionFailure = pdppVersionFailure(c);
+    if (versionFailure && context?.active) {
+      return { error: sendError(c, versionFailure, reqId) };
+    }
+
     return { context };
   }
 
-  // PDPP-Version negotiation: only PDPP_VERSION is supported in v0.1.
-  app.use("*", async (c, next) => {
-    try {
-      assertSupportedPdppVersion(c.req.header("PDPP-Version"));
-    } catch (error) {
-      return sendError(c, error as PdppError, requestId());
-    }
-    await next();
-  });
+  // PDPP-Version negotiation (spec-core §8 "API versioning"). The outcome is
+  // recorded here and reported by `authenticate` once the token is active,
+  // so an inactive token still gets its 401 first.
+  app.use(
+    "*",
+    pdppVersionMiddleware((c, error) => sendError(c, error, requestId())),
+  );
 
   /**
    * The declaration a read of `stream` is measured against.

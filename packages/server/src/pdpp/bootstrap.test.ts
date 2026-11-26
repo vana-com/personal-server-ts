@@ -757,42 +757,31 @@ describe("review C5 — /authorize binds an authenticated owner", () => {
   });
 });
 
-describe("review C1 — PDPP-Version is the spec's HTTP contract version", () => {
+describe("review C1 — PDPP-Version is the RS HTTP contract version only", () => {
   beforeEach(async () => {
     await seedScope("spotify.top_artists");
     ctx = await boot(pdppConfig([await writeDeclaration()]));
   });
 
-  it("accepts the normative header value from Core §8", async () => {
-    // Core §8 "API versioning" states `PDPP-Version: 2026-04-06`. The AS
-    // previously advertised the GRANT SCHEMA version here, which §7 says must
-    // not be conflated with the HTTP contract version — so a client pinning
-    // the spec's own value could reach the RS but not the AS.
-    const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${ctx!.devToken}`,
-        "content-type": "application/json",
-        "pdpp-version": "2026-04-06",
-      },
-      body: JSON.stringify(await ownerTokenRequestBody()),
-    });
-    expect(response.status).toBe(200);
-    expect(response.headers.get("pdpp-version")).toBe("2026-04-06");
-  });
-
-  it("rejects the grant schema version as an API version", async () => {
-    const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${ctx!.devToken}`,
-        "content-type": "application/json",
-        "pdpp-version": "0.1.0",
-      },
-      body: JSON.stringify(await ownerTokenRequestBody()),
-    });
-    expect(response.status).toBe(400);
-    expect((await response.json()).error).toBe("unsupported_version");
+  it("does not negotiate PDPP-Version on AS endpoints (spec-core §8)", async () => {
+    // Locked v0.1.0: PDPP-Version selects the RS HTTP contract only; it "does
+    // not negotiate OAuth authorization, token, revocation, introspection, or
+    // grant lifecycle endpoints". So any value — the pre-lock date, the grant
+    // schema version, or the RS identifier — leaves the AS response unchanged
+    // and the AS echoes none.
+    for (const value of ["2026-04-06", "0.1.0", "0.1"]) {
+      const response = await ctx!.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/json",
+          "pdpp-version": value,
+        },
+        body: JSON.stringify(await ownerTokenRequestBody()),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("pdpp-version")).toBeNull();
+    }
   });
 });
 

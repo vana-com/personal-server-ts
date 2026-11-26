@@ -45,23 +45,6 @@ export const PDPP_GRANT_VERSION = "0.1.0";
 export const PDPP_GRANT_VERSION_V02 = "0.2.0";
 
 /**
- * The PDPP HTTP API contract version, sent and echoed in the `PDPP-Version`
- * header. Normative value from Core §8 "API versioning".
- *
- * §7 "Version layering" is explicit that the three version axes MUST NOT be
- * conflated, and this is the one that is easiest to get wrong: it is the HTTP
- * *contract* version, not `PDPP_GRANT_VERSION` (the grant schema, `0.1.0`) and
- * not `source_declaration.version` (an opaque declaration revision). This
- * previously carried the grant schema version, which meant a client pinning
- * the spec's own header value was rejected by the AS while the RS accepted it —
- * a client could reach only half the server.
- *
- * Both the AS and RS surfaces import this one constant so they cannot drift
- * apart again.
- */
-export const PDPP_API_VERSION = "2026-04-06";
-
-/**
  * The one purpose code Core gives a protocol-level consent requirement
  * (§6 "AI training consent"). Every other code is a structured policy
  * declaration the AS displays but does not gate on.

@@ -4,6 +4,11 @@ import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
+import {
+  pdppVersionFailure,
+  pdppVersionMiddleware,
+  versionedHeaders,
+} from "./pdpp-version-negotiation.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
@@ -63,14 +68,13 @@ function jsonError(
   // Every 401 carries the challenge, not just the missing-token branch: a
   // client holding a STALE token is exactly who needs the pointer back to the
   // metadata document in order to re-authorize.
-  const headers: Record<string, string> = {
+  const headers: Record<string, string> = versionedHeaders(c, {
     "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
     ...(err.status === 401 && {
       "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
     }),
     ...extraHeaders,
-  };
+  }, PDPP_VERSION);
   if (err instanceof PdppAuthorizationUnavailableError) {
     headers["Retry-After"] = String(err.retryAfterSeconds);
   }
@@ -83,6 +87,12 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     if (error instanceof PdppError) return jsonError(c, error, requestId());
     throw error;
   });
+  // The blob endpoint is a Core RS operation, so it negotiates PDPP-Version
+  // like every other one (spec-core §8; RS item 11).
+  app.use(
+    "*",
+    pdppVersionMiddleware((c, error) => jsonError(c, error, requestId())),
+  );
   const readsFor = deps.reads ?? (() => deps.store);
 
   /**
@@ -132,6 +142,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       const err = new PdppError("authentication_error", "Invalid access token");
       return { error: jsonError(c, err, reqId) };
     }
+    // Version is reported only once the token is active (spec-core §8).
+    const versionFailure = pdppVersionFailure(c);
+    if (versionFailure) return { error: jsonError(c, versionFailure, reqId) };
 
     // DELETE removes the grant's record references and claim rows. Check its
     // connection before blob metadata so callers still get the K7 refusal.

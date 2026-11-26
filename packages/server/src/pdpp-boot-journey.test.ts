@@ -459,55 +459,55 @@ describe("PDPP boot journey: real createServer", () => {
   });
 
   /**
-   * One client, one `PDPP-Version`, both halves of the same server.
+   * One client, one `PDPP-Version`, against the locked v0.1.0 contract.
    *
-   * The two lanes picked version constants independently and of different
-   * kinds — the AS used `PDPP_API_VERSION = "0.1.0"` (semver), the RS routes
-   * used `PDPP_VERSION = "2026-04-06"` (a date). Both surfaces hard-reject an
-   * unrecognized value, so before this was unified a client pinning either
-   * one could reach only half the server:
-   *
-   *   AS + "0.1.0"      -> 201     AS + "2026-04-06" -> 400 unsupported_version
-   *   RS + "2026-04-06" -> 200     RS + "0.1.0"      -> 400 unsupported_version
-   *
-   * Every existing test missed it by omitting the header or by sending the
-   * value matching the one surface under test. This sends ONE header to BOTH
-   * halves, which is the only shape that catches a divergence.
+   * The RS selects `0.1` (absent field → `0.1`; exact `0.1` accepted and
+   * echoed; `2026-04-06`, the value this server used before the lock, is
+   * "not an alias" and is refused with no PDPP-Version echoed). The AS does
+   * not negotiate the field at all (spec-core §8), so the same header sent to
+   * an AS endpoint changes nothing there.
    */
-  it("negotiates one PDPP-Version across both the AS and the RS", async () => {
+  it("negotiates PDPP-Version 0.1 on the RS and ignores it on the AS", async () => {
     ctx = await boot();
     const { accessToken } = await obtainGrantBoundToken(ctx);
     const owner = await ownerToken(ctx);
 
-    // Whatever the server echoes is the version a real client would pin.
-    const probe = await ctx.app.request("/v1/streams", {
+    const absent = await ctx.app.request("/v1/streams", {
       headers: { authorization: `Bearer ${accessToken}` },
     });
-    const negotiated = probe.headers.get("PDPP-Version");
-    expect(negotiated).toBeTruthy();
+    expect(absent.status).toBe(200);
+    expect(absent.headers.get("PDPP-Version")).toBe("0.1");
 
-    // The RS accepts it and echoes it back.
-    const rs = await ctx.app.request("/v1/streams", {
+    const exact = await ctx.app.request("/v1/streams", {
       headers: {
         authorization: `Bearer ${accessToken}`,
-        "PDPP-Version": negotiated!,
+        "PDPP-Version": "0.1",
       },
     });
-    expect(rs.status).toBe(200);
-    expect(rs.headers.get("PDPP-Version")).toBe(negotiated);
+    expect(exact.status).toBe(200);
+    expect(exact.headers.get("PDPP-Version")).toBe("0.1");
 
-    // The AS must accept the SAME value, not a different one.
+    const legacy = await ctx.app.request("/v1/streams", {
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "PDPP-Version": "2026-04-06",
+      },
+    });
+    expect(legacy.status).toBe(400);
+    expect((await legacy.json()).error.code).toBe("unsupported_version");
+    expect(legacy.headers.get("PDPP-Version")).toBeNull();
+
     const as = await ctx.app.request("/pdpp/v1/introspect", {
       method: "POST",
       headers: {
         authorization: `Bearer ${owner}`,
         "content-type": "application/x-www-form-urlencoded",
-        "PDPP-Version": negotiated!,
+        "PDPP-Version": "2026-04-06",
       },
       body: new URLSearchParams({ token: accessToken }).toString(),
     });
     expect(as.status).toBe(200);
-    expect(as.headers.get("PDPP-Version")).toBe(negotiated);
+    expect(as.headers.get("PDPP-Version")).toBeNull();
   });
 
   /**

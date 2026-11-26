@@ -1214,6 +1214,72 @@ describe("pdpp records routes: version negotiation", () => {
   });
 });
 
+describe("pdpp records routes: locked v0.1.0 PDPP-Version rules (spec-core §8)", () => {
+  const ownerApp = () =>
+    buildApp({
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
+    }).app;
+
+  it("selects 0.1 when the field is absent and echoes exactly one value", async () => {
+    const res = await ownerApp().request("/streams", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("PDPP-Version")).toBe("0.1");
+  });
+
+  it.each(["2026-04-06", "0.1.0", "v0.1"])(
+    "refuses the non-alias %s with unsupported_version, param PDPP-Version, and no PDPP-Version echoed",
+    async (value) => {
+      const res = await ownerApp().request("/streams", {
+        headers: { Authorization: "Bearer owner-tok", "PDPP-Version": value },
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("unsupported_version");
+      expect(body.error.param).toBe("PDPP-Version");
+      expect(res.headers.get("PDPP-Version")).toBeNull();
+    },
+  );
+
+  it.each(['"0.1"', "0.1, 0.1", ""])(
+    "rejects the malformed field %j with invalid_request and no PDPP-Version echoed",
+    async (value) => {
+      const res = await ownerApp().request("/streams", {
+        headers: { Authorization: "Bearer owner-tok", "PDPP-Version": value },
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("invalid_request");
+      expect(body.error.param).toBe("PDPP-Version");
+      expect(res.headers.get("PDPP-Version")).toBeNull();
+    },
+  );
+
+  it("still answers 401 with the Bearer challenge for a missing token, before the version error", async () => {
+    const res = await ownerApp().request("/streams", {
+      headers: { "PDPP-Version": "2026-04-06" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toMatch(/^Bearer /);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+
+  it("still answers 401 for an inactive token, before the version error", async () => {
+    const { app } = buildApp({ "dead-tok": { active: false } as never });
+    const res = await app.request("/streams", {
+      headers: { Authorization: "Bearer dead-tok", "PDPP-Version": "9" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+});
+
 describe("pdpp records routes: pagination limit clamping", () => {
   it("clamps a limit above 100 and reports limit_clamped without erroring", async () => {
     const { app } = buildApp({

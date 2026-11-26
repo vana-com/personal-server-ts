@@ -161,5 +161,5 @@ export interface PdppGetRecordParams {
 
 /** Spec §8 API versioning: request/response header name and stable value used by this client. */
 export const PDPP_VERSION_HEADER = "PDPP-Version";
-export const PDPP_VERSION = "2026-04-06";
+export const PDPP_VERSION = "0.1";
 export const PDPP_REQUEST_ID_HEADER = "Request-Id";

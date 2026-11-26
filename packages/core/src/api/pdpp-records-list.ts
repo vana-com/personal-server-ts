@@ -2,7 +2,7 @@ import {
   decodeBase64UrlUtf8,
   encodeBase64UrlUtf8,
 } from "../encoding/base64url.js";
-import { PDPP_VERSION } from "../pdpp-version.js";
+import { negotiatePdppVersion } from "../pdpp-version.js";
 import { grantIsCandidate } from "../pdpp/types.js";
 import type { OwnedAccountStorageMode } from "./account-storage-mode.js";
 import { PdppError } from "../errors/pdpp-catalog.js";
@@ -555,19 +555,23 @@ function readDeclaration(
 }
 
 /**
- * Version negotiation for every PDPP request: only `PDPP_VERSION` is
- * supported. Both hosts call it before authentication or any query. An
- * absent or empty header is accepted.
+ * `PDPP-Version` negotiation for a Core RS operation (spec-core §8 "API
+ * versioning"). Returns the selected contract, or throws the 400 the spec
+ * names: `invalid_request` for a malformed field, `unsupported_version` for
+ * a valid identifier this server does not implement. Both carry
+ * `param: "PDPP-Version"`. A failed negotiation selects no contract, so the
+ * caller MUST omit `PDPP-Version` from the error response.
  */
 export function assertSupportedPdppVersion(
   requested: string | null | undefined,
-): void {
-  if (requested && requested !== PDPP_VERSION) {
-    throw new PdppError(
-      "unsupported_version",
-      `Unsupported PDPP-Version '${requested}'`,
-    );
+): string {
+  const result = negotiatePdppVersion(requested);
+  if (!result.ok) {
+    throw new PdppError(result.code, result.message, {
+      param: "PDPP-Version",
+    });
   }
+  return result.selected;
 }
 
 /** The connector a registered source id names: its last path segment. */

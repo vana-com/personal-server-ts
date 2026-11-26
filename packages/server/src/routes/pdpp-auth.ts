@@ -54,7 +54,6 @@ import {
   approveAuthorization,
   denyAuthorization,
   fetchReview,
-  PDPP_API_VERSION,
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
@@ -360,22 +359,6 @@ function scopedOwnerFailureResponse(c: Context, failure: ApprovalFailure) {
 }
 
 /**
- * Negotiate `PDPP-Version` (§7 version layering, §9 AS item 17).
- *
- * An absent header selects the current stable version. An unsupported one is
- * a 400 `unsupported_version` — not a silent downgrade, because a client that
- * asked for a version it needs must not be handed a different contract.
- */
-function negotiateVersion(
-  c: Context,
-): { ok: true } | { ok: false; requested: string } {
-  const requested = c.req.header("pdpp-version");
-  if (!requested) return { ok: true };
-  if (requested !== PDPP_API_VERSION) return { ok: false, requested };
-  return { ok: true };
-}
-
-/**
  * The PDPP AS metadata document, as a handler both of its locations share.
  *
  * Exported because the two URLs it is served at live in different routers: the
@@ -424,7 +407,6 @@ export function pdppAsMetadataHandler(
         // are public clients, so an intercepted code without a verifier is
         // redeemable by whoever intercepted it.
         code_challenge_methods_supported: ["S256"],
-        pdpp_api_version: PDPP_API_VERSION,
       },
       200,
       NO_STORE,
@@ -435,20 +417,11 @@ export function pdppAsMetadataHandler(
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
 
-  // The selected version echoes back on every response (§9 AS item 17).
-  app.use("*", async (c, next) => {
-    const version = negotiateVersion(c);
-    if (!version.ok) {
-      return errorResponse(
-        c,
-        400,
-        "unsupported_version",
-        `PDPP-Version '${version.requested}' is not supported; this server implements ${PDPP_API_VERSION}`,
-      );
-    }
-    await next();
-    c.header("PDPP-Version", PDPP_API_VERSION);
-  });
+  // No PDPP-Version negotiation here: "It does not negotiate OAuth
+  // authorization, token, revocation, introspection, or grant lifecycle
+  // endpoints" (spec-core §8 "API versioning"; §9 AS item 17 is "Not used").
+  // A PDPP-Version field on an AS request is ignored, and AS responses carry
+  // none.
 
   // The owner-proof chain, when a deployment wires one. `web3-auth` verifies
   // the Web3Signed wallet signature and populates `c.get("auth")`;

@@ -18,7 +18,6 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
-  PDPP_API_VERSION,
   PDPP_DATA_ACCESS_TYPE,
   PdppTokenService,
   type DeclarationSnapshot,
@@ -525,8 +524,11 @@ describe("§9 AS item 5 — Source validation failures map to RFC 9396", () => {
   });
 });
 
-describe("§9 AS item 17 — PDPP-Version negotiation", () => {
-  it("returns 400 unsupported_version for a version it does not implement", async () => {
+describe("§8 API versioning — the AS does not negotiate PDPP-Version", () => {
+  // spec-core §8: PDPP-Version "does not negotiate OAuth authorization, token,
+  // revocation, introspection, or grant lifecycle endpoints"; §9 AS item 17
+  // is "Not used".
+  it("ignores a PDPP-Version field on an AS request, even an unknown one", async () => {
     const response = await app.request("/pdpp/v1/authorize", {
       method: "POST",
       headers: {
@@ -535,18 +537,13 @@ describe("§9 AS item 17 — PDPP-Version negotiation", () => {
       },
       body: JSON.stringify(selectionBody()),
     });
-    expect(response.status).toBe(400);
-    expect((await response.json()).error).toBe("unsupported_version");
+    expect(response.status).not.toBe(400);
   });
 
-  it("echoes the selected version on a response", async () => {
-    const response = await post("/pdpp/v1/authorize", selectionBody());
-    expect(response.headers.get("pdpp-version")).toBe(PDPP_API_VERSION);
-  });
-
-  it("accepts an absent version header and uses the current stable version", async () => {
+  it("does not echo PDPP-Version on AS responses", async () => {
     const response = await post("/pdpp/v1/authorize", selectionBody());
     expect(response.status).toBe(201);
+    expect(response.headers.get("pdpp-version")).toBeNull();
   });
 });
 
