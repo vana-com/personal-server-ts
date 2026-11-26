@@ -864,7 +864,9 @@ it("does not seed rows after a non-deletion receipt lookup failure", async () =>
     }),
     manifests: () => [manifest],
   });
-  await expect(live.run(new AbortController().signal)).rejects.toBe(unavailable);
+  await expect(live.run(new AbortController().signal)).rejects.toBe(
+    unavailable,
+  );
   expect(live.report()).toBeNull();
   expect(puts).toEqual([]);
   expect(scopes.get("spotify.saved_tracks")).toHaveLength(1);
