@@ -14,7 +14,10 @@ import { createLocalSync } from "./sync.js";
 
 const owner = `0x${"11".repeat(20)}` as const;
 
-function driver(path: string): SqlDriver {
+function driver(
+  path: string,
+  read?: (sql: string, rows: unknown) => unknown,
+): SqlDriver {
   const db = new Database(path);
   const execute = (sql: string, params: readonly SqlValue[] = []) => {
     const stmt = db.prepare(sql);
@@ -28,7 +31,8 @@ function driver(path: string): SqlDriver {
       persistent: true,
     },
     async query(sql, params) {
-      return execute(sql, params) as never;
+      const rows = execute(sql, params);
+      return (read ? read(sql, rows) : rows) as never;
     },
     async batch(statements: readonly SqlStatement[]) {
       const changes = db.transaction(() =>
@@ -62,11 +66,11 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
 });
 
-async function open() {
+async function open(read?: (sql: string, rows: unknown) => unknown) {
   mkdirSync(join(homedir(), ".tmp"), { recursive: true });
   const root = mkdtempSync(join(homedir(), ".tmp", "listing-generation-"));
   roots.push(root);
-  const db = await openLocalDb(driver(join(root, "data.db")), {
+  const db = await openLocalDb(driver(join(root, "data.db"), read), {
     owner,
     network: "test",
     deviceId: "device",
@@ -107,6 +111,61 @@ async function open() {
   );
   return sync;
 }
+
+it("does not certify completeness from an older control read than the head read", async () => {
+  let armed = false;
+  let sawHeadStatement = false;
+  const sync = await open((sql, rows) => {
+    if (!armed || !Array.isArray(rows)) return rows;
+    if (/\bstream_state\b/.test(sql)) sawHeadStatement = true;
+    if (!sawHeadStatement) return rows;
+    // Model the control as pending-delete when the head read starts. A
+    // standalone earlier control read cannot observe this newer snapshot.
+    return rows.map((row) =>
+      Object.hasOwn(row, "control_state")
+        ? { ...row, control_state: "deleted" }
+        : row,
+    );
+  });
+  try {
+    const run = "snapshot-fixture";
+    await sync.intake.begin(run, {
+      connector: "fixture",
+      artifactDigest: "fixture",
+      owner: { address: owner, leaseId: null },
+      connect: true,
+    });
+    await sync.intake.batch(run, {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "one" } }],
+    });
+    await sync.intake.end(run, {
+      finish: "completed",
+      streams: { items: observed },
+      checkpoints: { items: { cursor: "a" } },
+      lastBatch: 0,
+    });
+    await sync.publish();
+    expect(
+      (await sync.listing.status()).connections[0]?.streams.items,
+    ).toMatchObject({
+      live: true,
+      complete: true,
+      records: 1,
+    });
+    armed = true;
+    const row = (await sync.listing.status()).connections[0];
+    expect(sawHeadStatement).toBe(true);
+    expect(row?.control).toBe("deleted");
+    expect(row?.streams.items).toMatchObject({
+      live: false,
+      complete: false,
+      records: null,
+    });
+  } finally {
+    await sync.close();
+  }
+});
 
 it("plain owner status distinguishes a reconnect with identical stream head and record count", async () => {
   const sync = await open();

@@ -9,6 +9,33 @@ import {
 import { loadOrCreatePsLiteServerIdentity } from "./state.js";
 import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { createPsLiteSyncManager } from "./sync.js";
+import type * as CoreLocalDb from "@opendatalabs/personal-server-ts-core/localdb";
+
+const retirementFixture = vi.hoisted(() => ({
+  waitAtOpen: undefined as (() => Promise<void>) | undefined,
+}));
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/localdb",
+  async (loadOriginal) => {
+    const real = await loadOriginal<typeof CoreLocalDb>();
+    return {
+      ...real,
+      createLocalSync(...args: Parameters<typeof real.createLocalSync>) {
+        const sync = real.createLocalSync(...args);
+        const wait = retirementFixture.waitAtOpen;
+        if (wait) {
+          vi.spyOn(sync.legacyRetirer, "resume").mockImplementation(
+            async () => {
+              await wait();
+              return [] as never;
+            },
+          );
+        }
+        return sync;
+      },
+    };
+  },
+);
 
 it.each([undefined, () => true])(
   "an unregistered gateway response captures nothing and sends no delete (callback=%s)",
@@ -217,6 +244,7 @@ it("keeps retirement closed when an older startup lookup confirms after a missin
 
 async function openSwitchedLite(
   getServer: () => Promise<{ id: string } | null>,
+  readMode: () => "switched" | "unswitched" = () => "switched",
 ) {
   const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
   const ownerSignature = await owner.signMessage({
@@ -238,7 +266,7 @@ async function openSwitchedLite(
     autoStartSync: false,
     registrationReady: () => true,
     localDb: { openDriver: async () => db },
-    accountStorageMode: { owner: owner.address, read: () => "switched" },
+    accountStorageMode: { owner: owner.address, read: readMode },
     stateStore,
     storage,
     ownerSignature,
@@ -270,31 +298,83 @@ it("close waits for a retirement step the registration check started", async () 
       await step;
       return [] as never;
     });
-  confirm({ id: "registered" });
-  await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
-  let closed = false;
-  const closing = lite.closeStreamSync().then(() => {
-    closed = true;
-  });
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  expect(closed).toBe(false);
-  expect(closeDb).not.toHaveBeenCalled();
-  releaseStep();
-  await closing;
+  let closing: Promise<void> | undefined;
+  try {
+    confirm({ id: "registered" });
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+    let closed = false;
+    closing = lite.closeStreamSync().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(closed).toBe(false);
+    expect(closeDb).not.toHaveBeenCalled();
+  } finally {
+    releaseStep();
+    await (closing ?? lite.closeStreamSync());
+  }
   expect(closeDb).toHaveBeenCalledOnce();
 });
 
 it("a registration that confirms after close starts no retirement", async () => {
   let confirm!: (value: { id: string }) => void;
-  const { lite } = await openSwitchedLite(
+  const { lite, closeDb } = await openSwitchedLite(
     () =>
       new Promise<{ id: string }>((resolve) => {
         confirm = resolve;
       }),
   );
   const resume = vi.spyOn(lite.localSync!.legacyRetirer, "resume");
-  const closing = lite.closeStreamSync();
-  confirm({ id: "registered" });
-  await closing;
+  let closed = false;
+  const closing = lite.closeStreamSync().then(() => {
+    closed = true;
+  });
+  try {
+    await vi.waitFor(() => expect(closed).toBe(true));
+    await closing;
+    expect(closeDb).toHaveBeenCalledOnce();
+    expect(resume).not.toHaveBeenCalled();
+  } finally {
+    confirm({ id: "registered" });
+    await closing;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
   expect(resume).not.toHaveBeenCalled();
+});
+
+it("close waits for retirement resumed when the database first opens", async () => {
+  let mode: "switched" | "unswitched" = "unswitched";
+  const getServer = vi.fn(async () => ({ id: "registered" }));
+  const { lite, closeDb } = await openSwitchedLite(getServer, () => mode);
+  let releaseStep!: () => void;
+  const step = new Promise<void>((resolve) => {
+    releaseStep = resolve;
+  });
+  const started = vi.fn();
+  let opening: ReturnType<typeof lite.getLocalSync> | undefined;
+  let closing: Promise<void> | undefined;
+  retirementFixture.waitAtOpen = async () => {
+    started();
+    await step;
+  };
+  try {
+    await lite.syncManager.trigger();
+    expect(getServer).toHaveBeenCalled();
+    expect(lite.localSync).toBeNull();
+    mode = "switched";
+    opening = lite.getLocalSync();
+    // Depending on close scheduling, this request can reject once closed.
+    void opening.catch(() => undefined);
+    await vi.waitFor(() => expect(started).toHaveBeenCalledOnce());
+    closing = lite.closeStreamSync();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(closeDb).not.toHaveBeenCalled();
+  } finally {
+    retirementFixture.waitAtOpen = undefined;
+    releaseStep();
+    await Promise.allSettled([opening]);
+    await (closing ?? lite.closeStreamSync());
+    await lite.syncManager.stop();
+  }
+  expect(closeDb).toHaveBeenCalledOnce();
 });

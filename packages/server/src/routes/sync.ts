@@ -131,13 +131,28 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   // what it missed while it was away without a read.
   app.get("/events", async (c) => {
     await auth.authorizeOwner(c.req.raw);
+    // Same rule as `requireStreamMode`: a host with no mode source serves the
+    // feed; one with a source serves it only while switched.
+    requireStreamMode();
+    const openingMode = deps.accountStorageMode?.read();
     return streamSSE(c, async (stream) => {
+      let endFeed!: () => void;
+      const left = new Promise<void>((resolve) => {
+        endFeed = resolve;
+      });
+      stream.onAbort(endFeed);
       // One writer per connection folds what arrives while a frame is being
       // written, so a reader that stops reading holds bounded memory.
-      const feed = createFeedWriter((event, data) =>
-        stream.writeSSE({ event, data: JSON.stringify(data) }),
-      );
-      const left = new Promise<void>((resolve) => stream.onAbort(resolve));
+      // Validate at dequeue, not at enqueue: a slow reader may still have
+      // frames pending when the account leaves switched mode.
+      const feed = createFeedWriter(async (event, data): Promise<void> => {
+        if (deps.accountStorageMode?.read() !== openingMode) {
+          feed.close();
+          endFeed();
+          return;
+        }
+        await stream.writeSSE({ event, data: JSON.stringify(data) });
+      });
       // A subscription joins this list when it is acquired, so whatever
       // happens next releases exactly what was acquired.
       const release: Array<() => void> = [];
@@ -173,13 +188,25 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   app.post("/file/:id", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
+    requireStreamMode();
     const file = await deps.localFile?.(c.req.param("id"));
+    requireStreamMode();
     if (!file)
       return c.json({ error: { errorCode: "STREAM_DATA_NOT_FOUND" } }, 404);
-    const result = await (await local()).syncConnection(file.connectionId);
+    const sync = await local();
+    requireStreamMode();
+    const result = await sync.syncConnection(file.connectionId);
+    requireStreamMode();
     if (result?.error)
       return c.json({ error: { errorCode: "STREAM_READ_UNAVAILABLE" } }, 503);
-    return file.read();
+    const response = await file.read();
+    try {
+      requireStreamMode();
+    } catch (error) {
+      void response.body?.cancel().catch(() => undefined);
+      throw error;
+    }
+    return response;
   });
 
   app.all("*", (c) =>
