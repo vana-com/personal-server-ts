@@ -128,8 +128,9 @@ export class PdppError extends Error {
     super(message);
     this.name = "PdppError";
     this.code = code;
-    const status = STATUS_BY_CODE[code];
-    const type = TYPE_BY_CODE[code];
+    const known = Object.hasOwn(STATUS_BY_CODE, code);
+    const status = known ? STATUS_BY_CODE[code] : undefined;
+    const type = known ? TYPE_BY_CODE[code] : undefined;
     if (status === undefined || type === undefined) {
       if (options?.status === undefined) {
         throw new RangeError(

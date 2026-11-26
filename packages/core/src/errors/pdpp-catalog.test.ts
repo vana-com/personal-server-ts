@@ -50,4 +50,14 @@ describe("PdppError", () => {
     expect(first.error.request_id).toBe("first-test");
     expect(second.error.request_id).toBe("second-test");
   });
+
+  it("treats inherited object keys as unknown codes", () => {
+    for (const code of ["constructor", "toString", "__proto__"]) {
+      expect(() => new PdppError(code as never, "x")).toThrow(RangeError);
+      const overridden = new PdppError(code as never, "x", { status: 418 });
+      expect(overridden.status).toBe(418);
+      expect(overridden.type).toBe("api_error");
+    }
+    expect(new PdppError("not_found", "missing").status).toBe(404);
+  });
 });
