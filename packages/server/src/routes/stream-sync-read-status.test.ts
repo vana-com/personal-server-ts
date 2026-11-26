@@ -351,6 +351,32 @@ describe("stream-sync read status route", () => {
     expect(body).not.toHaveProperty("streams");
   });
 
+  it.each([
+    ["unknown", "ACCOUNT_MODE_UNKNOWN"],
+    ["switched", "STREAM_READ_UNAVAILABLE"],
+  ] as const)("does not use the legacy port in %s mode", async (mode, errorCode) => {
+    const fallbackStatus = vi.fn(() => ({ listed: true, connections: [], issues: [] }));
+    const route = streamSyncReadStatusRoutes({
+      serverOrigin: "http://127.0.0.1",
+      serverOwner: OWNER,
+      gateway: {} as GatewayClient,
+      accessToken: TOKEN,
+      accountStorageMode: { owner: OWNER, read: () => mode },
+      streamSyncRead: { resolve: vi.fn(), status: fallbackStatus } as unknown as StreamSyncReadPort,
+    });
+    route.onError((error, c) =>
+      error instanceof ProtocolError
+        ? c.json(error.toJSON(), error.code as 503)
+        : c.json({ error: String(error) }, 500),
+    );
+    const response = await route.request("/", {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { errorCode } });
+    expect(fallbackStatus).not.toHaveBeenCalled();
+  });
+
   it("answers 404 when stream sync reading is off", async () => {
     const response = await app(undefined)();
     expect(response.status).toBe(404);
