@@ -313,12 +313,15 @@ describe("loadConfig", () => {
         const raw = '{"server":{"port":3017}}\n';
         await writeFile(configPath, raw);
 
-        await withEnv({ CLOUD_MODE: "true", SERVER_PORT: "not-a-port" }, async () => {
-          await expect(loadConfig({ configPath })).rejects.toMatchObject({
-            name: "ZodError",
-          });
-          expect(await readFile(configPath, "utf8")).toBe(raw);
-        });
+        await withEnv(
+          { CLOUD_MODE: "true", SERVER_PORT: "not-a-port" },
+          async () => {
+            await expect(loadConfig({ configPath })).rejects.toMatchObject({
+              name: "ZodError",
+            });
+            expect(await readFile(configPath, "utf8")).toBe(raw);
+          },
+        );
       });
     });
 
@@ -509,7 +512,9 @@ describe("config storage and path formatting", () => {
   it("creates config.json under the supplied root when saving without configPath", async () => {
     const { saveConfig } = await import("./loader.js");
     await withTempDir(async (dir) => {
-      const config = await loadConfig({ configPath: join(dir, "initial.json") });
+      const config = await loadConfig({
+        configPath: join(dir, "initial.json"),
+      });
       const rootPath = join(dir, "instance", "nested");
       await saveConfig(config, { rootPath });
       expect(await readFile(join(rootPath, "config.json"), "utf8")).toBe(
