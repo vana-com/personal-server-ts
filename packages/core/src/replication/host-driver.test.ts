@@ -163,6 +163,36 @@ describe("createReplicationDriver", () => {
     expect(clock.armed()).toEqual([60_000]);
   });
 
+  it("a synchronous reentrant trigger joins the reserved step", async () => {
+    const clock = fakeTimers();
+    const first = gate<ProgressReport>();
+    let calls = 0;
+    let joined: Promise<ProgressReport | undefined> | undefined;
+    const driver = createReplicationDriver({
+      budget,
+      timers: clock.timers,
+      stepper: {
+        step() {
+          calls++;
+          if (calls === 1) {
+            joined = driver.trigger();
+            return first.promise;
+          }
+          return Promise.resolve(report());
+        },
+      },
+    });
+    driver.start();
+    expect(calls).toBe(1);
+    const completed = report(T0 + 5_000);
+    first.resolve(completed);
+    expect(await joined).toBe(completed);
+    await flush();
+    expect(calls).toBe(2);
+    expect(clock.armed()).toHaveLength(1);
+    expect(await driver.stop(0)).toBe(true);
+  });
+
   it("a trigger replaces the armed timer instead of adding one", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();
