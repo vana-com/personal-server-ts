@@ -23,6 +23,7 @@
  * cover `issued_at` or `grant_id`, which do not exist yet at review time.
  */
 
+import { finalReviewHeldDataStatements } from "./held-data-statements.js";
 import { createHash } from "node:crypto";
 import { resolveCommitments, type ResolvedCommitments } from "./commitments.js";
 import { chooseLanguageVersion, type LocalizableValue } from "./language.js";
@@ -207,6 +208,15 @@ export interface ConsentReviewModel {
    * each stream row names its identifiers in `envelope_identifiers`.
    */
   envelope_disclosure?: { statement: string };
+  /**
+   * AS item 45 / spec-core L1286-L1299: what happens to held data after the
+   * grant ends, and (L1284) that ordinary access does not authorize
+   * disclosure to an independent recipient. Locked-rule reviews only. A
+   * pure function of `retention` and the processing-permission set (none in
+   * this build), both already decision fields, so it is not separately
+   * digested.
+   */
+  held_data?: { after_grant_ends: string[]; onward_disclosure: string };
   /**
    * AS item 34: every declaration display value this review shows, with the
    * exact string and chosen language tag, in the order the surface lists
@@ -572,6 +582,9 @@ export function buildConsentReview(
     ...(boundClaims && { client_claims: boundClaims }),
     ...(locked && {
       envelope_disclosure: { statement: ENVELOPE_DISCLOSURE_STATEMENT },
+      held_data: finalReviewHeldDataStatements({
+        ...(commitments.retention && { retention: commitments.retention }),
+      }),
       display_values: displayValues,
     }),
     review_digest,

@@ -237,6 +237,17 @@ export async function createPdppAuthDeps(
     throw err;
   }
 
+  // AS item 44: a history the anchor cannot establish as current fails
+  // closed on every enforcement path until the owner re-establishes it
+  // (docs/pdpp-durability-statement.md). Say so loudly at boot.
+  const history = store.history.current();
+  if (!history.current) {
+    logger.error(
+      { reason: history.reason },
+      "PDPP authorization history is not current — no tokens are issued until the owner re-establishes it (POST /pdpp/v1/owner/lifecycle/reestablish)",
+    );
+  }
+
   const tokens = new PdppTokenService(store);
   const sessions = new AuthorizationSessionStore();
   const subjectId = options.serverOwner.toLowerCase();

@@ -143,12 +143,57 @@
       "methods": ["GET", "POST"]
     },
     {
+      "path": "/pdpp/v1/grant-lifecycle",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
       "path": "/pdpp/v1/grants",
       "hosts": ["server"],
       "methods": ["GET"]
     },
     {
       "path": "/pdpp/v1/introspect",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/owner/decommission",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/v1/owner/decommission/confirm",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/owner/grants/affected",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/v1/owner/grants/end",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/owner/grants/erasure",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/owner/lifecycle/disable-tokens",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
+      "path": "/pdpp/v1/owner/lifecycle/history",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
+      "path": "/pdpp/v1/owner/lifecycle/reestablish",
       "hosts": ["server"],
       "methods": ["POST"]
     },

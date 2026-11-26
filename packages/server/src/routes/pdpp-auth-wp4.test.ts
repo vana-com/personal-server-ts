@@ -215,10 +215,12 @@ describe("metadata (AS items 14, 25, 33; case O7)", () => {
     expect(metadata.authorization_details_types_supported).toContain(
       PDPP_DATA_ACCESS_TYPE,
     );
-    // AS item 33 partial: grant-lifecycle is not advertised until the
-    // lifecycle operation exists (see TODO in pdpp-auth.ts).
-    expect(metadata.authorization_details_types_supported).not.toContain(
+    // AS item 33 (WP6): grant-lifecycle is advertised with its endpoint.
+    expect(metadata.authorization_details_types_supported).toContain(
       "https://pdpp.dev/grant-lifecycle",
+    );
+    expect(metadata.pdpp_grant_lifecycle_endpoint).toBe(
+      "https://ps.example/pdpp/v1/grant-lifecycle",
     );
   });
 });
@@ -582,7 +584,7 @@ describe("RFC 7009 revocation (AS item 25)", () => {
     const t = await issued();
     const res = await postForm(
       "/pdpp/v1/revoke",
-      { grant_id: t.grantId },
+      { grant_id: t.grantId, disposition: "keep" },
       auth(t.ownerTokenValue),
     );
     expect(res.status).toBe(200);
@@ -606,7 +608,7 @@ describe("terminal events vs every issuance path (AS item 44, case D1 here)", ()
         if (who === "owner") {
           const res = await postForm(
             "/pdpp/v1/revoke",
-            { grant_id: grantId },
+            { grant_id: grantId, disposition: "keep" },
             auth(a.token),
           );
           expect(res.status).toBe(200);

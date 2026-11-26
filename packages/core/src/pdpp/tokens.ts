@@ -18,6 +18,7 @@
 
 import { verifyCodeVerifier } from "./pkce.js";
 import {
+  hashToken,
   newOpaqueToken,
   type PdppAuthStore,
   type StoredGrant,
@@ -67,7 +68,17 @@ export interface TokenIssuanceResult {
   authorization_details: PdppAuthorizationEntry[];
 }
 
-export type TokenFailureCode = "invalid_grant" | "invalid_request";
+export type TokenFailureCode =
+  | "invalid_grant"
+  | "invalid_request"
+  /** AS item 44 / L1825: the history is not current; the AS issues nothing. */
+  | "temporarily_unavailable";
+
+const HISTORY_UNAVAILABLE: TokenFailure = {
+  code: "temporarily_unavailable",
+  message:
+    "the authorization history cannot be established as current; no token is issued until it is",
+};
 
 export interface TokenFailure {
   code: TokenFailureCode;
@@ -99,7 +110,8 @@ function grantInactiveReason(
   // state. Every issuance, refresh and introspection path asks here, so a
   // pre-lock code or refresh token redeems to `invalid_grant`, not to a token
   // that is dead on arrival.
-  if (!isSupportedPersistedGrant(stored.grant)) return "unsupported_legacy_shape";
+  if (!isSupportedPersistedGrant(stored.grant))
+    return "unsupported_legacy_shape";
   const status = store.grantStatus(stored, now);
   if (status === "revoked") return "grant_revoked";
   if (status === "expired") return "grant_expired";
@@ -115,10 +127,13 @@ function inactiveGrantMessage(reason: InactiveReason): string {
 
 export interface PdppTokenServiceOptions {
   accessTokenTtlSeconds?: number;
+  /** The AS clock. Tests control it (spec-core §9 held-data cases). */
+  clock?: () => Date;
 }
 
 export class PdppTokenService {
   private readonly accessTtl: number;
+  readonly clock: () => Date;
 
   constructor(
     private readonly store: PdppAuthStore,
@@ -126,6 +141,7 @@ export class PdppTokenService {
   ) {
     this.accessTtl =
       options.accessTokenTtlSeconds ?? DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
+    this.clock = options.clock ?? (() => new Date());
   }
 
   /**
@@ -144,7 +160,13 @@ export class PdppTokenService {
     codeVerifier?: string;
     now?: Date;
   }): TokenResult {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
+    // AS item 44 / L1825 (case D1a): no code exchange from a history that
+    // may omit a terminal event. Checked before the code is touched, so the
+    // code is not burned by a refusal the client did not cause.
+    if (!this.store.history.isCurrent()) {
+      return { ok: false, failure: HISTORY_UNAVAILABLE };
+    }
 
     const record = this.store.consumeAuthCode(input.code, now);
     if (!record) {
@@ -229,7 +251,12 @@ export class PdppTokenService {
    * and require fresh authorization.
    */
   refresh(input: { refreshToken: string; now?: Date }): TokenResult {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
+    // AS item 44 / L1825 (case D1a): no refresh exchange, and no rotation,
+    // from a history that may omit a terminal event.
+    if (!this.store.history.isCurrent()) {
+      return { ok: false, failure: HISTORY_UNAVAILABLE };
+    }
     const rotation = this.store.rotateRefreshToken(input.refreshToken, now);
 
     if (!rotation.ok) {
@@ -281,6 +308,17 @@ export class PdppTokenService {
     existingFamilyId?: string,
   ): TokenResult {
     const { grant } = stored;
+    // AS item 40 / L1593: a token response returning the grant is a positive
+    // assessment, so none is returned while an erasure instruction applies.
+    // An effective instruction always ends the grant (L1612), so this is a
+    // second line of defence behind grantInactiveReason.
+    const instruction = this.store.lifecycle.getInstruction(grant.grant_id);
+    if (instruction?.effectiveAt) {
+      return {
+        ok: false,
+        failure: { code: "invalid_grant", message: "grant is revoked" },
+      };
+    }
     const continuous = mayIssueRefreshToken([grant.access_mode]);
 
     let familyId: string | null = existingFamilyId ?? null;
@@ -353,9 +391,19 @@ export class PdppTokenService {
    * Reads live store state every call. That is what makes revocation immediate
    * in introspection (§9 AS item 8) — there is no AS-side cache to invalidate.
    */
-  resolveToken(accessToken: string, now: Date = new Date()): PdppTokenContext {
+  resolveToken(
+    accessToken: string,
+    now: Date = this.clock(),
+  ): PdppTokenContext {
     const record = this.store.getAccessToken(accessToken);
     if (!record) {
+      return { active: false, inactiveReason: "unknown" };
+    }
+    // AS item 44 / L1825: while the history is not current, no client token
+    // resolves active — not at the RS, not in introspection. "unknown" keeps
+    // the RS answer a plain 401 rather than a claim about the grant. Owner
+    // tokens carry no grant and still resolve, so the owner can act (L1827).
+    if (record.tokenKind === "client" && !this.store.history.isCurrent()) {
       return { active: false, inactiveReason: "unknown" };
     }
 
@@ -441,7 +489,7 @@ export class PdppTokenService {
    */
   introspect(
     accessToken: string,
-    now: Date = new Date(),
+    now: Date = this.clock(),
   ): PdppIntrospectionResponse {
     const context = this.resolveToken(accessToken, now);
     if (!context.active) {
@@ -473,7 +521,7 @@ export class PdppTokenService {
   }
 
   /** Revoke a grant and every linked token family. Immediate (§2, §9 item 8). */
-  revokeGrant(grantId: string, now: Date = new Date()): boolean {
+  revokeGrant(grantId: string, now: Date = this.clock()): boolean {
     return this.store.revokeGrant(grantId, now);
   }
 
@@ -496,7 +544,7 @@ export class PdppTokenService {
     ttlSeconds?: number;
     now?: Date;
   }): { access_token: string; token_type: "Bearer"; expires_in: number } {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
     const ttl = input.ttlSeconds ?? this.accessTtl;
     const token = newOpaqueToken("pdpp_ot");
     const expiresAt = new Date(now.getTime() + ttl * 1000);
@@ -549,10 +597,38 @@ export class PdppTokenService {
     | { ok: true; endedGrants: string[]; dispositionRecorded: boolean }
     | {
         ok: false;
-        code: "unauthorized_client" | "invalid_request";
+        code:
+          "unauthorized_client" | "invalid_request" | "temporarily_unavailable";
         message: string;
       } {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
+    // AS item 44: client revocation authenticates a write (a disposition)
+    // and changes ordered state, so it waits for a current history.
+    if (!this.store.history.isCurrent()) {
+      return {
+        ok: false,
+        code: "temporarily_unavailable",
+        message: HISTORY_UNAVAILABLE.message,
+      };
+    }
+    // A lifecycle recovery token (L1802) is revocable like any access token
+    // it issued; revoking it ends no grant.
+    const recovery = this.store.lifecycle.getRecoveryToken(
+      hashToken(input.token),
+    );
+    if (recovery) {
+      if (recovery.clientId === input.clientId) {
+        this.store.commit(
+          () =>
+            this.store.lifecycle.revokeRecoveryToken(
+              hashToken(input.token),
+              now.toISOString(),
+            ),
+          now,
+        );
+      }
+      return { ok: true, endedGrants: [], dispositionRecorded: false };
+    }
     const lookups =
       input.tokenTypeHint === "refresh_token"
         ? (["refresh", "access"] as const)
@@ -617,7 +693,9 @@ export class PdppTokenService {
     // still ends the grants but records no disposition").
     const endedGrants = accessTokenOnly !== undefined ? [] : [grantId];
     const record =
-      input.disposition !== undefined && current && accessTokenOnly === undefined;
+      input.disposition !== undefined &&
+      current &&
+      accessTokenOnly === undefined;
     const ended = this.store.revokeForClient({
       endGrants: endedGrants,
       ...(accessTokenOnly !== undefined && { accessTokenOnly }),
@@ -640,7 +718,7 @@ export class PdppTokenService {
   }
 
   /** Revoke a single access token without touching its grant. */
-  revokeAccessToken(token: string, now: Date = new Date()): boolean {
+  revokeAccessToken(token: string, now: Date = this.clock()): boolean {
     return this.store.revokeAccessToken(token, now);
   }
 }
@@ -697,7 +775,7 @@ export function toAuthorizationDetail(grant: Grant): PdppAuthorizationDetail {
     type:
       grant.version === PDPP_GRANT_VERSION_CANDIDATE
         ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
-      : PDPP_DATA_ACCESS_TYPE,
+        : PDPP_DATA_ACCESS_TYPE,
     source: grant.source,
     purpose_code: grant.purpose_code,
     ...(grant.purpose_description && {

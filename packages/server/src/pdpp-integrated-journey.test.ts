@@ -839,7 +839,10 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         Authorization: `Bearer ${harness.ownerToken}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revokeRes.status).toBe(200);
 

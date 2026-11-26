@@ -280,7 +280,10 @@ async function main(): Promise<void> {
       ...ownerAuth,
       "content-type": "application/x-www-form-urlencoded",
     },
-    body: new URLSearchParams({ grant_id: approval.grant_id }).toString(),
+    body: new URLSearchParams({
+      grant_id: approval.grant_id,
+      disposition: "keep",
+    }).toString(),
   });
   must(revoked.status === 200, `revoke returned ${revoked.status}`);
   say("grant revoked");

@@ -531,7 +531,10 @@ describe("scoped owner tokens in the AS consent path", () => {
         authorization: `Bearer ${ouraToken}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revoked.status).toBe(200);
   });
@@ -672,7 +675,10 @@ describe("scoped owner tokens in the AS consent path", () => {
         authorization: `Bearer ${legacyToken}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: "grant-never-reached" }).toString(),
+      body: new URLSearchParams({
+        grant_id: "grant-never-reached",
+        disposition: "keep",
+      }).toString(),
     });
     expect(revoked.status).toBe(404);
     expect(await json(revoked)).toMatchObject({
@@ -720,7 +726,10 @@ describe("scoped owner tokens in the AS consent path", () => {
         authorization: `Bearer ${owner}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revoked.status).toBe(200);
   });

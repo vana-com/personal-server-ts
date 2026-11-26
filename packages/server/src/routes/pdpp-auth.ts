@@ -11,9 +11,22 @@
  *   POST /introspect                     — RFC 7662 introspection
  *   POST /token/revoke                   — RFC 7009 client token revocation
  *                                          (the advertised `revocation_endpoint`)
- *   GET  /grants                         — the owner's grants, with status
+ *   POST /grant-lifecycle                — the grant lifecycle operation
+ *                                          (advertised `pdpp_grant_lifecycle_endpoint`)
+ *   GET  /grants                         — the owner's grants, with status and
+ *                                          held-data lifecycle
  *   POST /revoke                         — owner-initiated grant revocation
- *                                          (owner token + grant_id; not advertised)
+ *                                          (owner token + grant_id + disposition;
+ *                                          not advertised)
+ *   GET  /owner/grants/affected          — the affected set of an owner ending
+ *   POST /owner/grants/end               — owner revoke / disconnect / narrowing
+ *   POST /owner/grants/erasure           — owner erasure request or advance election
+ *   GET  /owner/decommission             — AS decommission view (AS item 46)
+ *   POST /owner/decommission/confirm     — record dispositions, confirm (wallet proof)
+ *   POST /owner/lifecycle/disable-tokens — disable tokens for lifecycle use
+ *   GET  /owner/lifecycle/history        — history currency and pending actions
+ *   POST /owner/lifecycle/reestablish    — re-establish a non-current history
+ *                                          (wallet proof when wired)
  *
  * Operator policy (AS item 38): the operator does not use owner data held in
  * this Authorization Server role for AI training, except under a training
@@ -74,6 +87,12 @@ import {
   parseUiLocales,
   SUPPORTED_PROCESSING_PERMISSIONS,
   validateCandidateOwnerChoices,
+  GrantLifecycleService,
+  HISTORY_RETRY_AFTER_SECONDS,
+  PDPP_GRANT_LIFECYCLE_TYPE,
+  PENDING_HISTORY_STATEMENT,
+  type OwnerActionResult,
+  type OwnerEndingAction,
   type ApprovalFailure,
   type DeclarationSnapshot,
   type GrantStatus,
@@ -198,6 +217,23 @@ export interface PdppAuthRouteDeps {
    * and falls back to configuration.
    */
   issuer?: string | (() => string);
+  /**
+   * The held-data lifecycle service (AS items 39-47). Defaults to one over
+   * `store`, using the token service's clock.
+   */
+  lifecycle?: GrantLifecycleService;
+}
+
+function unavailable(
+  c: Context,
+  description: string,
+  retryAfter = HISTORY_RETRY_AFTER_SECONDS,
+) {
+  return c.json(
+    { error: "temporarily_unavailable", error_description: description },
+    503,
+    { ...NO_STORE, "Retry-After": String(retryAfter) },
+  );
 }
 
 function errorResponse(
@@ -409,12 +445,12 @@ export function pdppAsMetadataHandler(
         // revocation MUST advertise `revocation_endpoint`. It points at the
         // RFC 7009 route, never at the owner-token grant revocation route.
         revocation_endpoint: `${base}/token/revoke`,
-        // AS item 33 requires `https://pdpp.dev/grant-lifecycle` here too.
-        // TODO(grant-lifecycle package): advertise it once the lifecycle
-        // operation (AS items 39, 47) is implemented. Advertising a type the
-        // AS cannot serve would invite requests it must reject.
+        // AS item 39 / spec-core L1692: the grant lifecycle operation.
+        pdpp_grant_lifecycle_endpoint: `${base}/grant-lifecycle`,
+        // AS item 33 / L1802: data access and lifecycle recovery.
         authorization_details_types_supported: [
           PDPP_DATA_ACCESS_TYPE,
+          PDPP_GRANT_LIFECYCLE_TYPE,
           PDPP_DATA_ACCESS_TYPE_V02,
           ...(protocolProfile === "candidate-0.1.0"
             ? [PDPP_DATA_ACCESS_TYPE_CANDIDATE]
@@ -440,6 +476,12 @@ export function pdppAsMetadataHandler(
 
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
+  const lifecycle =
+    deps.lifecycle ??
+    new GrantLifecycleService(deps.store, {
+      ...(deps.tokens.clock && { clock: deps.tokens.clock }),
+    });
+  const now = () => lifecycle.clock();
 
   // No PDPP-Version negotiation here: "It does not negotiate OAuth
   // authorization, token, revocation, introspection, or grant lifecycle
@@ -468,6 +510,26 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       "/owner/token",
       createOwnerCheckMiddleware(deps.ownerAuth.serverOwner),
     );
+    // Whole-server owner actions (decommission, history re-establishment)
+    // end grants across every source, so a source-scoped owner token held by
+    // a consent broker must not reach them: they take the wallet proof.
+    for (const path of [
+      "/owner/decommission/confirm",
+      "/owner/lifecycle/reestablish",
+    ]) {
+      app.use(path, createBodyLimit(DEFAULT_MAX_SIZE));
+      app.use(
+        path,
+        createWeb3AuthMiddleware({
+          serverOrigin: deps.ownerAuth.serverOrigin,
+          devToken: deps.ownerAuth.devToken,
+          accessToken: deps.ownerAuth.accessToken,
+          tokenStore: deps.ownerAuth.tokenStore,
+          serverOwner: deps.ownerAuth.serverOwner,
+        }),
+      );
+      app.use(path, createOwnerCheckMiddleware(deps.ownerAuth.serverOwner));
+    }
   }
 
   /**
@@ -664,6 +726,24 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
 
     const details = body.authorization_details;
+    // L1802 / case D3: a recovery request contains no other detail.
+    if (
+      Array.isArray(details) &&
+      details.length > 1 &&
+      details.some(
+        (d) =>
+          d &&
+          typeof d === "object" &&
+          (d as { type?: unknown }).type === PDPP_GRANT_LIFECYCLE_TYPE,
+      )
+    ) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_authorization_details",
+        "a lifecycle recovery request contains no other authorization detail",
+      );
+    }
     if (!Array.isArray(details) || details.length !== 1) {
       // v0.1 issues one grant per authorization. A package of several details
       // would need package-level access-mode rules (§9 AS item 20) that Core
@@ -757,6 +837,57 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
 
     const request = details[0];
+
+    // ── Lifecycle recovery (spec-core L1802-L1808, AS item 47) ──────────
+    if (
+      request &&
+      typeof request === "object" &&
+      (request as { type?: unknown }).type === PDPP_GRANT_LIFECYCLE_TYPE
+    ) {
+      const parsed = GrantLifecycleService.parseRecoveryDetail(request);
+      if (!parsed.ok) {
+        return errorResponse(
+          c,
+          400,
+          "invalid_authorization_details",
+          parsed.message,
+        );
+      }
+      const owner = resolveScopedOwnerToken(deps, bearer(c), subjectId);
+      if (!owner.ok) return scopedOwnerFailureResponse(c, owner.failure);
+      const opened = lifecycle.openRecoverySession({
+        subjectId,
+        clientId: body.client_id,
+        grantIds: parsed.grantIds,
+        redirectUri: body.redirect_uri,
+        ...(body.state && { stateParam: body.state }),
+        ...(body.code_challenge && { codeChallenge: body.code_challenge }),
+        ...(body.code_challenge_method && {
+          codeChallengeMethod: body.code_challenge_method,
+        }),
+        inScope: (stored) =>
+          grantContainedByOwnerScope(
+            subjectId,
+            stored,
+            owner.sourceId,
+            owner.instanceIds,
+          ),
+      });
+      if (!opened.ok) {
+        // L1804: reject without revealing which grant failed.
+        return errorResponse(
+          c,
+          400,
+          "invalid_authorization_details",
+          opened.message,
+        );
+      }
+      return c.json(
+        { session_id: opened.session_id, expires_at: opened.expires_at },
+        201,
+        NO_STORE,
+      );
+    }
 
     // ── Owner-independent checks (spec-core L1218, AS item 52) ──────────
     // Public structure and this build's fixed capabilities only. Every
@@ -867,6 +998,31 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    */
   app.get("/authorize/:session_id/review", (c) => {
     const sessionId = c.req.param("session_id");
+    if (lifecycle.hasRecoverySession(sessionId)) {
+      const owner = resolveScopedOwnerToken(
+        deps,
+        bearer(c),
+        lifecycle.recoverySessionSubject(sessionId),
+      );
+      if (!owner.ok) return scopedOwnerFailureResponse(c, owner.failure);
+      const review = lifecycle.recoveryReview(sessionId, owner.subjectId);
+      if (!review.ok)
+        return errorResponse(
+          c,
+          404,
+          "session_not_found",
+          "authorization session not found",
+        );
+      return c.json(
+        {
+          session_id: sessionId,
+          recovery: review.review,
+          expires_at: review.expires_at,
+        },
+        200,
+        NO_STORE,
+      );
+    }
     const session = deps.sessions.get(sessionId);
     const owner = resolveScopedOwnerToken(
       deps,
@@ -985,6 +1141,44 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    */
   app.post("/authorize/:session_id/approve", async (c) => {
     const sessionId = c.req.param("session_id");
+    if (lifecycle.hasRecoverySession(sessionId)) {
+      const owner = resolveScopedOwnerToken(
+        deps,
+        bearer(c),
+        lifecycle.recoverySessionSubject(sessionId),
+      );
+      if (!owner.ok) return scopedOwnerFailureResponse(c, owner.failure);
+      let recoveryBody: { review_digest?: unknown };
+      try {
+        recoveryBody = await c.req.json();
+      } catch {
+        return errorResponse(c, 400, "invalid_request", "body must be JSON");
+      }
+      const approved = lifecycle.approveRecovery({
+        sessionId,
+        subjectId: owner.subjectId,
+        reviewDigest:
+          typeof recoveryBody?.review_digest === "string"
+            ? recoveryBody.review_digest
+            : "",
+      });
+      if (!approved.ok) {
+        if (approved.code === "temporarily_unavailable")
+          return unavailable(
+            c,
+            "the authorization history cannot be established as current",
+          );
+        return errorResponse(
+          c,
+          approved.code === "stale_review" ? 409 : 404,
+          approved.code,
+          approved.code === "stale_review"
+            ? "the review digest does not match the recovery review"
+            : "authorization session not found",
+        );
+      }
+      return c.json({ redirect_uri: approved.redirect_uri }, 200, NO_STORE);
+    }
     const session = deps.sessions.get(sessionId);
     const owner = resolveScopedOwnerToken(
       deps,
@@ -1091,6 +1285,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
     }
 
+    // AS item 44 / L1825: no new grant from a history that is not current.
+    if (!deps.store.history.isCurrent()) {
+      return unavailable(
+        c,
+        "the authorization history cannot be established as current",
+      );
+    }
+
     // Persist the grant and its authorization code as one durable unit
     // before marking this session complete. Only
     // once this succeeds does the session move to "approved" — if the write
@@ -1112,7 +1314,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         // redeemer is the client that asked (RFC 7636 §4.4).
         codeChallenge: session!.code_challenge ?? null,
         codeChallengeMethod: session!.code_challenge_method ?? null,
-        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        expiresAt: new Date(now().getTime() + 60_000).toISOString(),
       },
     });
 
@@ -1139,6 +1341,23 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   /** Deny. Terminal; no grant and no consent evidence beyond the denial. */
   app.post("/authorize/:session_id/deny", async (c) => {
     const sessionId = c.req.param("session_id");
+    if (lifecycle.hasRecoverySession(sessionId)) {
+      const owner = resolveScopedOwnerToken(
+        deps,
+        bearer(c),
+        lifecycle.recoverySessionSubject(sessionId),
+      );
+      if (!owner.ok) return scopedOwnerFailureResponse(c, owner.failure);
+      const denied = lifecycle.denyRecovery(sessionId, owner.subjectId);
+      if (!denied.ok)
+        return errorResponse(
+          c,
+          404,
+          "session_not_found",
+          "authorization session not found",
+        );
+      return c.json({ redirect_uri: denied.redirect_uri }, 200, NO_STORE);
+    }
     const session = deps.sessions.get(sessionId);
     const owner = resolveScopedOwnerToken(
       deps,
@@ -1235,6 +1454,21 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           "code, client_id, and redirect_uri are required",
         );
       }
+      // L1806: a lifecycle recovery code redeems to a lifecycle-only token.
+      if (lifecycle.isRecoveryCode(code)) {
+        const recovered = lifecycle.redeemRecoveryCode({
+          code,
+          clientId,
+          redirectUri,
+          codeVerifier: asString(body.code_verifier) ?? undefined,
+        });
+        if (!recovered.ok) {
+          if (recovered.code === "temporarily_unavailable")
+            return unavailable(c, recovered.message);
+          return errorResponse(c, 400, recovered.code, recovered.message);
+        }
+        return c.json(recovered.issued, 200, NO_STORE);
+      }
       const result = deps.tokens.redeemAuthorizationCode({
         code,
         clientId,
@@ -1242,6 +1476,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         codeVerifier: asString(body.code_verifier) ?? undefined,
       });
       if (!result.ok) {
+        if (result.failure.code === "temporarily_unavailable")
+          return unavailable(c, result.failure.message);
         return errorResponse(
           c,
           400,
@@ -1263,6 +1499,9 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         );
       }
       const result = deps.tokens.refresh({ refreshToken });
+      if (!result.ok && result.failure.code === "temporarily_unavailable") {
+        return unavailable(c, result.failure.message);
+      }
       if (!result.ok) {
         return errorResponse(
           c,
@@ -1475,6 +1714,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
     if (!result.ok) {
+      if (result.code === "temporarily_unavailable")
+        return unavailable(c, result.message);
       return errorResponse(c, 400, result.code, result.message);
     }
     deps.logger.info(
@@ -1515,7 +1756,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     if (!caller.ok) return caller.response;
 
     const clientFilter = c.req.query("client_id");
-    const now = new Date();
+    const at = now();
     const grants = deps.store
       .listGrantsForSubject(caller.subjectId)
       .filter((stored) => !clientFilter || stored.clientId === clientFilter)
@@ -1530,7 +1771,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       .map((stored) => ({
         grant_id: stored.grant.grant_id,
         client_id: stored.clientId,
-        status: listedGrantStatus(deps.store, stored, now),
+        status: listedGrantStatus(deps.store, stored, at),
         issued_at: stored.grant.issued_at,
         ...(stored.grant.expires_at && { expires_at: stored.grant.expires_at }),
         access_mode: stored.grant.access_mode,
@@ -1539,14 +1780,51 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           name: s.name,
           fields: s.fields,
         })),
+        // AS items 42, 43, 46: read state, ending reason, disposition stage
+        // and erasure stages. Additive; `status` above is unchanged.
+        lifecycle: lifecycle.ownerView(stored, at),
       }));
 
-    return c.json({ grants }, 200, NO_STORE);
+    const pending = lifecycle.pendingOwnerActions(caller.subjectId);
+    return c.json(
+      {
+        grants,
+        // L1827-L1829: whether the history is current, and owner actions
+        // recorded while it was not, shown as pending.
+        history: {
+          current: deps.store.history.isCurrent(),
+          ...(pending.length > 0 && {
+            pending_actions: pending.map((a) => ({
+              action_id: a.action_id,
+              recorded_at: a.recorded_at,
+              kind: a.kind,
+              action: a.action,
+              grants: a.grant_ids.map((g) => ({
+                grant_id: g,
+                state: "pending",
+                ...(a.dispositions[g] && { disposition: a.dispositions[g] }),
+              })),
+            })),
+          }),
+          ...((!deps.store.history.isCurrent() || pending.length > 0) && {
+            statement: PENDING_HISTORY_STATEMENT,
+          }),
+        },
+      },
+      200,
+      NO_STORE,
+    );
   });
 
   /**
    * Revoke a grant. Owner-authenticated, and scoped to the owner's own grants
    * — a valid owner token is not authority over another subject's grant.
+   *
+   * AS item 41 / spec-core L1576: the request MUST carry `disposition`
+   * (`keep` or `delete`); one without it is rejected with
+   * `invalid_request` / `disposition_required` and no default is applied.
+   * `action=narrowing` marks the revoke-and-reissue flow (L1529). Optional
+   * `action_id` makes a retry idempotent. Form-encoded, as before.
    */
   app.post("/revoke", async (c) => {
     const caller = resolveOwner(c);
@@ -1557,29 +1835,637 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     if (!grantId) {
       return errorResponse(c, 400, "invalid_request", "grant_id is required");
     }
-
-    const stored = deps.store.getGrant(grantId);
-    // Not-found for another owner's grant as well, so a caller cannot probe
-    // which grant ids exist outside their own subject.
+    const disposition = asString(body.disposition);
+    if (disposition !== "keep" && disposition !== "delete") {
+      return c.json(
+        {
+          error: "invalid_request",
+          error_code: "disposition_required",
+          error_description:
+            "an explicit disposition (keep or delete) is required for the grant",
+          missing: [grantId],
+        },
+        400,
+        NO_STORE,
+      );
+    }
+    const actionParam = asString(body.action);
     if (
-      !stored ||
-      stored.subjectId !== caller.subjectId ||
-      !grantContainedByOwnerScope(
+      actionParam &&
+      actionParam !== "revoke" &&
+      actionParam !== "narrowing"
+    ) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "action must be revoke or narrowing",
+      );
+    }
+    return applyOwnerEnding(c, caller, {
+      action: (actionParam ?? "revoke") as OwnerEndingAction,
+      grantIds: [grantId],
+      dispositions: { [grantId]: disposition },
+      actionId: asString(body.action_id) ?? `act_${crypto.randomUUID()}`,
+      legacyGrantId: grantId,
+    });
+  });
+
+  /**
+   * The complete affected set of an owner ending, before its final step
+   * (L1566, L1576, AS item 41): grants it will end and ended or consumed
+   * grants whose disposition it will record, each with the keep and delete
+   * statements and `preselected: null`.
+   *
+   *   ?action=revoke|narrowing&grant_id=<id>[&grant_id=...]
+   *   ?action=disconnect_client&client_id=<id>
+   */
+  app.get("/owner/grants/affected", (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+    const url = new URL(c.req.url);
+    const action = url.searchParams.get("action") ?? "revoke";
+    if (!["revoke", "narrowing", "disconnect_client"].includes(action)) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "action must be revoke, narrowing or disconnect_client",
+      );
+    }
+    if (!deps.store.history.isCurrent()) {
+      return unavailable(
+        c,
+        "the affected set cannot be listed from a history that is not current; name each grant and its disposition instead",
+      );
+    }
+    const affected = lifecycle.affectedSet({
+      subjectId: caller.subjectId,
+      action: action as OwnerEndingAction,
+      ...(url.searchParams.get("client_id") && {
+        clientId: url.searchParams.get("client_id")!,
+      }),
+      grantIds: url.searchParams.getAll("grant_id"),
+      inScope: ownerScope(caller),
+    });
+    if (!affected.ok) {
+      return errorResponse(
+        c,
+        affected.message === "grant not found" ? 404 : 400,
+        affected.message === "grant not found"
+          ? "not_found"
+          : "invalid_request",
+        affected.message,
+      );
+    }
+    return c.json(
+      {
+        action,
+        grants: affected.grants,
+        will_end: affected.grants
+          .filter((g) => g.effect === "end")
+          .map((g) => g.grant_id),
+        will_record: affected.grants
+          .filter((g) => g.effect === "record")
+          .map((g) => g.grant_id),
+      },
+      200,
+      NO_STORE,
+    );
+  });
+
+  /**
+   * Owner ending (AS item 41): JSON `{ action, client_id?, grant_ids?,
+   * dispositions?: { <grant_id>: "keep" | "delete" }, disposition?, action_id? }`.
+   * `disposition` applies one explicit choice to every grant in scope (L1566
+   * "One choice MAY apply to all"); nothing is ever defaulted.
+   */
+  app.post("/owner/grants/end", async (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+    const body = await readJsonObject(c);
+    if (!body)
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "body must be a JSON object",
+      );
+    const action = body.action ?? "revoke";
+    if (
+      typeof action !== "string" ||
+      !["revoke", "narrowing", "disconnect_client"].includes(action)
+    ) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "action must be revoke, narrowing or disconnect_client",
+      );
+    }
+    const grantIds = Array.isArray(body.grant_ids)
+      ? body.grant_ids.filter((g): g is string => typeof g === "string")
+      : [];
+    const clientId =
+      typeof body.client_id === "string" ? body.client_id : undefined;
+    const dispositions = parseDispositions(body.dispositions);
+    if (dispositions === null) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "dispositions maps grant ids to keep or delete",
+      );
+    }
+    const all = body.disposition;
+    if (all !== undefined && all !== "keep" && all !== "delete") {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "disposition must be keep or delete",
+      );
+    }
+    if (all !== undefined) {
+      const scope = deps.store.history.isCurrent()
+        ? lifecycle.affectedSet({
+            subjectId: caller.subjectId,
+            action: action as OwnerEndingAction,
+            ...(clientId && { clientId }),
+            grantIds,
+            inScope: ownerScope(caller),
+          })
+        : {
+            ok: true as const,
+            grants: grantIds.map((g) => ({
+              grant_id: g,
+              disposition_required: true,
+            })),
+          };
+      if (scope.ok) {
+        for (const g of scope.grants) {
+          if (g.disposition_required && !dispositions[g.grant_id])
+            dispositions[g.grant_id] = all;
+        }
+      }
+    }
+    return applyOwnerEnding(c, caller, {
+      action: action as OwnerEndingAction,
+      ...(clientId && { clientId }),
+      grantIds,
+      dispositions,
+      actionId:
+        typeof body.action_id === "string" && body.action_id
+          ? body.action_id
+          : `act_${crypto.randomUUID()}`,
+    });
+  });
+
+  /**
+   * Owner erasure request (L1586, AS item 46): JSON `{ grant_id, advance?,
+   * action_id? }`. Immediate by default: ends an active grant, or records an
+   * instruction for an ended grant whose held data may remain. `advance:
+   * true` elects deletion at grant end without ending the grant.
+   */
+  app.post("/owner/grants/erasure", async (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+    const body = await readJsonObject(c);
+    if (!body || typeof body.grant_id !== "string" || !body.grant_id) {
+      return errorResponse(c, 400, "invalid_request", "grant_id is required");
+    }
+    if (body.advance !== undefined && typeof body.advance !== "boolean") {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "advance must be a boolean",
+      );
+    }
+    const result = lifecycle.requestErasureForOwner({
+      subjectId: caller.subjectId,
+      grantId: body.grant_id,
+      advance: body.advance === true,
+      actionId:
+        typeof body.action_id === "string" && body.action_id
+          ? body.action_id
+          : `act_${crypto.randomUUID()}`,
+      inScope: ownerScope(caller),
+    });
+    if (!result.ok) {
+      return errorResponse(
+        c,
+        result.code === "not_found" ? 404 : 400,
+        result.code,
+        result.message,
+      );
+    }
+    return ownerActionResponse(c, result.result, {
+      ...(result.erasure && { erasure: result.erasure }),
+    });
+  });
+
+  /**
+   * AS decommission (L1574, AS item 46, case P9). GET lists every grant whose
+   * held data may remain with its disposition stage (offered, recorded, sent,
+   * receipt_reported) and a warning for each `delete` no client has
+   * received. POST `{ dispositions?, disposition?, action_id? }` records an
+   * explicit disposition for each grant still offered, then the confirmation.
+   */
+  app.get("/owner/decommission", (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+    if (!deps.store.history.isCurrent()) {
+      return unavailable(
+        c,
+        "the authorization history cannot be established as current",
+      );
+    }
+    return c.json(
+      lifecycle.decommissionView({
+        subjectId: caller.subjectId,
+        inScope: ownerScope(caller),
+      }),
+      200,
+      NO_STORE,
+    );
+  });
+
+  app.post("/owner/decommission/confirm", async (c) => {
+    const caller = resolveWholeServerOwner(c);
+    if (!caller.ok) return caller.response;
+    if (!deps.store.history.isCurrent()) {
+      return unavailable(
+        c,
+        "the authorization history cannot be established as current",
+      );
+    }
+    const body = await readJsonObject(c);
+    if (!body)
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "body must be a JSON object",
+      );
+    const dispositions = parseDispositions(body.dispositions);
+    if (dispositions === null)
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "dispositions maps grant ids to keep or delete",
+      );
+    if (body.disposition !== undefined) {
+      if (body.disposition !== "keep" && body.disposition !== "delete")
+        return errorResponse(
+          c,
+          400,
+          "invalid_request",
+          "disposition must be keep or delete",
+        );
+      for (const g of lifecycle.decommissionView({
+        subjectId: caller.subjectId,
+        inScope: ownerScope(caller),
+      }).grants) {
+        if (g.stage === "offered" && !dispositions[g.grant_id])
+          dispositions[g.grant_id] = body.disposition;
+      }
+    }
+    const result = lifecycle.confirmDecommission({
+      subjectId: caller.subjectId,
+      dispositions,
+      actionId:
+        typeof body.action_id === "string" && body.action_id
+          ? body.action_id
+          : `act_${crypto.randomUUID()}`,
+      inScope: ownerScope(caller),
+    });
+    if (!result.ok) {
+      return c.json(
+        {
+          error: "invalid_request",
+          error_code: result.code,
+          error_description: result.message,
+          ...(result.missing && { missing: result.missing }),
+        },
+        400,
+        NO_STORE,
+      );
+    }
+    if (!result.result.complete) {
+      return c.json({ ...result.view, result: result.result }, 503, {
+        ...NO_STORE,
+        "Retry-After": "5",
+      });
+    }
+    return c.json({ ...result.view, result: result.result }, 200, NO_STORE);
+  });
+
+  /**
+   * Disable tokens for lifecycle use (L1716, case D3): JSON `{ client_id,
+   * grant_ids }` disables every token issued to that client for those
+   * grants; `token_sha256` names digests directly. Ends no grant and records
+   * no disposition.
+   */
+  app.post("/owner/lifecycle/disable-tokens", async (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+    if (!deps.store.history.isCurrent()) {
+      return unavailable(
+        c,
+        "the authorization history cannot be established as current",
+      );
+    }
+    const body = await readJsonObject(c);
+    if (
+      !body ||
+      typeof body.client_id !== "string" ||
+      !Array.isArray(body.grant_ids)
+    ) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "client_id and grant_ids are required",
+      );
+    }
+    const scope = ownerScope(caller);
+    const grantIds = body.grant_ids.filter((g): g is string => {
+      if (typeof g !== "string") return false;
+      const stored = deps.store.getGrant(g);
+      return !!stored && stored.subjectId === caller.subjectId && scope(stored);
+    });
+    // Only digests of tokens issued for grants inside the caller's scope.
+    const inScopeDigests = new Set(
+      deps.store.lifecycle.tokenDigestsFor(body.client_id, grantIds),
+    );
+    const digests = Array.isArray(body.token_sha256)
+      ? body.token_sha256.filter(
+          (d): d is string => typeof d === "string" && inScopeDigests.has(d),
+        )
+      : [];
+    const disabled = lifecycle.disableForLifecycle({
+      clientId: body.client_id,
+      grantIds,
+      tokenDigests: digests,
+    });
+    return c.json({ disabled }, 200, NO_STORE);
+  });
+
+  /** History currency, pending owner actions, and what re-establishing would end. */
+  app.get("/owner/lifecycle/history", (c) => {
+    const caller = resolveOwner(c);
+    if (!caller.ok) return caller.response;
+    const status = deps.store.history.current();
+    return c.json(
+      {
+        current: status.current,
+        ...(!status.current && {
+          reason: status.reason,
+          statement: PENDING_HISTORY_STATEMENT,
+          reestablish_ends: lifecycle.reestablishAffected(),
+        }),
+        pending_actions: lifecycle.pendingOwnerActions(caller.subjectId),
+      },
+      200,
+      NO_STORE,
+    );
+  });
+
+  /**
+   * Re-establish a history the mechanism found not current (L1823, L1827):
+   * restores anchored erasure instructions, applies pending owner actions,
+   * then ends every still-active grant with the owner's explicit
+   * disposition. JSON `{ dispositions?, disposition?, action_id? }`.
+   */
+  app.post("/owner/lifecycle/reestablish", async (c) => {
+    const caller = resolveWholeServerOwner(c);
+    if (!caller.ok) return caller.response;
+    const body = await readJsonObject(c);
+    if (!body)
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "body must be a JSON object",
+      );
+    const dispositions = parseDispositions(body.dispositions);
+    if (dispositions === null)
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "dispositions maps grant ids to keep or delete",
+      );
+    if (body.disposition !== undefined) {
+      if (body.disposition !== "keep" && body.disposition !== "delete")
+        return errorResponse(
+          c,
+          400,
+          "invalid_request",
+          "disposition must be keep or delete",
+        );
+      for (const g of lifecycle.reestablishAffected()) {
+        if (!dispositions[g.grant_id])
+          dispositions[g.grant_id] = body.disposition;
+      }
+    }
+    try {
+      const result = lifecycle.reestablishHistory({
+        dispositions,
+        actionId:
+          typeof body.action_id === "string" && body.action_id
+            ? body.action_id
+            : `act_${crypto.randomUUID()}`,
+      });
+      if (!result.ok) {
+        return c.json(
+          {
+            error: "invalid_request",
+            error_code: result.code,
+            error_description: result.message,
+            missing: result.missing,
+          },
+          400,
+          NO_STORE,
+        );
+      }
+      deps.logger.warn(
+        result,
+        "PDPP authorization history re-established by the owner",
+      );
+      return c.json({ current: true, ...result }, 200, NO_STORE);
+    } catch (err) {
+      deps.logger.error({ err }, "PDPP history re-establishment failed");
+      return unavailable(
+        c,
+        "the history could not be re-established; retry",
+        5,
+      );
+    }
+  });
+
+  /**
+   * The grant lifecycle operation (spec-core L1686-L1801, AS item 39):
+   * `application/x-www-form-urlencoded` POST. Queries authenticate with any
+   * token the AS issued to the client covering the grant; writes need
+   * current client authentication. 200 with `{ grants }`; request-level
+   * failures per RFC 6749 §5.2; 503 with Retry-After while the history is
+   * not current; 429 past the per-grant query allowance.
+   */
+  app.post("/grant-lifecycle", async (c) => {
+    const contentType = c.req.header("content-type") ?? "";
+    if (!contentType.includes("application/x-www-form-urlencoded")) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "Content-Type must be application/x-www-form-urlencoded",
+      );
+    }
+    const params = new Map<string, string[]>();
+    for (const [k, v] of new URLSearchParams(await c.req.text())) {
+      params.set(k, [...(params.get(k) ?? []), v]);
+    }
+    const result = lifecycle.handleLifecycleRequest(params);
+    const headers: Record<string, string> = { ...NO_STORE };
+    if (
+      "retryAfterSeconds" in result &&
+      result.retryAfterSeconds !== undefined
+    ) {
+      headers["Retry-After"] = String(result.retryAfterSeconds);
+    }
+    if (result.status === 401) {
+      headers["WWW-Authenticate"] =
+        result.body.error === "invalid_token"
+          ? 'Bearer error="invalid_token"'
+          : "Bearer";
+    }
+    return c.json(result.body, result.status, headers);
+  });
+
+  /**
+   * The owner for a whole-server action. With the wallet-proof chain wired,
+   * the verified signer (middleware above) and no scope ceiling; without it
+   * (unit tests), the owner token as elsewhere.
+   */
+  function resolveWholeServerOwner(
+    c: Context,
+  ):
+    | { ok: true; subjectId: string; sourceId?: string; instanceIds?: string[] }
+    | { ok: false; response: ReturnType<typeof errorResponse> } {
+    if (!deps.ownerAuth) return resolveOwner(c);
+    const signer = (c.get("auth") as { signer?: string } | undefined)?.signer;
+    const subjectId =
+      deps.ownerSubjectId?.(c) ?? (signer ? signer.toLowerCase() : null);
+    if (!subjectId) {
+      return {
+        ok: false,
+        response: errorResponse(
+          c,
+          401,
+          "unauthorized",
+          "a verified owner proof is required",
+        ),
+      };
+    }
+    return { ok: true, subjectId };
+  }
+
+  function ownerScope(caller: {
+    subjectId: string;
+    sourceId?: string;
+    instanceIds?: string[];
+  }) {
+    return (stored: StoredGrant) =>
+      grantContainedByOwnerScope(
         caller.subjectId,
         stored,
         caller.sourceId,
         caller.instanceIds,
-      )
-    ) {
-      return errorResponse(c, 404, "not_found", "grant not found");
+      );
+  }
+
+  /** 200 when every ending and disposition is durable; 202 while pending; 503 on a partial result (L1828). */
+  function ownerActionResponse(
+    c: Context,
+    result: OwnerActionResult,
+    extra: Record<string, unknown> = {},
+  ) {
+    if (result.complete) return c.json({ ...extra, result }, 200, NO_STORE);
+    if (result.statement) {
+      return c.json({ ...extra, result }, 202, NO_STORE);
     }
+    return c.json({ ...extra, result }, 503, {
+      ...NO_STORE,
+      "Retry-After": "5",
+    });
+  }
 
-    const revoked = deps.tokens.revokeGrant(grantId);
-    deps.logger.info({ grant_id: grantId, revoked }, "PDPP grant revocation");
-
-    // Idempotent: a second revoke is still "it is revoked".
-    return c.json({ grant_id: grantId, status: "revoked" }, 200, NO_STORE);
-  });
+  function applyOwnerEnding(
+    c: Context,
+    caller: { subjectId: string; sourceId?: string; instanceIds?: string[] },
+    input: {
+      action: OwnerEndingAction;
+      clientId?: string;
+      grantIds: string[];
+      dispositions: Record<string, "keep" | "delete">;
+      actionId: string;
+      legacyGrantId?: string;
+    },
+  ) {
+    const result = lifecycle.endGrantsForOwner({
+      subjectId: caller.subjectId,
+      action: input.action,
+      ...(input.clientId && { clientId: input.clientId }),
+      grantIds: input.grantIds,
+      dispositions: input.dispositions,
+      actionId: input.actionId,
+      inScope: ownerScope(caller),
+    });
+    if (!result.ok) {
+      if (result.code === "not_found")
+        return errorResponse(c, 404, "not_found", "grant not found");
+      return c.json(
+        {
+          error: "invalid_request",
+          ...(result.code === "disposition_required" && {
+            error_code: "disposition_required",
+          }),
+          error_description: result.message,
+          ...(result.missing && { missing: result.missing }),
+        },
+        400,
+        NO_STORE,
+      );
+    }
+    deps.logger.info(
+      {
+        action: input.action,
+        action_id: input.actionId,
+        grants: result.result.grants,
+      },
+      "PDPP owner grant ending",
+    );
+    const legacy = input.legacyGrantId
+      ? (() => {
+          const stored = deps.store.getGrant(input.legacyGrantId);
+          return {
+            grant_id: input.legacyGrantId,
+            // Back-compatible field: the grant is ended; `lifecycle` has the detail.
+            status: !result.result.complete
+              ? "pending"
+              : stored &&
+                  lifecycle.readStateOf(stored, now()).read_state === "expired"
+                ? "expired"
+                : "revoked",
+            ...(stored && { lifecycle: lifecycle.ownerView(stored, now()) }),
+          };
+        })()
+      : {};
+    return ownerActionResponse(c, result.result, legacy);
+  }
 
   /**
    * The single owner-token check the owner grant routes share.
@@ -1726,6 +2612,33 @@ function approvalStatus(code: string): 400 | 401 | 403 | 404 | 409 {
     default:
       return 400;
   }
+}
+
+async function readJsonObject(
+  c: Context,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const body = (await c.req.json()) as unknown;
+    return body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `{ <grant_id>: "keep" | "delete" }`, or null when malformed. Absent is `{}`. */
+function parseDispositions(
+  value: unknown,
+): Record<string, "keep" | "delete"> | null {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out: Record<string, "keep" | "delete"> = Object.create(null);
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v !== "keep" && v !== "delete") return null;
+    out[k] = v;
+  }
+  return out;
 }
 
 function asString(value: unknown): string | null {

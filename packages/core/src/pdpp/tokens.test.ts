@@ -469,14 +469,26 @@ describe("delivery §2 / §9 AS item 8 — revocation and lifecycle", () => {
     expect(store.grantStatus(store.getGrant(active.grant_id)!)).toBe("revoked");
   });
 
-  it("reports revoked rather than expired when a grant is both", () => {
-    // Revocation is the owner's decision and stays the reported fact; it does
-    // not silently become "expired" once the clock passes.
+  it("keeps the first ending: revoking an already expired grant leaves it expired", () => {
+    // spec-core L1735: "A grant keeps its first ending. [...] A later
+    // revocation attempt [...] for an ended grant does not change its
+    // `read_state` or `ended_at`." (WP6 replaced the earlier revoked-wins rule.)
     const { grant } = seedGrant("continuous", {
       expires_at: new Date(Date.now() - 1000).toISOString(),
     });
+    expect(tokens.revokeGrant(grant.grant_id)).toBe(false);
+    expect(store.grantStatus(store.getGrant(grant.grant_id)!)).toBe("expired");
+  });
+
+  it("still reports revoked after expiry when the revocation came first", () => {
+    const { grant } = seedGrant("continuous", {
+      expires_at: new Date(Date.now() + 1000).toISOString(),
+    });
     tokens.revokeGrant(grant.grant_id);
-    expect(store.grantStatus(store.getGrant(grant.grant_id)!)).toBe("revoked");
+    const later = new Date(Date.now() + 5000);
+    expect(store.grantStatus(store.getGrant(grant.grant_id)!, later)).toBe(
+      "revoked",
+    );
   });
 });
 

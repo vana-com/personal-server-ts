@@ -569,7 +569,10 @@ describe("PDPP boot journey: real createServer", () => {
         authorization: `Bearer ${owner}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revoked.status).toBe(200);
 

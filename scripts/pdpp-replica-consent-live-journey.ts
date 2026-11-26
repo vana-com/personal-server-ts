@@ -556,7 +556,7 @@ export async function revokeConsent(
   const response = await form(
     issuer.origin,
     "/revoke",
-    { grant_id: consent.grantId },
+    { grant_id: consent.grantId, disposition: "keep" },
     issuer.credential,
   );
   assert.equal(response.status, 200, "revoke at issuer");

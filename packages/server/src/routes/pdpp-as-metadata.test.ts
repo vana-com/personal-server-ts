@@ -81,8 +81,10 @@ describe("PDPP AS metadata", () => {
       };
       // Both, because both are implemented and each resolves under its own
       // revision. Advertising only v0.2 would strand existing v0.1 clients.
+      // AS item 33 / L1802: the lifecycle recovery type is advertised too.
       expect(body.authorization_details_types_supported).toEqual([
         PDPP_DATA_ACCESS_TYPE,
+        "https://pdpp.dev/grant-lifecycle",
         PDPP_DATA_ACCESS_TYPE_V02,
         PDPP_DATA_ACCESS_TYPE_CANDIDATE,
       ]);

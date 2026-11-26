@@ -303,7 +303,7 @@ describe("the full authorization journey", () => {
 
     const revoked = await postForm(
       "/pdpp/v1/revoke",
-      { grant_id },
+      { grant_id, disposition: "keep" },
       ownerAuth(ownerToken),
     );
     expect(revoked.status).toBe(200);
@@ -378,7 +378,7 @@ describe("owner authentication on the decision endpoints", () => {
     const intruder = scopedOwnerToken(OTHER_OWNER);
     const response = await postForm(
       "/pdpp/v1/revoke",
-      { grant_id },
+      { grant_id, disposition: "keep" },
       ownerAuth(intruder),
     );
     expect(response.status).toBe(404);

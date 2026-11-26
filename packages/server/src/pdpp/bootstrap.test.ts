@@ -390,7 +390,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
         "content-type": "application/x-www-form-urlencoded",
         authorization: `Bearer ${token}`,
       },
-      body: new URLSearchParams({ grant_id }).toString(),
+      body: new URLSearchParams({ grant_id, disposition: "keep" }).toString(),
     });
     expect(revoked.status).toBe(200);
 

@@ -184,8 +184,63 @@ export {
 export type {
   AccessTokenRecord,
   AuthCodeRecord,
+  GrantEndingReason,
+  OpenPdppAuthStoreOptions,
   StoredGrant,
 } from "./store.js";
+
+export {
+  defaultAnchorIo,
+  defaultPendingJournalIo,
+  HistoryEvidenceError,
+  HistoryRecorder,
+  PendingActionJournal,
+} from "./history.js";
+export type {
+  AnchorDocument,
+  AnchoredErasure,
+  AnchorIo,
+  HistoryStatus,
+  PendingJournalIo,
+  PendingOwnerAction,
+} from "./history.js";
+
+export {
+  DELETION_BOUND_MS,
+  GrantLifecycleService,
+  HISTORY_RETRY_AFTER_SECONDS,
+  isRfc3339,
+  parseRetainedUntil,
+  PDPP_GRANT_LIFECYCLE_TYPE,
+  RECONCILIATION_INTERVAL_MS,
+  RETRY_INTERVAL_MS,
+  STOP_USE_BOUND_MS,
+} from "./lifecycle.js";
+export type {
+  AffectedGrant,
+  ErasureOwnerView,
+  GrantLifecycleServiceOptions,
+  LifecycleAnswer,
+  LifecycleEntry,
+  LifecycleHttpResult,
+  OwnerActionResult,
+  OwnerEndingAction,
+  OwnerGrantLifecycleView,
+  ReadState,
+} from "./lifecycle.js";
+export type {
+  ErasureInstructionRecord,
+  RetainedReportRecord,
+} from "./lifecycle-store.js";
+
+export {
+  deleteStatements,
+  finalReviewHeldDataStatements,
+  keepStatement,
+  narrowingStatements,
+  PENDING_HISTORY_STATEMENT,
+  RECOVERY_STATEMENT,
+} from "./held-data-statements.js";
 
 export {
   checkDeclarationUrl,

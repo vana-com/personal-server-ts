@@ -24,6 +24,18 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
+import {
+  HistoryRecorder,
+  PendingActionJournal,
+  type AnchorIo,
+  type AnchoredErasure,
+  type PendingJournalIo,
+} from "./history.js";
+import {
+  LifecycleRecords,
+  STOP_USE_BOUND_MS,
+  type ErasureInstructionRecord,
+} from "./lifecycle-store.js";
 import type {
   DeclarationSnapshot,
   Grant,
@@ -146,8 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_access_grant ON pdpp_access_tokens (grant_id
 -- revocation with current client authentication, recorded in the same
 -- transaction as the revocation it rides on (L2787: "before, or atomically
 -- with"). Append-only: a matching retry inserts nothing, so clocks never move.
--- TODO(grant-lifecycle package): turn a recorded \`delete\` into an erasure
--- instruction (L1612) and answer it through the lifecycle operation.
+-- A recorded \`delete\` also creates the grant's erasure instruction in the
+-- same transaction (L2785, L1612; see lifecycle-store.ts).
 CREATE TABLE IF NOT EXISTS pdpp_revocation_dispositions (
   grant_id TEXT NOT NULL,
   client_id TEXT NOT NULL,
@@ -222,7 +234,23 @@ interface GrantRow {
  * any caller reads authorization facts out of it. That is §9 AS item 21: the
  * failure is loud and up front, not a silently-degraded read path.
  */
-export function openPdppAuthStore(dbPath: string): PdppAuthStore {
+export interface OpenPdppAuthStoreOptions {
+  /**
+   * The lifecycle-durability anchor file (history.ts). Defaults to
+   * `<dbPath>.history-anchor.json`; null disables restore detection. An
+   * in-memory database has no anchor.
+   */
+  anchorPath?: string | null;
+  /** Owner actions accepted while the history is unavailable (L1827). */
+  pendingJournalPath?: string | null;
+  anchorIo?: AnchorIo;
+  pendingJournalIo?: PendingJournalIo;
+}
+
+export function openPdppAuthStore(
+  dbPath: string,
+  options: OpenPdppAuthStoreOptions = {},
+): PdppAuthStore {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   // Transactions here express atomicity guarantees; a torn write would defeat
@@ -274,11 +302,67 @@ export function openPdppAuthStore(dbPath: string): PdppAuthStore {
     throw new UnsupportedAuthStateError(meta.version);
   }
 
-  return new PdppAuthStore(db);
+  const inMemory = dbPath === ":memory:" || dbPath === "";
+  const anchorPath =
+    options.anchorPath !== undefined
+      ? options.anchorPath
+      : inMemory
+        ? null
+        : `${dbPath}.history-anchor.json`;
+  const journalPath =
+    options.pendingJournalPath !== undefined
+      ? options.pendingJournalPath
+      : inMemory
+        ? null
+        : `${dbPath}.pending-owner-actions.jsonl`;
+  const history = new HistoryRecorder(db, anchorPath, options.anchorIo);
+  const journal = new PendingActionJournal(
+    journalPath,
+    options.pendingJournalIo,
+  );
+  return new PdppAuthStore(db, history, journal);
 }
 
+/** How a grant ended, for the owner surface (L1572). */
+export type GrantEndingReason =
+  | "owner_withdrawal"
+  | "client_revocation"
+  | "client_erasure"
+  | "erasure_request"
+  | "security"
+  | "history_restore";
+
 export class PdppAuthStore {
-  constructor(private readonly db: Database.Database) {}
+  readonly lifecycle: LifecycleRecords;
+
+  constructor(
+    private readonly db: Database.Database,
+    readonly history: HistoryRecorder = new HistoryRecorder(db, null),
+    readonly pendingActions: PendingActionJournal = new PendingActionJournal(
+      null,
+    ),
+  ) {
+    this.lifecycle = new LifecycleRecords(db, history);
+  }
+
+  /**
+   * Run `fn` as one transaction, then advance the durability evidence before
+   * the caller can acknowledge anything (L1816, L1823). Nested calls join the
+   * outer transaction and leave the advance to it.
+   */
+  commit<T>(fn: () => T, now: Date = new Date()): T {
+    if (this.db.inTransaction) return fn();
+    let result: T;
+    try {
+      result = this.db.transaction(fn)();
+    } catch (err) {
+      this.history.discardPending();
+      throw err;
+    }
+    this.history.markCommitted();
+    this.history.advance(now.toISOString());
+    return result;
+  }
 
   close(): void {
     this.db.close();
@@ -360,27 +444,36 @@ export class PdppAuthStore {
     consentEvidence?: unknown;
   }): void {
     const { grant } = input;
-    this.db
-      .prepare(
-        `INSERT INTO pdpp_grants
+    this.commit(() => {
+      this.db
+        .prepare(
+          `INSERT INTO pdpp_grants
            (grant_id, subject_id, client_id, source_id, declaration_version,
             access_mode, grant_json, issued_at, expires_at, review_digest,
             consent_evidence_json)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+        )
+        .run(
+          grant.grant_id,
+          input.subjectId,
+          grant.client.client_id,
+          grant.source.id,
+          grant.source_declaration.version,
+          grant.access_mode,
+          JSON.stringify(grant),
+          grant.issued_at,
+          grant.expires_at ?? null,
+          input.reviewDigest,
+          input.consentEvidence ? JSON.stringify(input.consentEvidence) : null,
+        );
+      // L1824: grant issuance and grant_id assignment are recorded events.
+      this.history.append(
+        "grant_issued",
         grant.grant_id,
-        input.subjectId,
-        grant.client.client_id,
-        grant.source.id,
-        grant.source_declaration.version,
-        grant.access_mode,
-        JSON.stringify(grant),
+        { client_id: grant.client.client_id },
         grant.issued_at,
-        grant.expires_at ?? null,
-        input.reviewDigest,
-        input.consentEvidence ? JSON.stringify(input.consentEvidence) : null,
       );
+    });
   }
 
   /**
@@ -403,7 +496,7 @@ export class PdppAuthStore {
     code: string;
     authCode: AuthCodeRecord;
   }): void {
-    const tx = this.db.transaction(() => {
+    this.commit(() => {
       this.insertGrant({
         grant: input.grant,
         subjectId: input.subjectId,
@@ -412,7 +505,6 @@ export class PdppAuthStore {
       });
       this.insertAuthCode(input.code, input.authCode);
     });
-    tx();
   }
 
   getGrant(grantId: string): StoredGrant | null {
@@ -430,6 +522,61 @@ export class PdppAuthStore {
       revokedAt: row.revoked_at,
       consumedAt: row.consumed_at,
     };
+  }
+
+  /** Every grant, for history re-establishment only. */
+  listAllGrants(): StoredGrant[] {
+    const rows = this.db
+      .prepare("SELECT grant_id FROM pdpp_grants ORDER BY issued_at")
+      .all() as { grant_id: string }[];
+    return rows.map((r) => this.getGrant(r.grant_id)!);
+  }
+
+  /**
+   * Re-establish a history that the anchor showed not current (history.ts,
+   * L1823). `apply` runs in one transaction without the currency gate; the
+   * anchor is then rewritten under a new epoch.
+   */
+  reestablishHistory(apply: () => void, now: Date): void {
+    try {
+      this.db.transaction(apply)();
+    } catch (err) {
+      this.history.discardPending();
+      throw err;
+    }
+    this.history.markCommitted();
+    this.history.reanchor(now.toISOString(), this.history.anchoredErasures());
+  }
+
+  /** Restore one anchored instruction and its grant-ending facts (L1820). */
+  restoreAnchoredInstructionInTx(e: AnchoredErasure, now: Date): boolean {
+    const at = now.toISOString();
+    if (e.read_state === "revoked") {
+      const changed = this.db
+        .prepare(
+          "UPDATE pdpp_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+        )
+        .run(e.ended_at, e.grant_id);
+      if (changed.changes > 0) {
+        this.lifecycle.recordEnding(
+          e.grant_id,
+          "erasure_request",
+          "restored from durability evidence",
+          at,
+        );
+      }
+    }
+    this.db
+      .prepare(
+        "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+      )
+      .run(at, e.grant_id);
+    this.db
+      .prepare(
+        "UPDATE pdpp_refresh_families SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+      )
+      .run(at, e.grant_id);
+    return this.lifecycle.restoreInstruction(e, at);
   }
 
   listGrantsForSubject(subjectId: string): StoredGrant[] {
@@ -474,29 +621,178 @@ export class PdppAuthStore {
    * Returns false if the grant does not exist or was already revoked, so a
    * double revoke is not reported as a fresh one.
    */
-  revokeGrant(grantId: string, now: Date = new Date()): boolean {
-    const at = now.toISOString();
-    const tx = this.db.transaction((): boolean => {
-      const result = this.db
-        .prepare(
-          "UPDATE pdpp_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
-        )
-        .run(at, grantId);
-      if (result.changes === 0) return false;
+  revokeGrant(
+    grantId: string,
+    now: Date = new Date(),
+    ending: { reason: GrantEndingReason; detail?: string } = {
+      reason: "owner_withdrawal",
+    },
+  ): boolean {
+    return this.commit(() => this.endGrantInTx(grantId, now, ending), now);
+  }
 
-      this.db
-        .prepare(
-          "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
-        )
-        .run(at, grantId);
-      this.db
-        .prepare(
-          "UPDATE pdpp_refresh_families SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
-        )
-        .run(at, grantId);
-      return true;
-    });
-    return tx();
+  /**
+   * End one grant inside the caller's transaction. A grant keeps its first
+   * ending (L1735): an already revoked or expired grant gets no new
+   * `revoked_at`, but its tokens and families are still disabled. An advance
+   * erasure election takes effect at the ending (L1586). Returns whether
+   * this call ended the grant.
+   */
+  endGrantInTx(
+    grantId: string,
+    now: Date,
+    ending: { reason: GrantEndingReason; detail?: string },
+  ): boolean {
+    const at = now.toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_grants SET revoked_at = ?
+         WHERE grant_id = ? AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .run(at, grantId, at);
+    this.db
+      .prepare(
+        "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+      )
+      .run(at, grantId);
+    this.db
+      .prepare(
+        "UPDATE pdpp_refresh_families SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+      )
+      .run(at, grantId);
+    const ended = result.changes > 0;
+    if (ended) {
+      this.lifecycle.recordEnding(
+        grantId,
+        ending.reason,
+        ending.detail ?? null,
+        at,
+      );
+      this.history.append(
+        "grant_revoked",
+        grantId,
+        { reason: ending.reason, detail: ending.detail ?? null },
+        at,
+      );
+    }
+    this.settleAdvanceInTx(grantId, now);
+    return ended;
+  }
+
+  /**
+   * The ending facts the lifecycle operation reports (L1729-L1735): the
+   * first ending wins, so a revocation after `expires_at` never replaces the
+   * expiry.
+   */
+  endingOf(
+    stored: StoredGrant,
+    now: Date,
+  ): { readState: "revoked" | "expired"; endedAt: string } | null {
+    const exp = stored.expiresAt ? Date.parse(stored.expiresAt) : null;
+    if (
+      stored.revokedAt &&
+      (exp === null || Date.parse(stored.revokedAt) < exp)
+    ) {
+      return { readState: "revoked", endedAt: stored.revokedAt };
+    }
+    if (exp !== null && exp <= now.getTime()) {
+      return { readState: "expired", endedAt: stored.expiresAt! };
+    }
+    return null;
+  }
+
+  /**
+   * Make an advance election effective once its grant has ended, at the
+   * ending time (L1586, case P6 variant: `effective_at` equals
+   * `expires_at`). Inside the caller's transaction.
+   */
+  settleAdvanceInTx(
+    grantId: string,
+    now: Date,
+  ): ErasureInstructionRecord | null {
+    const instruction = this.lifecycle.getInstruction(grantId);
+    if (!instruction) return null;
+    if (instruction.effectiveAt) return instruction;
+    const stored = this.getGrant(grantId);
+    if (!stored) return instruction;
+    const ending = this.endingOf(stored, now);
+    if (!ending) return instruction;
+    this.lifecycle.makeEffective(
+      instruction.instructionId,
+      ending.endedAt,
+      now.toISOString(),
+    );
+    const effective = this.lifecycle.getInstruction(grantId)!;
+    this.queueErasureEvidence(effective, ending);
+    return effective;
+  }
+
+  /** Put an effective instruction's complete record into the anchor (L1820). */
+  queueErasureEvidence(
+    instruction: ErasureInstructionRecord,
+    ending: { readState: "revoked" | "expired"; endedAt: string },
+  ): void {
+    if (!instruction.effectiveAt) return;
+    const evidence: AnchoredErasure = {
+      grant_id: instruction.grantId,
+      client_id: instruction.clientId,
+      instruction_id: instruction.instructionId,
+      accepted_at: instruction.acceptedAt,
+      effective_at: instruction.effectiveAt,
+      stop_use_by: new Date(
+        Date.parse(instruction.effectiveAt) + STOP_USE_BOUND_MS,
+      ).toISOString(),
+      read_state: ending.readState,
+      ended_at: ending.endedAt,
+    };
+    this.history.queueErasureEvidence(evidence);
+  }
+
+  /**
+   * Record an immediate erasure request for one grant (L1586, L1612, L1746),
+   * inside the caller's transaction. Ends the grant if it has not ended. An
+   * advance instruction becomes effective at that ending; an effective one
+   * is returned unchanged (L1622: "a repeated request returns the existing
+   * instruction"; clocks never move); otherwise a new instruction is
+   * accepted and effective now.
+   */
+  requestErasureInTx(input: {
+    grantId: string;
+    clientId: string;
+    origin: "owner" | "client";
+    now: Date;
+    ending: { reason: GrantEndingReason; detail?: string };
+    /** The client's first receipt, when the request reports it (L1746). */
+    receiptReportedAt?: string;
+  }): { instruction: ErasureInstructionRecord; ended: boolean } {
+    const at = input.now.toISOString();
+    const ended = this.endGrantInTx(input.grantId, input.now, input.ending);
+    let instruction = this.lifecycle.getInstruction(input.grantId);
+    if (!instruction) {
+      instruction = this.lifecycle.insertInstruction({
+        grantId: input.grantId,
+        clientId: input.clientId,
+        origin: input.origin,
+        advance: false,
+        at,
+        effectiveAt: at,
+      });
+    }
+    // endGrantInTx already settled an advance election at the ending.
+    instruction = this.lifecycle.getInstruction(input.grantId)!;
+    const stored = this.getGrant(input.grantId)!;
+    const ending = this.endingOf(stored, input.now);
+    if (ending) this.queueErasureEvidence(instruction, ending);
+    if (input.receiptReportedAt) {
+      this.lifecycle.recordReceipt(
+        instruction.instructionId,
+        input.receiptReportedAt,
+        at,
+      );
+      instruction = this.lifecycle.getInstruction(input.grantId)!;
+    }
+    return { instruction, ended };
   }
 
   // -- authorization codes ------------------------------------------------
@@ -532,7 +828,7 @@ export class PdppAuthStore {
   consumeAuthCode(code: string, now: Date = new Date()): AuthCodeRecord | null {
     const hash = hashToken(code);
     const at = now.toISOString();
-    const tx = this.db.transaction((): AuthCodeRecord | null => {
+    return this.commit((): AuthCodeRecord | null => {
       const result = this.db
         .prepare(
           `UPDATE pdpp_auth_codes SET redeemed_at = ?
@@ -551,6 +847,8 @@ export class PdppAuthStore {
         code_challenge_method: string | null;
         expires_at: string;
       };
+      // L1824: authorization-code redemption is a recorded event.
+      this.history.append("code_redeemed", row.grant_id, {}, at);
       return {
         grantId: row.grant_id,
         clientId: row.client_id,
@@ -559,8 +857,7 @@ export class PdppAuthStore {
         codeChallengeMethod: row.code_challenge_method,
         expiresAt: row.expires_at,
       };
-    });
-    return tx();
+    }, now);
   }
 
   // -- tokens -------------------------------------------------------------
@@ -596,7 +893,7 @@ export class PdppAuthStore {
     const now = input.now ?? new Date();
     const at = now.toISOString();
 
-    const tx = this.db.transaction((): boolean => {
+    return this.commit((): boolean => {
       if (input.consumeSingleUse) {
         if (!input.grantId) return false;
         const consumed = this.db
@@ -607,6 +904,8 @@ export class PdppAuthStore {
           )
           .run(at, input.grantId);
         if (consumed.changes === 0) return false;
+        // L1824: `single_use` consumption is a recorded event.
+        this.history.append("single_use_consumed", input.grantId, {}, at);
       }
 
       this.db
@@ -631,8 +930,7 @@ export class PdppAuthStore {
           input.expiresAt,
         );
       return true;
-    });
-    return tx();
+    }, now);
   }
 
   getAccessToken(token: string): AccessTokenRecord | null {
@@ -722,7 +1020,7 @@ export class PdppAuthStore {
     const hash = hashToken(presented);
     const at = now.toISOString();
 
-    const tx = this.db.transaction(() => {
+    return this.commit(() => {
       const row = this.db
         .prepare(
           `SELECT t.token_hash, t.family_id, t.superseded_at,
@@ -759,6 +1057,13 @@ export class PdppAuthStore {
              WHERE family_id = ? AND revoked_at IS NULL`,
           )
           .run(at, row.family_id);
+        // A credential event, not a grant ending (L1573, case P8).
+        this.history.append(
+          "refresh_family_revoked",
+          row.grant_id,
+          { family_id: row.family_id, reason: "reuse" },
+          at,
+        );
         return { ok: false as const, reason: "reuse_detected" as const };
       }
 
@@ -767,24 +1072,34 @@ export class PdppAuthStore {
           "UPDATE pdpp_refresh_tokens SET superseded_at = ? WHERE token_hash = ?",
         )
         .run(at, hash);
+      // L1824: refresh-token supersession is a recorded event.
+      this.history.append("refresh_superseded", row.grant_id, {}, at);
       return {
         ok: true as const,
         familyId: row.family_id,
         grantId: row.grant_id,
       };
-    });
-
-    return tx();
+    }, now);
   }
 
   /** Revoke one access token. Returns false if unknown or already revoked. */
   revokeAccessToken(token: string, now: Date = new Date()): boolean {
-    const result = this.db
-      .prepare(
-        "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
-      )
-      .run(now.toISOString(), hashToken(token));
-    return result.changes > 0;
+    return this.commit(() => {
+      const result = this.db
+        .prepare(
+          "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .run(now.toISOString(), hashToken(token));
+      if (result.changes > 0) {
+        this.history.append(
+          "access_token_revoked",
+          null,
+          { token_hash: hashToken(token) },
+          now.toISOString(),
+        );
+      }
+      return result.changes > 0;
+    }, now);
   }
 
   /**
@@ -860,7 +1175,7 @@ export class PdppAuthStore {
   }): string[] {
     const now = input.now ?? new Date();
     const at = now.toISOString();
-    const tx = this.db.transaction((): string[] => {
+    return this.commit((): string[] => {
       const ended: string[] = [];
       const d = input.disposition;
       if (d) {
@@ -887,6 +1202,12 @@ export class PdppAuthStore {
               d.credential,
               at,
             );
+          this.history.append(
+            "client_disposition",
+            grantId,
+            { disposition: d.value, reported_at: d.reportedAt ?? null },
+            at,
+          );
         }
       }
       if (input.accessTokenOnly !== undefined) {
@@ -895,34 +1216,42 @@ export class PdppAuthStore {
             "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
           )
           .run(at, hashToken(input.accessTokenOnly));
+        this.history.append(
+          "access_token_revoked",
+          null,
+          { token_hash: hashToken(input.accessTokenOnly) },
+          at,
+        );
       }
       for (const grantId of input.endGrants) {
-        // Only an active grant gets a new ending. An expired one keeps its
-        // `expires_at` as its end (L2785: recording "MUST NOT change the
-        // `read_state` or `ended_at` of a grant that had already expired or
-        // been revoked"); its tokens and families are still disabled below.
-        const changed = this.db
-          .prepare(
-            `UPDATE pdpp_grants SET revoked_at = ?
-             WHERE grant_id = ? AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > ?)`,
-          )
-          .run(at, grantId, at);
-        if (changed.changes > 0) ended.push(grantId);
-        this.db
-          .prepare(
-            "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
-          )
-          .run(at, grantId);
-        this.db
-          .prepare(
-            "UPDATE pdpp_refresh_families SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
-          )
-          .run(at, grantId);
+        // Only an active grant gets a new ending (L2785); endGrantInTx keeps
+        // an expired grant's `expires_at` as its end and still disables its
+        // tokens and families.
+        if (this.endGrantInTx(grantId, now, { reason: "client_revocation" })) {
+          ended.push(grantId);
+        }
+      }
+      // L2785: "A recorded `delete` creates an erasure instruction for each
+      // grant in that scope." Recorded atomically with the revocation, and
+      // an existing instruction keeps its clocks (L1622). With `reported_at`
+      // the request also reports the owner's choice as the client's first
+      // receipt; without it no receipt is inferred (L1746, L2785).
+      if (d && d.value === "delete") {
+        for (const grantId of d.scope) {
+          this.requestErasureInTx({
+            grantId,
+            clientId: d.clientId,
+            origin: "client",
+            now,
+            ending: { reason: "client_revocation" },
+            ...(d.reportedAt !== undefined && {
+              receiptReportedAt: d.reportedAt,
+            }),
+          });
+        }
       }
       return ended;
-    });
-    return tx();
+    }, now);
   }
 
   /** Dispositions recorded for a grant, oldest first (tests and owner views). */
