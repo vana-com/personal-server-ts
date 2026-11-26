@@ -800,3 +800,25 @@ describe("createByteBudget", () => {
     releaseSecond();
   });
 });
+
+describe("fake clock advance with a self-rescheduling timer", () => {
+  it("advance returns instead of looping forever on a zero-delay reschedule", async () => {
+    const clock = fakeClock();
+    clock.after(0, function reschedule() {
+      clock.after(0, reschedule);
+    });
+    await clock.advance(100);
+    expect(clock.now()).toBe(100);
+  });
+
+  it("drive's elapsed budget stops a same-tick loop", async () => {
+    const clock = fakeClock();
+    clock.after(0, function reschedule() {
+      clock.after(0, reschedule);
+    });
+    const never = new Promise(() => {});
+    await expect(clock.drive(never, 100, 1_000)).rejects.toThrow(
+      "fake clock: work still pending",
+    );
+  });
+});
