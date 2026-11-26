@@ -582,10 +582,16 @@ export interface StreamSyncSeedSource {
       };
     }[]
   >;
-  /** The retained records of one stream. */
+  /**
+   * The retained records of `upload`, the identity `streams()` listed. If the
+   * stream no longer stages that upload, this throws `SeedUploadError` with
+   * code `SEED_SUPERSEDED` and yields no rows of another upload; the caller
+   * defers and lists again.
+   */
   records(
     connector: string,
     stream: string,
+    upload: string,
   ): AsyncIterable<Record<string, unknown>>;
 }
 
