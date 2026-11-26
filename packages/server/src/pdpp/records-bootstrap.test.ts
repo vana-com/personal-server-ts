@@ -325,4 +325,23 @@ describe("legacyScopeRecords blob bytes", () => {
     shared[0] = 9;
     expect(Array.from(returned ?? [])).toEqual([1, 2, 3]);
   });
+
+  it("preserves the presence of a zero-length blob", () => {
+    const returned = readerFor(new Uint8Array()).getBlobBytes(
+      "synthetic-empty",
+    );
+    expect(returned).toBeInstanceOf(Uint8Array);
+    expect(returned?.byteLength).toBe(0);
+  });
+
+  it("copies only the requested shared-buffer view", () => {
+    const source = new Uint8Array(new SharedArrayBuffer(5));
+    source.set([9, 1, 2, 3, 8]);
+    const view = source.subarray(1, 4);
+    const returned = readerFor(view).getBlobBytes("synthetic-view");
+    expect(returned?.buffer).toBeInstanceOf(ArrayBuffer);
+    expect(returned?.buffer.byteLength).toBe(3);
+    view[1] = 4;
+    expect(Array.from(returned ?? [])).toEqual([1, 2, 3]);
+  });
 });
