@@ -448,6 +448,38 @@ describe("PS Lite sync", () => {
         await manager.stop();
       }
     });
+
+    it("does not answer ok when a newer check starts after the lookup returned but before canSync resumes", async () => {
+      const lookups: Array<(server: { id: string } | null) => void> = [];
+      const getServer = vi.fn(
+        () =>
+          new Promise<{ id: string } | null>((resolve) => {
+            lookups.push(resolve);
+          }),
+      );
+      const manager = await managerOver(getServer);
+      try {
+        const options = vi.mocked(createSyncManager).mock.lastCall![2]!;
+        const older = options.canSync!();
+        await vi.waitFor(() => expect(lookups).toHaveLength(1));
+        // The lookup's continuation runs first (it checks its generation and
+        // returns); a newer check starts in the next microtask, before the
+        // older canSync resumes from that return.
+        lookups[0]!({ id: "server-1" });
+        const started = new Promise<{
+          newer: ReturnType<NonNullable<typeof options.canSync>>;
+        }>((resolve) =>
+          queueMicrotask(() => resolve({ newer: options.canSync!() })),
+        );
+        const { newer } = await started;
+        expect(await older).toMatchObject({ ok: false });
+        await vi.waitFor(() => expect(lookups).toHaveLength(2));
+        lookups[1]!({ id: "server-1" });
+        expect(await newer).toEqual({ ok: true });
+      } finally {
+        await manager.stop();
+      }
+    });
   });
 
   it("uses the caller-provided logger for sync lifecycle logs", async () => {

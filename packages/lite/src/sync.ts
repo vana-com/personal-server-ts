@@ -597,14 +597,25 @@ export async function createPsLiteSyncManager(
     if (generation === registrationGeneration)
       registrationConfirmed = confirmed;
   }
-  async function checkRegistration(): Promise<boolean> {
+  /**
+   * `confirmed` is this lookup's own answer; `generation` is its token. A
+   * caller that resumes after an await must compare the token again, as a
+   * newer check can start between this return and the caller's resumption.
+   */
+  async function checkRegistration(): Promise<{
+    confirmed: boolean;
+    generation: number;
+  }> {
     const generation = ++registrationGeneration;
     setRegistrationConfirmed(false, generation);
     const serverInfo = await gateway.getServer(options.serverAccount.address);
     const confirmed = Boolean(serverInfo?.id);
     setRegistrationConfirmed(confirmed, generation);
     // A lookup that a newer one superseded confirms nothing for its caller.
-    return generation === registrationGeneration && confirmed;
+    return {
+      confirmed: generation === registrationGeneration && confirmed,
+      generation,
+    };
   }
   const retirementWriteReady = () =>
     registrationConfirmed &&
@@ -898,7 +909,9 @@ export async function createPsLiteSyncManager(
           )
             return { ok: true };
           try {
-            if (await checkRegistration()) return { ok: true };
+            const check = await checkRegistration();
+            if (check.confirmed && check.generation === registrationGeneration)
+              return { ok: true };
             return {
               ok: false,
               reason: "unregistered",

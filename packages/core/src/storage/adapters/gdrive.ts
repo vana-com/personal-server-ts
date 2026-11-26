@@ -47,6 +47,7 @@ interface DriveFileRecord {
 
 interface DriveListResponse {
   files?: DriveFileRecord[];
+  nextPageToken?: string;
 }
 
 export interface GoogleDriveStorageAdapterParams {
@@ -282,23 +283,39 @@ export function createGoogleDriveStorageAdapter(
   ): Promise<DriveFileRecord[]> {
     const fileName = driveFileNameForKey(key);
     const query = `name = '${escapeDriveQuery(fileName)}' and '${escapeDriveQuery(folderId)}' in parents and trashed = false`;
-    const qs = new URLSearchParams({
+    const baseParams = {
       q: query,
       spaces: "drive",
       orderBy: "createdTime asc",
       pageSize: "20",
-      fields: "files(id,name,size,sha256Checksum,createdTime)",
-    });
-    const res = await authorizedFetch(
-      `${apiBase}/drive/v3/files?${qs.toString()}`,
-      { method: "GET" },
-      signal,
-    );
-    if (!res.ok) {
-      throw await classifyHttpError(res, "list");
-    }
-    const payload = (await res.json()) as DriveListResponse;
-    const files = (payload.files ?? []).filter((f) => typeof f.id === "string");
+      fields: "nextPageToken,files(id,name,size,sha256Checksum,createdTime)",
+    };
+    const files: DriveFileRecord[] = [];
+    const seenTokens = new Set<string>();
+    let pageToken: string | undefined;
+    do {
+      const qs = new URLSearchParams(baseParams);
+      if (pageToken !== undefined) qs.set("pageToken", pageToken);
+      const res = await authorizedFetch(
+        `${apiBase}/drive/v3/files?${qs.toString()}`,
+        { method: "GET" },
+        signal,
+      );
+      if (!res.ok) {
+        throw await classifyHttpError(res, "list");
+      }
+      const payload = (await res.json()) as DriveListResponse;
+      for (const f of payload.files ?? []) {
+        if (typeof f.id === "string") files.push(f);
+      }
+      pageToken = payload.nextPageToken || undefined;
+      if (pageToken !== undefined) {
+        if (seenTokens.has(pageToken)) {
+          throw new Error("gdrive list failed: repeated page token");
+        }
+        seenTokens.add(pageToken);
+      }
+    } while (pageToken !== undefined);
     // Deterministic tie-break when two concurrent uploads share identical createdTime.
     files.sort((a, b) => {
       const ta = a.createdTime ?? "";
