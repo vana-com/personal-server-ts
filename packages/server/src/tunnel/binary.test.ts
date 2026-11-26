@@ -331,6 +331,39 @@ describe("tunnel/binary", () => {
       ).rejects.toThrow();
     });
 
+    it("does not publish a binary or metadata on a successful HTTP response without a body", async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+      try {
+        await expect(ensureFrpcBinary(tempDir, { log: () => {} })).rejects.toThrow("No response body received");
+        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await getInstalledVersion(tempDir)).toBeNull();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("removes the temporary archive and writes no version on a mid-stream download failure", async () => {
+      const originalFetch = globalThis.fetch;
+      const failure = new Error("synthetic response stream interrupted");
+      let pulls = 0;
+      const partial = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulls++ === 0) controller.enqueue(new Uint8Array([1, 2, 3]));
+          else controller.error(failure);
+        },
+      });
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(partial, { status: 200 }));
+      try {
+        await expect(ensureFrpcBinary(tempDir, { log: () => {} })).rejects.toThrow(failure.message);
+        await expect(access(join(tempDir, "bin", `_frpc_download.${getPlatformInfo().ext}`))).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await getInstalledVersion(tempDir)).toBeNull();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     it("provides clear error on HTTP failure", async () => {
       const originalFetch = globalThis.fetch;
       globalThis.fetch = vi.fn().mockResolvedValue({
