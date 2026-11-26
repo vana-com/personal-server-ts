@@ -615,7 +615,20 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
     // sync a no-op rather than a fabricated change.
     // `getRecord` returns undefined for a deleted row as well as an absent
     // one, which is exactly the distinction both branches below need.
-    const existing = store.getRecord(instance, meta.stream.name, keyFromData);
+    const isUnchanged = (): boolean => {
+      const existing = store.getRecord(instance, meta.stream.name, keyFromData);
+      if (meta.record.op === "delete") {
+        // A delete for a record we do not currently hold changes nothing.
+        // Ingesting it would write a tombstone announcing the removal of
+        // something this store never served — a fabricated change.
+        return !existing;
+      }
+      return (
+        !!existing &&
+        jsonEqual(existing.data, payload) &&
+        existing.emittedAt === envelope.collectedAt
+      );
+    };
     const unchanged = {
       status: "unchanged" as const,
       instance,
@@ -623,18 +636,7 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
       recordKey: keyFromData,
     };
 
-    if (meta.record.op === "delete") {
-      // A delete for a record we do not currently hold changes nothing.
-      // Ingesting it would write a tombstone announcing the removal of
-      // something this store never served — a fabricated change.
-      if (!existing) return unchanged;
-    } else if (
-      existing &&
-      jsonEqual(existing.data, payload) &&
-      existing.emittedAt === envelope.collectedAt
-    ) {
-      return unchanged;
-    }
+    if (isUnchanged()) return unchanged;
 
     // A single-field key must stay a bare string. `encodeRecordKey` treats an
     // array as a COMPOUND key and JSON-encodes it, so wrapping a lone value
@@ -661,17 +663,22 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
         "The account storage mode is not known yet",
       );
     }
-    let result: ReturnType<PdppRecordStore["ingestBatch"]>;
+    let result: ReturnType<PdppRecordStore["ingestBatch"]> | null;
     try {
       // One envelope per call, but through the batch API so the store's own
       // transaction wraps the write: a failure rolls back rather than leaving
       // a row without its history entry.
+      // The seal does not serialize writers, so the check above can be stale
+      // by the time this runs: a concurrent import of the same envelope may
+      // have landed. Re-check inside the seal and skip a repeat.
       result = await seal.commit(() =>
-        store.ingestBatch(
-          [input],
-          () => declaredStream.semantics,
-          () => declaredStream.primaryKey,
-        ),
+        isUnchanged()
+          ? null
+          : store.ingestBatch(
+              [input],
+              () => declaredStream.semantics,
+              () => declaredStream.primaryKey,
+            ),
       );
     } catch (err) {
       if (!(err instanceof LegacyWriteRefusedError)) throw err;
@@ -685,6 +692,7 @@ export function createPdppImporter(deps: PdppImporterDeps): PdppImporter {
         "The account storage mode is not known yet",
       );
     }
+    if (result === null) return unchanged;
     if (result.rejected.length > 0) {
       const reason = result.rejected[0].reason;
       return reject(

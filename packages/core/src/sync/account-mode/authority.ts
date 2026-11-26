@@ -153,7 +153,16 @@ export function createModeAuthority(
   options: ModeAuthorityOptions,
 ): ModeAuthority {
   const now = options.now ?? Date.now;
-  const warn = options.onWarning ?? (() => {});
+  const sink = options.onWarning ?? (() => {});
+  // A diagnostic sink that throws must not reject the never-rejecting `ready`
+  // or hide a failed load from the retry path.
+  const warn = (message: string, detail?: unknown): void => {
+    try {
+      sink(message, detail);
+    } catch {
+      // The diagnostic is lost; the state it reports is not.
+    }
+  };
   const records = new Map<string, AccountModeRecord>();
   const lock = createRwLock();
   /**

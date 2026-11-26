@@ -148,6 +148,18 @@ describe("an invalid persisted ledger", () => {
     },
   );
 
+  it("completes recovery and lets the first upload proceed when the degraded sink throws", async () => {
+    const store = storeHolding({ version: 2, records: [] });
+    const ledger = createUploadAttemptLedger(store, OWNER_A, {
+      onDegraded: () => {
+        throw new Error("sink broke");
+      },
+    });
+    await expect(ledger.recover()).resolves.toBe(true);
+    expect(store.written).toEqual([{ version: 1, records: [] }]);
+    await expect(ledger.begin(entry(1))).resolves.toBeDefined();
+  });
+
   it("does not reset the same corruption twice in one ledger lifetime", async () => {
     const bad = { version: 2, records: [] };
     const store = storeHolding(bad);

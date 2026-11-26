@@ -807,6 +807,34 @@ describe("the account-mode record", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  it("keeps ready from rejecting and still reloads when the warning sink throws", async () => {
+    let loads = 0;
+    const authority = createModeAuthority({
+      store: {
+        load: async () => {
+          loads += 1;
+          if (loads === 1) throw new Error("unreadable");
+          return new Map([
+            ["0xabc", { answer: "on" as const, generation: 7, receivedAt: 1 }],
+          ]);
+        },
+        save: async () => {},
+      },
+      onWarning: () => {
+        throw new Error("sink broke");
+      },
+    });
+    await expect(authority.ready).resolves.toBeUndefined();
+    expect(authority.read(OWNER).kind).toBe("refuse");
+    const next = await authority.submitEvidence({
+      owner: OWNER,
+      state: "on",
+      generation: 8,
+    });
+    expect(next.kind).not.toBe("refuse");
+    expect(loads).toBe(2);
+  });
+
   it("never saves a stale Off while the load has failed, and recovers from the reload", async () => {
     const saves: Array<{ owner: string; generation: number }> = [];
     const durable = new Map([

@@ -950,4 +950,35 @@ describe("createGoogleDriveStorageAdapter (loopback Drive v3 HTTP)", () => {
     });
     expect(drive.files.size).toBe(0);
   });
+
+  it("a repeated upload finds an existing object behind an empty first list page", async () => {
+    const { provider } = makeCredentials();
+    const adapter = createGoogleDriveStorageAdapter({
+      folderId,
+      credentials: provider,
+      apiBaseUrl: drive.baseUrl,
+    });
+    const key = "paged.repeat/key/1";
+    const bytes = new TextEncoder().encode("same synthetic content");
+    await adapter.upload(key, bytes);
+    const initialIds = [...drive.files.keys()];
+    expect(initialIds).toHaveLength(1);
+
+    drive.listPaging = "empty-first";
+    drive.requests.length = 0;
+    await adapter.upload(key, bytes);
+
+    expect([...drive.files.keys()]).toEqual(initialIds);
+    expect(
+      drive.requests.some(
+        (r) => r.method === "GET" && r.path.includes("pageToken=page-2"),
+      ),
+    ).toBe(true);
+    expect(
+      drive.requests.some(
+        (r) =>
+          r.method === "POST" && r.path.startsWith("/upload/drive/v3/files"),
+      ),
+    ).toBe(false);
+  });
 });
