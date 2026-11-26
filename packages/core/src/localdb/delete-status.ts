@@ -55,7 +55,9 @@ export type DeleteBlockReason =
    * never widens to the head it finds.
    */
   | "legacy_head_changed"
-  | "legacy_manifest_missing";
+  | "legacy_manifest_missing"
+  /** A sent retirement tombstone has no durable, valid version acknowledgement. */
+  | "legacy_tombstone_unacknowledged";
 
 export type DeletePart =
   | { readonly state: "done" }

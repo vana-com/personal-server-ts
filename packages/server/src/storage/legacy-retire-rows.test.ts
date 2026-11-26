@@ -379,7 +379,7 @@ for (const kind of ["node", "lite"])
         f.pipeline.advance(id, f.authority, new AbortController().signal),
       ).rejects.toThrow("revoked");
       expect(erase).not.toHaveBeenCalled();
-      expect(f.effects).toHaveLength(1);
+      expect(f.effects).toHaveLength(2);
     });
     it("preserves a row replaced between the snapshot and the manifest commit", async () => {
       const b = await backend(kind);
@@ -412,8 +412,19 @@ for (const kind of ["node", "lite"])
       expect(erase).not.toHaveBeenCalled();
       expect(f.effects).toHaveLength(0);
       const replacing = b.insert({ ...base, version: 2 });
-      if (kind === "node") await replacing;
-      release();
+      try {
+        await Promise.race([
+          replacing,
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(Error("replacement held by manifest commit")),
+              500,
+            ),
+          ),
+        ]);
+      } finally {
+        release();
+      }
       const id = await capturing;
       const replacement = await replacing;
       const stored = f.sql
@@ -429,6 +440,18 @@ for (const kind of ["node", "lite"])
       ).toEqual({ state: "done" });
       expect(await b.read(replacement)).toMatchObject({ scope: base.scope });
     });
+    it("uses the same numeric tombstone match for remote, local and completion checks", async () => {
+      const b = await backend(kind);
+      await b.insert(base);
+      const f = fixture(b.rows);
+      f.head({ state: "deleted", version: "3" });
+      const id = await f.pipeline.capture("github", f.authority);
+      f.head({ state: "deleted", version: "03" });
+      expect(
+        await f.pipeline.advance(id, f.authority, new AbortController().signal),
+      ).toEqual({ state: "done" });
+    });
+
     it("a failed manifest commit leaves no durable intent and retry captures afresh", async () => {
       const b = await backend(kind);
       await b.insert(base);

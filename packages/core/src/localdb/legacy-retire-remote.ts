@@ -7,7 +7,10 @@ import {
   TOMBSTONE_DATA_HASH,
   TOMBSTONE_METADATA_HASH,
 } from "../sync/tombstone.js";
-import type { LegacyRetirePipelinePorts } from "./legacy-retire-pipeline.js";
+import {
+  LegacyTombstoneUnacknowledged,
+  type LegacyRetirePipelinePorts,
+} from "./legacy-retire-pipeline.js";
 
 /** Retirement transport: exact requests, with no ordinary delete hooks or retries. */
 export function createLegacyRetireRemote(
@@ -69,11 +72,11 @@ export function createLegacyRetireRemote(
           body.code,
           "legacy retirement refused",
         );
-      if (
-        !response.ok ||
-        (body?.data ?? body)?.expectedVersion !== String(version)
-      )
-        throw new Error("legacy tombstone was not acknowledged at pin + 1");
+      if (!response.ok) throw new Error("legacy tombstone request failed");
+      if ((body?.data ?? body)?.expectedVersion !== String(version))
+        throw new LegacyTombstoneUnacknowledged(
+          "legacy tombstone was not acknowledged at pin + 1",
+        );
     },
     async eraseBlob(scope, version, authority, signal) {
       const base = options.storage.endpoint.replace(/\/+$/, "");

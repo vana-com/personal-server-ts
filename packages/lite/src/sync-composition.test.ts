@@ -1,3 +1,4 @@
+import type { PsLiteStoragePort } from "./storage.js";
 import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
 import { createMemoryPsLitePersistence } from "./test-support/memory.js";
 import type * as LocalDbModule from "@opendatalabs/personal-server-ts-core/localdb";
@@ -564,6 +565,29 @@ describe("PS Lite local database composition", () => {
         errorCode: "STREAM_READ_UNAVAILABLE",
       });
       expect(locks).toEqual([]);
+    } finally {
+      await lite.syncManager.stop();
+      await lite.closeStreamSync();
+    }
+  });
+
+  it("keeps custom storage without retirementRows usable and retirement unavailable", async () => {
+    const db = driver();
+    facade(db);
+    const storage: PsLiteStoragePort = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+    );
+    const { retirementRows: _retirementRows, ...custom } = storage;
+    const { lite } = await setup(
+      { openDriver: vi.fn().mockResolvedValue(db) },
+      undefined,
+      custom,
+    );
+    try {
+      expect(lite.localSync).not.toBeNull();
+      const options = vi.mocked(createLocalSync).mock.calls[0]![1];
+      expect(options.legacyRetire?.()).toBeUndefined();
     } finally {
       await lite.syncManager.stop();
       await lite.closeStreamSync();

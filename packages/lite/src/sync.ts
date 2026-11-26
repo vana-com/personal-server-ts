@@ -1,7 +1,5 @@
-import {
-  createLegacyRetireRemote,
-  type RetirementRows,
-} from "@opendatalabs/personal-server-ts-core/localdb";
+import type { PsLiteStoragePort } from "./storage.js";
+import { createLegacyRetireRemote } from "@opendatalabs/personal-server-ts-core/localdb";
 import { createPsLiteSeedStaging } from "./seed-staging.js";
 import {
   LEGACY_SCOPE_BINDINGS,
@@ -181,7 +179,7 @@ export interface PsLiteSyncOptions {
    */
   streamSyncFlags?: string;
   stateStore: PsLiteStateStore;
-  storage: DataStoragePort;
+  storage: DataStoragePort & Pick<PsLiteStoragePort, "retirementRows">;
   ownerAddress?: `0x${string}`;
   ownerSignature: `0x${string}`;
   serverAccount: ServerAccount;
@@ -673,11 +671,7 @@ export async function createPsLiteSyncManager(
           erasure: () => logErasurePorts,
           // Standalone retirement owns its transport, receipts and row leaves.
           legacyRetire: () => {
-            const rows = (
-              options.storage as DataStoragePort & {
-                retirementRows?: RetirementRows;
-              }
-            ).retirementRows;
+            const rows = options.storage.retirementRows;
             if (!rows) return undefined;
             return {
               scopesOf: legacyScopesOfConnector,

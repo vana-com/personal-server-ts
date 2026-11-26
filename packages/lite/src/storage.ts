@@ -104,7 +104,7 @@ export interface PsLiteStorageCapabilities {
 /** Persistent Lite storage with its public backend capability report. */
 export interface PsLiteStoragePort extends DataStoragePort {
   readonly capabilities: PsLiteStorageCapabilities;
-  readonly retirementRows: RetirementRows;
+  readonly retirementRows?: RetirementRows;
   /**
    * The seal every legacy write of this storage runs inside, and every
    * removal under its shared lock. Given at construction; see
@@ -584,7 +584,7 @@ export async function createPersistentPsLiteStorage(
   persistenceAdapter: PsLitePersistenceAdapter | undefined,
   dataFileStore: PsLiteDataFileStore | undefined,
   legacyWriteSeal: LegacyWriteSeal,
-): Promise<PsLiteStoragePort> {
+): Promise<PsLiteStoragePort & { readonly retirementRows: RetirementRows }> {
   const persistence = persistenceAdapter ?? createIndexedDbPsLitePersistence();
   let state = normalizeState(await persistence.read());
   const fallbackEnvelopes = new Map(
@@ -823,15 +823,19 @@ export async function createPersistentPsLiteStorage(
     return sortEntries(scopeGroups.groups.get(scope) ?? []);
   }
 
-  const storagePort: PsLiteStoragePort = {
+  const storagePort: PsLiteStoragePort & {
+    readonly retirementRows: RetirementRows;
+  } = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
     retirementRows: {
-      capture: (save, authority) =>
-        enqueue(async () => {
+      capture: async (save, authority) => {
+        const rows = await enqueue(async () => {
           authority();
-          return save(state.entries.map((row) => ({ ...row })));
-        }),
+          return state.entries.map((row) => ({ ...row }));
+        });
+        return save(rows);
+      },
       absent: (rows, authority) =>
         enqueue(async () => {
           authority();

@@ -1,3 +1,4 @@
+import { isEntryCoveredByTombstone } from "../sync/scope-deletions.js";
 import { GatewayRefusalError } from "../sync/delete-data-port.js";
 import { isGatewayRefusalCode } from "../sync/gateway-refusal.js";
 import type { IndexEntry } from "../storage/index/index.js";
@@ -11,6 +12,8 @@ import {
 } from "./delete-status.js";
 import type { LogVersionLister } from "./log-erase.js";
 import type { TombstoneFinalityPort } from "../ports/index.js";
+
+export class LegacyTombstoneUnacknowledged extends Error {}
 
 /** Throws synchronously when the caller no longer owns write authority. */
 export type RetirementAuthority = () => void;
@@ -52,6 +55,7 @@ interface Scope {
   head: LegacyHead;
   streams: readonly string[];
   rows: readonly IndexEntry[];
+  acknowledgement?: "unconfirmed" | "accepted" | "blocked";
 }
 interface Manifest {
   scopes: readonly Scope[];
@@ -64,11 +68,11 @@ export function capturedAtPin(row: IndexEntry, head: LegacyHead): boolean {
   const pin = versionOf(head);
   const tombstone =
     pin === null ? null : pin + (head.state === "live" ? 1n : 0n);
-  return (
-    (pin === null || BigInt(row.version) <= pin) &&
-    (row.afterTombstoneVersion == null ||
-      (tombstone !== null && BigInt(row.afterTombstoneVersion) < tombstone))
-  );
+  if (row.dataPointId === null)
+    return isEntryCoveredByTombstone(row, {
+      version: tombstone?.toString() ?? null,
+    });
+  return pin === null || BigInt(row.version) <= pin;
 }
 function sameHead(a: LegacyHead, b: LegacyHead): boolean {
   if (a.state !== b.state) return false;
@@ -81,6 +85,13 @@ function sameHead(a: LegacyHead, b: LegacyHead): boolean {
     a.fence.dataHash.toLowerCase() === b.fence.dataHash.toLowerCase() &&
     a.fence.metadataHash.toLowerCase() === b.fence.metadataHash.toLowerCase()
   );
+}
+function matchesTombstone(pin: LegacyHead, head: LegacyHead): boolean {
+  const version = versionOf(pin);
+  return version === null
+    ? head.state === "absent"
+    : head.state === "deleted" &&
+        BigInt(head.version) === version + (pin.state === "live" ? 1n : 0n);
 }
 export function createLegacyRetirePipeline(
   deps: LegacyRetirerDeps,
@@ -166,6 +177,17 @@ export function createLegacyRetirePipeline(
       );
       if (!stored) return blocked("legacy_manifest_missing");
       const manifest = JSON.parse(stored.manifest) as Manifest;
+      if (manifest.scopes.some((scope) => scope.acknowledgement === "blocked"))
+        return blocked("legacy_tombstone_unacknowledged");
+      const saveManifest = async () => {
+        check();
+        await deps.db.batch([
+          {
+            sql: "UPDATE legacy_retire_manifests SET manifest = ? WHERE retire_id = ?",
+            params: [JSON.stringify(manifest), retireId],
+          },
+        ]);
+      };
       const receipts = new Set(
         (
           await deps.db.query<{ scope: string; version: string }>(
@@ -177,26 +199,33 @@ export function createLegacyRetirePipeline(
       const requiredReceipts = new Set<string>();
       for (const scope of manifest.scopes) {
         check();
-        const pin = versionOf(scope.head);
-        const tombstone =
-          pin === null
-            ? null
-            : String(pin + (scope.head.state === "live" ? 1n : 0n));
         const matches = (head: LegacyHead) =>
-          tombstone === null
-            ? head.state === "absent"
-            : head.state === "deleted" && head.version === tombstone;
+          matchesTombstone(scope.head, head);
         let head = await ports.head(scope.scope, signal);
+        // An interrupted send may retry only while the original live head remains.
+        // Seeing its tombstone is insufficient evidence of the required echo.
+        if (
+          scope.acknowledgement === "unconfirmed" &&
+          !sameHead(head, scope.head)
+        )
+          return blocked("legacy_tombstone_unacknowledged");
         if (
           scope.head.state === "live" &&
           head.state === "live" &&
           sameHead(head, scope.head)
         ) {
           check();
+          scope.acknowledgement = "unconfirmed";
+          await saveManifest();
           try {
             await ports.tombstone(scope.scope, scope.head, check, signal);
           } catch (error) {
             check();
+            if (error instanceof LegacyTombstoneUnacknowledged) {
+              scope.acknowledgement = "blocked";
+              await saveManifest();
+              return blocked("legacy_tombstone_unacknowledged");
+            }
             if (
               error instanceof GatewayRefusalError &&
               isGatewayRefusalCode(error.code)
@@ -207,6 +236,8 @@ export function createLegacyRetirePipeline(
               return blocked("legacy_head_changed");
             throw error;
           }
+          scope.acknowledgement = "accepted";
+          await saveManifest();
           check();
           head = await ports.head(scope.scope, signal);
         }
@@ -220,9 +251,7 @@ export function createLegacyRetirePipeline(
             ? null
             : String(pin + (scope.head.state === "live" ? 1n : 0n));
         const matches = (head: LegacyHead) =>
-          tombstone === null
-            ? head.state === "absent"
-            : head.state === "deleted" && head.version === tombstone;
+          matchesTombstone(scope.head, head);
         if (!matches(await ports.head(scope.scope, signal)))
           return blocked("legacy_head_changed");
         if (tombstone !== null) {
@@ -275,15 +304,8 @@ export function createLegacyRetirePipeline(
       // Remote completion for the whole manifest precedes any local erase.
       for (const scope of manifest.scopes) {
         check();
-        const pin = versionOf(scope.head);
         const head = await ports.head(scope.scope, signal);
-        if (
-          pin === null
-            ? head.state !== "absent"
-            : head.state !== "deleted" ||
-              BigInt(head.version) !==
-                pin + (scope.head.state === "live" ? 1n : 0n)
-        )
+        if (!matchesTombstone(scope.head, head))
           return blocked("legacy_head_changed");
         for (const row of scope.rows) {
           check();
@@ -309,14 +331,7 @@ export function createLegacyRetirePipeline(
         if (!(await ports.rows.absent(scope.rows, check))) return PART_PENDING;
         check();
         const head = await ports.head(scope.scope, signal);
-        const pin = versionOf(scope.head);
-        if (
-          pin === null
-            ? head.state !== "absent"
-            : head.state !== "deleted" ||
-              BigInt(head.version) !==
-                pin + (scope.head.state === "live" ? 1n : 0n)
-        )
+        if (!matchesTombstone(scope.head, head))
           return blocked("legacy_head_changed");
       }
       check();

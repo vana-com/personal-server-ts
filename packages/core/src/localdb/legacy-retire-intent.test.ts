@@ -894,46 +894,84 @@ describe("a retirement's destructive steps run only under live write authority a
       expect(f.legacy.storage.countVersions(scope)).toBe(0);
   });
 
-  it("a fenced delete whose 2xx echoes a later version cleans nothing past the pinned version", async () => {
-    const f = await reconnected({
-      host: {
-        wrapFetch: (fetchImpl) =>
-          (async (input, init) => {
-            const res = await fetchImpl(input, init);
-            if (
-              init?.method !== "DELETE" ||
-              !String(input).startsWith(FAKE_GATEWAY)
-            )
-              return res;
-            const body = (await res.json()) as {
-              data: Record<string, unknown>;
-            };
-            return new Response(
-              JSON.stringify({ data: { ...body.data, expectedVersion: "9" } }),
-              {
-                status: res.status,
-                headers: { "content-type": "application/json" },
-              },
-            );
-          }) as typeof fetch,
-      },
-    });
-    placeLocalEntries(f);
-    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+  it.each(["9", undefined])(
+    "a malformed echo %s stays blocked across a restart, even though the gateway shows the tombstone",
+    async (echo) => {
+      const f = await reconnected({
+        dbFile: tempDbFile(),
+        host: {
+          wrapFetch: (fetchImpl) =>
+            (async (input, init) => {
+              const res = await fetchImpl(input, init);
+              if (
+                init?.method !== "DELETE" ||
+                !String(input).startsWith(FAKE_GATEWAY)
+              )
+                return res;
+              const body = (await res.json()) as {
+                data: Record<string, unknown>;
+              };
+              return new Response(
+                JSON.stringify({
+                  data: { ...body.data, expectedVersion: echo },
+                }),
+                {
+                  status: res.status,
+                  headers: { "content-type": "application/json" },
+                },
+              );
+            }) as typeof fetch,
+        },
+      });
+      placeLocalEntries(f);
+      const { retireId } = await f.a.sync.legacyRetirer.request(GH);
 
-    await vi.waitFor(async () =>
-      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
-        retireId,
-        legacy: DONE,
-      }),
-    );
-    // The pins named version 2: its tombstone is 3. No blob above it is asked for.
-    const versions = storageDeletes(f.fake).map((r) =>
-      Number(decodeURIComponent(r.url).split("/").pop()),
-    );
-    expect(versions.length).toBeGreaterThan(0);
-    expect(Math.max(...versions)).toBeLessThanOrEqual(3);
-  });
+      await vi.waitFor(async () =>
+        expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+          retireId,
+          legacy: {
+            state: "blocked",
+            reason: "legacy_tombstone_unacknowledged",
+          },
+        }),
+      );
+      expect(storageDeletes(f.fake)).toEqual([]);
+      await f.a.sync.legacyRetirer.close();
+      const restarted = await f.a.restart();
+      await vi.waitFor(async () =>
+        expect((await restarted.sync.legacyRetirer.status(GH))?.legacy).toEqual(
+          {
+            state: "blocked",
+            reason: "legacy_tombstone_unacknowledged",
+          },
+        ),
+      );
+      expect(storageDeletes(f.fake)).toEqual([]);
+      expect(f.fake.isLive(SCOPES[0])).toBe(false);
+      for (const scope of SCOPES)
+        expect(f.legacy.storage.countVersions(scope)).toBe(1);
+    },
+  );
+
+  it.each([undefined, 3])(
+    "an unsynced legacy row above the pin uses its causal re-add marker %s",
+    async (marker) => {
+      const f = await reconnected();
+      placeLocalEntries(f);
+      for (const row of f.legacy.storage.entries) {
+        row.version = 99;
+        row.afterTombstoneVersion = marker;
+      }
+      await f.a.sync.legacyRetirer.request(GH);
+      await vi.waitFor(async () =>
+        expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual(DONE),
+      );
+      for (const scope of SCOPES)
+        expect(f.legacy.storage.countVersions(scope)).toBe(
+          marker === undefined ? 0 : 1,
+        );
+    },
+  );
 
   it("resumes local cleanup when the process stopped after the tombstone landed", async () => {
     const dbFile = tempDbFile();
