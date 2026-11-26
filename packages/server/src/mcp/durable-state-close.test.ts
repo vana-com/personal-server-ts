@@ -456,4 +456,40 @@ describe("MCP durable state close", () => {
       await reopened.close();
     }
   });
+
+  it("preserves an owner binding after a refused change and shutdown", async () => {
+    const s = await seeded();
+    const other = "0x2222222222222222222222222222222222222222";
+    await expect(
+      s.state.bindOwner(s.id, { owner: other, chainId: 14800 }),
+    ).rejects.toThrow("MCP connection owner cannot change");
+    await s.state.close();
+
+    const reopened = await openMcpDurableState({ path: s.path, key: s.key });
+    try {
+      await expect(reopened.getOwner(s.id)).resolves.toEqual({
+        owner: OWNER,
+        chainId: 14800,
+      });
+      await expect(reopened.ownerConnections(other)).resolves.toEqual([]);
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("does not persist a stale wakeup identity when queued before close", async () => {
+    const s = await emptyTarget();
+    const fresh = s.state.rememberIdentity(identity);
+    const stale = s.state.rememberIdentity({ ...identity, epoch: 1 });
+    await Promise.all([fresh, stale, s.state.close()]);
+
+    const reopened = await openMcpDurableState({ path: s.path, key: s.key });
+    try {
+      await expect(reopened.getIdentity(identity.userPsId)).resolves.toEqual(
+        identity,
+      );
+    } finally {
+      await reopened.close();
+    }
+  });
 });
