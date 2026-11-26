@@ -239,7 +239,9 @@ export async function ensureFrpcBinary(
   const key = resolve(storageRoot);
   let pending = pendingInstalls.get(key);
   if (!pending) {
-    pending = installCachedFrpc(storageRoot, log).finally(() => pendingInstalls.delete(key));
+    pending = installCachedFrpc(storageRoot, log).finally(() =>
+      pendingInstalls.delete(key),
+    );
     pendingInstalls.set(key, pending);
   }
   return pending;

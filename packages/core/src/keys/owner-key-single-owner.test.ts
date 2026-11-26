@@ -246,24 +246,31 @@ const fixturePublicKey =
 describe("createPublicOnlyAccount", () => {
   it("keeps the public identity readable but rejects both signing methods", async () => {
     const address = publicKeyToAddress(fixturePublicKey);
-    const account = createPublicOnlyAccount({ address, publicKey: fixturePublicKey });
+    const account = createPublicOnlyAccount({
+      address,
+      publicKey: fixturePublicKey,
+    });
     expect(account.address).toBe(address);
     expect(account.publicKey).toBe(fixturePublicKey);
-    await expect(account.signMessage("public-only fixture")).rejects.toBeInstanceOf(
-      ServerSigningUnavailableError,
-    );
-    await expect(account.signTypedData({
-      domain: {},
-      types: { Fixture: [{ name: "note", type: "string" }] },
-      primaryType: "Fixture",
-      message: { note: "public-only fixture" },
-    })).rejects.toBeInstanceOf(ServerSigningUnavailableError);
+    await expect(
+      account.signMessage("public-only fixture"),
+    ).rejects.toBeInstanceOf(ServerSigningUnavailableError);
+    await expect(
+      account.signTypedData({
+        domain: {},
+        types: { Fixture: [{ name: "note", type: "string" }] },
+        primaryType: "Fixture",
+        message: { note: "public-only fixture" },
+      }),
+    ).rejects.toBeInstanceOf(ServerSigningUnavailableError);
   });
 
   it("refuses a declared address that does not match its public key", () => {
-    expect(() => createPublicOnlyAccount({
-      address: "0x0000000000000000000000000000000000000000",
-      publicKey: fixturePublicKey,
-    })).toThrow("Public key does not match server address");
+    expect(() =>
+      createPublicOnlyAccount({
+        address: "0x0000000000000000000000000000000000000000",
+        publicKey: fixturePublicKey,
+      }),
+    ).toThrow("Public key does not match server address");
   });
 });
