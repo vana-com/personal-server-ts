@@ -7,7 +7,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdir, open, readdir, readFile, rename } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   parseRecord,
@@ -60,14 +60,20 @@ export function createFileModeRecordStore(
       }
       await mkdir(dir, { recursive: true });
       const tmp = join(dir, `.${owner}.${randomBytes(6).toString("hex")}.tmp`);
-      const handle = await open(tmp, "w", 0o600);
+      const handle = await open(tmp, "wx", 0o600);
       try {
-        await handle.writeFile(JSON.stringify(record));
-        await handle.sync();
-      } finally {
-        await handle.close();
+        try {
+          await handle.writeFile(JSON.stringify(record));
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await rename(tmp, join(dir, `${owner}.json`));
+      } catch (error) {
+        // The temp file belongs to this save. Keep the original failure if cleanup also fails.
+        await rm(tmp, { force: true }).catch(() => undefined);
+        throw error;
       }
-      await rename(tmp, join(dir, `${owner}.json`));
       const dirHandle = await open(dir, "r");
       try {
         await dirHandle.sync();
