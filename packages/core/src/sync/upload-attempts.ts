@@ -605,7 +605,11 @@ export function createUploadAttemptLedger(
       generation += 1;
       if (replaced) {
         resetOnce = true;
-        options.onDegraded?.(UPLOAD_ATTEMPTS_RESET_NOTICE);
+        try {
+          options.onDegraded?.(UPLOAD_ATTEMPTS_RESET_NOTICE);
+        } catch {
+          // A diagnostic must not undo a repair that already completed.
+        }
       }
       return true;
     } catch (error) {
