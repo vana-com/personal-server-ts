@@ -70,6 +70,51 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("access reporter refusal boundaries", () => {
+  it("does not salvage a batch when a 422 happens to name an index", async () => {
+    const send = vi.fn(async () =>
+      refusal(422, { code: "not_accepted", rejected: [{ index: 0 }] }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(logIdsOf(send.mock.calls[0])).toEqual(["log-1", "log-2"]);
+    expect(warn.mock.calls).toEqual([
+      [
+        {
+          count: 2,
+          droppedTotal: 2,
+          reason: "refused_422",
+          code: "not_accepted",
+          attempts: 1,
+        },
+        ACCESS_RECORDS_DROPPED,
+      ],
+    ]);
+  });
+
+  it("refuses a non-JSON 400 once and sends the next batch normally", async () => {
+    const send = okFetch();
+    send.mockResolvedValueOnce(new Response("not json", { status: 400 }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.flush();
+    await instance.report(event(2));
+    await instance.flush();
+
+    expect(send.mock.calls.map(logIdsOf)).toEqual([["log-1"], ["log-2"]]);
+    expect(warn.mock.calls).toEqual([
+      [
+        { count: 1, droppedTotal: 1, reason: "refused_400", attempts: 1 },
+        ACCESS_RECORDS_DROPPED,
+      ],
+    ]);
+  });
+});
+
 describe("access reporter batching", () => {
   it("holds a partial batch until the flush interval", async () => {
     const send = okFetch();
