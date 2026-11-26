@@ -11,7 +11,6 @@ import {
   type StorageCredentialProvider,
 } from "./interface.js";
 import { createRateLimitPolicyFeed } from "./rate-limit-policy.js";
-import { settleFailure } from "./throttle.js";
 
 const DEFAULT_GOOGLE_API_BASE_URL = "https://www.googleapis.com";
 const MULTIPART_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024;
@@ -55,6 +54,12 @@ export interface GoogleDriveStorageAdapterParams {
   folderId: string;
   /** Host-owned short-lived access-token broker (never receives refresh token). */
   credentials: StorageCredentialProvider;
+  /**
+   * Optional protocol chain id used to namespace blob keys inside the Drive
+   * folder so separate networks (e.g. Moksha 14800 vs Mainnet 1480) cannot
+   * collide on identical `${scope}/${version}` keys.
+   */
+  chainId?: number;
   /** Optional Drive API base URL (defaults to https://www.googleapis.com). */
   apiBaseUrl?: string;
   /** Optional custom fetch implementation (defaults to globalThis.fetch). */
@@ -69,7 +74,7 @@ export interface GoogleDriveStorageAdapterParams {
  * Contract guarantees:
  * - Private blobs only (`drive.file` scope; never calls `/permissions`).
  * - `urlForKey(key)` is synchronous and the exact inverse of `upload(key, data)`:
- *   `gdrive://<folderId>/<encodeURIComponent-per-segment(key)>`.
+ *   `gdrive://<folderId>/[chains/<chainId>/]<encodeURIComponent-per-segment(key)>`.
  * - Write-once keys: identical bytes return idempotently; different bytes throw
  *   `StoredBlobConflictError(key)` with the stored bytes untouched. Concurrent
  *   multi-device races are resolved deterministically by earliest `createdTime`
@@ -82,12 +87,20 @@ export function createGoogleDriveStorageAdapter(
   if (!folderId || folderId.includes("/") || folderId.includes("\\")) {
     throw new Error("Google Drive folderId must be a non-empty identifier");
   }
+  if (
+    params.chainId !== undefined &&
+    (!Number.isSafeInteger(params.chainId) || params.chainId < 0)
+  ) {
+    throw new Error("Google Drive chainId must be a non-negative integer");
+  }
+  const chainSegment =
+    params.chainId !== undefined ? `chains/${params.chainId}/` : "";
   const apiBase = (params.apiBaseUrl ?? DEFAULT_GOOGLE_API_BASE_URL).replace(
     /\/+$/,
     "",
   );
   const feed = createRateLimitPolicyFeed(params.fetch);
-  const urlPrefix = `gdrive://${folderId}/`;
+  const urlPrefix = `gdrive://${folderId}/${chainSegment}`;
 
   // In-memory cache of logical key -> resolved Drive file metadata.
   const fileCache = new Map<string, { fileId: string; sha256?: string }>();
@@ -142,7 +155,7 @@ export function createGoogleDriveStorageAdapter(
   }
 
   function driveFileNameForKey(key: string): string {
-    return encodeURIComponent(key);
+    return encodeURIComponent(`${chainSegment}${key}`);
   }
 
   async function acquireToken(
@@ -560,14 +573,7 @@ export function createGoogleDriveStorageAdapter(
         res = await downloadFileBytes(fileId, budget.signal);
       }
       if (!res.ok) {
-        const retryAfterMs = await settleFailure(res);
-        throw Object.assign(
-          new Error(`gdrive download failed: ${res.status}`),
-          {
-            status: res.status,
-            ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
-          },
-        );
+        throw await classifyHttpError(res, "download");
       }
       return readBoundedResponse(res, budget);
     },

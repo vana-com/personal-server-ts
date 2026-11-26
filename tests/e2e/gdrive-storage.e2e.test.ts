@@ -508,7 +508,9 @@ describe("Google Drive storage E2E (PS Node -> Drive -> PS Lite)", () => {
       expect(drive.files.size).toBe(1);
       const [uploadedBlob] = [...drive.files.values()];
       expect(uploadedBlob!.parents).toEqual([folderId]);
-      expect(uploadedBlob!.name).toBe(encodeURIComponent("spotify.profile/1"));
+      expect(uploadedBlob!.name).toBe(
+        encodeURIComponent("chains/14800/spotify.profile/1"),
+      );
       // Security: plaintext must NEVER appear in Drive bytes, and /permissions must NEVER be called
       expect(Buffer.from(uploadedBlob!.bytes).toString("utf8")).not.toContain(
         "secret-playlist-42",

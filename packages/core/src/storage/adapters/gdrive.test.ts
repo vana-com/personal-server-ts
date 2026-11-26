@@ -670,11 +670,179 @@ describe("createGoogleDriveStorageAdapter (loopback Drive v3 HTTP)", () => {
       );
       expect(fallbackRead).toEqual(preSwitchBytes);
 
-      // New uploads go to Google Drive, not Vana Storage.
+      // New uploads go to Google Drive, not Vana Storage (scoped by chainId).
       const newBytes = new TextEncoder().encode("new-gdrive-blob");
       const newUrl = await adapter.upload("new.scope/1", newBytes);
-      expect(newUrl).toBe(`gdrive://${folderId}/new.scope/1`);
+      expect(newUrl).toBe(`gdrive://${folderId}/chains/14800/new.scope/1`);
       expect(drive.files.size).toBe(1);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        vanaServer.close((err) => (err ? reject(err) : resolve())),
+      );
+    }
+  });
+
+  it("downloadBounded classifies 403 insufficientPermissions and userRateLimitExceeded like download()", async () => {
+    const revokedEvents: string[] = [];
+    const { provider } = makeCredentials();
+    const adapter = createGoogleDriveStorageAdapter({
+      folderId,
+      credentials: {
+        ...provider,
+        onAuthRevoked: (_p, reason) => revokedEvents.push(reason ?? "revoked"),
+      },
+      apiBaseUrl: drive.baseUrl,
+    });
+
+    const url = await adapter.upload(
+      "spotify.profile/1",
+      new TextEncoder().encode("cached-id-blob"),
+    );
+
+    // Cached fileId bypasses listMatchingFiles and hits media GET directly.
+    drive.nextError = {
+      status: 403,
+      body: {
+        error: {
+          code: 403,
+          message: "Insufficient Permission",
+          errors: [{ reason: "insufficientPermissions" }],
+        },
+      },
+    };
+    await expect(
+      adapter.downloadBounded(url, new AdditionsBudget(1024, 5000)),
+    ).rejects.toThrow(StorageAuthRevokedError);
+    expect(revokedEvents).toHaveLength(1);
+
+    drive.nextError = {
+      status: 403,
+      body: {
+        error: {
+          code: 403,
+          message: "User rate limit exceeded",
+          errors: [{ reason: "userRateLimitExceeded" }],
+        },
+      },
+    };
+    let rateErr: unknown;
+    try {
+      await adapter.downloadBounded(url, new AdditionsBudget(1024, 5000));
+    } catch (err) {
+      rateErr = err;
+    }
+    expect((rateErr as { status?: number })?.status).toBe(429);
+  });
+
+  it("namespaces Drive blobs by chainId so independent networks never collide", async () => {
+    const { provider } = makeCredentials();
+    const moksha = createGoogleDriveStorageAdapter({
+      folderId,
+      chainId: 14800,
+      credentials: provider,
+      apiBaseUrl: drive.baseUrl,
+    });
+    const mainnet = createGoogleDriveStorageAdapter({
+      folderId,
+      chainId: 1480,
+      credentials: provider,
+      apiBaseUrl: drive.baseUrl,
+    });
+
+    const key = "spotify.profile/1";
+    const mokshaBytes = new TextEncoder().encode("moksha-ciphertext");
+    const mainnetBytes = new TextEncoder().encode("mainnet-ciphertext");
+
+    const mokshaUrl = await moksha.upload(key, mokshaBytes);
+    const mainnetUrl = await mainnet.upload(key, mainnetBytes);
+    expect(mokshaUrl).toBe(`gdrive://${folderId}/chains/14800/${key}`);
+    expect(mainnetUrl).toBe(`gdrive://${folderId}/chains/1480/${key}`);
+    expect(drive.files.size).toBe(2);
+
+    // Deleting on Moksha leaves Mainnet untouched.
+    expect(await moksha.delete(mokshaUrl)).toBe(true);
+    expect(await moksha.exists(mokshaUrl)).toBe(false);
+    expect(await mainnet.exists(mainnetUrl)).toBe(true);
+    expect(await mainnet.download(mainnetUrl)).toEqual(mainnetBytes);
+  });
+
+  it("fallbackReadToVana deletes pre-switch Vana blobs and propagates Vana delete failures", async () => {
+    const owner = "0x1111111111111111111111111111111111111111" as const;
+    const preSwitchKey = "pre.switch/1";
+    const vanaBlobs = new Map<string, Uint8Array>([
+      [
+        `/v1/chains/14800/blobs/${owner}/${encodeURIComponent("pre.switch")}/1`,
+        new TextEncoder().encode("legacy-vana-ciphertext"),
+      ],
+    ]);
+    let failNextDelete = false;
+    const vanaServer = createHttpServer((req, res) => {
+      const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      if (req.method === "DELETE") {
+        if (failNextDelete) {
+          failNextDelete = false;
+          res.writeHead(500);
+          res.end("vana storage error");
+          return;
+        }
+        if (vanaBlobs.delete(path)) {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      res.writeHead(404);
+      res.end("not found");
+    });
+    await new Promise<void>((resolve) =>
+      vanaServer.listen(0, "127.0.0.1", resolve),
+    );
+    const vanaPort = (vanaServer.address() as AddressInfo).port;
+
+    try {
+      const config = ServerConfigSchema.parse({
+        storage: {
+          backend: "gdrive",
+          config: {
+            vana: { apiUrl: `http://127.0.0.1:${vanaPort}` },
+            gdrive: {
+              folderId,
+              folderName: "Vana",
+              apiBaseUrl: drive.baseUrl,
+            },
+          },
+        },
+        gateway: { chainId: 14800 },
+      });
+      const { provider } = makeCredentials();
+      const adapter = createSyncStorageAdapter({
+        config,
+        serverOwner: owner,
+        serverAccount: {
+          address: owner,
+          signMessage: async () => ("0x" + "11".repeat(65)) as `0x${string}`,
+        },
+        reads: "signed",
+        storageCredentials: provider,
+        fallbackReadToVana: true,
+      });
+
+      // Transient Vana delete failure must reject rather than acknowledging missing.
+      failNextDelete = true;
+      await expect(
+        adapter.delete(adapter.urlForKey(preSwitchKey)),
+      ).rejects.toThrow();
+      expect(vanaBlobs.size).toBe(1);
+
+      // Retrying succeeds and removes the pre-switch Vana blob.
+      expect(await adapter.delete(adapter.urlForKey(preSwitchKey))).toBe(true);
+      expect(vanaBlobs.size).toBe(0);
+
+      // Deleting again when absent in both Drive and Vana returns false.
+      expect(await adapter.delete(adapter.urlForKey(preSwitchKey))).toBe(false);
     } finally {
       await new Promise<void>((resolve, reject) =>
         vanaServer.close((err) => (err ? reject(err) : resolve())),

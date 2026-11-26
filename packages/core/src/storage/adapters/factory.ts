@@ -47,9 +47,11 @@ export function createSyncStorageAdapter(
         "Google Drive storage backend requires a host storageCredentials provider",
       );
     }
+    const chainId = params.config.gateway.chainId;
     const primary = createGoogleDriveStorageAdapter({
       folderId: gdriveConfig.folderId,
       credentials: params.storageCredentials,
+      chainId,
       apiBaseUrl: gdriveConfig.apiBaseUrl,
       fetch: params.fetch,
     });
@@ -64,7 +66,11 @@ export function createSyncStorageAdapter(
       audience: params.audience,
       fetch: params.fetch,
     });
-    return withVanaReadFallback(primary, vanaFallback, gdriveConfig.folderId);
+    return withVanaReadFallback(
+      primary,
+      vanaFallback,
+      `gdrive://${gdriveConfig.folderId}/chains/${chainId}/`,
+    );
   }
 
   return createVanaSyncStorageAdapter({
@@ -80,12 +86,11 @@ export function createSyncStorageAdapter(
 function withVanaReadFallback(
   primary: BoundedStorageAdapter,
   fallback: BoundedStorageAdapter,
-  folderId: string,
+  primaryPrefix: string,
 ): BoundedStorageAdapter {
-  const gdrivePrefix = `gdrive://${folderId}/`;
   const keyFromPrimaryUrl = (url: string): string | null => {
-    if (!url.startsWith(gdrivePrefix)) return null;
-    const rest = url.slice(gdrivePrefix.length);
+    if (!url.startsWith(primaryPrefix)) return null;
+    const rest = url.slice(primaryPrefix.length);
     if (!rest) return null;
     return rest
       .split("/")
@@ -114,6 +119,20 @@ function withVanaReadFallback(
         if (!key) throw err;
         return fallback.downloadBounded(fallback.urlForKey(key), budget);
       }
+    },
+    async delete(url) {
+      // Delete from both primary (Google Drive) and fallback (Vana Hosted
+      // Storage) so pre-switch hosted blobs are never left behind when a user
+      // deletes a scope after migrating to Google Drive. Any non-404 error from
+      // either backend propagates so the delete worker retains its pending
+      // deletion marker and retries.
+      const primaryDeleted = await primary.delete(url);
+      const key = keyFromPrimaryUrl(url);
+      if (!key) {
+        return primaryDeleted;
+      }
+      const fallbackDeleted = await fallback.delete(fallback.urlForKey(key));
+      return primaryDeleted || fallbackDeleted;
     },
   };
 }
