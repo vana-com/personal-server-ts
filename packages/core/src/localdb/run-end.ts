@@ -288,8 +288,6 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           declarations,
           raw ? "raw-v1" : "legacy",
         );
-        if (plan.outcome === "failed")
-          return discard("failed", plan.unconfirmed, plan.streamStatus);
         const covered = new Set(plan.covered);
         const trips = await checkRunFence(deps, runId, "end");
         if (trips.length > 0) {
@@ -335,6 +333,10 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           ]);
           return fenced;
         }
+        // A failed plan with no fence trip is discarded as it is. With a trip,
+        // the fenced path above has already reset what the delete left.
+        if (plan.outcome === "failed")
+          return discard("failed", plan.unconfirmed, plan.streamStatus);
         // A cursor applied during the run is the entry this run's own merges onto.
         await foldAppliedCursors(db, run.connection_id);
         const [connection] = await db.query<{
