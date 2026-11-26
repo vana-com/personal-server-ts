@@ -1,5 +1,8 @@
 import { GatewayRefusalError } from "../sync/delete-data-port.js";
-import { isGatewayRefusalCode } from "../sync/gateway-refusal.js";
+import {
+  isGatewayAlreadyDeletedCode,
+  isGatewayRefusalCode,
+} from "../sync/gateway-refusal.js";
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type { GatewayDeleteDataPortOptions } from "../sync/delete-data-port.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -82,10 +85,7 @@ export function createLegacyRetireRemote(
       } catch {
         body = null;
       }
-      if (
-        response.status === 409 &&
-        body?.code === "owner_stream_head_already_deleted"
-      )
+      if (response.status === 409 && isGatewayAlreadyDeletedCode(body?.code))
         return "not-applied";
       if (!response.ok && body && isGatewayRefusalCode(body.code))
         throw new GatewayRefusalError(

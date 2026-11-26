@@ -8,6 +8,7 @@ import {
   FAKE_STORAGE,
 } from "../test-utils/legacy-gateway-fake.js";
 import { legacyHeadFrom } from "./legacy-delete.js";
+import { GATEWAY_ALREADY_DELETED_CODES } from "../sync/gateway-refusal.js";
 const owner = `0x${"11".repeat(20)}` as const;
 async function fixture() {
   const fake = createLegacyGatewayFake({ owner, cutover: "v3" });
@@ -116,6 +117,22 @@ it("reports not applied for the exact already-deleted 409 after sending DELETE",
   ).resolves.toBe("not-applied");
   expect(f.fake.requests.filter((r) => r.method === "DELETE")).toHaveLength(1);
 });
+
+it.each(GATEWAY_ALREADY_DELETED_CODES)(
+  "reports not applied for the 409 code %s the shared already-deleted list admits",
+  async (code) => {
+    const f = await fixture();
+    f.options.fetch = async () =>
+      new Response(JSON.stringify({ code }), { status: 409 });
+    await expect(
+      createLegacyRetireRemote(f.options).tombstone(
+        "github.events",
+        f.head,
+        f.check,
+      ),
+    ).resolves.toBe("not-applied");
+  },
+);
 
 it.each([
   [400, "owner_stream_head_already_deleted"],
