@@ -67,7 +67,11 @@ export interface StagedSeed {
 export class SeedUploadError extends Error {
   constructor(
     readonly errorCode:
-      "SEED_BAD_NAME" | "SEED_BAD_DESCRIPTOR" | "SEED_COUNT_MISMATCH",
+      | "SEED_BAD_NAME"
+      | "SEED_BAD_DESCRIPTOR"
+      | "SEED_COUNT_MISMATCH"
+      /** The stream's staged upload is no longer the one the caller listed. */
+      | "SEED_SUPERSEDED",
     message: string,
   ) {
     super(message);
@@ -117,8 +121,10 @@ export interface SeedStaging {
   /**
    * Remove the staged rows of a stream that holds a receipt. Only call it
    * for such a stream: the writer reads staged rows only before the receipt.
+   * With `upload`, it removes only that upload; a newer upload of the stream
+   * stays staged.
    */
-  drop(connector: string, stream: string): Promise<void>;
+  drop(connector: string, stream: string, upload?: string): Promise<void>;
 }
 
 function hex(name: string): string {
@@ -314,9 +320,15 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
           await collect();
           return out.sort((a, b) => (a.stream < b.stream ? -1 : 1));
         },
-        async *records(connector, stream) {
+        async *records(connector, stream, upload) {
           const pointer = await readPointer(pointerPath(connector, stream));
-          if (!pointer) return;
+          // The listing named `upload`. A different or missing pointer means
+          // the stream was restaged or removed since; never serve other rows.
+          if (pointer?.upload !== upload)
+            throw new SeedUploadError(
+              "SEED_SUPERSEDED",
+              "the staged upload changed since it was listed",
+            );
           const chunks = files.readChunks(
             `uploads/${pointer.upload}/rows.ndjson`,
           );
@@ -419,10 +431,11 @@ export function createSeedStaging(files: StreamSyncFiles): SeedStaging {
 
     staged,
 
-    async drop(connector, stream) {
+    async drop(connector, stream, upload) {
       const path = pointerPath(connector, stream);
       const pointer = await readPointer(path);
       if (!pointer) return;
+      if (upload !== undefined && pointer.upload !== upload) return;
       await files.remove(path);
       await files.remove(`uploads/${pointer.upload}`);
     },

@@ -369,6 +369,38 @@ describe("SyncManager", () => {
     expect(downloadAll).toHaveBeenCalledTimes(1);
   });
 
+  it("restarts polling after a manual trigger rejects", async () => {
+    const pollInterval = 60_000;
+    let calls = 0;
+    let failNext = false;
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      {
+        pollInterval,
+        async canSync(): Promise<{ ok: true }> {
+          calls += 1;
+          if (failNext) {
+            failNext = false;
+            throw new Error("cycle broke");
+          }
+          return { ok: true };
+        },
+      },
+    );
+    try {
+      manager.start();
+      await vi.advanceTimersByTimeAsync(0);
+      failNext = true;
+      await expect(manager.trigger()).rejects.toThrow("cycle broke");
+      const before = calls;
+      await vi.advanceTimersByTimeAsync(pollInterval);
+      expect(calls).toBeGreaterThan(before);
+    } finally {
+      await manager.stop();
+    }
+  });
+
   it("checks for lost data points once per boot, then retries only failed scopes, a bounded number of times", async () => {
     const check = vi.mocked(requeueLostDataPoints);
     check.mockReset();

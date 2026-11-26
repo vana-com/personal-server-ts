@@ -230,8 +230,10 @@ describe("stream-sync seed route", () => {
       receipts: {},
       skipped: [],
     }));
-    expect(await source.streams("c")).toHaveLength(1);
-    for await (const row of source.records("c", "s")) rowsRead.push(row);
+    const listed = await source.streams("c");
+    expect(listed).toHaveLength(1);
+    for await (const row of source.records("c", "s", listed[0]!.upload))
+      rowsRead.push(row);
     expect(rowsRead).toEqual([{ id: "a" }, { id: "b" }]);
   });
 });
