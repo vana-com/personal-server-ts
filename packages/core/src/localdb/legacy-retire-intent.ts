@@ -246,8 +246,8 @@ export function createLegacyRetirer(
     async status(connector) {
       const intent = await intentOf(connector);
       if (!intent) return null;
-      const manifest = await deps.db.query(
-        "SELECT retire_id FROM legacy_retire_manifests WHERE retire_id = ?",
+      const manifest = await deps.db.query<{ manifest: string }>(
+        "SELECT manifest FROM legacy_retire_manifests WHERE retire_id = ?",
         [intent.retireId],
       );
       if (!manifest.length)
@@ -257,6 +257,14 @@ export function createLegacyRetirer(
         };
       if (intent.state === "done")
         return { retireId: intent.retireId, legacy: PART_DONE };
+      const stored = JSON.parse(manifest[0].manifest) as {
+        scopes: readonly { acknowledgement: string }[];
+      };
+      if (stored.scopes.some((scope) => scope.acknowledgement === "blocked"))
+        return {
+          retireId: intent.retireId,
+          legacy: blocked("legacy_tombstone_unacknowledged"),
+        };
       // A poll reports the verdict. It starts a worker only where none was
       // started (a process that has not cycled since a restart): it is not a
       // retry, so it neither skips a pending intent's backoff nor restarts a

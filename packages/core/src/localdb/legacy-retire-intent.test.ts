@@ -1,3 +1,5 @@
+import { handleOwnerLegacyRetireStatus } from "../api/owner-legacy-retire.js";
+import { LegacyTombstoneUnacknowledged } from "./legacy-retire-pipeline.js";
 import { createLegacyRetireRemote } from "./legacy-retire-remote.js";
 import type { LegacyRetirePipelinePorts } from "./legacy-retire-pipeline.js";
 import { legacyStreamsOfScope } from "../legacy-projection/erase-connector.js";
@@ -1203,4 +1205,52 @@ describe("a connector with no bound legacy scope", () => {
     );
     expect(f.fake.requests).toEqual([]);
   });
+});
+
+it("GET reports a stored blocked acknowledgement while write readiness is false", async () => {
+  let ready = true;
+  const f = await reconnected({
+    dbFile: tempDbFile(),
+    writeReady: () => ready,
+    wrapLegacy: (ports) => ({
+      ...ports,
+      tombstone: async () => {
+        throw new LegacyTombstoneUnacknowledged();
+      },
+    }),
+  });
+  const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+  const expected = {
+    retireId,
+    legacy: { state: "blocked", reason: "legacy_tombstone_unacknowledged" },
+  };
+  await vi.waitFor(async () =>
+    expect(await f.a.sync.legacyRetirer.status(GH)).toEqual(expected),
+  );
+  await f.a.sync.legacyRetirer.close();
+  ready = false;
+  const restarted = await f.a.restart();
+  const get = () =>
+    handleOwnerLegacyRetireStatus(
+      new Request("https://example.test/v1/owner/connectors/github/legacy"),
+      GH,
+      {
+        authorizeOwner: async () => {},
+        mode: { read: () => "switched" },
+        connectionDelete: {
+          requestConnectionDelete: vi.fn(),
+          requestLegacyRetire: (connector) =>
+            restarted.sync.legacyRetirer.request(connector),
+          legacyRetireStatus: (connector) =>
+            restarted.sync.legacyRetirer.status(connector),
+        },
+      },
+    );
+  const reply = await get();
+  expect(reply.status).toBe(200);
+  expect(await reply.json()).toEqual(expected);
+  // A paused pass must not hide the durable block on subsequent polls either.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(await (await get()).json()).toEqual(expected);
+  expect(storageDeletes(f.fake)).toEqual([]);
 });
