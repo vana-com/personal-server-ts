@@ -82,6 +82,61 @@ it("still lists control rows only", async () => {
   ).toEqual([controlScope("acme", "")]);
 });
 
+it.each([
+  ["missing rows", { data: {}, pagination: { hasMore: false } }],
+  [
+    "missing scope",
+    {
+      data: { dataPoints: [{ expectedVersion: "1" }] },
+      pagination: { hasMore: false },
+    },
+  ],
+  [
+    "blank scope",
+    {
+      data: { dataPoints: [row(" ", 1)] },
+      pagination: { hasMore: false },
+    },
+  ],
+  [
+    "non-boolean hasMore",
+    {
+      data: { dataPoints: [] },
+      pagination: { hasMore: "false", nextCursor: "unexpected-third" },
+    },
+  ],
+])(
+  "rejects the entire stream inventory when the later page has %s",
+  async (_name, later) => {
+    const cursors: (string | null)[] = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: "0x" + "11".repeat(20),
+      fetch: (async (url: string) => {
+        const cursor = new URL(url).searchParams.get("cursor");
+        cursors.push(cursor);
+        const body =
+          cursor === null
+            ? {
+                data: {
+                  dataPoints: [row(streamScope("acme", "", "items"), 1)],
+                },
+                pagination: { hasMore: true, nextCursor: "next" },
+              }
+            : cursor === "next"
+              ? later
+              : { data: { dataPoints: [] }, pagination: { hasMore: false } };
+        return new Response(JSON.stringify(body));
+      }) as typeof fetch,
+    });
+
+    await expect(registry.listStreamRows("acme")).rejects.toThrow(
+      /registry listing/,
+    );
+    expect(cursors).toEqual([null, "next"]);
+  },
+);
+
 /** One listing response with the given `pagination` marker. */
 function registryWithMarker(pagination: unknown) {
   return createGatewayStreamSyncRegistry({
