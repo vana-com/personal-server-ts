@@ -86,7 +86,13 @@ describe("switched-mode GET /status", () => {
 // The mode can move across any await of a switched-mode route. A route that
 // chose the stream branch must not act or answer under a mode that left it.
 describe("switched-mode routes re-check the mode after their awaits", () => {
-  function setup(opts: { holdLocal?: boolean; holdStatus?: boolean } = {}) {
+  function setup(
+    opts: {
+      holdLocal?: boolean;
+      holdStatus?: boolean;
+      holdFile?: boolean;
+    } = {},
+  ) {
     // The first read picks the route; `flip()` moves every later read.
     let moved = false;
     let first = true;
@@ -105,8 +111,16 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
     const local = hold<void>();
     const localEntered = vi.fn();
     const listing = hold<unknown>();
+    const fileReady = hold<void>();
+    const readFile = vi.fn(async () => new Response("fixture only"));
+    const localFile = vi.fn(async () => {
+      await fileReady.promise;
+      return { connectionId: "fixture", read: readFile };
+    });
+    const syncConnection = vi.fn(async () => undefined);
     const localSync = {
       cycle: vi.fn(async () => undefined),
+      syncConnection,
       listing: {
         status: vi.fn(() =>
           opts.holdStatus
@@ -132,6 +146,7 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
           }
         : localSync,
       accountStorageMode: { read } as never,
+      ...(opts.holdFile ? { localFile } : {}),
     });
     app.onError((err, c) =>
       err instanceof ProtocolError
@@ -145,6 +160,10 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
       syncManager,
       flip: () => (moved = true),
       releaseLocal: () => local.release(),
+      releaseFile: () => fileReady.release(),
+      localFile,
+      readFile,
+      syncConnection,
       releaseListing: () =>
         listing.release({ listed: 0, connections: [], issues: [] }),
     };
@@ -174,6 +193,17 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
     t.releaseLocal();
     await stopped(await pending);
     expect(t.localSync.cycle).not.toHaveBeenCalled();
+  });
+
+  it("refuses a file response if its account is no longer switched", async () => {
+    const t = setup({ holdFile: true });
+    const pending = t.app.request("/file/fixture", { method: "POST", headers });
+    await vi.waitFor(() => expect(t.localFile).toHaveBeenCalledTimes(1));
+    t.flip();
+    t.releaseFile();
+    await stopped(await pending);
+    expect(t.syncConnection).not.toHaveBeenCalled();
+    expect(t.readFile).not.toHaveBeenCalled();
   });
 
   it("answers no counts when the mode moved while status was read", async () => {

@@ -173,13 +173,25 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   app.post("/file/:id", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
+    requireStreamMode();
     const file = await deps.localFile?.(c.req.param("id"));
+    requireStreamMode();
     if (!file)
       return c.json({ error: { errorCode: "STREAM_DATA_NOT_FOUND" } }, 404);
-    const result = await (await local()).syncConnection(file.connectionId);
+    const sync = await local();
+    requireStreamMode();
+    const result = await sync.syncConnection(file.connectionId);
+    requireStreamMode();
     if (result?.error)
       return c.json({ error: { errorCode: "STREAM_READ_UNAVAILABLE" } }, 503);
-    return file.read();
+    const response = await file.read();
+    try {
+      requireStreamMode();
+    } catch (error) {
+      void response.body?.cancel().catch(() => undefined);
+      throw error;
+    }
+    return response;
   });
 
   app.all("*", (c) =>
