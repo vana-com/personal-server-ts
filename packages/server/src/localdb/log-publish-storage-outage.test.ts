@@ -2,7 +2,10 @@
 // in the data (`StorageDeferredError`). The publish leaves the connection's
 // changes queued and reports `backoff`; the next cycle sends them.
 import { afterEach, describe, expect, it } from "vitest";
-import { decodeSegment } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  decodeSegment,
+  type WireOperation,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 // The world runs core from source: the error class must be that module's.
 import { StorageDeferredError } from "../../../core/src/stream-sync/storage-retry.js";
 import { publishLog } from "../../../core/src/localdb/log-publish.js";
@@ -11,6 +14,7 @@ import {
   CONNECTION_ID,
   LOG,
   closeWorldDrivers,
+  idHash,
   sName,
   tempDbFile,
   world,
@@ -80,25 +84,47 @@ it("keeps storage backoff after an earlier round published the same stream", asy
   expect(result?.map((r) => r.outcome)).toEqual(["backoff"]);
 });
 
-/** The segments the remote registered for the log, in registry order. */
+/**
+ * The operations of each segment the remote registered for the log, in
+ * registry order, decoded in full: key hash, payload and the whole stamp.
+ */
 async function registered(w: Awaited<ReturnType<typeof world>>) {
-  const out: string[][] = [];
+  const out: WireOperation[][] = [];
   for (const version of w.gateway.versions.get(LOG) ?? []) {
     const bytes = await w.innerBlobs.get(
       `${LOG}/s-${version.dataHash.slice(2)}`,
     );
     const decoded = decodeSegment(bytes!);
     if (decoded.kind !== "ok") throw new Error("segment did not decode");
-    out.push(
-      decoded.segment.operations.map((op) =>
-        op.kind === "upsert"
-          ? `upsert ${(op.value as { id: string }).id}@${op.stamp.r}`
-          : op.kind,
-      ),
-    );
+    out.push(decoded.segment.operations);
   }
   return out;
 }
+
+/** An upsert of stream s0's record `value`, as the log carries it. */
+const upsert = async (
+  value: { id: string; v?: number },
+  stamp: { o: number; r: string },
+  firstSeen: number,
+): Promise<WireOperation> => ({
+  kind: "upsert",
+  stream: sName(0),
+  pkHash: await idHash(value.id),
+  stamp,
+  firstSeen,
+  value,
+});
+
+/** The record keys a device holds changes for that the publisher has not acknowledged. */
+const pendingKeys = async (db: SqlDriver) =>
+  (
+    await db.query<{ key: string }>(
+      `SELECT c.record_key AS key FROM record_changes c JOIN stream_state s
+         ON s.connection_id=c.connection_id AND s.stream=c.stream
+        WHERE c.connection_id=? AND c.seq > s.publish_watermark ORDER BY c.seq`,
+      [CONNECTION_ID],
+    )
+  ).map((r) => r.key);
 
 it("loses nothing when the remote accepted a run before a cold restart: the run is sent once more beside the newer run", async () => {
   const w = await world({ streams: 1 });
@@ -114,32 +140,32 @@ it("loses nothing when the remote accepted a run before a cold restart: the run 
   await a.sync.cycle();
   expect(w.gateway.dropNextBatchReply).toBe(false);
   expect(w.gateway.versions.get(LOG)).toHaveLength(1);
-  const pending = async (db: typeof a.db) =>
-    (
-      await db.query<{ key: string }>(
-        `SELECT c.record_key AS key FROM record_changes c JOIN stream_state s
-           ON s.connection_id=c.connection_id AND s.stream=c.stream
-          WHERE c.connection_id=? AND c.seq > s.publish_watermark ORDER BY c.seq`,
-        [CONNECTION_ID],
-      )
-    ).map((r) => r.key);
-  expect(await pending(a.db)).toEqual(["old"]);
+  expect(await pendingKeys(a.db)).toEqual(["old"]);
   // A newer local run ends while the first is still unacknowledged.
   await a.run("r2", [{ stream: sName(0), id: "new" }], { full: false });
   // Fresh process state, and the remote is reachable again.
   const fresh = await a.restart();
   w.gateway.beforeBatch = undefined;
-  expect(await pending(fresh.db)).toEqual(["old", "new"]);
+  expect(await pendingKeys(fresh.db)).toEqual(["old", "new"]);
   const report = await fresh.sync.cycle();
   expect(report.connections.map((c) => c.error)).toEqual([null]);
-  expect(await pending(fresh.db)).toEqual([]);
+  expect(await pendingKeys(fresh.db)).toEqual([]);
   // Two registered versions. The process lost its local acknowledgement, so
   // the second version repeats run r1's record (same stamp, same data) next to
   // run r2's: write amplification of one record, no change to any reader's
   // result.
+  const old = await upsert({ id: "old" }, { o: 1001, r: "r1" }, 1001);
   expect(await registered(w)).toEqual([
-    ["upsert old@r1", "complete"],
-    ["upsert old@r1", "upsert new@r2"],
+    [
+      old,
+      {
+        kind: "complete",
+        stream: sName(0),
+        cutoff: { o: 1001, r: "r1" },
+        omitted: [],
+      },
+    ],
+    [old, await upsert({ id: "new" }, { o: 1002, r: "r2" }, 1002)],
   ]);
   const b = await w.device("b");
   await b.cycle();
@@ -152,7 +178,8 @@ it("loses nothing when the remote accepted a run before a cold restart: the run 
 describe("a cold restart after another device built on the accepted run", () => {
   /**
    * Device `a` publishes run r1 (k = 1); the remote accepts, but `a`'s process
-   * stops before it records that. `a`'s database still lists k as unpublished.
+   * stops before it records that. A later local run r3 (m) is also still
+   * unpublished. `a`'s database lists both as unpublished.
    */
   async function acceptedThenLost(w: Awaited<ReturnType<typeof world>>) {
     const a = await w.device("a", { dbFile: tempDbFile() });
@@ -167,41 +194,61 @@ describe("a cold restart after another device built on the accepted run", () => 
     expect(w.gateway.dropNextBatchReply).toBe(false);
     expect(w.gateway.versions.get(LOG)).toHaveLength(1);
     w.gateway.beforeBatch = undefined;
+    await a.run("r3", [{ stream: sName(0), id: "m" }], { full: false });
+    expect(await pendingKeys(a.db)).toEqual(["k", "m"]);
     return a;
   }
-  const bodiesOfK = async (d: { db: SqlDriver }) =>
+  const bodiesOf = async (d: { db: SqlDriver }, key: string) =>
     (
       await d.db.query<{ body: string }>(
         "SELECT body FROM records WHERE stream = ? AND record_key = ?",
-        [sName(0), "k"],
+        [sName(0), key],
       )
     ).map((r) => r.body);
-  /** The restarted process publishes with no error and leaves nothing unpublished. */
-  const catchUp = async (fresh: {
-    sync: { cycle(): Promise<{ connections: { error: string | null }[] }> };
-  }) => {
-    const report = await fresh.sync.cycle();
-    expect(report.connections.map((c) => c.error)).toEqual([null]);
-    await fresh.sync.cycle();
-  };
+  const k1 = () => upsert({ id: "k", v: 1 }, { o: 1001, r: "r1" }, 1001);
+  const m = () => upsert({ id: "m" }, { o: 1002, r: "r3" }, 1002);
 
   it("every replica reads the newer value, not the accepted run's", async () => {
     const w = await world({ streams: 1 });
     const a = await acceptedThenLost(w);
     const b = await w.device("b");
     await b.cycle();
-    expect(await bodiesOfK(b)).toEqual(['{"id":"k","v":1}']);
+    expect(await bodiesOf(b, "k")).toEqual(['{"id":"k","v":1}']);
     await b.run("r2", [{ stream: sName(0), id: "k", v: 2 }], { full: false });
     await b.cycle();
-    expect(w.gateway.versions.get(LOG)).toHaveLength(2);
+    const k2 = await upsert({ id: "k", v: 2 }, { o: 1003, r: "r2" }, 1001);
+    expect(await registered(w)).toHaveLength(2);
+    // A is still stopped, and still holds both unpublished changes.
+    expect(await pendingKeys(a.db)).toEqual(["k", "m"]);
 
     const fresh = await a.restart();
-    await catchUp(fresh);
+    expect(await pendingKeys(fresh.db)).toEqual(["k", "m"]);
+    const report = await fresh.sync.cycle();
+    expect(report.connections.map((c) => c.error)).toEqual([null]);
+    // Recovery ran on A's pending work: it is acknowledged, and what A sent is
+    // exactly B's newer record (not the accepted run's k = 1) and its own m.
+    expect(await pendingKeys(fresh.db)).toEqual([]);
+    expect(await registered(w)).toEqual([
+      [
+        await k1(),
+        {
+          kind: "complete",
+          stream: sName(0),
+          cutoff: { o: 1001, r: "r1" },
+          omitted: [],
+        },
+      ],
+      [k2],
+      [k2, await m()],
+    ]);
+    await fresh.sync.cycle();
     await b.cycle();
     const c = await w.device("c");
     await c.cycle();
-    for (const replica of [fresh, b, c])
-      expect(await bodiesOfK(replica)).toEqual(['{"id":"k","v":2}']);
+    for (const replica of [fresh, b, c]) {
+      expect(await bodiesOf(replica, "k")).toEqual(['{"id":"k","v":2}']);
+      expect(await bodiesOf(replica, "m")).toEqual(['{"id":"m"}']);
+    }
   });
 
   it("a key another device deleted stays deleted on every replica", async () => {
@@ -209,20 +256,50 @@ describe("a cold restart after another device built on the accepted run", () => 
     const a = await acceptedThenLost(w);
     const b = await w.device("b");
     await b.cycle();
-    expect(await bodiesOfK(b)).toEqual(['{"id":"k","v":1}']);
+    expect(await bodiesOf(b, "k")).toEqual(['{"id":"k","v":1}']);
     await b.run("r2", [{ stream: sName(0), id: "k", remove: true }], {
       full: false,
     });
     await b.cycle();
-    expect(await bodiesOfK(b)).toEqual([]);
-    expect(w.gateway.versions.get(LOG)).toHaveLength(2);
+    expect(await bodiesOf(b, "k")).toEqual([]);
+    const del: WireOperation = {
+      kind: "delete",
+      stream: sName(0),
+      pkHash: await idHash("k"),
+      key: ["k"],
+      stamp: { o: 1003, r: "r2" },
+    };
+    expect(await registered(w)).toHaveLength(2);
+    // A is still stopped, and still holds both unpublished changes.
+    expect(await pendingKeys(a.db)).toEqual(["k", "m"]);
 
     const fresh = await a.restart();
-    await catchUp(fresh);
+    expect(await pendingKeys(fresh.db)).toEqual(["k", "m"]);
+    const report = await fresh.sync.cycle();
+    expect(report.connections.map((c) => c.error)).toEqual([null]);
+    // Recovery ran on A's pending work: it is acknowledged, and A sent only
+    // its own m. It did not send k again, so the delete stands.
+    expect(await pendingKeys(fresh.db)).toEqual([]);
+    expect(await registered(w)).toEqual([
+      [
+        await k1(),
+        {
+          kind: "complete",
+          stream: sName(0),
+          cutoff: { o: 1001, r: "r1" },
+          omitted: [],
+        },
+      ],
+      [del],
+      [await m()],
+    ]);
+    await fresh.sync.cycle();
     await b.cycle();
     const c = await w.device("c");
     await c.cycle();
-    for (const replica of [fresh, b, c])
-      expect(await bodiesOfK(replica)).toEqual([]);
+    for (const replica of [fresh, b, c]) {
+      expect(await bodiesOf(replica, "k")).toEqual([]);
+      expect(await bodiesOf(replica, "m")).toEqual(['{"id":"m"}']);
+    }
   });
 });
