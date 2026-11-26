@@ -582,7 +582,13 @@ export async function createPsLiteSyncManager(
     read: () => "unknown" as const,
   };
   // Only this host's registration observations may authorize retirement.
-  let registrationConfirmed = options.registrationReady?.() === true;
+  let registrationConfirmed = false;
+  async function checkRegistration(): Promise<boolean> {
+    registrationConfirmed = false;
+    const serverInfo = await gateway.getServer(options.serverAccount.address);
+    registrationConfirmed = Boolean(serverInfo?.id);
+    return registrationConfirmed;
+  }
   const retirementWriteReady = () =>
     registrationConfirmed &&
     (options.registrationReady === undefined ||
@@ -765,7 +771,23 @@ export async function createPsLiteSyncManager(
       requireDatabaseMode();
       return sync;
     }
-    if (mode.read() === "switched") await openDatabase();
+    if (mode.read() === "switched") {
+      // A host callback cannot substitute for this runtime's own write check.
+      if (options.registrationReady?.() === true) {
+        if (options.ownerSyncSigner) registrationConfirmed = true;
+        else {
+          try {
+            await checkRegistration();
+          } catch (error) {
+            logger.warn(
+              { error: String(error) },
+              "Could not verify server registration before retirement",
+            );
+          }
+        }
+      }
+      await openDatabase();
+    }
     const streamSyncSeed = createSeedIntake(
       createLocalSeed({
         getDeps: async () => {
@@ -857,11 +879,7 @@ export async function createPsLiteSyncManager(
           )
             return { ok: true };
           try {
-            const serverInfo = await gateway.getServer(
-              options.serverAccount.address,
-            );
-            registrationConfirmed = Boolean(serverInfo?.id);
-            if (registrationConfirmed) return { ok: true };
+            if (await checkRegistration()) return { ok: true };
             return {
               ok: false,
               reason: "unregistered",
