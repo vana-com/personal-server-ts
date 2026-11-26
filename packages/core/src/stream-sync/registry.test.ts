@@ -82,6 +82,39 @@ it("still lists control rows only", async () => {
   ).toEqual([controlScope("acme", "")]);
 });
 
+it("a partial legacy row outside the stream-sync scope grammar does not abort the listing", async () => {
+  const { registry } = registryOverPages([
+    [
+      row(streamScope("acme", "", "items"), 3),
+      // An old raw name (`pdpp.<c>.<s>`, no `~`) with no version or hashes:
+      // legacy data, not a stream-sync row.
+      { scope: "pdpp.acme.items" },
+      row(controlScope("acme", ""), 1),
+    ],
+  ]);
+  expect(
+    (await registry.listStreamRows("acme")).map((entry) => entry.scope),
+  ).toEqual([streamScope("acme", "", "items")]);
+  expect(
+    (await registry.listControlRows()).map((entry) => entry.scope),
+  ).toEqual([controlScope("acme", "")]);
+});
+
+it("a malformed in-scope row still fails the listing instead of dropping out silently", async () => {
+  const { registry } = registryOverPages([
+    [
+      row(streamScope("acme", "", "items"), 3),
+      // A stream-scope row with no version or hashes: in scope, so it must
+      // stay explicit and never silently drop out of a listing a
+      // destructive caller relies on.
+      { scope: streamScope("acme", "", "orders") },
+    ],
+  ]);
+  await expect(registry.listStreamRows("acme")).rejects.toThrow(
+    /registry row has no valid version or hashes/,
+  );
+});
+
 /** One listing response with the given `pagination` marker. */
 function registryWithMarker(pagination: unknown) {
   return createGatewayStreamSyncRegistry({

@@ -350,6 +350,15 @@ export function createGatewayStreamSyncRegistry(
       };
       for (const row of envelope.data?.dataPoints ?? []) {
         if (typeof row.scope !== "string") continue;
+        // A row outside the stream-sync scope grammar is not a stream-sync
+        // row at all: old raw names (`pdpp.<c>.<s>`, no `~`) and any other
+        // owner's rows never parse, so a partial legacy row of that kind
+        // must not abort the whole listing. Skip it before strict decoding.
+        // A row whose scope does parse but whose version or hashes are
+        // invalid still throws below, so a malformed in-scope row stays
+        // explicit and never silently drops out of a listing a destructive
+        // caller relies on.
+        if (parseScope(row.scope) === null) continue;
         out.push({ scope: row.scope, read: toControlRead(row) });
       }
       // A delete depends on the whole listing: a missing or inconsistent page
