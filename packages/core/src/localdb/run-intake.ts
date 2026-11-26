@@ -248,12 +248,20 @@ export function createRunIntakeStore(
         sql: "UPDATE run_streams SET decision='discarded',reason='fence',replace=0 WHERE run_id=?",
         params: [id],
       },
+      // A fenced collector from an old lifetime must not reset the newer
+      // generation's durable discovery and checkpoint state.
       {
-        sql: "UPDATE connections SET checkpoint=NULL WHERE connection_id=(SELECT connection_id FROM runs WHERE run_id=?)",
+        sql: `UPDATE connections SET checkpoint=NULL WHERE EXISTS (
+          SELECT 1 FROM runs r WHERE r.run_id=? AND r.connection_id=connections.connection_id
+            AND (r.generation IS NULL OR connections.generation<=r.generation))`,
         params: [id],
       },
       {
-        sql: "UPDATE stream_state SET needs_full=1,complete=0 WHERE connection_id=(SELECT connection_id FROM runs WHERE run_id=?) AND stream IN (SELECT stream FROM run_streams WHERE run_id=?)",
+        sql: `UPDATE stream_state SET needs_full=1,complete=0 WHERE EXISTS (
+          SELECT 1 FROM runs r JOIN connections c ON c.connection_id=r.connection_id
+          WHERE r.run_id=? AND r.connection_id=stream_state.connection_id
+            AND (r.generation IS NULL OR c.generation<=r.generation))
+          AND stream IN (SELECT stream FROM run_streams WHERE run_id=?)`,
         params: [id, id],
       },
       { sql: "UPDATE runs SET state='ended' WHERE run_id=?", params: [id] },

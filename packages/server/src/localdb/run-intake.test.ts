@@ -181,7 +181,7 @@ it("stages deletes, upserts duplicate keys, and rejects the whole malformed batc
   ]);
 });
 
-it.each(["intent", "control", "stream", "generation"] as const)(
+it.each(["intent", "control", "stream"] as const)(
   "a %s fence drops staging and forces a full recollect",
   async (kind) => {
     const f = await fixture();
@@ -195,9 +195,7 @@ it.each(["intent", "control", "stream", "generation"] as const)(
         ? "INSERT INTO delete_intents VALUES ('fixture-source','delete','{}')"
         : kind === "control"
           ? "UPDATE connections SET control_state='deleted'"
-          : kind === "stream"
-            ? "UPDATE stream_state SET last_delete_version=1"
-            : "UPDATE connections SET generation=3";
+          : "UPDATE stream_state SET last_delete_version=1";
     await f.db.batch([{ sql }]);
     await expect(
       f.store.batch("run", { batch: 1, records: [] }),
@@ -209,6 +207,70 @@ it.each(["intent", "control", "stream", "generation"] as const)(
     expect(
       await f.db.query("SELECT complete,needs_full FROM stream_state"),
     ).toEqual([{ complete: 0, needs_full: 1 }]);
+  },
+);
+
+it.each(["preflight", "write batch"] as const)(
+  "preserves newer generation checkpoint and completeness at the %s fence",
+  async (fence) => {
+    const f = await fixture();
+    await f.store.begin("old", request, declaration);
+    await f.db.batch([
+      { sql: "UPDATE connections SET generation=1" },
+      { sql: "UPDATE runs SET generation=1 WHERE run_id='old'" },
+    ]);
+    await f.store.batch("old", {
+      batch: 0,
+      records: [{ stream: "items", data: { id: "old" } }],
+    });
+    const checkpoint = JSON.stringify({ items: "generation-two" });
+    // Model what the newer generation has already committed, with the old
+    // collector still present locally. Exercise both ways into discard().
+    const commitNewer = [
+      {
+        sql: "UPDATE connections SET generation=2, checkpoint=?",
+        params: [checkpoint],
+      },
+      {
+        sql: "UPDATE stream_state SET complete=1, needs_full=0 WHERE stream='items'",
+      },
+    ];
+    if (fence === "preflight") {
+      await f.db.batch(commitNewer);
+    } else {
+      const batch = f.db.batch.bind(f.db);
+      let injected = false;
+      vi.spyOn(f.db, "batch").mockImplementation(async (statements) => {
+        if (
+          !injected &&
+          statements.some((s) =>
+            s.sql.includes("CREATE TEMP TRIGGER intake_rows_check"),
+          )
+        ) {
+          injected = true;
+          await batch(commitNewer);
+        }
+        return batch(statements);
+      });
+    }
+    await expect(
+      f.store.batch("old", {
+        batch: 1,
+        records: [{ stream: "items", data: { id: "late" } }],
+      }),
+    ).rejects.toMatchObject({ code: "connection_stopped" });
+    expect(
+      await f.db.query("SELECT state FROM runs WHERE run_id='old'"),
+    ).toEqual([{ state: "ended" }]);
+    expect(
+      await f.db.query("SELECT * FROM run_rows WHERE run_id='old'"),
+    ).toEqual([]);
+    expect(
+      await f.db.query("SELECT generation,checkpoint FROM connections"),
+    ).toEqual([{ generation: 2, checkpoint }]);
+    expect(
+      await f.db.query("SELECT complete,needs_full FROM stream_state"),
+    ).toEqual([{ complete: 1, needs_full: 0 }]);
   },
 );
 
