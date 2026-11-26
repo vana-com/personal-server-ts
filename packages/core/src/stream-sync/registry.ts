@@ -67,7 +67,15 @@ interface RegistryRow {
 }
 
 function toControlRead(row: RegistryRow): ControlRead {
-  const version = Number(row.expectedVersion);
+  const raw = row.expectedVersion;
+  // Only an integer number or a plain decimal-digit string is a version;
+  // Number() would also accept true, "0x2", " 2" and "1e1".
+  const version =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string" && /^[0-9]+$/.test(raw)
+        ? Number(raw)
+        : Number.NaN;
   if (
     !Number.isSafeInteger(version) ||
     version < 1 ||
