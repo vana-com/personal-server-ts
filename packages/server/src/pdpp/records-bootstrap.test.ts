@@ -39,6 +39,40 @@ describe("createPdppRecordsDeps: instancesForSubject", () => {
     db = new Database(":memory:");
   });
   afterEach(() => db.close());
+  it("does not mount record services without both an authorization server and an owner", () => {
+    const options = {
+      pdppAuth: fakePdppAuth(),
+      declarations: [DECLARATION],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      replication: false,
+      logger: pino({ level: "silent" }),
+    };
+    expect(
+      createPdppRecordsDeps({ ...options, pdppAuth: undefined }),
+    ).toBeUndefined();
+    expect(
+      createPdppRecordsDeps({ ...options, serverOwner: undefined }),
+    ).toBeUndefined();
+  });
+
+  it("does not mount record services when retained sources declare no streams", () => {
+    const deps = createPdppRecordsDeps({
+      pdppAuth: fakePdppAuth(),
+      declarations: [{ ...DECLARATION, streams: [] }],
+      db,
+      serverOwner: SERVER_OWNER,
+      resource: "https://ps.example.com",
+      replication: false,
+      logger: pino({ level: "silent" }),
+      configuredMethods: [
+        { sourceId: DECLARATION.source_id, methodId: "spotify" },
+      ],
+    });
+    expect(deps).toBeUndefined();
+  });
+
   it("returns account one and explicitly registered connections for the owner", () => {
     const deps = createPdppRecordsDeps({
       pdppAuth: fakePdppAuth(),
