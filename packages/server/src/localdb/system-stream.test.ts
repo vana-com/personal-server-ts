@@ -18,6 +18,47 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { ACCESS_ACTIVITY_DESCRIPTOR } from "../../../core/src/logging/activity-stream.js";
 
+it("rejects extra network fields rather than including them in access activity", () => {
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    action: "read",
+    scope: "fixture.scope",
+    grantId: "fixture-grant",
+    builder: "fixture-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      ...event,
+      networkLabel: "synthetic",
+    }),
+  ).toThrow("Invalid access activity event");
+});
+
+it.each(["eventId", "instanceId"])(
+  "rejects invalid %s UUID variants",
+  (field) => {
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({
+        schemaVersion: 1,
+        eventId: "00000000-0000-4000-8000-000000000001",
+        instanceId: "00000000-0000-4000-8000-000000000002",
+        occurredAt: "2026-01-02T03:04:05.000Z",
+        action: "read",
+        scope: "fixture.scope",
+        grantId: "fixture-grant",
+        builder: "fixture-builder",
+        phase: "served-start",
+        [field]: "00000000-0000-4000-7000-000000000001",
+      }),
+    ).toThrow("Invalid access activity identity");
+  },
+);
+
 it("rejects an access activity descriptor with an unreadable timestamp", () => {
   const event = {
     schemaVersion: 1,
