@@ -293,8 +293,8 @@ export function createLocalSeed(options: {
             declarationFor(connector, stream, descriptor);
           });
         }),
-      drop: (connector, stream) =>
-        lock(connector, () => staging.drop(connector, stream)),
+      drop: (connector, stream, upload) =>
+        lock(connector, () => staging.drop(connector, stream, upload)),
     },
   };
 }
