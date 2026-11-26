@@ -184,7 +184,11 @@ export function streamSyncRunsRoutes(deps: StreamSyncRunsRouteDeps): Hono {
   );
   app.post("/:runId/abort", (c) =>
     answer(c, async () => {
-      const { reason } = (await body(c, 4096)) as { reason?: unknown };
+      const parsed = await body(c, 4096);
+      const reason =
+        typeof parsed === "object" && parsed !== null
+          ? (parsed as { reason?: unknown }).reason
+          : undefined;
       if (reason !== "failed" && reason !== "cancelled") {
         throw new RunIntakeError("invalid_request", "reason is required");
       }

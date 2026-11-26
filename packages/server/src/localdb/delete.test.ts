@@ -26,6 +26,7 @@ import {
   InvalidConnectionLifetime,
   createConnectionDeleter,
 } from "../../../core/src/localdb/delete.js";
+import { retireLegacyOf } from "../../../core/src/localdb/legacy-delete.js";
 import { createLocalResolver } from "../../../core/src/localdb/resolve.js";
 import { createRecordQuery } from "../../../core/src/localdb/query.js";
 import {
@@ -36,6 +37,12 @@ import {
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { legacyHeadRow } from "./legacy-head-fixture.test-utils.js";
 import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
+import type * as LegacyDelete from "../../../core/src/localdb/legacy-delete.js";
+
+vi.mock("../../../core/src/localdb/legacy-delete.js", async (original) => {
+  const actual = await original<typeof LegacyDelete>();
+  return { ...actual, retireLegacyOf: vi.fn(actual.retireLegacyOf) };
+});
 
 const owner = `0x${"12".repeat(20)}`;
 const drivers: SqlDriver[] = [];
@@ -601,6 +608,89 @@ it("writes only confirmed tombstones to the ledger: a fence a foreign head super
   expect((await restarted.deleteStatus("fixture-source")).storage).toEqual({
     state: "done",
   });
+});
+
+it("a settled named delete replay writes no fence, generation or destructive effect", async () => {
+  const f = await world();
+  const connector = "fixture-source";
+  const lifetime = await f.a.deleter.readConnectionLifetime(connector);
+  expect(
+    (await f.a.deleter.requestConnectionDelete(connector, { lifetime })).fenced,
+  ).toBe(true);
+  expect(await f.a.deleter.resumeDeletes()).toEqual([]);
+  await f.a.deleter.close();
+
+  // A restart lets the retry loop settle the first erasure without competing
+  // with the landing's automatic pass. Both independent erasure parts must
+  // provide done evidence before the ledger can mark this lifetime final.
+  const legacyDone = vi.fn(async () => ({
+    part: { state: "done" } as const,
+    pending: false,
+  }));
+  const eraseLogs = vi.fn(async () => ({
+    connections: [
+      {
+        connector,
+        ns: "",
+        outcome: {
+          kind: "erased" as const,
+          deleted: 1,
+          retained: 0,
+          unenumerated: 0,
+          witnessed: true,
+        },
+      },
+    ],
+    pending: false,
+    skipped: [],
+  }));
+  let replaySettled: (() => void) | undefined;
+  const replay = new Promise<void>((resolve) => {
+    replaySettled = resolve;
+  });
+  let watchingReplay = false;
+  const afterRestart = createConnectionDeleter(f.a.deps, {
+    // Narrow sentinel: the legacy part itself is provided by the inert
+    // retirement stub, while the real deleter owns the ledger and replay.
+    legacy: () => ({}) as never,
+    eraseLogs,
+    onRetryStateChange: () => {
+      if (watchingReplay) replaySettled?.();
+    },
+  });
+  try {
+    await vi.mocked(retireLegacyOf).withImplementation(legacyDone, async () => {
+      expect(await afterRestart.resumeErasures()).toBe(false);
+      const verdict = await ledger(f);
+      expect(verdict).toEqual([
+        { ns: "", version: 2, done_at: expect.any(Number) },
+      ]);
+      expect(eraseLogs).toHaveBeenCalledOnce();
+      expect(legacyDone).toHaveBeenCalledOnce();
+
+      const writes = [...f.registry.log];
+      const connections = () =>
+        f.a.db.query(
+          "SELECT connection_id, generation, control_state FROM connections ORDER BY connection_id",
+        );
+      const before = await connections();
+      watchingReplay = true;
+      expect(
+        (await afterRestart.requestConnectionDelete(connector, { lifetime }))
+          .fenced,
+      ).toBe(true);
+      await replay;
+
+      expect(f.registry.log).toEqual(writes);
+      expect(await connections()).toEqual(before);
+      expect(await f.a.db.query("SELECT * FROM delete_intents")).toEqual([]);
+      expect(await ledger(f)).toEqual(verdict);
+      expect(eraseLogs).toHaveBeenCalledOnce();
+      expect(legacyDone).toHaveBeenCalledOnce();
+    });
+  } finally {
+    await afterRestart.close();
+  }
 });
 
 it("writes no tombstone for a local-only purge: nothing was confirmed, so a restart owes nothing", async () => {
