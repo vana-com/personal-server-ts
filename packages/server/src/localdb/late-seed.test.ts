@@ -824,23 +824,34 @@ it("a stage and a drop of one stream are serialized: a stage during a drop is no
   let held!: () => void;
   const holding = new Promise<void>((resolve) => (held = resolve));
   let gated = false;
-  let published!: () => void;
-  const publishing = new Promise<void>((resolve) => (published = resolve));
-  const staging = createSeedStaging({
+  const whileDropHeld: string[] = [];
+  let dropHeld = false;
+  const onDisk = createSeedStaging({
     ...files,
     async write(path, bytes) {
+      if (dropHeld && path.startsWith("staged/")) whileDropHeld.push("publish");
       await files.write(path, bytes);
-      if (gated && path.startsWith("staged/")) published();
     },
     async remove(prefix) {
       if (!gated && prefix.startsWith("staged/")) {
         gated = true;
+        dropHeld = true;
         held();
         await gate;
+        dropHeld = false;
       }
       return files.remove(prefix);
     },
   });
+  const staging = {
+    ...onDisk,
+    stage(...args: Parameters<typeof onDisk.stage>) {
+      // Reaching the storage adapter proves stage got through its lock, even
+      // if its later blob/pointer writes would be delayed by the filesystem.
+      if (dropHeld) whileDropHeld.push("stage entered");
+      return onDisk.stage(...args);
+    },
+  };
   const seed = createLocalSeed({
     getDeps: async () => device.deps,
     manifests: () => [manifest],
@@ -849,15 +860,16 @@ it("a stage and a drop of one stream are serialized: a stage during a drop is no
   const a = await seed.staging.stage("fixture", "items", upload(["A"]));
   const dropping = seed.staging.drop("fixture", "items", a.upload);
   await holding;
-  // The drop has read the pointer and is mid-removal; a new upload arrives.
+  // The old pointer is still held in drop. Give the promise-based lock and
+  // getDeps handoff one event-loop turn; the admission probe does not wait on disk.
   const staging2 = seed.staging.stage("fixture", "items", upload(["B"]));
-  // Unserialized, the new pointer lands while the drop is held; serialized,
-  // it cannot, so the wait times out.
-  await Promise.race([
-    publishing,
-    new Promise((resolve) => setTimeout(resolve, 300)),
-  ]);
-  release();
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(whileDropHeld).toEqual([]);
+  } finally {
+    release();
+    await Promise.allSettled([dropping, staging2]);
+  }
   await dropping;
   const b = await staging2;
   expect((await staging.staged("fixture")).items?.upload).toBe(b.upload);
