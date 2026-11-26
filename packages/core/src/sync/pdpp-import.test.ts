@@ -378,6 +378,47 @@ describe("createPdppImporter", () => {
       );
     });
 
+    it("ingests one envelope once when two imports overlap on a deferred seal", async () => {
+      // The seal's shared lock does not serialize writers, so two imports can
+      // both read the row as absent before either write runs.
+      const real = fixedLegacyWriteSeal("unswitched");
+      const queued: Array<() => void> = [];
+      const seal = {
+        ...real,
+        commit: <T>(write: Parameters<typeof real.commit<T>>[0]) =>
+          new Promise<Awaited<ReturnType<typeof real.commit<T>>>>(
+            (resolve, reject) => {
+              queued.push(() => {
+                real.commit(write).then(resolve, reject);
+              });
+            },
+          ),
+      } as typeof real;
+      const store = createMemoryRecordStore();
+      const ingest = vi.spyOn(store, "ingestBatch");
+      const importer = createPdppImporter({
+        store,
+        declarations: [RETAINED],
+        instanceFor: (sourceId) =>
+          sourceId === SOURCE_ID ? INSTANCE : undefined,
+        legacyWriteSeal: seal,
+        logger: silentLogger(),
+      });
+
+      const a = importer.importEnvelope(envelope());
+      const b = importer.importEnvelope(envelope());
+      await vi.waitFor(() => expect(queued).toHaveLength(2));
+      queued[0]();
+      await a;
+      queued[1]();
+      await b;
+
+      expect(ingest).toHaveBeenCalledTimes(1);
+      expect(store.getRecord(INSTANCE, "profile", "235680975")?.version).toBe(
+        1,
+      );
+    });
+
     it("treats a key-order-only difference as unchanged", async () => {
       const { importer, store } = setup();
       await importer.importEnvelope(envelope());
