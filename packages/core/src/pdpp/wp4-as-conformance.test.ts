@@ -818,11 +818,11 @@ describe("AS items 25, 44 — RFC 7009 client revocation", () => {
     expect(store.getGrant(grant.grant_id)?.revokedAt).not.toBeNull();
   });
 
-  it("refuses a token issued to another client", () => {
+  it("treats a token issued to another client like an unknown token, with no effect", () => {
     const { issued } = seed("continuous", "other");
     expect(
       tokens.revokeClientToken({ token: issued.access_token, clientId: "c" }),
-    ).toMatchObject({ ok: false, code: "unauthorized_client" });
+    ).toEqual({ ok: true, endedGrants: [], dispositionRecorded: false });
     expect(tokens.introspect(issued.access_token).active).toBe(true);
   });
 

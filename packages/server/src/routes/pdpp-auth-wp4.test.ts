@@ -555,16 +555,27 @@ describe("RFC 7009 revocation (AS item 25)", () => {
     ).toBe(400);
   });
 
-  it("refuses to revoke a token issued to another client", async () => {
+  it("answers a token issued to another client exactly like an unknown token, with no effect", async () => {
     const t = await issued();
-    const res = await postForm("/pdpp/v1/token/revoke", {
+    const foreign = await postForm("/pdpp/v1/token/revoke", {
       token: t.access_token,
       client_id: "someone_else",
     });
-    expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toBe(
-      "unauthorized_client",
+    const unknown = await postForm("/pdpp/v1/token/revoke", {
+      token: "never-issued",
+      client_id: "someone_else",
+    });
+    // RFC 7009 §2.2; no signal about which client a token belongs to.
+    expect(foreign.status).toBe(200);
+    expect(await foreign.text()).toBe(await unknown.text());
+    expect(unknown.status).toBe(200);
+    // The real client's token still works.
+    const still = await postForm(
+      "/pdpp/v1/introspect",
+      { token: t.access_token },
+      auth(t.ownerTokenValue),
     );
+    expect(((await still.json()) as { active: boolean }).active).toBe(true);
   });
 
   it("keeps the owner grant revocation on its own non-advertised route", async () => {

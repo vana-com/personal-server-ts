@@ -72,10 +72,13 @@ restore does not extend them.
 
 ## What this AS does not yet do
 
-- It does not accept owner revocations while the history is unavailable. If
-  `pdpp-auth.db` cannot be opened, `/pdpp/v1` is not mounted and the owner
-  cannot revoke until the store is back (spec-core L1827 requires the AS to
-  accept and queue them).
+- It does not accept owner revocations while the history is unavailable
+  (spec-core L1827 requires the AS to accept, record and later apply them).
+  If `pdpp-auth.db` holds a state version this build does not support,
+  `/pdpp/v1` is not mounted; any other open failure stops the server at boot.
+  Either way the owner cannot revoke until the store is back.
+- The opt-in replica read path asks a remote issuer to introspect; this
+  statement covers only the local store, not that issuer's history.
 - It records no erasure instructions and has no grant lifecycle operation.
   A recorded `delete` disposition is stored, but is not yet an erasure
   instruction (grant-lifecycle work package).

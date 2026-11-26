@@ -566,16 +566,16 @@ export class PdppTokenService {
       if (kind === "access") {
         const record = this.store.getAccessToken(input.token);
         if (!record) continue;
+        // A token that is not this client's is treated exactly like an
+        // unknown one: no effect and the same empty 200 (RFC 7009 §2.2).
+        // `client_id` is not authenticated here, so a distinct refusal would
+        // only let a token holder probe which client a token belongs to.
         if (
           record.tokenKind !== "client" ||
           record.clientId !== input.clientId ||
           !record.grantId
         )
-          return {
-            ok: false,
-            code: "unauthorized_client",
-            message: "the token was not issued to this client",
-          };
+          return { ok: true, endedGrants: [], dispositionRecorded: false };
         grantId = record.grantId;
         credential = "access_token";
         current = this.resolveToken(input.token, now).active;
@@ -587,11 +587,7 @@ export class PdppTokenService {
       if (!refresh) continue;
       const stored = this.store.getGrant(refresh.grantId);
       if (!stored || stored.clientId !== input.clientId)
-        return {
-          ok: false,
-          code: "unauthorized_client",
-          message: "the token was not issued to this client",
-        };
+        return { ok: true, endedGrants: [], dispositionRecorded: false };
       grantId = refresh.grantId;
       credential = "refresh_token";
       current =

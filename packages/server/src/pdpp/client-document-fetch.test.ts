@@ -163,6 +163,14 @@ describe("isBlockedAddress: the connect-time address table", () => {
     ["100.100.100.200", true],
     ["100.63.255.255", false],
     ["100.128.0.1", false],
+    // IPv6 transition ranges that can reach IPv4 space through a gateway.
+    ["64:ff9b::7f00:1", true], // NAT64 of 127.0.0.1
+    ["64:ff9b:1::a00:1", true], // NAT64 local-use
+    ["2002:7f00:1::", true], // 6to4 of 127.0.0.1
+    ["2001:0:4136:e378::1", true], // Teredo
+    ["::127.0.0.1", true], // IPv4-compatible
+    ["2001:db8::1", true], // documentation
+    ["fec0::1", true], // site-local
   ])("%s -> blocked=%s", (address, expected) => {
     expect(isBlockedAddress(address)).toBe(expected);
   });
