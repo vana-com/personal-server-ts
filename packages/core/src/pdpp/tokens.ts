@@ -517,6 +517,132 @@ export class PdppTokenService {
     return { access_token: token, token_type: "Bearer", expires_in: ttl };
   }
 
+  /**
+   * RFC 7009 client-initiated revocation (AS item 25, spec-core L2777-L2789).
+   *
+   * Semantics fixed by L2777:
+   *   - a refresh token, current or superseded, ends every grant its family
+   *     covers, with every access token issued under them;
+   *   - an access token ends itself, and ends its grant only when no
+   *     refresh-token family covers it.
+   *
+   * `pdpp_disposition` is recorded only with current client authentication
+   * (L2785): an active access token covering the grant, or the current
+   * (not superseded, family live) refresh token — presented as the revoked
+   * token itself or as a bearer. Without it the grants still end and nothing
+   * is recorded. Revocation and record commit in one transaction before the
+   * route acknowledges (AS item 44).
+   *
+   * An unknown token is not an error (RFC 7009 §2.2). A token issued to a
+   * different client is refused (RFC 7009 §2.1).
+   */
+  revokeClientToken(input: {
+    token: string;
+    clientId: string;
+    tokenTypeHint?: string;
+    disposition?: "keep" | "delete";
+    reportedAt?: string;
+    /** A bearer the request carried as extra current client authentication. */
+    bearer?: string;
+    now?: Date;
+  }):
+    | { ok: true; endedGrants: string[]; dispositionRecorded: boolean }
+    | {
+        ok: false;
+        code: "unauthorized_client" | "invalid_request";
+        message: string;
+      } {
+    const now = input.now ?? new Date();
+    const lookups =
+      input.tokenTypeHint === "refresh_token"
+        ? (["refresh", "access"] as const)
+        : (["access", "refresh"] as const);
+
+    let grantId: string | null = null;
+    let credential: "access_token" | "refresh_token" | null = null;
+    let current = false;
+    let accessTokenOnly: string | undefined;
+    for (const kind of lookups) {
+      if (kind === "access") {
+        const record = this.store.getAccessToken(input.token);
+        if (!record) continue;
+        if (
+          record.tokenKind !== "client" ||
+          record.clientId !== input.clientId ||
+          !record.grantId
+        )
+          return {
+            ok: false,
+            code: "unauthorized_client",
+            message: "the token was not issued to this client",
+          };
+        grantId = record.grantId;
+        credential = "access_token";
+        current = this.resolveToken(input.token, now).active;
+        if (this.store.refreshFamilyCovers(record.grantId))
+          accessTokenOnly = input.token;
+        break;
+      }
+      const refresh = this.store.inspectRefreshToken(input.token);
+      if (!refresh) continue;
+      const stored = this.store.getGrant(refresh.grantId);
+      if (!stored || stored.clientId !== input.clientId)
+        return {
+          ok: false,
+          code: "unauthorized_client",
+          message: "the token was not issued to this client",
+        };
+      grantId = refresh.grantId;
+      credential = "refresh_token";
+      current =
+        !refresh.superseded &&
+        !refresh.familyRevoked &&
+        grantInactiveReason(this.store, stored, now) === null;
+      break;
+    }
+    if (grantId === null || credential === null)
+      // RFC 7009 §2.2: an invalid token is not an error.
+      return { ok: true, endedGrants: [], dispositionRecorded: false };
+
+    if (!current && input.bearer !== undefined) {
+      const bearer = this.resolveToken(input.bearer, now);
+      current =
+        bearer.active &&
+        bearer.tokenKind === "client" &&
+        bearer.clientId === input.clientId &&
+        bearer.grant?.grant_id === grantId;
+    }
+
+    // An access-token revocation that a live refresh family covers ends no
+    // grant, so a conveyed disposition has no ending to ride on (L2785 scopes
+    // it to the grants a revoked family covers). The token is still ended
+    // (L2777 "MUST end that token") and nothing is recorded, which the result
+    // reports as `dispositionRecorded: false` (L2785: "Without it, the AS
+    // still ends the grants but records no disposition").
+    const endedGrants = accessTokenOnly !== undefined ? [] : [grantId];
+    const record =
+      input.disposition !== undefined && current && accessTokenOnly === undefined;
+    const ended = this.store.revokeForClient({
+      endGrants: endedGrants,
+      ...(accessTokenOnly !== undefined && { accessTokenOnly }),
+      ...(record && {
+        disposition: {
+          value: input.disposition!,
+          ...(input.reportedAt !== undefined && {
+            reportedAt: input.reportedAt,
+          }),
+          clientId: input.clientId,
+          credential,
+          scope: [grantId],
+        },
+      }),
+      now,
+    });
+    // Report only grants this request actually ended (an already revoked or
+    // expired grant keeps its own ending, L2785).
+    return { ok: true, endedGrants: ended, dispositionRecorded: record };
+  }
+
   /** Revoke a single access token without touching its grant. */
   revokeAccessToken(token: string, now: Date = new Date()): boolean {
     return this.store.revokeAccessToken(token, now);
@@ -552,6 +678,21 @@ export function toAuthorizationEntry(grant: Grant): PdppAuthorizationEntry {
   if (isV02Grant(grant)) {
     return { type: PDPP_DATA_ACCESS_TYPE_V02, grant };
   }
+  // AS item 32 / spec-core L1415: "Each element MUST contain `type` equal to
+  // `https://pdpp.dev/data-access` and `grant` containing the complete
+  // immutable grant [...]. The AS MUST NOT substitute the original selection
+  // request or a lossy summary." The same element serves the token response
+  // (code and refresh) and introspection, so client and RS see one fact set.
+  if (grantUsesLockedRules(grant)) {
+    return {
+      type:
+        grant.version === PDPP_GRANT_VERSION_CANDIDATE
+          ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
+          : PDPP_DATA_ACCESS_TYPE,
+      grant,
+    };
+  }
+  // Pre-lock grants never reach here: they resolve inactive (AS item 21).
   return toAuthorizationDetail(grant);
 }
 

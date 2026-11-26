@@ -45,6 +45,12 @@ import type { RegisteredRedirectPolicy } from "./redirect.js";
 export const MAX_CLIENT_DOCUMENT_BYTES = 64 * 1024;
 
 export type ClientIdentityFailureCode =
+  /**
+   * AS item 50 / spec-core L1027: local admission policy refused the client.
+   * Distinct from every identity-form failure below: the identity was not
+   * judged invalid, the deployment simply does not admit it.
+   */
+  | "client_not_admitted"
   | "untrusted_client_url"
   | "fetch_failed"
   | "invalid_document"
@@ -69,6 +75,13 @@ export interface ResolveClientIdentityOptions {
   fetcher: ClientDocumentFetcher;
   /** Reuses the declaration trust policy; same bounds, same allowlist. */
   policy: DeclarationTrustPolicy;
+  /**
+   * Local admission policy: when set, only these hosts are admitted, and any
+   * other host is refused as `client_not_admitted` before any fetch. This is
+   * an authorization decision under local policy (spec-core L1027), kept
+   * separate from identity-form validation, which `policy` governs.
+   */
+  admittedHosts?: string[];
 }
 
 export type ClientIdentityResult =
@@ -116,6 +129,21 @@ export async function resolveUrlHostedClientIdentity(
       failure: {
         code: "untrusted_client_url",
         message: "client_id is not a URL-hosted identity",
+      },
+    };
+  }
+
+  // Admission under local policy first, so a non-admitted host is never
+  // fetched. The answer names policy, never the identity form (AS item 50).
+  if (
+    options.admittedHosts !== undefined &&
+    !options.admittedHosts.includes(parsed.hostname)
+  ) {
+    return {
+      ok: false,
+      failure: {
+        code: "client_not_admitted",
+        message: `client host '${parsed.hostname}' is not admitted by this server's local policy`,
       },
     };
   }

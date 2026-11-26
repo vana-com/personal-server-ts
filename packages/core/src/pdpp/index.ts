@@ -34,6 +34,7 @@ export type {
   InactiveReason,
   PdppAuthorizationDetail,
   PdppAuthorizationEntry,
+  PdppAuthorizationResult,
   PdppAuthorizationResultV02,
   PdppIntrospectionResponse,
   PdppTokenContext,
@@ -53,6 +54,26 @@ export type {
 } from "./types.js";
 
 export { validateSelectionRequest } from "./selection.js";
+export {
+  APPENDIX_A_PURPOSE_CODES,
+  SUPPORTED_PROCESSING_PERMISSIONS,
+  validatePublicDetail,
+} from "./public-validation.js";
+export type {
+  PublicDetailFailure,
+  PublicDetailValidation,
+} from "./public-validation.js";
+export {
+  chooseLanguageVersion,
+  isWellFormedLanguageTag,
+  parseUiLocales,
+  validateLanguageMap,
+} from "./language.js";
+export type {
+  ChosenVersion,
+  LanguageMap,
+  LocalizableValue,
+} from "./language.js";
 export type {
   SelectionFailure,
   SelectionFailureCode,
@@ -79,12 +100,14 @@ export type {
 export {
   buildConsentReview,
   computeReviewDigest,
+  ENVELOPE_DISCLOSURE_STATEMENT,
   isRegisteredPurposeCode,
   normalizeClientClaims,
 } from "./review.js";
 export type {
   BuildReviewInput,
   ConsentReviewModel,
+  DisplayValueShown,
   ExistingGrant,
   RequesterIdentity,
   ReviewStream,

@@ -27,6 +27,10 @@ import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/local
  * Returns undefined when the AS did not mount, which leaves the resource
  * surface unmounted too. An RS with no authorization server cannot enforce a
  * grant, and a resource server that cannot enforce is worse than absent.
+ *
+ * Operator policy (PDPP Core §9 RS item 29): the operator does not use owner
+ * data held in this Resource Server role for AI training, except under a
+ * training grant issued to it as a client. See docs/pdpp-operator-policy.md.
  */
 
 import { createHash } from "node:crypto";

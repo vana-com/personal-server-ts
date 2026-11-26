@@ -19,6 +19,7 @@ import {
   buildConsentReview,
   computeReviewDigest,
   normalizeClientClaims,
+  type DisplayValueShown,
   type RequesterIdentity,
 } from "./review.js";
 import { resolveCommitments } from "./commitments.js";
@@ -95,6 +96,15 @@ export interface ConsentEvidence {
    * not.
    */
   recipient_terms?: { id: string; version: string };
+  /**
+   * AS items 15 and 34: what final review showed, as bound into the digest —
+   * the requester identity and each declaration display value with its exact
+   * string and chosen language tag. Locked-rule grants only.
+   */
+  displayed?: {
+    client: RequesterIdentity;
+    display_values: DisplayValueShown[];
+  };
 }
 
 export interface IssueGrantInput {
@@ -125,6 +135,8 @@ export interface IssueGrantInput {
   /** AS-policy grant expiry. Absent means the grant never expires. */
   expiresAt?: string;
   streamDescriptions?: Record<string, string>;
+  /** The review's language priority list (AS item 34); see `BuildReviewInput`. */
+  languagePriority?: string[];
   now?: Date;
 }
 
@@ -160,7 +172,8 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     const refused =
       resolution.failure.code === "minimum_not_met" ||
       resolution.failure.code === "required_stream_declined" ||
-      resolution.failure.code === "no_streams_approved";
+      resolution.failure.code === "no_streams_approved" ||
+      resolution.failure.code === "required_stream_ineligible";
     return {
       ok: false,
       failure: {
@@ -223,6 +236,7 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     requester: input.requester,
     expiresAt: input.expiresAt,
     streamDescriptions: input.streamDescriptions,
+    languagePriority: input.languagePriority,
   });
 
   if (review.review_digest !== input.approvedReviewDigest) {
@@ -306,6 +320,12 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
       explicit_ai_training_consent: true,
     }),
     recipient_terms: commitments.evidence,
+    ...(review.display_values && {
+      displayed: {
+        client: input.requester,
+        display_values: review.display_values,
+      },
+    }),
   };
 
   return { ok: true, grant, consentEvidence };

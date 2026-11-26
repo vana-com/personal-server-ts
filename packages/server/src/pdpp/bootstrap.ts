@@ -11,6 +11,11 @@
  * Returns undefined when PDPP is disabled and no connection registry is
  * configured. It also returns undefined when no declarations or connection
  * methods remain, so `/pdpp/v1` is mounted only when it can issue tokens.
+ *
+ * Operator policy (PDPP Core §9 AS item 38): the operator does not use owner
+ * data held in this Authorization Server role for AI training, except under a
+ * training grant issued to it as a client. See docs/pdpp-operator-policy.md.
+ * Lifecycle durability (AS item 44): see docs/pdpp-durability-statement.md.
  */
 
 import { createHash } from "node:crypto";
@@ -325,20 +330,24 @@ export async function createPdppAuthDeps(
       if (!lifetimeSeconds) return undefined;
       return new Date(Date.now() + lifetimeSeconds * 1000).toISOString();
     },
-    // §6 URL-hosted identity for a client NOT in `clients` above. Left
-    // unset (undefined, not a function that always fails) when the
-    // allowlist is empty, so this deployment performs no outbound fetch and
-    // the route's registration-only fallback runs exactly as it did before
-    // this path existed.
-    resolveClientIdentity:
-      config.pdpp.urlHostedClientHosts.length > 0
-        ? (clientId) =>
-            resolveUrlHostedClientIdentity({
-              clientId,
-              fetcher: boundedClientDocumentFetcher,
-              policy: { trustedHosts: config.pdpp.urlHostedClientHosts },
-            })
-        : undefined,
+    // §6 URL-hosted identity for a client NOT in `clients` above (AS item
+    // 50, spec-core L1025-L1029): a valid client ID metadata document is
+    // accepted as an identity without preregistration, by default. The fetch
+    // is the bounded, DNS-pinned one (`client-document-fetch.ts`: HTTPS only,
+    // every dialed address checked against non-public ranges, no redirects,
+    // 64 KiB cap, 5 s timeout), and `/authorize` that triggers it is itself
+    // owner-authenticated. A non-empty `urlHostedClientHosts` is now local
+    // ADMISSION policy: other hosts are denied as `unauthorized_client`
+    // before any fetch, which is distinct from rejecting the identity form.
+    resolveClientIdentity: (clientId) =>
+      resolveUrlHostedClientIdentity({
+        clientId,
+        fetcher: boundedClientDocumentFetcher,
+        policy: { allowAnyHttpsHost: true },
+        ...(config.pdpp.urlHostedClientHosts.length > 0 && {
+          admittedHosts: config.pdpp.urlHostedClientHosts,
+        }),
+      }),
     requirePkce: config.pdpp.requirePkce,
     ownerAuth: {
       serverOrigin: options.serverOrigin,

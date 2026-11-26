@@ -261,13 +261,20 @@ describe("the full authorization journey", () => {
       active: boolean;
       grant_id: string;
       pdpp_token_kind: string;
-      authorization_details: Array<{ streams: Array<{ fields: string[] }> }>;
+      authorization_details: Array<{
+        type: string;
+        grant: { grant_id: string; streams: Array<{ fields: string[] }> };
+      }>;
     };
     expect(context.active).toBe(true);
     expect(context.pdpp_token_kind).toBe("client");
     expect(context.grant_id).toBe(grant_id);
-    // The RS gets the complete resolved enforcement context in one response.
-    expect(context.authorization_details[0].streams[0].fields).toContain("id");
+    // AS item 32 / L1415: `{ type, grant }` with the complete grant.
+    expect(context.authorization_details[0].type).toBe(PDPP_DATA_ACCESS_TYPE);
+    expect(context.authorization_details[0].grant.grant_id).toBe(grant_id);
+    expect(context.authorization_details[0].grant.streams[0].fields).toContain(
+      "id",
+    );
     // RFC 9396 §7: the token response MUST carry the authorization_details as
     // granted — identical to what the RS later resolves via introspection.
     expect(issued.authorization_details).toEqual(context.authorization_details);
@@ -522,14 +529,48 @@ describe("§9 AS item 5 — Source validation failures map to RFC 9396", () => {
     expect((await response.json()).error).toBe("invalid_authorization_details");
   });
 
-  it("rejects an unknown source with no retained snapshot", async () => {
+  // spec-core L1220: whether a source is accepted for this owner is protected
+  // owner state, so an unaccepted source is not public invalidity. The
+  // session opens as for any request, review refuses, and the client sees
+  // only the owner-decline `access_denied` (AS items 2, 52).
+  it("defers an unknown source with no retained snapshot to review", async () => {
+    const NOPE = "https://registry.pdpp.dev/connectors/nope";
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+      sourceId: NOPE,
+    }).access_token;
+    const response = await post(
+      "/pdpp/v1/authorize",
+      selectionBody({ source: { id: NOPE } }),
+      ownerAuth(ownerToken),
+    );
+    expect(response.status).toBe(201);
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(403);
+    expect((await reviewed.json()).error).toBe("access_denied");
+    const denied = await post(
+      `/pdpp/v1/authorize/${session_id}/deny`,
+      {},
+      ownerAuth(ownerToken),
+    );
+    expect(denied.status).toBe(200);
+    const { redirect_uri } = (await denied.json()) as { redirect_uri: string };
+    expect(redirect_uri).toBe(`${REDIRECT}?error=access_denied&state=xyz`);
+  });
+
+  it("refuses an owner token scoped to a different source", async () => {
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
         source: { id: "https://registry.pdpp.dev/connectors/nope" },
       }),
     );
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(403);
+    expect((await response.json()).error).toBe("access_denied");
   });
 });
 
@@ -559,7 +600,12 @@ describe("§8 API versioning — the AS does not negotiate PDPP-Version", () => 
 describe("§9 AS item 14 — AI training consent over the wire", () => {
   it("refuses approval without the explicit flag", async () => {
     const { sessionId, ownerToken, digest } = await openSessionAndReview(
-      selectionBody({ purpose_code: "https://pdpp.dev/purpose/ai_training" }),
+      // The withdrawn code (spec-core L3233) is outside Appendix A, so it
+      // needs a purpose_description (AS item 6).
+      selectionBody({
+        purpose_code: "https://pdpp.dev/purpose/ai_training",
+        purpose_description: "Train a recommendation model",
+      }),
     );
     const response = await post(
       `/pdpp/v1/authorize/${sessionId}/approve`,
@@ -572,7 +618,12 @@ describe("§9 AS item 14 — AI training consent over the wire", () => {
 
   it("issues with the explicit flag", async () => {
     const { sessionId, ownerToken, digest } = await openSessionAndReview(
-      selectionBody({ purpose_code: "https://pdpp.dev/purpose/ai_training" }),
+      // The withdrawn code (spec-core L3233) is outside Appendix A, so it
+      // needs a purpose_description (AS item 6).
+      selectionBody({
+        purpose_code: "https://pdpp.dev/purpose/ai_training",
+        purpose_description: "Train a recommendation model",
+      }),
     );
     const response = await post(
       `/pdpp/v1/authorize/${sessionId}/approve`,
@@ -1308,8 +1359,13 @@ describe("§6 — instance choice over the wire", () => {
 describe("owner instance ceiling — a scoped owner token stays inside its instances", () => {
   const ACCOUNT_B = "spotify-account-b";
 
-  it("refuses to open an authorization that explicitly names an instance outside the token", async () => {
+  // spec-core L1220: instance handles and their eligibility are protected
+  // owner state, so an out-of-ceiling handle no longer changes what
+  // /authorize returns. The session opens, review refuses for the owner, and
+  // the handle is never resolved, counted or shown.
+  it("never resolves an instance outside the token named at /authorize", async () => {
     eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const ownerToken = scopedOwnerToken();
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
@@ -1321,10 +1377,23 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
           },
         ],
       }),
-      ownerAuth(scopedOwnerToken()),
+      ownerAuth(ownerToken),
     );
-    expect(response.status).toBe(403);
-    expect((await response.json()).error).toBe("access_denied");
+    expect(response.status).toBe(201);
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(403);
+    expect((await reviewed.json()).error).toBe("access_denied");
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      { review_digest: "x" },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(403);
+    expect(store.listGrantsForSubject(OWNER)).toHaveLength(0);
   });
 
   it("refuses an instance choice outside the token at review, and never shows it", async () => {
@@ -1504,7 +1573,14 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
       selectionBody(),
       ownerAuth(emptyToken),
     );
-    expect(response.status).toBe(403);
+    // Deferred (L1220): the session opens, review refuses, nothing issues.
+    expect(response.status).toBe(201);
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(emptyToken) },
+    );
+    expect(reviewed.status).toBe(403);
   });
 });
 

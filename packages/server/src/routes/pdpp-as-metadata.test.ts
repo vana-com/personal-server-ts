@@ -103,8 +103,9 @@ describe("PDPP AS metadata", () => {
       expect(body.introspection_endpoint).toBe(
         "https://ps.example.com/pdpp/v1/introspect",
       );
+      // AS item 25: the RFC 7009 client route, not the owner grant route.
       expect(body.revocation_endpoint).toBe(
-        "https://ps.example.com/pdpp/v1/revoke",
+        "https://ps.example.com/pdpp/v1/token/revoke",
       );
       // AS endpoints are not versioned by PDPP-Version (spec-core §8).
       expect(body).not.toHaveProperty("pdpp_api_version");

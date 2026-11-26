@@ -141,6 +141,23 @@ CREATE TABLE IF NOT EXISTS pdpp_access_tokens (
   revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pdpp_access_grant ON pdpp_access_tokens (grant_id);
+
+-- AS item 25 / spec-core L2785: a \`pdpp_disposition\` conveyed on an RFC 7009
+-- revocation with current client authentication, recorded in the same
+-- transaction as the revocation it rides on (L2787: "before, or atomically
+-- with"). Append-only: a matching retry inserts nothing, so clocks never move.
+-- TODO(grant-lifecycle package): turn a recorded \`delete\` into an erasure
+-- instruction (L1612) and answer it through the lifecycle operation.
+CREATE TABLE IF NOT EXISTS pdpp_revocation_dispositions (
+  grant_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK (disposition IN ('keep','delete')),
+  reported_at TEXT,
+  credential TEXT NOT NULL CHECK (credential IN ('access_token','refresh_token')),
+  recorded_at TEXT NOT NULL,
+  FOREIGN KEY (grant_id) REFERENCES pdpp_grants (grant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_dispositions_grant ON pdpp_revocation_dispositions (grant_id);
 CREATE INDEX IF NOT EXISTS idx_pdpp_access_family ON pdpp_access_tokens (family_id);
 `;
 
@@ -768,6 +785,174 @@ export class PdppAuthStore {
       )
       .run(now.toISOString(), hashToken(token));
     return result.changes > 0;
+  }
+
+  /**
+   * Read a refresh token's state without rotating it (RFC 7009 revocation).
+   * Null when unknown.
+   */
+  inspectRefreshToken(token: string): {
+    familyId: string;
+    grantId: string;
+    superseded: boolean;
+    familyRevoked: boolean;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT t.family_id, t.superseded_at, f.revoked_at AS family_revoked_at,
+                f.grant_id
+         FROM pdpp_refresh_tokens t
+         JOIN pdpp_refresh_families f ON f.family_id = t.family_id
+         WHERE t.token_hash = ?`,
+      )
+      .get(hashToken(token)) as
+      | {
+          family_id: string;
+          superseded_at: string | null;
+          family_revoked_at: string | null;
+          grant_id: string;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      familyId: row.family_id,
+      grantId: row.grant_id,
+      superseded: row.superseded_at !== null,
+      familyRevoked: row.family_revoked_at !== null,
+    };
+  }
+
+  /** Whether a live (unrevoked) refresh-token family covers the grant. */
+  refreshFamilyCovers(grantId: string): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT 1 FROM pdpp_refresh_families WHERE grant_id = ? AND revoked_at IS NULL LIMIT 1",
+      )
+      .get(grantId);
+    return row !== undefined;
+  }
+
+  /**
+   * One RFC 7009 client revocation as a single durable unit (AS items 25, 44).
+   * Returns the grants this call ended (active before it, revoked after).
+   *
+   * `endGrants` are ended exactly as `revokeGrant` ends one: grant, linked
+   * access tokens and refresh families. `accessTokenOnly` ends just that
+   * token (spec-core L2777: an access token's grants end "only when no
+   * refresh-token family covers them"). A disposition, when given, is
+   * recorded for every grant in `dispositionScope` inside the same
+   * transaction, so the 200 the route returns is never ahead of the record
+   * (L2787). An already-ended grant keeps its `revoked_at` (L2785: "MUST NOT
+   * change the `read_state` or `ended_at` of a grant that had already expired
+   * or been revoked").
+   */
+  revokeForClient(input: {
+    endGrants: string[];
+    accessTokenOnly?: string;
+    disposition?: {
+      value: "keep" | "delete";
+      reportedAt?: string;
+      clientId: string;
+      credential: "access_token" | "refresh_token";
+      scope: string[];
+    };
+    now?: Date;
+  }): string[] {
+    const now = input.now ?? new Date();
+    const at = now.toISOString();
+    const tx = this.db.transaction((): string[] => {
+      const ended: string[] = [];
+      const d = input.disposition;
+      if (d) {
+        for (const grantId of d.scope) {
+          const existing = this.db
+            .prepare(
+              `SELECT 1 FROM pdpp_revocation_dispositions
+               WHERE grant_id = ? AND client_id = ? AND disposition = ?
+                 AND reported_at IS ?`,
+            )
+            .get(grantId, d.clientId, d.value, d.reportedAt ?? null);
+          if (existing) continue;
+          this.db
+            .prepare(
+              `INSERT INTO pdpp_revocation_dispositions
+                 (grant_id, client_id, disposition, reported_at, credential, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              grantId,
+              d.clientId,
+              d.value,
+              d.reportedAt ?? null,
+              d.credential,
+              at,
+            );
+        }
+      }
+      if (input.accessTokenOnly !== undefined) {
+        this.db
+          .prepare(
+            "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+          )
+          .run(at, hashToken(input.accessTokenOnly));
+      }
+      for (const grantId of input.endGrants) {
+        // Only an active grant gets a new ending. An expired one keeps its
+        // `expires_at` as its end (L2785: recording "MUST NOT change the
+        // `read_state` or `ended_at` of a grant that had already expired or
+        // been revoked"); its tokens and families are still disabled below.
+        const changed = this.db
+          .prepare(
+            `UPDATE pdpp_grants SET revoked_at = ?
+             WHERE grant_id = ? AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?)`,
+          )
+          .run(at, grantId, at);
+        if (changed.changes > 0) ended.push(grantId);
+        this.db
+          .prepare(
+            "UPDATE pdpp_access_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+          )
+          .run(at, grantId);
+        this.db
+          .prepare(
+            "UPDATE pdpp_refresh_families SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
+          )
+          .run(at, grantId);
+      }
+      return ended;
+    });
+    return tx();
+  }
+
+  /** Dispositions recorded for a grant, oldest first (tests and owner views). */
+  listDispositions(grantId: string): Array<{
+    clientId: string;
+    disposition: "keep" | "delete";
+    reportedAt: string | null;
+    credential: "access_token" | "refresh_token";
+    recordedAt: string;
+  }> {
+    return (
+      this.db
+        .prepare(
+          `SELECT client_id, disposition, reported_at, credential, recorded_at
+           FROM pdpp_revocation_dispositions WHERE grant_id = ? ORDER BY rowid`,
+        )
+        .all(grantId) as Array<{
+        client_id: string;
+        disposition: "keep" | "delete";
+        reported_at: string | null;
+        credential: "access_token" | "refresh_token";
+        recorded_at: string;
+      }>
+    ).map((r) => ({
+      clientId: r.client_id,
+      disposition: r.disposition,
+      reportedAt: r.reported_at,
+      credential: r.credential,
+      recordedAt: r.recorded_at,
+    }));
   }
 
   isFamilyRevoked(familyId: string): boolean {

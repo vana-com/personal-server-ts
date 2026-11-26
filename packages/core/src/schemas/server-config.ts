@@ -382,9 +382,12 @@ export const ServerConfigSchema = z.object({
           }),
         )
         .default(DEFAULTS.pdpp.clients),
-      // Opt-in allowlist: no host here means no client_id URL is ever
-      // fetched. A static registration in `clients` remains first choice and
-      // is always checked before this path runs.
+      // Local admission policy for URL-hosted clients (AS item 50). Empty
+      // (the default) admits any valid client ID metadata document served
+      // over HTTPS from a public address. Non-empty admits only these hosts;
+      // others are denied by policy (`unauthorized_client`) without a fetch.
+      // A static registration in `clients` remains first choice and is always
+      // checked before this path runs.
       urlHostedClientHosts: z
         .array(z.string().min(1))
         .default(DEFAULTS.pdpp.urlHostedClientHosts),

@@ -335,8 +335,12 @@ describe("PDPP boot journey: real createServer", () => {
       active: boolean;
       pdpp_token_kind?: string;
       grant_id?: string;
+      // AS item 32: `{ type, grant }` with the complete grant (spec-core L1415).
       authorization_details?: {
-        streams: { name: string; fields: string[]; instance_ids: string[] }[];
+        type: string;
+        grant: {
+          streams: { name: string; fields: string[]; instance_ids: string[] }[];
+        };
       }[];
     };
 
@@ -348,7 +352,7 @@ describe("PDPP boot journey: real createServer", () => {
     // set is the requested `name` plus the declaration's required `id` floor,
     // and the instance handle was resolved from the deployment's inventory
     // rather than asserted by the client.
-    const stream = body.authorization_details?.[0]?.streams.find(
+    const stream = body.authorization_details?.[0]?.grant.streams.find(
       (s) => s.name === "top_artists",
     );
     expect(stream).toBeDefined();

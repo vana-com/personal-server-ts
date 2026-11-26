@@ -351,12 +351,15 @@ describe("§8 — introspection carries the full enforcement context", () => {
     expect(response.client_id).toBe("music_recommendations");
     expect(response.authorization_details).toHaveLength(1);
 
-    const detail = response.authorization_details![0];
+    // AS item 32 / spec-core L1415: `{ type, grant }` with the complete
+    // immutable grant -- the same element the token response carries.
+    const detail = response.authorization_details![0] as {
+      type: string;
+      grant: typeof grant;
+    };
     expect(detail.type).toBe(PDPP_DATA_ACCESS_TYPE);
-    // The complete Section 7 constraints, in one response.
-    expect(detail.streams).toEqual(grant.streams);
-    expect(detail.access_mode).toBe("continuous");
-    expect(detail.source).toEqual(grant.source);
+    expect(detail.grant).toEqual(grant);
+    expect(issued.issued.authorization_details).toEqual([detail]);
   });
 
   it("returns exactly { active: false } for an inactive token", () => {

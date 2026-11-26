@@ -85,7 +85,13 @@ export type ResolutionFailureCode =
   /** v0.2: the owner declined a stream the request marks `required`. */
   | "required_stream_declined"
   /** v0.2: nothing survived the owner's choices. No empty grants. */
-  | "no_streams_approved";
+  | "no_streams_approved"
+  /**
+   * Locked v0.1.0: a `required` stream has no eligible instance (spec-core
+   * L1226, AS item 53). An owner-dependent refusal the binding reports as
+   * `access_denied`, never as malformed authorization details.
+   */
+  | "required_stream_ineligible";
 
 export interface ResolutionFailure {
   code: ResolutionFailureCode;
@@ -391,6 +397,8 @@ function resolveTimeConstraint(
 type StreamOutcome =
   | { kind: "resolved"; stream: StreamGrant }
   | { kind: "minimum_unmet"; reason: string }
+  /** Locked rules: no eligible instance for an otherwise valid stream. */
+  | { kind: "ineligible"; reason: string }
   | { kind: "failed"; failure: ResolutionFailure };
 
 function resolveOneStream(
@@ -497,6 +505,18 @@ function resolveOneStream(
   }
 
   const instances = resolveInstances(request, declared.name, inventory);
+  if (
+    !instances.ok &&
+    revision === "candidate" &&
+    (instances.failure.code === "no_eligible_instance" ||
+      instances.failure.code === "unknown_instance")
+  )
+    // spec-core L1226: "The AS MUST treat an otherwise valid stream that has
+    // no eligible instance as unapproved. The AS MAY omit that stream only
+    // when it is optional. The AS MUST refuse the detail when a required
+    // stream cannot be retained." A requested handle that is not eligible is
+    // the same owner-dependent fact (L1220), so it takes the same path.
+    return { kind: "ineligible", reason: instances.failure.message };
   if (!instances.ok) return { kind: "failed", failure: instances.failure };
 
   const timeConstraint = resolveTimeConstraint(
@@ -711,12 +731,11 @@ export function resolveSelection(
   inventory: InstanceInventory,
   choices?: OwnerChoices,
 ): ResolutionResult {
-  const revision =
-    usesLockedRules(request.type)
-      ? "candidate"
-      : request.type === PDPP_DATA_ACCESS_TYPE_V02
-        ? "0.2"
-        : "0.1";
+  const revision = usesLockedRules(request.type)
+    ? "candidate"
+    : request.type === PDPP_DATA_ACCESS_TYPE_V02
+      ? "0.2"
+      : "0.1";
   if (revision === "candidate") {
     const invalid = validateCandidateOwnerChoices(request, snapshot, choices);
     if (invalid) return failure("invalid_owner_choices", invalid);
@@ -784,6 +803,18 @@ export function resolveSelection(
 
     if (outcome.kind === "failed") {
       return { ok: false, failure: outcome.failure };
+    }
+
+    if (outcome.kind === "ineligible") {
+      if (necessity === "required")
+        return failure(
+          "required_stream_ineligible",
+          `stream '${declared.name}' is required and ${outcome.reason}`,
+          { stream: declared.name },
+        );
+      // Optional: unapproved, so omitted like a declined stream (L1226).
+      omitted.push(declared.name);
+      continue;
     }
 
     if (outcome.kind === "minimum_unmet") {

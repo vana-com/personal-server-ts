@@ -168,6 +168,11 @@
       "methods": ["POST"]
     },
     {
+      "path": "/pdpp/v1/token/revoke",
+      "hosts": ["server"],
+      "methods": ["POST"]
+    },
+    {
       "path": "/ui",
       "hosts": ["server"],
       "methods": ["GET"]
@@ -273,6 +278,10 @@
       "path": "/v1/owner/connectors",
       "hosts": ["server"],
       "methods": ["ALL", "DELETE", "GET"]
+    },
+    {
+      "path": "/v1/records",
+      "hosts": ["server"]
     },
     {
       "path": "/v1/records/completions",

@@ -9,8 +9,15 @@
  *   POST /authorize/:session_id/deny     — authenticated owner denial
  *   POST /token                          — code redemption + refresh rotation
  *   POST /introspect                     — RFC 7662 introspection
+ *   POST /token/revoke                   — RFC 7009 client token revocation
+ *                                          (the advertised `revocation_endpoint`)
  *   GET  /grants                         — the owner's grants, with status
  *   POST /revoke                         — owner-initiated grant revocation
+ *                                          (owner token + grant_id; not advertised)
+ *
+ * Operator policy (AS item 38): the operator does not use owner data held in
+ * this Authorization Server role for AI training, except under a training
+ * grant issued to it as a client. See docs/pdpp-operator-policy.md.
  *
  * This is deliberately a NEW surface rather than an extension of
  * `oauth-token.ts`. That endpoint serves the control-plane and CLI device
@@ -63,6 +70,9 @@ import {
   validateCodeChallenge,
   validateRedirectUri,
   validateSelectionRequest,
+  validatePublicDetail,
+  parseUiLocales,
+  SUPPORTED_PROCESSING_PERMISSIONS,
   validateCandidateOwnerChoices,
   type ApprovalFailure,
   type DeclarationSnapshot,
@@ -395,13 +405,25 @@ export function pdppAsMetadataHandler(
         authorization_endpoint: `${base}/authorize`,
         token_endpoint: `${base}/token`,
         introspection_endpoint: `${base}/introspect`,
-        revocation_endpoint: `${base}/revoke`,
+        // AS item 25 / spec-core L2781: an AS that supports RFC 7009
+        // revocation MUST advertise `revocation_endpoint`. It points at the
+        // RFC 7009 route, never at the owner-token grant revocation route.
+        revocation_endpoint: `${base}/token/revoke`,
+        // AS item 33 requires `https://pdpp.dev/grant-lifecycle` here too.
+        // TODO(grant-lifecycle package): advertise it once the lifecycle
+        // operation (AS items 39, 47) is implemented. Advertising a type the
+        // AS cannot serve would invite requests it must reject.
         authorization_details_types_supported: [
           PDPP_DATA_ACCESS_TYPE,
           PDPP_DATA_ACCESS_TYPE_V02,
           ...(protocolProfile === "candidate-0.1.0"
             ? [PDPP_DATA_ACCESS_TYPE_CANDIDATE]
             : []),
+        ],
+        // AS item 14 / spec-core L1126: only permissions whose complete
+        // defining contract the AS implements. None (case O7).
+        pdpp_processing_permissions_supported: [
+          ...SUPPORTED_PROCESSING_PERMISSIONS,
         ],
         grant_types_supported: ["authorization_code", "refresh_token"],
         response_types_supported: ["code"],
@@ -624,11 +646,21 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       code_challenge?: string;
       code_challenge_method?: string;
       client_display?: { name: string };
+      /** OIDC `ui_locales` (spec-core L1073): a hint, never a rejection. */
+      ui_locales?: string;
     };
     try {
       body = await c.req.json();
     } catch {
       return errorResponse(c, 400, "invalid_request", "body must be JSON");
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "body must be a JSON object",
+      );
     }
 
     const details = body.authorization_details;
@@ -673,6 +705,19 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       if (resolved.ok) {
         redirectPolicy = resolved.policy;
         validatedClientDocument = resolved.document;
+      } else if (resolved.failure.code === "client_not_admitted") {
+        // AS item 50 / spec-core L1027: a denial under local policy is not a
+        // rejection of the identity form, so it gets its own error.
+        deps.logger.warn(
+          { client_id: body.client_id },
+          "PDPP authorization refused: client not admitted by local policy",
+        );
+        return errorResponse(
+          c,
+          400,
+          "unauthorized_client",
+          resolved.failure.message,
+        );
       } else {
         // The refusal names the actual reason -- untrusted URL, unreachable,
         // mismatched document -- rather than "not registered", so an operator
@@ -712,68 +757,71 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
 
     const request = details[0];
-    if (
-      request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE &&
-      deps.protocolProfile !== "candidate-0.1.0"
-    ) {
+
+    // ── Owner-independent checks (spec-core L1218, AS item 52) ──────────
+    // Public structure and this build's fixed capabilities only. Every
+    // failure here is public invalidity: `invalid_authorization_details`
+    // (AS items 2, 5, 14, 33).
+    const publicValidation = validatePublicDetail(request, {
+      candidateEnabled: deps.protocolProfile === "candidate-0.1.0",
+    });
+    if (!publicValidation.ok) {
       return errorResponse(
         c,
         400,
         "invalid_authorization_details",
-        "candidate protocol profile is not enabled on this deployment",
+        publicValidation.failure.message,
       );
     }
-    const snapshot = deps.resolveDeclaration(request.source?.id ?? "");
-    if (!snapshot) {
-      return errorResponse(
-        c,
-        400,
-        "invalid_authorization_details",
-        "no retained declaration snapshot for the requested source",
-      );
-    }
+
+    // The owner token deciding this flow must be scoped to the requested
+    // source. This checks the broker's credential, not owner data.
     const owner = resolveScopedOwnerToken(
       deps,
       bearer(c),
       subjectId,
-      snapshot.source_id,
+      request.source.id,
     );
     if (!owner.ok) {
       return scopedOwnerFailureResponse(c, owner.failure);
     }
-    if (namesOutsideCeiling(owner.instanceIds, namedInstanceHandles(request))) {
-      return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
-    }
-    if (
-      !scopedOwnerCoversSnapshot(deps, subjectId, snapshot, owner.instanceIds)
-    ) {
-      return errorResponse(
-        c,
-        403,
-        "access_denied",
-        "owner token is not scoped to the requested source",
-      );
-    }
 
-    const validation = validateSelectionRequest(request, snapshot);
-    if (!validation.ok) {
-      // §9 AS item 5: the binding maps a Source validation failure to RFC 9396
-      // `invalid_authorization_details`. Other shape failures map to
-      // `invalid_request`.
-      //
-      // v0.2 names the same code for a malformed minimum ("Malformed or
-      // unsupported authorization details instead produce
-      // `invalid_authorization_details`"), and `invalid_minimum` reaches it
-      // through this default. That is deliberately the *shape* half of the
-      // v0.2 error split: an unsatisfiable-but-well-formed minimum is an
-      // owner-decision outcome and surfaces at approval as `access_denied`,
-      // not here.
-      const oauthError =
-        validation.failure.code === "invalid_request"
-          ? "invalid_request"
-          : "invalid_authorization_details";
-      return errorResponse(c, 400, oauthError, validation.failure.message);
-    }
+    // ── Owner-dependent checks, deferred (spec-core L1220-L1222) ─────────
+    // Declaration acceptance is per-owner on a Personal Server, and so are
+    // instance handles and their eligibility. None of these may change what
+    // this endpoint returns: a failure opens the session exactly as success
+    // does, and is explained only inside authenticated review, ending for
+    // the client in the same `access_denied` an owner decline produces
+    // (L1230, L1238; AS items 2, 53, 57). Every check runs on every request,
+    // so the work done does not depend on which one fails (L1238, AS 54).
+    const retained = deps.resolveDeclaration(request.source.id);
+    const snapshot: DeclarationSnapshot = retained ?? {
+      source_id: request.source.id,
+      source_kind: "connector",
+      version: "",
+      digest: "",
+      streams: [],
+    };
+    const outsideCeiling = namesOutsideCeiling(
+      owner.instanceIds,
+      namedInstanceHandles(request),
+    );
+    const covered = scopedOwnerCoversSnapshot(
+      deps,
+      subjectId,
+      snapshot,
+      owner.instanceIds,
+    );
+    const declarationValidation = validateSelectionRequest(request, snapshot);
+    const ineligibleReason = !retained
+      ? "this server holds no accepted declaration for the requested source"
+      : outsideCeiling
+        ? OUTSIDE_INSTANCE_CEILING
+        : !covered
+          ? "owner token is not scoped to the requested source"
+          : !declarationValidation.ok
+            ? declarationValidation.failure.message
+            : undefined;
 
     const session = deps.sessions.create({
       subjectId,
@@ -789,6 +837,11 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       codeChallenge: body.code_challenge,
       codeChallengeMethod: body.code_challenge_method,
       grantExpiresAt: deps.grantExpiryFor?.(request, body.client_id),
+      // AS item 34: unparseable tags are ignored, never rejected (L1073).
+      languagePriority: parseUiLocales(body.ui_locales),
+      ...(ineligibleReason !== undefined && {
+        ineligible: { message: ineligibleReason },
+      }),
     });
 
     deps.logger.info(
@@ -826,6 +879,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
     if (
       session &&
+      !session.ineligible &&
       !scopedOwnerCoversSnapshot(
         deps,
         session.subject_id,
@@ -840,6 +894,11 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "owner token is not scoped to the requested source",
       );
     }
+
+    // spec-core L1228: an owner-dependent failure recorded at /authorize is
+    // explained to the authenticated owner here, and nowhere else.
+    const ineligible = ineligibleResponse(c, session);
+    if (ineligible) return ineligible;
 
     // Refuse any handle outside the token's ceiling before a review is built, so
     // an out-of-token instance is never resolved, counted, or shown.
@@ -938,6 +997,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
     if (
       session &&
+      !session.ineligible &&
       !scopedOwnerCoversSnapshot(
         deps,
         session.subject_id,
@@ -952,6 +1012,9 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "owner token is not scoped to the requested source",
       );
     }
+
+    const ineligible = ineligibleResponse(c, session);
+    if (ineligible) return ineligible;
 
     let body: {
       review_digest?: string;
@@ -1088,6 +1151,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
     if (
       session &&
+      !session.ineligible &&
       !scopedOwnerCoversSnapshot(
         deps,
         session.subject_id,
@@ -1306,6 +1370,126 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   });
 
   /**
+   * RFC 7009 token revocation for clients (AS item 25, spec-core L2777-L2789).
+   *
+   * This is the advertised `revocation_endpoint`. PDPP clients are public
+   * clients, so the client identifies itself with `client_id` (RFC 7009
+   * §2.1); the token must have been issued to it. Revoking a refresh token
+   * ends its grant; revoking an access token ends its grant only when no
+   * refresh-token family covers it.
+   *
+   * `pdpp_disposition` (`keep` | `delete`) is accepted, any other value is
+   * `invalid_request` (L2785), and a value is recorded — durably, in the
+   * same transaction as the revocation — only when the request carries
+   * current client authentication. A 200 is returned only after that commit
+   * (L2787, AS item 44). `reported_at` is accepted only with `delete`.
+   *
+   * The owner path stays at `POST /revoke` (owner token + `grant_id`), which
+   * is not advertised as `revocation_endpoint`.
+   */
+  app.post("/token/revoke", async (c) => {
+    const contentType = c.req.header("content-type") ?? "";
+    if (!contentType.includes("application/x-www-form-urlencoded")) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "Content-Type must be application/x-www-form-urlencoded",
+      );
+    }
+    const body = await c.req.parseBody();
+    const token = asString(body.token);
+    const clientId = asString(body.client_id);
+    if (!token || !clientId) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "token and client_id are required",
+      );
+    }
+    const rawDisposition = body.pdpp_disposition;
+    if (
+      rawDisposition !== undefined &&
+      rawDisposition !== "keep" &&
+      rawDisposition !== "delete"
+    ) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_request",
+        "pdpp_disposition must be keep or delete",
+      );
+    }
+    const reportedAt = body.reported_at;
+    if (reportedAt !== undefined) {
+      if (rawDisposition !== "delete") {
+        return errorResponse(
+          c,
+          400,
+          "invalid_request",
+          "reported_at is accepted only with pdpp_disposition=delete",
+        );
+      }
+      if (
+        typeof reportedAt !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}[tT]\d{2}:\d{2}:\d{2}(\.\d+)?([zZ]|[+-]\d{2}:\d{2})$/.test(
+          reportedAt,
+        ) ||
+        Number.isNaN(Date.parse(reportedAt)) ||
+        // spec-core L1748: a reported time later than the request is invalid.
+        Date.parse(reportedAt) > Date.now()
+      ) {
+        return errorResponse(
+          c,
+          400,
+          "invalid_request",
+          "reported_at must be an RFC 3339 date-time",
+        );
+      }
+    }
+    const hint = asString(body.token_type_hint) ?? undefined;
+    let result: ReturnType<typeof deps.tokens.revokeClientToken>;
+    try {
+      result = deps.tokens.revokeClientToken({
+        token,
+        clientId,
+        ...(hint && { tokenTypeHint: hint }),
+        ...(rawDisposition !== undefined && {
+          disposition: rawDisposition as "keep" | "delete",
+        }),
+        ...(typeof reportedAt === "string" && { reportedAt }),
+        ...(bearer(c) !== undefined && { bearer: bearer(c) }),
+      });
+    } catch (err) {
+      // spec-core L2787: 200 only once every ending and disposition is
+      // durable; otherwise 503 with Retry-After. The transaction rolled back.
+      deps.logger.error({ err }, "PDPP client token revocation not recorded");
+      return c.json(
+        {
+          error: "temporarily_unavailable",
+          error_description: "the revocation could not be recorded; retry",
+        },
+        503,
+        { ...NO_STORE, "Retry-After": "5" },
+      );
+    }
+    if (!result.ok) {
+      return errorResponse(c, 400, result.code, result.message);
+    }
+    deps.logger.info(
+      {
+        client_id: clientId,
+        ended_grants: result.endedGrants,
+        disposition_recorded: result.dispositionRecorded,
+      },
+      "PDPP client token revocation",
+    );
+    // RFC 7009 §2.2: an empty 200 body.
+    return c.body(null, 200, NO_STORE);
+  });
+
+  /**
    * List the owner's PDPP grants, newest first, with each one's status.
    *
    * Sits at `/grants` rather than under `/owner` because `/owner/*` is the
@@ -1446,6 +1630,29 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   }
 
   return app;
+}
+
+/**
+ * The owner-only refusal for a session whose owner-dependent checks failed at
+ * `/authorize` (spec-core L1228). Called after the owner token has been
+ * matched to the session's subject. A decided or expired session falls
+ * through to the ordinary handling.
+ */
+function ineligibleResponse(
+  c: Context,
+  session: {
+    ineligible?: { message: string };
+    status: string;
+    expires_at: string;
+  } | null,
+) {
+  if (
+    !session?.ineligible ||
+    session.status !== "pending" ||
+    Date.parse(session.expires_at) <= Date.now()
+  )
+    return undefined;
+  return errorResponse(c, 403, "access_denied", session.ineligible.message);
 }
 
 /**

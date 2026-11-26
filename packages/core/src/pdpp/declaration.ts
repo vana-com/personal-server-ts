@@ -23,6 +23,11 @@ import type {
   SourceKind,
 } from "./types.js";
 import { MAX_DECLARATION_BYTES } from "./declaration-limits.js";
+import {
+  isWellFormedLanguageTag,
+  validateLanguageMap,
+  type LanguageMap,
+} from "./language.js";
 
 export { MAX_DECLARATION_BYTES };
 export const MAX_REDIRECTS = 3;
@@ -455,14 +460,158 @@ interface RawDeclarationDocument {
  */
 function readDeclaredDisplay(
   value: unknown,
+  defaultLanguage: string | undefined,
 ): { display: DeclaredDisplay } | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const { label, detail } = value as { label?: unknown; detail?: unknown };
+  const labelMap = asLanguageMap(label);
+  const detailMap = asLanguageMap(detail);
+  // A language map's plain projection is its `default_language` version
+  // (spec-core L857 requires that key), so readers that predate language maps
+  // keep a string to render. The AS chooses the rendered version itself.
+  const labelText = labelMap
+    ? defaultVersion(labelMap, defaultLanguage)
+    : label;
+  const detailText = detailMap
+    ? defaultVersion(detailMap, defaultLanguage)
+    : detail;
   const display: DeclaredDisplay = {
-    ...(typeof label === "string" && label.length > 0 && { label }),
-    ...(typeof detail === "string" && detail.length > 0 && { detail }),
+    ...(typeof labelText === "string" &&
+      labelText.length > 0 && { label: labelText }),
+    ...(typeof detailText === "string" &&
+      detailText.length > 0 && { detail: detailText }),
+    ...(labelMap && { label_map: labelMap }),
+    ...(detailMap && { detail_map: detailMap }),
   };
   return Object.keys(display).length > 0 ? { display } : undefined;
+}
+
+/** A value that passed `validateDisplayLanguages` as a language map. */
+function asLanguageMap(value: unknown): LanguageMap | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as LanguageMap)
+    : undefined;
+}
+
+/** The map version whose key matches `default_language` without regard to case. */
+function defaultVersion(
+  map: LanguageMap,
+  defaultLanguage: string | undefined,
+): string | undefined {
+  if (defaultLanguage === undefined) return undefined;
+  const key = Object.keys(map).find(
+    (k) => k.toLowerCase() === defaultLanguage.toLowerCase(),
+  );
+  return key === undefined ? undefined : map[key];
+}
+
+/**
+ * spec-core L834 "Display text languages", enforced at acceptance (AS item 22):
+ * "The AS MUST reject a declaration that breaks a structural or language-tag
+ * rule in this section."
+ *
+ * Checks every localizable display value L836 lists — `display.name`,
+ * `selection_presets[].label`, `streams[].description`,
+ * `streams[].display.label` / `.detail`, each `streams[].display.fields`
+ * entry's `label` / `meaning`, and `streams[].views[].label` (plus the
+ * internal top-level `views[].label`) — is a plain string or a well-formed
+ * language map, that `display.default_language` is a well-formed tag, that it
+ * is present when any map is, and that every map has a key matching it
+ * without regard to case. Runs on the raw document, before projection.
+ */
+function validateDisplayLanguages(doc: Record<string, unknown>): string | null {
+  const values: Array<[string, unknown]> = [];
+  const display = doc.display;
+  let defaultLanguage: unknown;
+  if (typeof display === "object" && display !== null) {
+    const d = display as Record<string, unknown>;
+    if (d.name !== undefined) values.push(["display.name", d.name]);
+    defaultLanguage = d.default_language;
+  }
+  if (Array.isArray(doc.selection_presets)) {
+    for (const preset of doc.selection_presets as Record<string, unknown>[]) {
+      if (preset && preset.label !== undefined)
+        values.push([
+          `selection_presets[${String(preset.name ?? preset.id)}].label`,
+          preset.label,
+        ]);
+    }
+  }
+  if (Array.isArray(doc.views)) {
+    for (const view of doc.views as Record<string, unknown>[]) {
+      if (view && view.label !== undefined)
+        values.push([
+          `views[${String(view.name ?? view.id)}].label`,
+          view.label,
+        ]);
+    }
+  }
+  if (Array.isArray(doc.streams)) {
+    for (const raw of doc.streams as Record<string, unknown>[]) {
+      if (!raw || typeof raw !== "object") continue;
+      const name = String(raw.name);
+      if (raw.description !== undefined)
+        values.push([`streams[${name}].description`, raw.description]);
+      const sd = raw.display;
+      if (typeof sd === "object" && sd !== null) {
+        const sdo = sd as Record<string, unknown>;
+        if (sdo.label !== undefined)
+          values.push([`streams[${name}].display.label`, sdo.label]);
+        if (sdo.detail !== undefined)
+          values.push([`streams[${name}].display.detail`, sdo.detail]);
+        const fields = sdo.fields;
+        if (typeof fields === "object" && fields !== null) {
+          for (const [field, entry] of Object.entries(
+            fields as Record<string, unknown>,
+          )) {
+            if (typeof entry !== "object" || entry === null) continue;
+            const e = entry as Record<string, unknown>;
+            if (e.label !== undefined)
+              values.push([
+                `streams[${name}].display.fields.${field}.label`,
+                e.label,
+              ]);
+            if (e.meaning !== undefined)
+              values.push([
+                `streams[${name}].display.fields.${field}.meaning`,
+                e.meaning,
+              ]);
+          }
+        }
+      }
+      if (Array.isArray(raw.views)) {
+        for (const view of raw.views as Record<string, unknown>[]) {
+          if (view && view.label !== undefined)
+            values.push([
+              `streams[${name}].views[${String(view.id ?? view.name)}].label`,
+              view.label,
+            ]);
+        }
+      }
+    }
+  }
+
+  if (
+    defaultLanguage !== undefined &&
+    !isWellFormedLanguageTag(defaultLanguage)
+  )
+    return `display.default_language '${String(defaultLanguage)}' is not a well-formed BCP 47 language tag`;
+
+  let anyMap = false;
+  for (const [path, value] of values) {
+    if (typeof value === "string") continue;
+    const problem = validateLanguageMap(value);
+    if (problem) return `${path}: ${problem}`;
+    anyMap = true;
+    if (typeof defaultLanguage === "string") {
+      const folded = defaultLanguage.toLowerCase();
+      if (!Object.keys(value as object).some((k) => k.toLowerCase() === folded))
+        return `${path}: language map has no key matching display.default_language '${defaultLanguage}'`;
+    }
+  }
+  if (anyMap && defaultLanguage === undefined)
+    return "display.default_language is required when any display value is a language map";
+  return null;
 }
 
 /**
@@ -520,6 +669,28 @@ export function parseDeclaration(
   // their digest are untouched — `digest` above is computed over `body`
   // exactly as retrieved, which is the property that proves a producer read
   // the same bytes the owner consented against.
+  // AS item 22 / spec-core L857: language maps and `display.default_language`
+  // are checked on the document as authored, before projection.
+  if (typeof doc === "object" && doc !== null && !Array.isArray(doc)) {
+    const languageProblem = validateDisplayLanguages(
+      doc as unknown as Record<string, unknown>,
+    );
+    if (languageProblem) {
+      return {
+        ok: false,
+        failure: { code: "invalid_document", message: languageProblem },
+      };
+    }
+  }
+  const rawDisplay = (doc as { display?: unknown } | null)?.display;
+  const defaultLanguage =
+    typeof rawDisplay === "object" &&
+    rawDisplay !== null &&
+    typeof (rawDisplay as { default_language?: unknown }).default_language ===
+      "string"
+      ? (rawDisplay as { default_language: string }).default_language
+      : undefined;
+
   doc = normalizeNormativeDeclaration(doc);
 
   if (typeof doc.source_id !== "string" || doc.source_id.length === 0) {
@@ -755,7 +926,19 @@ export function parseDeclaration(
       // print a blank label where it must fall back to the stream name.
       ...(typeof s.description === "string" &&
         s.description.length > 0 && { description: s.description }),
-      ...(readDeclaredDisplay(s.display) ?? {}),
+      // L836: a description authored as a language map keeps its
+      // default-language version as the plain member, for existing readers.
+      ...(asLanguageMap(s.description) && {
+        description_map: asLanguageMap(s.description),
+        ...(defaultVersion(asLanguageMap(s.description)!, defaultLanguage) !==
+          undefined && {
+          description: defaultVersion(
+            asLanguageMap(s.description)!,
+            defaultLanguage,
+          ),
+        }),
+      }),
+      ...(readDeclaredDisplay(s.display, defaultLanguage) ?? {}),
       ...(typeof s.semantics === "string" && {
         semantics: s.semantics as "mutable_state" | "append_only",
       }),
@@ -803,8 +986,17 @@ export function parseDeclaration(
     }
   }
 
-  const sourceDisplayName = (doc as { display?: { name?: unknown } }).display
-    ?.name;
+  const rawSourceName = (doc as { display?: { name?: unknown } }).display?.name;
+  const sourceNameMap = asLanguageMap(rawSourceName);
+  const sourceDisplayName = sourceNameMap
+    ? defaultVersion(sourceNameMap, defaultLanguage)
+    : rawSourceName;
+  const sourceDisplay = {
+    ...(typeof sourceDisplayName === "string" &&
+      sourceDisplayName.length > 0 && { name: sourceDisplayName }),
+    ...(sourceNameMap && { name_map: sourceNameMap }),
+    ...(defaultLanguage !== undefined && { default_language: defaultLanguage }),
+  };
 
   return {
     ok: true,
@@ -817,10 +1009,7 @@ export function parseDeclaration(
       // §5 top-level `display.name`. Only carried when it is a non-empty
       // string: a blank name would outrank the source id in the renderer's
       // fallback chain and put an empty heading on the consent surface.
-      ...(typeof sourceDisplayName === "string" &&
-        sourceDisplayName.length > 0 && {
-          display: { name: sourceDisplayName },
-        }),
+      ...(Object.keys(sourceDisplay).length > 0 && { display: sourceDisplay }),
       ...(Array.isArray(doc.views) && {
         views: doc.views as DeclarationSnapshot["views"],
       }),

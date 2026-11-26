@@ -233,7 +233,10 @@ describe("§6 / §9 AS item 15 — instance handle resolution", () => {
     expect(result.streams[0].instance_ids).toEqual(["account-a", "account-b"]);
   });
 
-  it("rejects an instance handle that is not eligible", () => {
+  // spec-core L1226 / AS item 53: an otherwise valid stream with no eligible
+  // instance is unapproved. Optional: omitted. Required: refused, which the
+  // binding reports as access_denied. Never authorized.
+  it("leaves an optional stream naming an ineligible handle unapproved", () => {
     const result = resolveSelection(
       request({
         streams: [
@@ -245,15 +248,71 @@ describe("§6 / §9 AS item 15 — instance handle resolution", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.failure.code).toBe("unknown_instance");
+    expect(result.failure.code).toBe("no_streams_approved");
+    expect(result.failure.omittedStreams).toEqual(["top_artists"]);
   });
 
-  it("fails when no instance is connected", () => {
+  it("refuses a required stream naming an ineligible handle", () => {
+    const result = resolveSelection(
+      request({
+        streams: [
+          {
+            name: "top_artists",
+            necessity: "required",
+            instance_ids: ["someone-elses-account"],
+          },
+        ],
+      }),
+      snapshot,
+      singleInstance,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("required_stream_ineligible");
+  });
+
+  it("leaves an optional stream unapproved when no instance is connected", () => {
     const none: InstanceInventory = { eligibleFor: () => [] };
     const result = resolveSelection(request(), snapshot, none);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.failure.code).toBe("no_eligible_instance");
+    expect(result.failure.code).toBe("no_streams_approved");
+  });
+
+  it("refuses a required stream when no instance is connected", () => {
+    const none: InstanceInventory = { eligibleFor: () => [] };
+    const result = resolveSelection(
+      request({
+        streams: [
+          { name: "top_artists", necessity: "required", fields: ["*"] },
+        ],
+      }),
+      snapshot,
+      none,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("required_stream_ineligible");
+  });
+
+  it("omits an ineligible optional stream and keeps the eligible one", () => {
+    const perStream: InstanceInventory = {
+      eligibleFor: (stream) => (stream === "top_artists" ? ["account-a"] : []),
+    };
+    const result = resolveSelection(
+      request({
+        streams: [
+          { name: "top_artists", fields: ["*"] },
+          { name: "profile", fields: ["*"] },
+        ],
+      }),
+      snapshot,
+      perStream,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.streams.map((s) => s.name)).toEqual(["top_artists"]);
+    expect(result.omittedStreams).toEqual(["profile"]);
   });
 
   it("verifies wildcard-carried handles against every expanded stream", () => {
@@ -265,14 +324,18 @@ describe("§6 / §9 AS item 15 — instance handle resolution", () => {
       eligibleFor: (stream) =>
         stream === "top_artists" ? ["account-a"] : ["account-b"],
     };
+    // Locked rules (L1226): the stream the handle is not eligible for is
+    // unapproved and, being optional, omitted -- never authorized.
     const result = resolveSelection(
       request({ streams: [{ name: "*", instance_ids: ["account-a"] }] }),
       snapshot,
       perStream,
     );
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.failure.code).toBe("unknown_instance");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.streams.map((s) => s.name)).toEqual(["top_artists"]);
+    expect(result.streams[0].instance_ids).toEqual(["account-a"]);
+    expect(result.omittedStreams).toEqual(["profile"]);
   });
 });
 
@@ -387,17 +450,18 @@ describe("§9 AS item 13 — cursor_field frozen as sort_field", () => {
   };
 
   it("freezes a date-time cursor_field the grant includes", () => {
-    expect(streamOf(withCursor("date-time"), ["id", "source_updated_at"]).sort_field).toBe(
-      "source_updated_at",
-    );
+    expect(
+      streamOf(withCursor("date-time"), ["id", "source_updated_at"]).sort_field,
+    ).toBe("source_updated_at");
   });
 
   it("omits sort_field when the cursor_field is not date or date-time", () => {
-    expect(streamOf(withCursor(undefined), ["id", "source_updated_at"]).sort_field).toBeUndefined();
+    expect(
+      streamOf(withCursor(undefined), ["id", "source_updated_at"]).sort_field,
+    ).toBeUndefined();
   });
 
   it("omits sort_field when the stream declares no cursor_field", () => {
     expect(streamOf(snapshot, ["id"]).sort_field).toBeUndefined();
   });
 });
-

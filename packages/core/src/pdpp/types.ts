@@ -1,4 +1,5 @@
 import type { TimeType } from "./time.js";
+import type { LanguageMap } from "./language.js";
 
 /**
  * PDPP Core v0.1.0 authorization types.
@@ -189,6 +190,14 @@ export interface SelectionRequest {
   /** Alternative to explicit streams. Exactly one of the two. */
   selection_preset?: string;
   client_claims?: ClientClaims;
+  /**
+   * spec-core L1093 / AS item 14: unique absolute-URI processing-permission
+   * identifiers. This build implements no processing permission, so any value
+   * is rejected with `invalid_authorization_details` before consent
+   * (`public-validation.ts`); the member exists here only so the request type
+   * names what the AS refuses.
+   */
+  processing_permissions?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +321,15 @@ export interface DeclaredDisplay {
    * part an owner cannot reconstruct from a field list.
    */
   detail?: string;
+  /**
+   * spec-core L834 "Display text languages": the declaration authored
+   * `label` / `detail` as a language map. The plain member above then holds
+   * the `display.default_language` version, so a reader that predates
+   * language maps keeps rendering a string; the AS chooses among the map's
+   * versions per "Display language" (L1071) when it builds a review.
+   */
+  label_map?: LanguageMap;
+  detail_map?: LanguageMap;
 }
 
 export interface DeclaredStream {
@@ -324,6 +342,8 @@ export interface DeclaredStream {
    * (label → description → name) instead of guessing at render time.
    */
   description?: string;
+  /** L834: `description` authored as a language map (see `DeclaredDisplay`). */
+  description_map?: LanguageMap;
   /** §5 consent-surface metadata. Absent means the declaration authored none. */
   display?: DeclaredDisplay;
   /**
@@ -387,7 +407,17 @@ export interface DeclarationSnapshot {
    * Absent means the declaration authored none, and the surface falls back to
    * the id rather than rendering a blank.
    */
-  display?: { name?: string };
+  display?: {
+    name?: string;
+    /** L834: `display.name` authored as a language map. */
+    name_map?: LanguageMap;
+    /**
+     * L779 `display.default_language`: the language of every plain-string
+     * display value. Absent means the declaration states none and the AS
+     * must not assume one (L857).
+     */
+    default_language?: string;
+  };
   /** Opaque revision identifier recorded into the grant. */
   version: string;
   /** Digest over the retrieved document, verified before the snapshot is trusted. */
@@ -428,9 +458,22 @@ export interface PdppAuthorizationResultV02 {
   grant: Grant;
 }
 
+/**
+ * The locked v0.1.0 client-visible authorization result (spec-core L1413, AS
+ * item 32): `{ type, grant }` with the complete immutable grant, never the
+ * lossy projection above. `type` is `https://pdpp.dev/data-access`; a grant
+ * issued under the development alias carries the alias type.
+ */
+export interface PdppAuthorizationResult {
+  type: typeof PDPP_DATA_ACCESS_TYPE | typeof PDPP_DATA_ACCESS_TYPE_CANDIDATE;
+  grant: Grant;
+}
+
 /** Either revision's element, as it appears in `authorization_details`. */
 export type PdppAuthorizationEntry =
-  PdppAuthorizationDetail | PdppAuthorizationResultV02;
+  | PdppAuthorizationDetail
+  | PdppAuthorizationResult
+  | PdppAuthorizationResultV02;
 
 /**
  * RFC 7662 introspection response with the PDPP extension members. An inactive
@@ -514,7 +557,10 @@ export function usesLockedRules(type: string | undefined): boolean {
  */
 export function grantUsesLockedRules(
   grant:
-    | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }
+    | {
+        version: string;
+        streams?: ReadonlyArray<{ required_fields?: unknown }>;
+      }
     | undefined,
 ): boolean {
   if (!grant) return false;
@@ -551,7 +597,10 @@ export function isSupportedPersistedGrant(
 
 export function isPreLockGrant(
   grant:
-    | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }
+    | {
+        version: string;
+        streams?: ReadonlyArray<{ required_fields?: unknown }>;
+      }
     | undefined,
 ): boolean {
   return grant?.version === PDPP_GRANT_VERSION && !grantUsesLockedRules(grant);

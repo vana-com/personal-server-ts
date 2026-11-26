@@ -368,11 +368,20 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
     const context = (await introspected.json()) as {
       active: boolean;
       grant_id: string;
-      authorization_details: Array<{ streams: Array<{ fields: string[] }> }>;
+      // AS item 32: `{ type, grant }` with the complete grant (L1415).
+      authorization_details: Array<{
+        type: string;
+        grant: { streams: Array<{ fields: string[] }> };
+      }>;
     };
     expect(context.active).toBe(true);
     expect(context.grant_id).toBe(grant_id);
-    expect(context.authorization_details[0].streams[0].fields).toContain("id");
+    expect(context.authorization_details[0].type).toBe(
+      "https://pdpp.dev/data-access",
+    );
+    expect(context.authorization_details[0].grant.streams[0].fields).toContain(
+      "id",
+    );
 
     // 6. Revocation is immediate.
     const revoked = await app.request("/pdpp/v1/revoke", {
