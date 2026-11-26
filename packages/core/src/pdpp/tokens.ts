@@ -27,7 +27,7 @@ import {
   grantUsesLockedRules,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   PDPP_GRANT_VERSION_CANDIDATE,
-  isPreLockGrant,
+  isSupportedPersistedGrant,
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   type AccessMode,
@@ -99,7 +99,7 @@ function grantInactiveReason(
   // state. Every issuance, refresh and introspection path asks here, so a
   // pre-lock code or refresh token redeems to `invalid_grant`, not to a token
   // that is dead on arrival.
-  if (isPreLockGrant(stored.grant)) return "unsupported_legacy_shape";
+  if (!isSupportedPersistedGrant(stored.grant)) return "unsupported_legacy_shape";
   const status = store.grantStatus(stored, now);
   if (status === "revoked") return "grant_revoked";
   if (status === "expired") return "grant_expired";

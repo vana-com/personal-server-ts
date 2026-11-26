@@ -600,6 +600,26 @@ describe("pdpp records routes: authentication", () => {
   });
 });
 
+describe("pdpp records routes: pre-lock grant state (AS item 21)", () => {
+  it("answers 401 authorization_state.unsupported_legacy_shape with the Bearer challenge", async () => {
+    const { app } = buildApp({
+      "legacy-tok": {
+        active: false,
+        tokenKind: "client",
+        subjectId: "sub_1",
+        inactiveReason: "unsupported_legacy_shape",
+      },
+    });
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer legacy-tok" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toMatch(/^Bearer error="invalid_token"/);
+    const body = await res.json();
+    expect(body.error.code).toBe("authorization_state.unsupported_legacy_shape");
+  });
+});
+
 describe("pdpp records routes: 500 observability", () => {
   // An unexpected store fault used to escape `toPdppError` as a rethrow, so
   // the route emitted no PDPP error body of its own and the only record of it

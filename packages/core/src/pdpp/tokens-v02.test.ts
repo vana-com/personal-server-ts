@@ -235,6 +235,14 @@ describe("v0.1 results are unchanged", () => {
       unknown
     >;
     expect(entry.type).toBe(PDPP_DATA_ACCESS_TYPE);
+    // Recorded decision for this commit: the 0.1.0 result is still the
+    // projection {type, source, purpose_code, access_mode, streams}, not the
+    // complete grant AS item 32 requires (§7 "Client-visible authorization
+    // result"). The next work package replaces it with {type, grant}; until
+    // then the frozen floor must at least reach the client.
+    expect(entry.grant).toBeUndefined();
+    const streams = entry.streams as Array<{ required_fields?: string[] }>;
+    expect(streams[0]?.required_fields).toEqual([]);
   });
 
   it("refuses to redeem a pre-lock v0.1 grant (AS item 21)", () => {

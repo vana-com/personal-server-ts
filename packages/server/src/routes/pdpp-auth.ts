@@ -58,7 +58,7 @@ import {
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   usesLockedRules,
-  isPreLockGrant,
+  isSupportedPersistedGrant,
   resolveRequesterIdentity,
   validateCodeChallenge,
   validateRedirectUri,
@@ -1463,7 +1463,7 @@ function listedGrantStatus(
 ): GrantStatus | "consumed" | "requires_fresh_consent" {
   // Pre-lock grants no longer authorize anything (AS item 21); the owner sees
   // that they must approve again rather than a live grant.
-  if (isPreLockGrant(stored.grant)) return "requires_fresh_consent";
+  if (!isSupportedPersistedGrant(stored.grant)) return "requires_fresh_consent";
   const status = store.grantStatus(stored, now);
   if (
     status === "active" &&

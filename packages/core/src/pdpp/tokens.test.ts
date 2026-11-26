@@ -8,6 +8,7 @@
  * the methods it calls, which is not the property that matters.
  */
 
+import { createRequire } from "node:module";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -514,3 +515,68 @@ describe("§10 — tokens are not stored in plaintext", () => {
     expect(record!.tokenHash).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+describe("§9 AS item 21 — persisted pre-lock state is rejected on every path", () => {
+  /** Rewrite a stored grant in place, as a pre-lock build would have left it. */
+  function rewriteGrant(grantId: string, mutate: (g: Record<string, unknown>) => void) {
+    const Database = createRequire(import.meta.url)("better-sqlite3");
+    const db = new Database(join(dir, "auth.db"));
+    const row = db
+      .prepare("SELECT grant_json FROM pdpp_grants WHERE grant_id = ?")
+      .get(grantId) as { grant_json: string };
+    const grant = JSON.parse(row.grant_json) as Record<string, unknown>;
+    mutate(grant);
+    db.prepare("UPDATE pdpp_grants SET grant_json = ? WHERE grant_id = ?").run(
+      JSON.stringify(grant),
+      grantId,
+    );
+    db.close();
+  }
+  const stripFloor = (g: Record<string, unknown>) => {
+    for (const s of g.streams as Array<Record<string, unknown>>) delete s.required_fields;
+  };
+
+  it("refuses refresh, resolution and introspection for a live grant left in pre-lock shape", () => {
+    const { grant, code } = seedGrant("continuous");
+    const issued = redeem(code);
+    expect(issued.ok).toBe(true);
+    if (!issued.ok || !issued.issued.refresh_token) throw new Error("setup");
+    rewriteGrant(grant.grant_id, stripFloor);
+
+    const context = tokens.resolveToken(issued.issued.access_token);
+    expect(context.active).toBe(false);
+    expect(context.inactiveReason).toBe("unsupported_legacy_shape");
+    expect(tokens.introspect(issued.issued.access_token)).toEqual({ active: false });
+    const refreshed = tokens.refresh({ refreshToken: issued.issued.refresh_token });
+    expect(refreshed.ok).toBe(false);
+    if (!refreshed.ok) expect(refreshed.failure.code).toBe("invalid_grant");
+  });
+
+  it("refuses an unknown persisted grant version (allowlist, §7 Version layering)", () => {
+    const { grant, code } = seedGrant("continuous");
+    const issued = redeem(code);
+    if (!issued.ok) throw new Error("setup");
+    rewriteGrant(grant.grant_id, (g) => {
+      g.version = "0.9.0";
+    });
+    expect(tokens.resolveToken(issued.issued.access_token).inactiveReason).toBe(
+      "unsupported_legacy_shape",
+    );
+  });
+
+  it("treats mixed-shape streams as pre-lock and empty floors as locked", () => {
+    const mixed = seedGrant("continuous", {
+      streams: [
+        { name: "a", instance_ids: ["i1"], fields: ["id"], required_fields: ["id"] },
+        { name: "b", instance_ids: ["i2"], fields: ["id"] } as never,
+      ],
+    });
+    const m = redeem(mixed.code);
+    expect(m.ok).toBe(false);
+    const emptyFloor = seedGrant("continuous", {
+      streams: [{ name: "a", instance_ids: ["i1"], fields: ["id"], required_fields: [] }],
+    });
+    expect(redeem(emptyFloor.code).ok).toBe(true);
+  });
+});
+

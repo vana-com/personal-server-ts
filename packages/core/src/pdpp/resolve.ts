@@ -448,7 +448,7 @@ function resolveOneStream(
         failure: {
           code: "invalid_time_range",
           message:
-            "candidate owner bounds must be valid values of the frozen temporal type",
+            "owner bounds must be valid values of the frozen temporal type",
           stream: declared.name,
         },
       };
@@ -474,7 +474,7 @@ function resolveOneStream(
         failure: {
           code: "invalid_time_range",
           message:
-            "candidate temporal narrowing must have valid typed bounds in increasing order",
+            "temporal narrowing must have valid typed bounds in increasing order",
           stream: declared.name,
         },
       };

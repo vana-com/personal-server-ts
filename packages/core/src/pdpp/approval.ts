@@ -47,7 +47,7 @@ import { resolveCommitments } from "./commitments.js";
 import {
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   usesLockedRules,
-  isPreLockGrant,
+  isSupportedPersistedGrant,
   type DeclarationSnapshot,
   type Grant,
   type OwnerConditions,
@@ -370,7 +370,7 @@ function existingActiveGrantsForClient(
     .filter(
       (stored) =>
         // A pre-lock grant is not an existing grant: it needs fresh consent.
-        !isPreLockGrant(stored.grant) &&
+        isSupportedPersistedGrant(stored.grant) &&
         store.grantStatus(stored, now) === "active" &&
         !(stored.grant.access_mode === "single_use" && stored.consumedAt),
     )

@@ -206,6 +206,7 @@ function validateMinimum(
   declared: DeclaredStream,
   snapshot: DeclarationSnapshot,
   type?: TimeType,
+  lockedRules = false,
 ): SelectionValidation {
   const minimum = stream.minimum;
   if (minimum === undefined) return { ok: true };
@@ -241,10 +242,16 @@ function validateMinimum(
     if (new Set(fields).size !== fields.length) {
       return bad("fields must not contain duplicates");
     }
-    const permitted = expandedRequestFields(stream, declared, snapshot, true);
+    // Locked v0.1.0: the ceiling is "the stream's expanded requested fields
+    // together with its schema-required fields" (spec-core L1248, L1258).
+    // v0.2 keeps its stricter expanded-request-only rule.
+    const expanded = expandedRequestFields(stream, declared, snapshot, true);
+    const permitted = lockedRules
+      ? [...new Set([...expanded, ...declared.required_fields])]
+      : expanded;
     const outside = fields.filter((f) => !permitted.includes(f));
     if (outside.length > 0) {
-      return bad(`fields outside the expanded request: ${outside.join(", ")}`);
+      return bad(`fields outside the field ceiling: ${outside.join(", ")}`);
     }
   }
 
@@ -360,7 +367,7 @@ function validateStreamRequest(
     if (stream.fields === undefined && stream.view === undefined)
       return fail(
         "invalid_request",
-        "each candidate stream requires fields or view",
+        "each stream request requires fields or view (use fields: [\"*\"] for every permitted field)",
       );
     if (
       stream.fields !== undefined &&
@@ -518,7 +525,7 @@ function validateStreamRequest(
     if (revision === "candidate" && !timeType)
       return fail(
         "unsupported_selection_parameter",
-        "candidate consent_time_field must declare a date or date-time string",
+        "consent_time_field must declare a date or date-time string",
       );
     const bounds = validateTimeRangeBounds(
       stream.time_range,
@@ -565,6 +572,7 @@ function validateStreamRequest(
     declared,
     snapshot,
     revision === "candidate" ? declaredTimeType(declared) : undefined,
+    revision === "candidate",
   );
 }
 

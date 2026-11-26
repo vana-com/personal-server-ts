@@ -533,6 +533,22 @@ export function grantUsesLockedRules(
  * before use, missing facts are not reconstructed from current configuration,
  * and fresh consent is required.
  */
+/**
+ * Whether persisted grant state is a contract this build supports (§7
+ * "Version layering": "MUST reject any persisted authorization state whose
+ * version or shape it cannot validate against a supported contract").
+ * An allowlist: locked v0.1.0 shape, the candidate alias, or v0.2.
+ */
+export function isSupportedPersistedGrant(
+  grant:
+    | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }
+    | undefined,
+): boolean {
+  if (!grant) return false;
+  if (grantUsesLockedRules(grant)) return true;
+  return grant.version === PDPP_GRANT_VERSION_V02;
+}
+
 export function isPreLockGrant(
   grant:
     | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }

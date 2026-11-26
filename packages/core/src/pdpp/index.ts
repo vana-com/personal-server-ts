@@ -14,6 +14,7 @@ export {
   grantUsesLockedRules,
   usesLockedRules,
   isPreLockGrant,
+  isSupportedPersistedGrant,
   PDPP_GRANT_VERSION_CANDIDATE,
   PDPP_GRANT_VERSION,
   PDPP_GRANT_VERSION_V02,

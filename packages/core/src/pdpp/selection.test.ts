@@ -397,3 +397,42 @@ describe("§7 — retention", () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe("locked v0.1.0 minimum field ceiling (spec-core L1248, L1258)", () => {
+  const snap: DeclarationSnapshot = {
+    source_id: "https://registry.pdpp.dev/connectors/spotify",
+    source_kind: "connector",
+    version: "1",
+    digest: "d".repeat(64),
+    streams: [
+      {
+        name: "top_artists",
+        fields: ["id", "name", "genres"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+      },
+    ],
+  };
+  const req = (minimumFields: string[]) =>
+    validateSelectionRequest(
+      {
+        type: PDPP_DATA_ACCESS_TYPE,
+        source: { id: snap.source_id },
+        purpose_code: "https://pdpp.dev/purpose/personalization",
+        access_mode: "single_use",
+        streams: [{ name: "top_artists", fields: ["name"], minimum: { fields: minimumFields } }],
+      },
+      snap,
+    );
+
+  it("accepts a minimum naming a schema-required field the client did not list", () => {
+    expect(req(["id"]).ok).toBe(true);
+  });
+
+  it("still refuses a minimum outside the field ceiling", () => {
+    const result = req(["genres"]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.failure.code).toBe("invalid_minimum");
+  });
+});
+
