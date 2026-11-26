@@ -481,12 +481,13 @@ export async function assertAppRead(
       "/streams/messages/records/visible?fields=private_note",
       token,
     ),
-    400,
+    // spec-core §4 "Effective projection": 403 field_not_granted (RS 31).
+    403,
     "hidden field request",
   );
   const response = await api(
     origin,
-    `/blobs/${encodeURIComponent(blob.blobId)}`,
+    `/blobs/${encodeURIComponent(blob.blobId)}?instance_id=conn`,
     token,
   );
   assert.equal(response.status, 200, "authorized blob");
@@ -540,7 +541,7 @@ export async function assertTokenDenied(
   for (const path of [
     "/streams/messages/records",
     "/streams/messages/records/visible",
-    `/blobs/${encodeURIComponent(blobId)}`,
+    `/blobs/${encodeURIComponent(blobId)}?instance_id=conn`,
   ])
     await json(
       await api(origin, path, token),
@@ -904,7 +905,7 @@ async function main() {
           await json(
             await api(
               origin,
-              `/blobs/${encodeURIComponent(blob.blobId)}`,
+              `/blobs/${encodeURIComponent(blob.blobId)}?instance_id=conn`,
               consent.token,
             ),
             404,

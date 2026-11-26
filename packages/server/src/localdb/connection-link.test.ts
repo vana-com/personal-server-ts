@@ -299,8 +299,10 @@ describe("grant reads through database HTTP ports", () => {
         (await selected.json()).data.map((r: { id: string }) => r.id),
       ).toEqual(["allowed"]);
       expect(
+        // A stream outside the grant is refused before any declaration
+        // lookup (spec-core §8 grant enforcement; RS item 32).
         (await app.request("/streams/private/records", { headers })).status,
-      ).toBe(404);
+      ).toBe(403);
       const listed = await app.request("/streams", { headers });
       expect(listed.status).toBe(200);
       expect(
@@ -350,7 +352,7 @@ describe("grant reads through database HTTP ports", () => {
       });
       const headers = { Authorization: "Bearer token" };
       const firstResponse = await app.request(
-        "/streams/selected/records?limit=1",
+        "/streams/selected/records?limit=1&order=asc",
         { headers },
       );
       expect(firstResponse.status).toBe(200);
@@ -364,7 +366,7 @@ describe("grant reads through database HTTP ports", () => {
       ).not.toContain("0-hidden");
       const second = await (
         await app.request(
-          `/streams/selected/records?limit=1&cursor=${encodeURIComponent(first.next_cursor)}`,
+          `/streams/selected/records?limit=1&order=asc&cursor=${encodeURIComponent(first.next_cursor)}`,
           { headers },
         )
       ).json();
@@ -390,7 +392,7 @@ describe("grant reads through database HTTP ports", () => {
         "UPDATE records SET stamp_o=3,body_sha256='replacement' WHERE stream='selected' AND record_key='z-visible'",
       );
       const expired = await app.request(
-        `/streams/selected/records?limit=1&cursor=${encodeURIComponent(first.next_cursor)}`,
+        `/streams/selected/records?limit=1&order=asc&cursor=${encodeURIComponent(first.next_cursor)}`,
         { headers },
       );
       expect(expired.status).toBe(410);
@@ -459,14 +461,14 @@ describe("grant reads through database HTTP ports", () => {
       isConnectionAvailable: (i) => !deleted.has(i),
     });
     try {
-      const response = await app.request(`/${blobId}`, {
+      const response = await app.request(`/${blobId}?instance_id=handle-a`, {
         headers: { Authorization: "Bearer token" },
       });
       expect(response.status).toBe(200);
       expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
       expect(
         (
-          await app.request(`/${blobId}`, {
+          await app.request(`/${blobId}?instance_id=handle-a`, {
             headers: { Authorization: "Bearer noFields" },
           })
         ).status,
@@ -474,7 +476,7 @@ describe("grant reads through database HTTP ports", () => {
       removeReference = true;
       expect(
         (
-          await app.request(`/${blobId}`, {
+          await app.request(`/${blobId}?instance_id=handle-a`, {
             method: "HEAD",
             headers: { Authorization: "Bearer token" },
           })
@@ -483,7 +485,7 @@ describe("grant reads through database HTTP ports", () => {
       deleted.add("handle-a");
       expect(
         (
-          await app.request(`/${blobId}`, {
+          await app.request(`/${blobId}?instance_id=handle-a`, {
             headers: { Authorization: "Bearer token" },
           })
         ).status,
@@ -526,10 +528,11 @@ describe("grant change history after compaction", () => {
       page = await read("selected", { ...opts, cursor: page.nextCursor });
       values.push(...page.data.map((r) => [r.recordKey, r.instance]));
     }
+    // (instance_id, canonical key) order (spec-core §9 RS item 21).
     expect(values).toEqual([
       ["", "handle-a"],
-      ["", "handle-b"],
       ["allowed", "handle-a"],
+      ["", "handle-b"],
       ["allowed", "handle-b"],
     ]);
   });
@@ -641,4 +644,54 @@ it("a relink during an exact-count list reads one target for count and page", as
   );
   const count = (body.meta as { count: { value: number } }).count.value;
   expect((body.data as unknown[]).length).toBe(count);
+});
+
+it("grant listing orders by (instance_id, key) in the requested direction, or by the frozen sort_field (RS item 33)", async () => {
+  const { db, id } = await fixture();
+  for (const [key, at] of [
+    ["b", "2026-03-01T00:00:00Z"],
+    ["c", "nope"],
+    ["d", "2026-05-01"],
+  ] as const)
+    await run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run',?,'hash')",
+      [id, "selected", key, key, JSON.stringify({ at })],
+    );
+  const read = createGrantHistory(db, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  const walk = async (options: Record<string, unknown>) => {
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await read("selected", {
+        purpose: "listing",
+        instanceIds: ["handle-a"],
+        limit: 1,
+        cursor,
+        ...options,
+      });
+      ids.push(...page.data.map((row) => row.recordKey));
+      if (!page.hasMore) return ids;
+      cursor = page.nextCursor;
+    }
+  };
+  expect(await walk({ order: "desc", sort: { by: "key" } })).toEqual([
+    "d",
+    "c",
+    "b",
+    "allowed",
+  ]);
+  expect(await walk({ order: "asc", sort: { by: "key" } })).toEqual([
+    "allowed",
+    "b",
+    "c",
+    "d",
+  ]);
+  // Dates and instants by what they denote; absent or invalid values last.
+  expect(
+    await walk({ order: "desc", sort: { by: "field", field: "at" } }),
+  ).toEqual(["d", "b", "c", "allowed"]);
 });

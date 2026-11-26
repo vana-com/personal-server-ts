@@ -8,8 +8,14 @@ import {
   CursorExpiredError,
   type ChangesSinceOptions,
   type ChangesSincePage,
+  type ListSort,
   type PdppStoredRecord,
 } from "../storage/pdpp-records/types.js";
+import {
+  compareListPositions,
+  listPosition,
+  type ListPosition,
+} from "../storage/pdpp-records/list-page.js";
 import type { ConnectionLink } from "./connection-link.js";
 
 import type { SqlReader, SqlValue } from "./driver.js";
@@ -505,6 +511,9 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
       targets,
       options.fields?.slice().sort() ?? null,
       options.purpose ?? "changes",
+      ...(options.purpose === "listing"
+        ? [options.order ?? "asc", options.sort ?? null]
+        : []),
     ]);
     const clock = async () => {
       const [row] = await db.query<{
@@ -606,21 +615,35 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
     const rows: PdppStoredRecord[] = [];
     let visibleCount = 0;
     const limit = Math.max(1, Math.min(100, options.limit));
+    // The scan runs in `(instance_id, canonical key)` order, which is the
+    // `changes_since` order (spec-core §9 RS item 21) and the ascending key
+    // list order. A listing in another order (descending, or by the frozen
+    // `sort_field`) ranks every visible position, then reads the page's
+    // bodies (spec-core §8 "Stable sort"; RS item 33).
+    const sort: ListSort = options.sort ?? { by: "key" };
+    const ranked =
+      options.purpose === "listing" &&
+      (options.order === "desc" || sort.by === "field");
+    const positions: (ListPosition & {
+      connectionId: string;
+      pkHash: string;
+    })[] = [];
     let after: [string, string, string] | undefined;
     while (targets.length > 0) {
       const current = await db.query<{
         instance: string;
+        connection_id: string;
         record_key: string;
         pk_hash: string;
         body: string;
         stamp_o: number;
       }>(
         `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
-         SELECT t.instance,r.record_key,r.pk_hash,r.body,${seenStamp("r.").o} AS stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
-         WHERE r.stream=? ${after ? "AND (r.record_key,t.instance,r.pk_hash)>(?,?,?)" : ""}
+         SELECT t.instance,r.connection_id,r.record_key,r.pk_hash,r.body,${seenStamp("r.").o} AS stamp_o FROM records r JOIN targets t ON t.connection_id=r.connection_id
+         WHERE r.stream=? ${after ? "AND (t.instance,r.record_key,r.pk_hash)>(?,?,?)" : ""}
          ${since === null ? "" : "AND EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq<=? AND c.seq>?)"}
          AND NOT EXISTS (SELECT 1 FROM record_changes c WHERE c.connection_id=r.connection_id AND c.stream=r.stream AND c.pk_hash=r.pk_hash AND c.seq>?)
-         ORDER BY r.record_key,t.instance,r.pk_hash LIMIT 100`,
+         ORDER BY t.instance,r.record_key,r.pk_hash LIMIT 100`,
         [
           ...targets.flatMap((t) => [t.instance, t.id]),
           stream,
@@ -640,13 +663,44 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           deleted: false,
         };
         if (!options.isVisible || options.isVisible(value)) {
-          if (visibleCount++ >= offset && rows.length <= limit)
+          if (ranked) {
+            positions.push({
+              ...listPosition(value, sort),
+              connectionId: row.connection_id,
+              pkHash: row.pk_hash,
+            });
+          } else if (visibleCount >= offset && rows.length <= limit) {
             rows.push(value);
+          }
+          visibleCount++;
         }
       }
       if (current.length < 100) break;
       const last = current.at(-1)!;
-      after = [last.record_key, last.instance, last.pk_hash];
+      after = [last.instance, last.record_key, last.pk_hash];
+    }
+    if (ranked) {
+      positions.sort((a, b) =>
+        compareListPositions(a, b, options.order ?? "asc", sort),
+      );
+      for (const position of positions.slice(offset, offset + limit + 1)) {
+        const [row] = await db.query<{ body: string; stamp_o: number }>(
+          `SELECT r.body,${seenStamp("r.").o} AS stamp_o FROM records r
+           WHERE r.connection_id=? AND r.stream=? AND r.pk_hash=?`,
+          [position.connectionId, stream, position.pkHash],
+        );
+        // The final exactness check below expires a page whose body moved.
+        if (!row) throw new CursorExpiredError();
+        rows.push({
+          instance: position.instance,
+          stream,
+          recordKey: position.recordKey,
+          data: JSON.parse(row.body),
+          emittedAt: new Date(row.stamp_o).toISOString(),
+          version: 1,
+          deleted: false,
+        });
+      }
     }
     await assertExact();
     const data = rows.slice(0, limit),

@@ -610,7 +610,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         for (const method of ["GET", "HEAD"])
           for (const range of [undefined, "bytes=0-7"]) {
             const response = await fetch(
-              `${rs.origin}/pdpp/v1/blobs/${encodeURIComponent(id)}`,
+              `${rs.origin}/pdpp/v1/blobs/${encodeURIComponent(id)}?instance_id=conn`,
               {
                 method,
                 headers: {
@@ -635,7 +635,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       for (const method of ["GET", "HEAD"])
         await noDisclosure(
           await fetch(
-            `${rs.origin}/pdpp/v1/blobs/${encodeURIComponent(hidden.blobId)}`,
+            `${rs.origin}/pdpp/v1/blobs/${encodeURIComponent(hidden.blobId)}?instance_id=conn`,
             { method },
           ),
           401,
@@ -664,7 +664,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       const changes = await payload(
         await request(
           rs.origin,
-          "/streams/messages/records?changes_since=&limit=1",
+          "/streams/messages/records?changes_since=beginning&limit=1",
           consent.token,
         ),
         200,
@@ -676,10 +676,10 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         "/streams/messages/records",
         "/streams/messages/records/visible",
         `/streams/messages/records?cursor=${encodeURIComponent(String(page.next_cursor))}`,
-        "/streams/messages/records?changes_since=",
+        "/streams/messages/records?changes_since=beginning",
         ...(changes.next_cursor
           ? [
-              `/streams/messages/records?changes_since=&cursor=${encodeURIComponent(String(changes.next_cursor))}`,
+              `/streams/messages/records?changes_since=beginning&cursor=${encodeURIComponent(String(changes.next_cursor))}`,
             ]
           : []),
       ];
@@ -693,7 +693,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       for (const method of ["GET", "HEAD"])
         await noDisclosure(
           await fetch(
-            `${rs.origin}/pdpp/v1/blobs/${encodeURIComponent(f.blob.blobId)}`,
+            `${rs.origin}/pdpp/v1/blobs/${encodeURIComponent(f.blob.blobId)}?instance_id=conn`,
             {
               method,
               headers: {
@@ -811,8 +811,8 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         ).toBe(data.text);
         await assertAppRead(rs.origin, consent.token, f.expected, f.blob);
         for (const path of [
-          "/streams/messages/records?changes_since=",
-          `/blobs/${encodeURIComponent(id)}`,
+          "/streams/messages/records?changes_since=beginning",
+          `/blobs/${encodeURIComponent(id)}?instance_id=conn`,
         ]) {
           const response = await request(rs.origin, path, consent.token);
           await noDisclosure(response, path.includes("/blobs/") ? 404 : 200, [
@@ -845,7 +845,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         await noDisclosure(
           await request(
             rs.origin,
-            `/blobs/${encodeURIComponent(f.blob.blobId)}`,
+            `/blobs/${encodeURIComponent(f.blob.blobId)}?instance_id=conn`,
             consent.token,
           ),
           404,
@@ -918,7 +918,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       for (const path of [
         "/streams/messages/records/visible",
         "/streams/messages/records",
-        "/streams/messages/records?changes_since=",
+        "/streams/messages/records?changes_since=beginning",
         "/streams",
         "/streams/messages",
       ]) {
@@ -946,7 +946,10 @@ describe("P0 adversarial public AS and app-read contracts", () => {
             `/streams/messages/records?${query}`,
             allowed.token,
           ),
-          400,
+          // A well-formed field outside the grant is 403 field_not_granted
+          // (spec-core §4 "Effective projection"; RS item 31). Every other
+          // shape is a 400.
+          query.startsWith("fields=") ? 403 : 400,
           ["hidden despite schema-required", f.blob.blobId],
         );
       const single = await payload(

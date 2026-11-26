@@ -421,12 +421,12 @@ it("requires verified claimed blob bytes before exposing an imported record", as
       return stored ? new Uint8Array(stored) : undefined;
     },
   });
-  const response = await blobs.request(`/${blob.blobId}`, {
+  const response = await blobs.request(`/${blob.blobId}?instance_id=conn_a`, {
     headers: { Authorization: "Bearer client" },
   });
   expect(response.status).toBe(200);
   expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
-  expect((await blobs.request(`/${blob.blobId}`)).status).toBe(401);
+  expect((await blobs.request(`/${blob.blobId}?instance_id=conn_a`)).status).toBe(401);
 
   expect(
     target.store.replication.readTailPage({ limit: 100 }).operations,
@@ -3618,7 +3618,8 @@ it("canonical change feeds validate original scope, exclude all conflicted histo
       .readStore()
       .changesSince("messages", options)
       .data.map((row) => row.recordKey),
-  ).toEqual(["b", "healthy"]);
+    // (instance_id, key) order: conn_a before conn_b (RS item 21).
+  ).toEqual(["healthy", "b"]);
   const old = receiver
     .readStore()
     .changesSince("messages", { ...options, limit: 1 });
@@ -4837,7 +4838,7 @@ it.each(["owner", "grant"] as const)(
       instancesForSubject: () => ["conn_a"],
     });
 
-    const response = await app.request(`/${blob.blobId}`, {
+    const response = await app.request(`/${blob.blobId}?instance_id=conn_a`, {
       headers: { Authorization: `Bearer ${reader}` },
     });
     expect(quarantineCalls).toBe(1);
@@ -5044,7 +5045,7 @@ it.each([
       );
       const address = server.address() as { port: number };
       const responsePromise = fetch(
-        `http://127.0.0.1:${address.port}/${blob.blobId}`,
+        `http://127.0.0.1:${address.port}/${blob.blobId}?instance_id=conn_a`,
         { headers: { Authorization: `Bearer ${reader}` } },
       );
       // Attach the response handler immediately, including failure handling

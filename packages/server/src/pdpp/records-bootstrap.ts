@@ -29,7 +29,8 @@ import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/local
  * grant, and a resource server that cannot enforce is worse than absent.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -132,6 +133,8 @@ export interface PdppRecordsDeps {
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
   resource: string;
   authorizationServers?: string[];
+  /** Seals RS cursors and sync tokens; see `cursorSealKeyFor`. */
+  cursorSealKey?: Uint8Array;
 }
 
 /**
@@ -475,7 +478,47 @@ export function createPdppRecordsDeps(
     resource: options.resource,
     // Co-located: this server is its own authorization server.
     authorizationServers: [options.resource],
+    cursorSealKey: cursorSealKeyFor(options.db, logger),
   };
+}
+
+/**
+ * The key that seals page cursors and `changes_since` tokens (spec-core §4;
+ * §9 RS item 21), kept in a file beside the records database so a client's
+ * stored `next_changes_since` survives a restart. Not a database table: a
+ * new table would change the schema older builds open. Owner-only file mode;
+ * whoever can read it can already read the database. An in-memory database
+ * gets a fresh key, and so does a host where the file cannot be written.
+ */
+export function cursorSealKeyFor(
+  db: Database,
+  logger: Pick<Logger, "warn">,
+): Uint8Array {
+  const file = db.name && db.name !== ":memory:" ? `${db.name}.pdpp-cursor-key` : undefined;
+  if (!file) return randomBytes(32);
+  try {
+    const existing = readFileSync(file);
+    if (existing.byteLength === 32) return existing;
+  } catch {
+    // Absent: created below.
+  }
+  const key = randomBytes(32);
+  try {
+    writeFileSync(file, key, { mode: 0o600, flag: "wx" });
+    return key;
+  } catch {
+    try {
+      // Another opener won the race: use its key.
+      const existing = readFileSync(file);
+      if (existing.byteLength === 32) return existing;
+    } catch {
+      // Fall through.
+    }
+  }
+  logger.warn(
+    "PDPP cursor key file is unavailable; sync tokens will not survive a restart",
+  );
+  return key;
 }
 
 /**
@@ -603,9 +646,9 @@ export function createPdppSyncImporter(options: {
 /**
  * Project a retained declaration onto the per-stream shapes the RS enforces.
  *
- * `cursorField` falls back to `emitted_at` because that is what both record
- * store backends actually sort by; naming a declared field the store does not
- * order by would produce cursors that resume at the wrong place.
+ * `cursorField` is the declared field, or absent: owner stream metadata must
+ * report the real current `cursor_field` (spec-core §8; RS item 14). It
+ * never drives a store order or a cursor.
  */
 function toStreamDeclarations(
   snapshot: DeclarationSnapshot,
@@ -618,7 +661,9 @@ function toStreamDeclarations(
     // stream into upsert behavior and left a producer's claim unfalsifiable.
     semantics: stream.semantics ?? ("mutable_state" as const),
     primaryKey: stream.primary_key,
-    cursorField: "emitted_at",
+    ...(stream.cursor_field !== undefined && {
+      cursorField: stream.cursor_field,
+    }),
     consentTimeField: stream.consent_time_field,
     requiredFields: stream.required_fields,
     // The declared member list, carried rather than dropped: it is what makes

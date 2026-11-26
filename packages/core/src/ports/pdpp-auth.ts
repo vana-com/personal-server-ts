@@ -35,6 +35,12 @@ export interface StreamGrant {
    * sparse-read floor from this set, never from a later declaration.
    */
   required_fields?: string[];
+  /**
+   * The declared date or date-time `cursor_field`, frozen at issuance when
+   * the grant includes it; absent means key order (spec-core §6, §8 "Stable
+   * sort").
+   */
+  sort_field?: string;
 }
 
 export interface ClientDisplay {

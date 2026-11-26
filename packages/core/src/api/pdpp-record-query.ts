@@ -11,8 +11,13 @@ const PARAMETERS = {
     "changes_since",
     "source",
   ],
-  getRecord: ["fields"],
-  deleteRecord: [],
+  // spec-core §8 "Get a single record" / "Delete a record": `instance_id`
+  // selects the record's instance (RS items 1, 23).
+  getRecord: ["fields", "instance_id"],
+  deleteRecord: ["instance_id"],
+  // spec-core §8 "Get a blob": `instance_id` is the only parameter, and an
+  // unknown one is a 400 like on every other route (RS items 10, 23).
+  getBlob: ["instance_id"],
 } satisfies Record<string, string[]>;
 
 type Endpoint = keyof typeof PARAMETERS;
@@ -26,8 +31,21 @@ export function parseRecordQuery(
   const params = new URL(url).searchParams;
   const allowed: readonly string[] = PARAMETERS[endpoint];
   for (const key of params.keys()) {
+    // spec-core §8 "List records": "A `changes_since` request with
+    // `expand[]` or `expand_limit[...]` is rejected with 400
+    // `invalid_request` for every token kind" (RS item 21).
+    const base = key.replace(/\[.*$/, "");
+    if (
+      params.has("changes_since") &&
+      (base === "expand" || base === "expand_limit")
+    ) {
+      throw new PdppError(
+        "invalid_request",
+        "Expansion is not supported on a changes_since request",
+        { param: key },
+      );
+    }
     if (!allowed.includes(key)) {
-      const base = key.replace(/\[.*$/, "");
       const ownerExpand =
         tokenKind === "owner" &&
         (endpoint === "listRecords" || endpoint === "getRecord") &&
@@ -77,6 +95,7 @@ export function parseRecordQuery(
     cursor: params.get("cursor") ?? undefined,
     changesSince: params.get("changes_since") ?? undefined,
     source: params.get("source") ?? undefined,
+    instanceId: params.get("instance_id") ?? undefined,
   };
 }
 

@@ -26,6 +26,9 @@ export function selectSyncChange(
           emittedAt: current.emittedAt,
           deletedAt: current.emittedAt,
           deleted: true,
+          // spec-core §4 "Tombstones": the record still exists but left
+          // the query context; an owner tombstone says so (RS item 20).
+          removal: "left_query",
         };
   }
   if (current.deleted) return current; // existing current-protocol tombstones

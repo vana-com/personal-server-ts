@@ -360,6 +360,8 @@ export interface AppDeps {
     /** This resource server's own identifier, RFC 9728 `resource` member. */
     resource: string;
     authorizationServers?: string[];
+    /** Seals RS page cursors and `changes_since` tokens (RS item 21). */
+    cursorSealKey?: Uint8Array;
   };
 }
 
@@ -565,6 +567,7 @@ export function createApp(deps: AppDeps): Hono {
         reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
+        cursorSealKey: deps.pdpp.cursorSealKey,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
         instancesForSource: deps.pdpp.instancesForSource,

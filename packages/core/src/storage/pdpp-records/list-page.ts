@@ -5,10 +5,11 @@ import {
   type ListCursorPayload,
 } from "./cursor.js";
 import { InvalidCursorError, CursorExpiredError } from "./types.js";
-import { timeSortKey } from "../../pdpp/time.js";
+import { parseTime, timeSortKey } from "../../pdpp/time.js";
 import type {
   ListRecordsOptions,
   ListRecordsPage,
+  ListSort,
   PdppStoredRecord,
 } from "./types.js";
 
@@ -28,6 +29,108 @@ export function decodeListCursor(
   )
     throw new CursorExpiredError();
   return { ...payload, instance: payload.instance, horizon: payload.horizon };
+}
+
+/** The identity of a list order, carried in its page cursor. */
+export function listSortTag(sort: ListSort | undefined): string {
+  return sort === undefined
+    ? "emitted"
+    : sort.by === "key"
+      ? "key"
+      : `field:${sort.field}`;
+}
+
+/** A list cursor minted under another order names a different position. */
+export function assertListCursorSort(
+  payload: ListCursorPayload,
+  sort: ListSort | undefined,
+): void {
+  if ((payload.sort ?? "emitted") !== listSortTag(sort))
+    throw new InvalidCursorError();
+}
+
+/**
+ * The sort key of a `sort_field` value: the exact instant (date-time) or the
+ * calendar date (date, as its UTC midnight) its RFC 3339 form denotes, or
+ * null when the value is absent, null or not valid RFC 3339 (spec-core §8
+ * "Stable sort").
+ */
+export function fieldSortKey(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  if (parseTime(value, "date-time")) return timeSortKey(value);
+  if (parseTime(value, "date")) return timeSortKey(`${value}T00:00:00Z`);
+  return null;
+}
+
+/** The position a list cursor names (see `listSnapshotPage`). */
+export function cursorPosition(
+  payload: ListCursorPayload & { instance: string },
+  sort: ListSort | undefined,
+): ListPosition {
+  return {
+    sortKey:
+      sort === undefined
+        ? timeSortKey(payload.sortValue ?? "")
+        : payload.sortValue,
+    instance: payload.instance,
+    recordKey: payload.recordKey,
+  };
+}
+
+/** A row's place in a list order. */
+export interface ListPosition {
+  /** Emitted order and field order; null sorts after every value. */
+  readonly sortKey: string | null;
+  readonly instance: string;
+  readonly recordKey: string;
+}
+
+export function listPosition(
+  row: Pick<PdppStoredRecord, "instance" | "recordKey" | "data" | "emittedAt">,
+  sort: ListSort | undefined,
+): ListPosition {
+  return {
+    sortKey:
+      sort === undefined
+        ? timeSortKey(row.emittedAt)
+        : sort.by === "field"
+          ? fieldSortKey(row.data[sort.field])
+          : null,
+    instance: row.instance,
+    recordKey: row.recordKey,
+  };
+}
+
+/**
+ * Compare two positions in `order`. Emitted order keeps its tie-break on key
+ * then instance (the SQLite index order). Key and field order use
+ * `(instance_id, canonical key)` by code point, and field order puts an
+ * absent, null or invalid value after every valid one in both directions
+ * (spec-core §8 "Stable sort"; §9 RS item 33).
+ */
+export function compareListPositions(
+  a: ListPosition,
+  b: ListPosition,
+  order: "asc" | "desc",
+  sort: ListSort | undefined,
+): number {
+  const dir = order === "desc" ? -1 : 1;
+  if (sort === undefined) {
+    return (
+      dir *
+      (compareText(a.sortKey ?? "", b.sortKey ?? "") ||
+        compareText(a.recordKey, b.recordKey) ||
+        compareText(a.instance, b.instance))
+    );
+  }
+  if (sort.by === "field") {
+    const am = a.sortKey === null,
+      bm = b.sortKey === null;
+    if (am !== bm) return am ? 1 : -1;
+    if (!am && a.sortKey !== b.sortKey)
+      return dir * compareText(a.sortKey!, b.sortKey!);
+  }
+  return dir * compareRecordIdentity(a, b);
 }
 
 /**
@@ -66,24 +169,30 @@ function compareText(a: string, b: string): number {
   return Math.sign(left.length - right.length);
 }
 
-/** Locale-independent complete record identity, shared by list and sync. */
+/**
+ * Locale-independent complete record identity: `instance_id`, then canonical
+ * key, by code point. spec-core §9 RS item 21: "Orders a `changes_since`
+ * session by `instance_id` and then canonical key string".
+ */
 export function compareRecordIdentity(
   a: { recordKey: string; instance: string },
   b: { recordKey: string; instance: string },
 ): number {
   return (
-    compareText(a.recordKey, b.recordKey) || compareText(a.instance, b.instance)
+    compareText(a.instance, b.instance) || compareText(a.recordKey, b.recordKey)
   );
 }
 
-/** List order: emitted instant, then complete identity. SQLite's `emitted_key` is the same `timeSortKey`. */
+/** Emitted list order: emitted instant, then key, then instance. SQLite's `emitted_key` is the same `timeSortKey`. */
 export function compareListRows(
   a: PdppStoredRecord,
   b: PdppStoredRecord,
 ): number {
-  return (
-    compareText(timeSortKey(a.emittedAt), timeSortKey(b.emittedAt)) ||
-    compareRecordIdentity(a, b)
+  return compareListPositions(
+    listPosition(a, undefined),
+    listPosition(b, undefined),
+    "asc",
+    undefined,
   );
 }
 
@@ -115,10 +224,17 @@ export function listSnapshotPage(
           kind: "list",
           ...snapshot,
           order: options.order,
-          sortValue: last.emittedAt,
+          // Emitted order keeps the raw emitted time; key and field order
+          // carry the position's sort key. The cursor is sealed before it
+          // leaves the RS (spec-core §4; RS item 21).
+          sortValue:
+            options.sort === undefined
+              ? last.emittedAt
+              : listPosition(last, options.sort).sortKey,
           recordKey: last.recordKey,
           instance: last.instance,
           orderKey: "instant",
+          sort: listSortTag(options.sort),
         }
       : undefined;
   return {

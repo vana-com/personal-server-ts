@@ -38,6 +38,7 @@ export type PdppErrorCode =
   | "blob_not_found"
   | "instance_unavailable"
   | "not_found"
+  | "conflict"
   | "cursor_expired"
   | "rate_limit_exceeded"
   | "api_error";
@@ -66,6 +67,9 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   blob_not_found: 404,
   instance_unavailable: 404,
   not_found: 404,
+  // Not in the §8 table: a write refused by connection state. An unknown
+  // code is opaque to a client, which falls back to the status (§8 Errors).
+  conflict: 409,
   cursor_expired: 410,
   rate_limit_exceeded: 429,
   api_error: 500,
@@ -93,6 +97,7 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   blob_not_found: "not_found_error",
   instance_unavailable: "not_found_error",
   not_found: "not_found_error",
+  conflict: "invalid_request_error",
   cursor_expired: "gone_error",
   rate_limit_exceeded: "rate_limit_error",
   api_error: "api_error",

@@ -50,6 +50,11 @@ export interface PdppTombstoneRecord {
   deletedAt: string;
   emittedAt: string;
   deleted: true;
+  /**
+   * Set when the record still exists but left the query's visible set
+   * (spec-core §4 "Tombstones": `left_query`). Absent means a deletion.
+   */
+  removal?: "left_query";
 }
 
 export type PdppRecordRow = PdppStoredRecord | PdppTombstoneRecord;
@@ -82,6 +87,14 @@ export interface IngestResult {
   results: IngestOutcome[];
 }
 
+/**
+ * List order (spec-core §8 "Stable sort"). `key` is `(instance_id, canonical
+ * key)`; `field` orders by the RFC 3339 instant or date a top-level field
+ * holds, absent/null/invalid values last, then `(instance_id, key)`. Absent:
+ * emitted time, then `(instance_id, key)`.
+ */
+export type ListSort = { by: "key" } | { by: "field"; field: string };
+
 export interface ListRecordsOptions {
   /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
   isVisible?: (row: PdppVisibleRecord) => boolean;
@@ -89,6 +102,7 @@ export interface ListRecordsOptions {
   limit: number;
   cursor?: string;
   order: "asc" | "desc";
+  sort?: ListSort;
   /** undefined = no projection restriction (owner reads / unrestricted). */
   fields?: string[];
 }
@@ -121,6 +135,9 @@ export interface ChangesSinceOptions {
   cursor?: string;
   limit: number;
   fields?: string[];
+  /** `listing` purpose only: the list order (spec-core §8 "Stable sort"). */
+  order?: "asc" | "desc";
+  sort?: ListSort;
 }
 
 export interface ChangesSincePage {

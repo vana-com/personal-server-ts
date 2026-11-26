@@ -153,23 +153,30 @@ describe("Node and Lite serve identical pages for one store", () => {
     const local = await switchedStore();
     const runtime = await liteRuntime(local);
     const app = nodeApp(local);
-    let cursor: string | undefined;
+    // Each runtime seals its own cursors with a fresh IV (RS item 21), so the
+    // bodies match apart from `next_cursor`, and each walk follows its own.
+    let liteCursor: string | undefined;
+    let nodeCursor: string | undefined;
     const seen: string[] = [];
+    const base = `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`;
+    const at = (cursor: string | undefined) =>
+      cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base;
     for (let page = 0; page < 5; page++) {
-      const query =
-        `limit=2&source=${CONNECTOR}` +
-        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
-      const path = `/v1/streams/posts/records?${query}`;
       const [lite, node] = [
-        await liteGet(runtime, path),
-        await nodeGet(app, path),
+        await liteGet(runtime, at(liteCursor)),
+        await nodeGet(app, at(nodeCursor)),
       ];
       expect(lite.status).toBe(200);
       expect(node.status).toBe(200);
       const liteBody = await lite.json();
-      expect(liteBody).toEqual(await node.json());
+      const nodeBody = await node.json();
+      liteCursor = liteBody.next_cursor;
+      nodeCursor = nodeBody.next_cursor;
+      expect({ ...liteBody, next_cursor: undefined }).toEqual({
+        ...nodeBody,
+        next_cursor: undefined,
+      });
       seen.push(...liteBody.data.map((row: { id: string }) => row.id));
-      cursor = liteBody.next_cursor;
       if (!liteBody.has_more) break;
     }
     expect(seen).toEqual(POSTS.map((post) => post.id));

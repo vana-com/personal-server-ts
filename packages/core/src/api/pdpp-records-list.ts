@@ -20,7 +20,10 @@ import {
 import type {
   ChangesSinceOptions,
   ChangesSincePage,
+  ListSort,
 } from "../storage/pdpp-records/types.js";
+import { PDPP_VERSION } from "../pdpp-version.js";
+import { createCursorSeal, type CursorSeal } from "./pdpp-cursor-seal.js";
 import type {
   StreamDeclaration,
   StreamDeclarationRegistry,
@@ -55,24 +58,84 @@ export function localRecordJson(
   stream: string,
   row: LocalRecord,
   fields: string[] | undefined,
-  candidate: boolean,
+  tokenKind: "owner" | "client",
 ) {
+  // RecordQuery exposes the removal sequence, not a deletion timestamp, so
+  // an owner tombstone from this backend carries null deletion times.
+  return servedRecordJson(
+    stream,
+    { ...row, deletedAt: row.deleted ? null : undefined },
+    fields,
+    tokenKind,
+  );
+}
+
+/** A stored row as a §8 response record or tombstone needs it. */
+export interface ServedRow {
+  readonly instance: string;
+  readonly recordKey: string;
+  readonly data?: Record<string, unknown>;
+  readonly deleted?: boolean;
+  readonly emittedAt?: string | null;
+  readonly deletedAt?: string | null;
+  /** Owner tombstones only: why the record left the query (spec-core §4). */
+  readonly removal?: "deleted" | "left_query";
+  readonly confirmation?: string;
+  readonly visibility?: string;
+  readonly status?: string;
+}
+
+/**
+ * One §8 response record or tombstone, by token kind.
+ *
+ * spec-core §4 "Response records": every record and tombstone carries
+ * `instance_id` (RS item 23); "A client-token response MUST NOT include
+ * `emitted_at`; an owner-token response includes it" (RS item 26).
+ * §4 "Tombstones": a client tombstone is exactly `{object, id, instance_id,
+ * stream, deleted}`; an owner tombstone adds `removal`, and `deleted_at` and
+ * `emitted_at` only when `removal` is `deleted` (RS item 20). The instance id
+ * is the grant's handle for a client and the owner's handle for an owner:
+ * both are the stored instance id on this co-located server.
+ */
+export function servedRecordJson(
+  stream: string,
+  row: ServedRow,
+  fields: string[] | undefined,
+  tokenKind: "owner" | "client",
+): Record<string, unknown> {
   const identity = {
     object: "record",
     id: row.recordKey,
-    ...(candidate && { instance_id: row.instance }),
+    instance_id: row.instance,
     stream,
   };
+  const owner = tokenKind === "owner";
+  // Replica preview labels reach only an owner reader.
+  const preview = owner
+    ? {
+        ...(row.confirmation && { confirmation: row.confirmation }),
+        ...(row.status && { visibility: row.visibility, status: row.status }),
+      }
+    : {};
   if (row.deleted) {
-    // RecordQuery exposes the removal sequence, not a deletion timestamp.
-    return candidate
-      ? { ...identity, deleted: true }
-      : { ...identity, deleted: true, deleted_at: null, emitted_at: null };
+    if (!owner) return { ...identity, deleted: true };
+    const removal = row.removal ?? "deleted";
+    return {
+      ...identity,
+      deleted: true,
+      removal,
+      ...(removal === "deleted" && {
+        deleted_at: row.deletedAt ?? null,
+        emitted_at: row.emittedAt ?? null,
+      }),
+      ...preview,
+    };
   }
   return {
     ...identity,
-    data: projectFields(row.data, fields),
-    emitted_at: row.emittedAt,
+    data: projectFields(row.data ?? {}, fields),
+    ...(owner && { emitted_at: row.emittedAt ?? null }),
+    ...preview,
   };
 }
 
@@ -131,6 +194,8 @@ export async function localRecordPage(
    * each instance's page. Only the owner's plain listing has one.
    */
   withTotal = false,
+  /** Client listing order (spec-core §8 "Stable sort"). */
+  sort?: ListSort,
 ): Promise<{
   data: LocalRecord[];
   hasMore: boolean;
@@ -151,10 +216,10 @@ export async function localRecordPage(
         );
       const page = await history(stream, {
         instanceIds: instances,
+        // spec-core §4 "Starting a sync": `beginning` is an empty horizon on
+        // every stream, for every grant (RS item 7).
         changesSince:
-          candidate && input.changesSince === "beginning"
-            ? undefined
-            : input.changesSince,
+          input.changesSince === "beginning" ? undefined : input.changesSince,
         cursor: input.cursor,
         limit: input.limit,
         fields: eligibilityFields,
@@ -230,7 +295,8 @@ export async function localRecordPage(
       data: page.flatMap(({ row }) => (row && visible(row) ? [row] : [])),
       hasMore,
       nextCursor: hasMore ? String(last) : null,
-      nextChangesSince: String(last),
+      // spec-core §4: "A non-terminal page MUST NOT include it" (RS item 8).
+      ...(!hasMore && { nextChangesSince: String(last) }),
     };
   }
 
@@ -247,6 +313,8 @@ export async function localRecordPage(
       instanceIds: instances,
       cursor: input.cursor,
       limit: input.limit,
+      order: input.order,
+      sort,
       fields: eligibilityFields,
       isVisible: (row) =>
         visible({
@@ -356,6 +424,8 @@ export interface RecordListPlan {
   readonly scope: ReturnType<typeof resolveReadScope>;
   /** Connections this read may touch: authorized, owned and declaring the stream. */
   readonly instanceIds: string[];
+  /** Client list order; absent for an owner read (emitted order). */
+  readonly sort?: ListSort;
 }
 
 /**
@@ -383,6 +453,11 @@ export interface PdppRecordListPorts {
   requireRegisteredConnections?(instanceIds: string[]): void;
   /** The unswitched account's reader. Absent where no legacy store exists. */
   legacy?(plan: RecordListPlan): Promise<Record<string, unknown>>;
+  /**
+   * Seals every page cursor and `changes_since` token this read issues and
+   * opens every one it receives. Hosts pass one keyed by a persisted secret.
+   */
+  cursorSeal?: CursorSeal;
 }
 
 export interface RecordListResult {
@@ -409,12 +484,23 @@ export async function listPdppRecords(
 ): Promise<RecordListResult> {
   const { context, stream } = input;
   const owner = context.tokenKind === "owner";
-  const query = parseRecordQuery(input.url, "listRecords", context.tokenKind);
-  if (!owner && query.source !== undefined) {
+  const requested = parseRecordQuery(
+    input.url,
+    "listRecords",
+    context.tokenKind,
+  );
+  if (!owner && requested.source !== undefined) {
     throw new PdppError(
       "invalid_request",
       "Parameter 'source' applies to owner reads only",
       { param: "source" },
+    );
+  }
+  if (requested.instanceId !== undefined) {
+    throw new PdppError(
+      "invalid_request",
+      "Unsupported query parameter 'instance_id'",
+      { param: "instance_id" },
     );
   }
   const localQuery = localRecordsFor(ports);
@@ -423,9 +509,14 @@ export async function listPdppRecords(
     ports,
     context,
     stream,
-    query.source,
+    requested.source,
   );
-  const scope = resolveReadScope(context, stream, declaration, query.fields);
+  const scope = resolveReadScope(
+    context,
+    stream,
+    declaration,
+    requested.fields,
+  );
   const instanceIds = owner ? ownerInstanceIds : scope.instanceIds;
   if (!owner) ports.requireRegisteredConnections?.(instanceIds);
   if (owner && instanceIds.length === 0) {
@@ -434,6 +525,64 @@ export async function listPdppRecords(
       "Owner token is not scoped to a currently owned instance",
     );
   }
+
+  // spec-core §8 "List records": a page cursor is bound to the grant (owner:
+  // subject and effective scope), stream, `fields`, `order`, every filter,
+  // any `changes_since` token and the `PDPP-Version` contract; a sync token
+  // to the same context minus its input token. Mismatch → `invalid_cursor`
+  // (§9 RS item 21). Tokens are sealed so they reveal no position.
+  const seal = ports.cursorSeal ?? defaultCursorSeal();
+  const binding = [
+    PDPP_VERSION,
+    owner
+      ? [
+          "owner",
+          context.subjectId ?? null,
+          context.sourceId ?? null,
+          [...new Set(instanceIds)].sort(),
+        ]
+      : ["grant", context.grant?.grant_id ?? null],
+    stream,
+    requested.fields ?? null,
+    requested.order,
+    requested.source ?? null,
+  ];
+  const pageBinding = [...binding, requested.changesSince ?? null];
+  const query = {
+    ...requested,
+    // `beginning` is not a token: it is bound only when used (spec-core §4).
+    changesSince:
+      requested.changesSince === undefined ||
+      requested.changesSince === "beginning"
+        ? requested.changesSince
+        : await seal.open("sync", binding, requested.changesSince),
+    cursor:
+      requested.cursor === undefined
+        ? undefined
+        : await seal.open("page", pageBinding, requested.cursor),
+  };
+  const sealBody = async (body: Record<string, unknown>) => ({
+    ...body,
+    ...(typeof body.next_cursor === "string" && {
+      next_cursor: await seal.seal("page", pageBinding, body.next_cursor),
+    }),
+    ...(typeof body.next_changes_since === "string" && {
+      next_changes_since: await seal.seal(
+        "sync",
+        binding,
+        body.next_changes_since,
+      ),
+    }),
+  });
+
+  // spec-core §8 "Stable sort": a client list uses the grant's frozen
+  // `sort_field` when present, else `(instance_id, canonical key)` in the
+  // direction `order` selects (§9 RS items 2, 33).
+  const sort: ListSort | undefined = owner
+    ? undefined
+    : scope.streamGrant?.sort_field
+      ? { by: "field", field: scope.streamGrant.sort_field }
+      : { by: "key" };
 
   const candidate = grantUsesLockedRules(context.grant);
   const warnings: { code: string; message: string; param?: string }[] = [];
@@ -462,8 +611,9 @@ export async function listPdppRecords(
       owner,
       ports.recordHistory,
       candidate,
-      candidate ? scope.streamGrant?.fields : scope.fields,
+      owner ? scope.fields : scope.streamGrant?.fields,
       wantsCount && countable,
+      sort,
     );
     const count =
       page.total === undefined
@@ -471,7 +621,7 @@ export async function listPdppRecords(
         : ({ kind: "exact", value: page.total } as const);
     return {
       feed: true,
-      body: {
+      body: await sealBody({
         object: "list",
         has_more: page.hasMore,
         ...(page.nextCursor !== null && { next_cursor: page.nextCursor }),
@@ -479,7 +629,12 @@ export async function listPdppRecords(
           next_changes_since: page.nextChangesSince,
         }),
         data: page.data.map((row) =>
-          localRecordJson(stream, row, scope.fields, candidate),
+          localRecordJson(
+            stream,
+            row,
+            scope.fields,
+            owner ? "owner" : "client",
+          ),
         ),
         ...((count || warnings.length > 0) && {
           meta: {
@@ -487,7 +642,7 @@ export async function listPdppRecords(
             ...(warnings.length > 0 && { warnings }),
           },
         }),
-      },
+      }),
     };
   }
 
@@ -499,8 +654,16 @@ export async function listPdppRecords(
   }
   return {
     feed: query.changesSince === undefined,
-    body: await ports.legacy({ query, stream, context, scope, instanceIds }),
+    body: await sealBody(
+      await ports.legacy({ query, stream, context, scope, instanceIds, sort }),
+    ),
   };
+}
+
+let fallbackSeal: CursorSeal | undefined;
+/** A process-lifetime seal for a host that wires none (tests, harnesses). */
+function defaultCursorSeal(): CursorSeal {
+  return (fallbackSeal ??= createCursorSeal());
 }
 
 /** Read the mode once per request. A switched read never uses legacy rows. */
@@ -535,12 +698,18 @@ function readDeclaration(
   stream: string,
   source: string | undefined,
 ): {
-  declaration: StreamDeclaration | undefined;
+  declaration:
+    | StreamDeclaration
+    | undefined
+    | (() => StreamDeclaration | undefined);
   ownerInstanceIds: string[];
 } {
   if (context.tokenKind !== "owner") {
+    // Looked up only after the grant checks (spec-core §4 "Effective
+    // projection"; RS item 32).
     return {
-      declaration: ports.declarations.get(stream, context.grant?.source.id),
+      declaration: () =>
+        ports.declarations.get(stream, context.grant?.source.id),
       ownerInstanceIds: [],
     };
   }

@@ -85,7 +85,9 @@ for (const backend of ["memory", "sqlite"])
           };
           put(store, "inst_a", "r1");
           put(store, "inst_a", "gone");
-          const identity = candidate ? { instance_id: "inst_a" } : {};
+          // spec-core §4 "Response records": every record and tombstone
+          // carries instance_id, for every grant (RS item 23).
+          const identity = { instance_id: "inst_a" };
 
           const listed = await get("/streams/events/records?order=asc");
           expect(listed.data).toEqual(
@@ -93,18 +95,14 @@ for (const backend of ["memory", "sqlite"])
               expect.objectContaining({ id, ...identity }),
             ),
           );
-          if (!candidate)
-            for (const row of listed.data)
-              expect(row).not.toHaveProperty("instance_id");
 
           const detail = await get("/streams/events/records/r1");
           expect(detail).toEqual(
             expect.objectContaining({ id: "r1", ...identity }),
           );
-          if (!candidate) expect(detail).not.toHaveProperty("instance_id");
 
           const first = await get(
-            `/streams/events/records?changes_since=${candidate ? "beginning" : ""}`,
+            "/streams/events/records?changes_since=beginning",
           );
           expect(first.data).toEqual(
             ["gone", "r1"].map((id) =>
@@ -124,8 +122,6 @@ for (const backend of ["memory", "sqlite"])
           expect(next.data).toEqual([
             expect.objectContaining({ id: "gone", deleted: true, ...identity }),
           ]);
-          if (!candidate)
-            expect(next.data[0]).not.toHaveProperty("instance_id");
         } finally {
           store.close();
         }

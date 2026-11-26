@@ -30,18 +30,30 @@ export interface ResolvedReadScope {
 export function resolveReadScope(
   context: PdppTokenContext,
   stream: string,
-  declaration: StreamDeclaration | undefined,
+  /**
+   * The current declaration, or a lookup for it. A client read resolves the
+   * lookup only after its grant checks pass, so a `fields` request outside
+   * the grant is refused before any source-schema lookup (spec-core §4
+   * "Effective projection"; §9 RS item 32).
+   */
+  declarationOrLookup:
+    | StreamDeclaration
+    | undefined
+    | (() => StreamDeclaration | undefined),
   requestedFields?: string[],
 ): ResolvedReadScope {
   if (!context.active) {
     throw mapInactiveToError(context);
   }
-
-  if (!declaration) {
-    throw new PdppError("not_found", `Stream '${stream}' not found`);
-  }
+  const lookup = () =>
+    typeof declarationOrLookup === "function"
+      ? declarationOrLookup()
+      : declarationOrLookup;
 
   if (context.tokenKind === "owner") {
+    if (!lookup()) {
+      throw new PdppError("not_found", `Stream '${stream}' not found`);
+    }
     // Owner tokens carry no grant: full current-capability read, but still
     // scoped to the owner's own subject — enforced by the caller passing
     // only that subject's instance_ids into the store query, which for the
@@ -92,6 +104,28 @@ export function resolveReadScope(
       "grant_invalid",
       "Candidate time constraint has no valid frozen type",
     );
+  }
+
+  // spec-core §4 "Effective projection": "If Q is not a subset of G, the RS
+  // MUST reject the whole read with HTTP 403 `field_not_granted` before any
+  // source-schema or record-data lookup." The grant and stream are resolved
+  // above; the declaration is looked up only after this check (RS 31, 32).
+  if (requestedFields && requestedFields.length > 0) {
+    const ungranted = [
+      ...new Set(requestedFields.filter((f) => !streamGrant.fields.includes(f))),
+    ];
+    if (ungranted.length > 0) {
+      throw new PdppError(
+        "field_not_granted",
+        `Fields not granted for stream '${stream}': ${ungranted.join(", ")}`,
+        { param: "fields" },
+      );
+    }
+  }
+
+  const declaration = lookup();
+  if (!declaration) {
+    throw new PdppError("not_found", `Stream '${stream}' not found`);
   }
 
   // Issuance resolves required fields into grant.fields. A later declaration
@@ -163,15 +197,8 @@ function resolveReadFields(
 ): string[] {
   const allowed = [...granted];
   if (!requested || requested.length === 0) return allowed;
-  for (const field of requested) {
-    if (!allowed.includes(field)) {
-      throw new PdppError(
-        "invalid_request",
-        `Field '${field}' is not in this grant's authorized fields for the stream`,
-        { param: "fields" },
-      );
-    }
-  }
+  // `resolveReadScope` refused every requested name outside the grant before
+  // the declaration lookup (field_not_granted); none reaches here.
   const floor = requiredFloor.filter((field) => granted.includes(field));
   return [...new Set([...requested, ...floor])];
 }
