@@ -1800,4 +1800,37 @@ describe("baseline checkpoint receipt", () => {
       db.close();
     }
   });
+  it("keeps the final checkpoint when a delayed earlier receipt is replayed", () => {
+    const { db, exporter } = journal(0);
+    try {
+      exporter.acknowledgeBaselinePage(0, 2);
+      exporter.acknowledgeBaselinePage(2, 4);
+      expect(() => exporter.acknowledgeBaselinePage(0, 2)).toThrow(
+        "baseline checkpoint conflict",
+      );
+      expect(exporter.getBaselineCheckpoint()).toBe(4);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("validates receipt cursors even when the target is already acknowledged", () => {
+    const { db, exporter } = journal(2);
+    try {
+      for (const [expected, next] of [
+        [-1, 2],
+        [1.5, 2],
+        [3, 2],
+        [2, NaN],
+      ] as const) {
+        expect(() => exporter.acknowledgeBaselinePage(expected, next)).toThrow(
+          "invalid baseline checkpoint",
+        );
+        expect(exporter.getBaselineCheckpoint()).toBe(2);
+      }
+      expect(() => exporter.acknowledgeBaselinePage(1, 2)).not.toThrow();
+    } finally {
+      db.close();
+    }
+  });
 });
