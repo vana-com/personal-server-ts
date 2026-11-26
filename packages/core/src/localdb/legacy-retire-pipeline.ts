@@ -3,7 +3,10 @@ import { GatewayRefusalError } from "../sync/delete-data-port.js";
 import { isGatewayRefusalCode } from "../sync/gateway-refusal.js";
 import type { IndexEntry } from "../storage/index/index.js";
 import type { LegacyHead } from "./legacy-delete.js";
-import type { LegacyRetirerDeps } from "./legacy-retire-intent.js";
+import {
+  isLegacyRetireAcknowledgement,
+  type LegacyRetirerDeps,
+} from "./legacy-retire-intent.js";
 import {
   blocked,
   PART_DONE,
@@ -195,10 +198,7 @@ export function createLegacyRetirePipeline(
       const manifest = JSON.parse(stored.manifest) as Manifest;
       if (
         manifest.scopes.some(
-          (scope) =>
-            !["not-sent", "unconfirmed", "accepted"].includes(
-              scope.acknowledgement,
-            ),
+          (scope) => !isLegacyRetireAcknowledgement(scope.acknowledgement),
         )
       )
         return blocked("legacy_tombstone_unacknowledged");

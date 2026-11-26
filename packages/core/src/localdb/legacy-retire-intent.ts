@@ -12,6 +12,15 @@ import {
 } from "./delete-status.js";
 import type { LocalSyncDeps } from "./deps.js";
 
+/** Stored acknowledgement values that permit a retirement pass to continue. */
+export function isLegacyRetireAcknowledgement(
+  value: unknown,
+): value is "not-sent" | "unconfirmed" | "accepted" {
+  return (
+    value === "not-sent" || value === "unconfirmed" || value === "accepted"
+  );
+}
+
 /** What a request answers: the intent, and what is left of it. */
 export interface LegacyRetireStatus {
   readonly retireId: string;
@@ -258,9 +267,13 @@ export function createLegacyRetirer(
       if (intent.state === "done")
         return { retireId: intent.retireId, legacy: PART_DONE };
       const stored = JSON.parse(manifest[0].manifest) as {
-        scopes: readonly { acknowledgement: string }[];
+        scopes: readonly { acknowledgement?: unknown }[];
       };
-      if (stored.scopes.some((scope) => scope.acknowledgement === "blocked"))
+      if (
+        stored.scopes.some(
+          (scope) => !isLegacyRetireAcknowledgement(scope.acknowledgement),
+        )
+      )
         return {
           retireId: intent.retireId,
           legacy: blocked("legacy_tombstone_unacknowledged"),
