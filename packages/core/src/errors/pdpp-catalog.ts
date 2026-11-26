@@ -40,6 +40,7 @@ export type PdppErrorCode =
   | "not_found"
   | "conflict"
   | "update_required"
+  | "append_only_delete_unsupported"
   | "cursor_expired"
   | "rate_limit_exceeded"
   | "api_error";
@@ -74,6 +75,9 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   // Not in the §8 table: a record delete on a stream-sync account, whose
   // local database has no per-record owner delete (see the records route).
   update_required: 426,
+  // Not in the §8 table: replication cannot carry an append-only delete yet
+  // (merge-plan.ts `append_only_delete`), so a replicating store refuses it.
+  append_only_delete_unsupported: 409,
   cursor_expired: 410,
   rate_limit_exceeded: 429,
   api_error: 500,
@@ -103,6 +107,7 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   not_found: "not_found_error",
   conflict: "invalid_request_error",
   update_required: "invalid_request_error",
+  append_only_delete_unsupported: "invalid_request_error",
   cursor_expired: "gone_error",
   rate_limit_exceeded: "rate_limit_error",
   api_error: "api_error",

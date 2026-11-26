@@ -24,6 +24,7 @@ import {
   type ListSort,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { Database } from "better-sqlite3";
+import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
 import {
@@ -110,6 +111,14 @@ export class PdppBindingError extends Error {
   constructor(public readonly reason: string) {
     super(reason);
   }
+}
+
+/** The refusal of an append-only delete while replication is enabled. */
+function appendOnlyDeleteUnsupported(): PdppError {
+  return new PdppError(
+    "append_only_delete_unsupported",
+    "This server replicates its records, and replication cannot carry an append-only delete",
+  );
 }
 
 function blobIdForBytes(bytes: Uint8Array): string {
@@ -948,6 +957,17 @@ export function createSqliteRecordStore(
       if (envelopes.length > 0) {
         checkBinding(binding.method, generation, envelopes);
       }
+      // Replication cannot carry an append-only delete (merge-plan.ts and
+      // pdpp-replication-sqlite.ts refuse it), so while it is on, the whole
+      // batch is refused before any write instead of diverging the peers.
+      if (replica)
+        for (const envelope of envelopes)
+          if (
+            envelope.op === "delete" &&
+            streamSemantics(envelope.stream, envelope.instance) ===
+              "append_only"
+          )
+            throw appendOnlyDeleteUnsupported();
       envelopes.forEach((envelope, index) => {
         const semantics = streamSemantics(envelope.stream, envelope.instance);
         const primaryKey = primaryKeyFields(envelope.stream, envelope.instance);
@@ -1941,6 +1961,9 @@ export function createSqliteRecordStore(
     // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
     // permitted" (§8 "Delete a record"; RS item 1). Only re-emitted
     // duplicates are no-ops, at ingest.
+    // While replication is on it cannot carry the delete: refuse it.
+    if (replica && streamSemantics === "append_only")
+      throw appendOnlyDeleteUnsupported();
     let result = false;
     const run = () =>
       connectionMutation(instance, () => {

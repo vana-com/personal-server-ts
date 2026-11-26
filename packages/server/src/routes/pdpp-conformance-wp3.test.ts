@@ -17,6 +17,7 @@ import { createFixtureAuthorizationService } from "@opendatalabs/personal-server
 import type { PdppTokenContext } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { PdppBindingError } from "../storage/pdpp-records-sqlite-store.js";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
+import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 import { pdppRecordsRoutes } from "./pdpp-records.js";
 
 const A = "inst_a";
@@ -855,5 +856,112 @@ describe.each<Backend>(["memory", "sqlite"])("RS 1: owner DELETE on an append_on
         emitted_at: expect.any(String),
       }),
     ]);
+  });
+});
+
+describe("RS 1/6: append_only delete while replication is enabled", () => {
+  // §4 permits the delete; replication cannot carry it yet (merge-plan.ts
+  // `append_only_delete`), so a replicating server refuses it with the
+  // unified §8 body. The default configuration (replication off) deletes.
+  it("answers 409 append_only_delete_unsupported and keeps the record", async () => {
+    const db = new Database(":memory:");
+    const store = createReplicaRecordStore(db);
+    store.registerConnection({ instance: A, sourceId: "src", method: "m", label: "A" });
+    store.ingestBatch(
+      [{ instance: A, stream: "log", key: "e1", data: { id: "e1" }, emitted_at: "2026-05-01T00:00:00.000Z" }],
+      () => "append_only",
+      () => ["id"],
+      { method: "m", generation: 1 },
+    );
+    const app = new Hono();
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        accountStorageMode: explicitLegacyStorageMode("unswitched"),
+        store,
+        auth: createFixtureAuthorizationService({
+          owner: { active: true, tokenKind: "owner", subjectId: "owner", instanceIds: [A] },
+        }),
+        declarations: createStreamDeclarationRegistry([
+          { name: "log", semantics: "append_only", primaryKey: ["id"], requiredFields: ["id"] },
+        ]),
+        instancesForSubject: () => [A],
+      }),
+    );
+    const res = await app.request("/v1/streams/log/records/e1", {
+      method: "DELETE",
+      headers: { Authorization: "Bearer owner" },
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: {
+        type: "invalid_request_error",
+        code: "append_only_delete_unsupported",
+        message: expect.any(String),
+        request_id: expect.stringMatching(/^req_/),
+      },
+    });
+    expect(store.getRecord(A, "log", "e1")).toBeDefined();
+    store.close();
+  });
+});
+
+describe.each<Backend>(["memory", "sqlite"])("RS 7/20: append_only delete, then the connector re-emits the key (%s store)", (backend) => {
+  it("serves the re-emitted record as a new record to owner and client sync", async () => {
+    const store =
+      backend === "memory"
+        ? createMemoryRecordStore()
+        : createTestBoundRecordStore(new Database(":memory:"));
+    const emit = (name: string, at: string) =>
+      store.ingestBatch(
+        [{ instance: A, stream: "log", key: "e1", data: { id: "e1", name }, emitted_at: at }],
+        () => "append_only",
+        () => ["id"],
+      );
+    emit("first", "2026-05-01T00:00:00.000Z");
+    const app = new Hono();
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        accountStorageMode: explicitLegacyStorageMode("unswitched"),
+        store,
+        auth: createFixtureAuthorizationService({
+          owner: { active: true, tokenKind: "owner", subjectId: "owner", instanceIds: [A] },
+          client: {
+            active: true,
+            tokenKind: "client",
+            subjectId: "sub",
+            clientId: "c1",
+            grant: grant([{ name: "log", instance_ids: [A], fields: ["id", "name"], required_fields: ["id"] }]),
+          },
+        }),
+        declarations: createStreamDeclarationRegistry([
+          { name: "log", semantics: "append_only", primaryKey: ["id"], requiredFields: ["id"] },
+        ]),
+        instancesForSubject: () => [A],
+      }),
+    );
+    const call = (path: string, token = "owner", method = "GET") =>
+      app.request(`/v1${path}`, { method, headers: { Authorization: `Bearer ${token}` } });
+    const starts = {
+      owner: (await (await call("/streams/log/records?changes_since=beginning")).json()).next_changes_since,
+      client: (await (await call("/streams/log/records?changes_since=beginning", "client")).json()).next_changes_since,
+    };
+    expect((await call("/streams/log/records/e1", "owner", "DELETE")).status).toBe(204);
+    // The re-emitted key is not a duplicate any more: it is a new insert.
+    expect(emit("second", "2026-05-03T00:00:00.000Z").results[0]?.outcome).toBe("accepted");
+    const one = await (await call("/streams/log/records/e1")).json();
+    expect(one.data).toEqual({ id: "e1", name: "second" });
+    expect(one.emitted_at).toBe("2026-05-03T00:00:00.000Z");
+    // Visible at both horizons with a new projection: the record, no tombstone.
+    for (const token of ["owner", "client"] as const) {
+      const next = await (
+        await call(`/streams/log/records?changes_since=${encodeURIComponent(starts[token])}`, token)
+      ).json();
+      expect(next.data).toEqual([
+        expect.objectContaining({ id: "e1", instance_id: A, data: { id: "e1", name: "second" } }),
+      ]);
+      expect(next.data[0].deleted).toBeUndefined();
+    }
   });
 });

@@ -218,8 +218,41 @@ describe("own-write log (replication enabled)", () => {
     },
   );
 
-  // An append_only delete is no longer forbidden: spec-core §4, `append_only`:
-  // "Explicit deletion is permitted" (§8 "Delete a record"; RS item 1).
+  // §4 permits an append_only delete, but replication cannot carry one
+  // (merge-plan.ts `append_only_delete`, pdpp-replication-sqlite.ts), so a
+  // replicating store refuses it, owner delete and `op: delete` alike, and
+  // writes nothing to the own-write log.
+  it("refuses an append_only delete while replication is enabled", () => {
+    store.ingestBatch([envelope()], semantics, primaryKey, binding);
+    const before = ownWrites(db).length;
+    expect(() =>
+      store.deleteRecord(
+        "account-a",
+        "messages",
+        "same-key",
+        "2026-10-20T12:00:00.000Z",
+        "append_only",
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        code: "append_only_delete_unsupported",
+        status: 409,
+      }),
+    );
+    expect(() =>
+      store.ingestBatch(
+        [{ ...envelope(), data: null, op: "delete" }],
+        () => "append_only" as const,
+        primaryKey,
+        binding,
+      ),
+    ).toThrow(
+      expect.objectContaining({ code: "append_only_delete_unsupported" }),
+    );
+    expect(ownWrites(db)).toHaveLength(before);
+    expect(store.getRecord("account-a", "messages", "same-key")).toBeDefined();
+  });
+
   it("captures owner deletion as a data-free tombstone and suppresses repeated or missing deletes", () => {
     store.ingestBatch([envelope()], semantics, primaryKey, binding);
     const deletedAt = "2026-10-20T12:00:00.000Z";
