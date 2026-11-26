@@ -435,3 +435,18 @@ describe("stored lineage presentation", () => {
     ]);
   });
 });
+
+describe("stored lineage representation boundaries", () => {
+  it("distinguishes a root record from a present non-object lineage field", async () => {
+    const { readStoredLineage, StoredLineageMalformedError } = await import("./lineage.js");
+    expect(readStoredLineage({ name: "fixture" })).toBeNull();
+    expect(() => readStoredLineage({ $lineage: null })).toThrow(StoredLineageMalformedError);
+  });
+
+  it("rejects a stored timestamp with the wrong type without dropping the statement", async () => {
+    const { readStoredLineage } = await import("./lineage.js");
+    expect(() => readStoredLineage({
+      $lineage: { sources: [`0x${"ab".repeat(32)}`], writtenAt: 123 },
+    })).toThrow("writtenAt is not a string");
+  });
+});
