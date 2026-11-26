@@ -1625,9 +1625,13 @@ export function createSyncManager(
       // Clear existing timers, run immediately, restart interval
       clearIntervalTimer();
       clearNotifyTimer();
-      await runCycle();
-      if (isRunning && !paused) {
-        startInterval();
+      try {
+        await runCycle();
+      } finally {
+        // A rejected cycle must not leave the manager without its poll timer.
+        if (isRunning && !paused) {
+          startInterval();
+        }
       }
     },
 

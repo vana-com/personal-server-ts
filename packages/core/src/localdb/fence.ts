@@ -76,18 +76,15 @@ export async function checkRunFence(
   const connections = await deps.db.query<{
     control_state: string;
     generation: number;
+    intent_pending: number;
   }>(
-    "SELECT control_state, generation FROM connections WHERE connection_id = ?",
+    `SELECT c.control_state, c.generation,
+            EXISTS(SELECT 1 FROM delete_intents d WHERE d.connector=c.connector) AS intent_pending
+       FROM connections c WHERE c.connection_id=?`,
     [run.connection_id],
   );
   const connection = connections[0];
-  // A delete intent fences every run of its connector, as the in-transaction
-  // triggers do for batches, even while the control row is still active.
-  const intents = await deps.db.query(
-    "SELECT 1 FROM delete_intents d JOIN connections c ON c.connector = d.connector WHERE c.connection_id = ?",
-    [run.connection_id],
-  );
-  const intentPending = intents.length > 0;
+  const intentPending = connection?.intent_pending === 1;
   const states = await deps.db.query<{
     stream: string;
     last_delete_version: number;

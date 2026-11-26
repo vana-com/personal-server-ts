@@ -21,6 +21,14 @@ export function createFileModeRecordStore(
   dir: string,
   options: { onCorrupt?: (file: string) => void } = {},
 ): ModeRecordStore {
+  const reportCorrupt = (file: string) => {
+    try {
+      options.onCorrupt?.(file);
+    } catch {
+      // A diagnostic failure must not prevent loading other owners' records.
+    }
+  };
+
   return {
     async load() {
       const records = new Map<string, AccountModeRecord>();
@@ -39,9 +47,9 @@ export function createFileModeRecordStore(
             JSON.parse(await readFile(join(dir, name), "utf8")),
           );
           if (record) records.set(match[1], record);
-          else options.onCorrupt?.(name);
+          else reportCorrupt(name);
         } catch {
-          options.onCorrupt?.(name);
+          reportCorrupt(name);
         }
       }
       return records;
