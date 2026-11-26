@@ -42,7 +42,10 @@ import {
 afterEach(closeWorldDrivers);
 
 describe("canonical import source page bounds", () => {
-  async function candidate(page: CanonicalImportPageReader["page"]) {
+  async function candidate(
+    page: CanonicalImportPageReader["page"],
+    assertRevision: CanonicalImportPageReader["assertRevision"] = async () => {},
+  ) {
     type Options = Parameters<typeof createCanonicalImportSource>[0];
     const reader: CanonicalImportPageReader = {
       declarations: [
@@ -59,7 +62,7 @@ describe("canonical import source page bounds", () => {
           rows: 1,
         };
       },
-      assertRevision: async () => {},
+      assertRevision,
       connections: async () => [
         { instance: "fixture-instance", deleted: false, lastActive: 1 },
       ],
@@ -124,6 +127,34 @@ describe("canonical import source page bounds", () => {
     const step = await item.records()[Symbol.asyncIterator]().next();
     expect(step.done).toBe(true);
     expect(page).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not yield a page if the snapshot revision changed while it was read", async () => {
+    let changed = false;
+    const page = vi.fn(async () => {
+      changed = true;
+      return { rows: [{ id: 1 }], next: null };
+    });
+    const check = vi.fn(async () => {
+      if (changed) throw new Error("fixture revision changed");
+    });
+    const item = await candidate(page, check);
+    await expect(item.records()[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "fixture revision changed",
+    );
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenLastCalledWith("fixture-revision");
+  });
+
+  it("rejects a nonempty page that repeats its input cursor before yielding that page", async () => {
+    const page = vi.fn<CanonicalImportPageReader["page"]>();
+    page.mockResolvedValueOnce({ rows: [{ id: 1 }], next: "again" });
+    page.mockResolvedValueOnce({ rows: [{ id: 2 }], next: "again" });
+    const item = await candidate(page);
+    const records = item.records()[Symbol.asyncIterator]();
+    expect(await records.next()).toEqual({ value: { id: 1 }, done: false });
+    await expect(records.next()).rejects.toThrow("invalid_page_cursor");
+    expect(page.mock.calls.map((call) => call[2])).toEqual([null, "again"]);
   });
 
   it("refuses a cursor on an empty page instead of looping to a second page", async () => {
