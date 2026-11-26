@@ -3,7 +3,11 @@
  * (spec-core §4 "Binary data (blob_ref)" and "Cross-stream references").
  */
 
-/** A §4 `resource_ref`: `{ source_id, stream, record_id }`. */
+/**
+ * A §4 `resource_ref` shape: an object with a string `source_id`, a string
+ * `stream` and a `record_id` member. The `record_id` type is not checked: an
+ * invalid one is redacted the same way rather than passed through.
+ */
 export function isResourceRef(value: unknown): value is {
   source_id: string;
   stream: string;
@@ -15,9 +19,7 @@ export function isResourceRef(value: unknown): value is {
   return (
     typeof ref.source_id === "string" &&
     typeof ref.stream === "string" &&
-    (typeof ref.record_id === "string" ||
-      (Array.isArray(ref.record_id) &&
-        ref.record_id.every((part) => typeof part === "string")))
+    Object.hasOwn(ref, "record_id")
   );
 }
 
@@ -34,32 +36,47 @@ export function isBlobRef(
 }
 
 /**
- * Serve every `resource_ref` in its redacted form.
+ * Serve every `resource_ref` in its redacted form, at any depth.
  *
  * spec-core §4: the RS serves the resolved form "only when the target is in
  * the referencing record's source and is authorized under the requesting
  * token"; "Otherwise it serves the redacted form, which has exactly
- * `source_id`, `stream`, and `redacted: true`", and "never drops the field
- * that holds it" (§9 RS item 23). This RS does not resolve targets, so every
- * top-level reference is redacted for client and owner tokens alike. The
+ * `source_id`, `stream`, and `redacted: true`", "wherever a `resource_ref`
+ * can appear", and "never drops the field that holds it" (§9 RS item 23).
+ * This RS does not resolve targets, so every reference, in a field, in an
+ * array or in a nested object, is redacted for client and owner tokens. The
  * redacted form does not depend on the target, so it never changes between
- * horizons and needs no sync re-return. Nested references are not detected:
- * Core places a reference in a top-level field of `data`.
+ * horizons and needs no sync re-return.
  */
 export function redactResourceRefs(
   data: Record<string, unknown>,
 ): Record<string, unknown> {
-  let out: Record<string, unknown> | undefined;
-  for (const [field, value] of Object.entries(data)) {
-    if (!isResourceRef(value)) continue;
-    out ??= { ...data };
-    out[field] = {
+  return redactValue(data) as Record<string, unknown>;
+}
+
+function redactValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    let out: unknown[] | undefined;
+    value.forEach((item, index) => {
+      const next = redactValue(item);
+      if (next !== item) (out ??= [...value])[index] = next;
+    });
+    return out ?? value;
+  }
+  if (typeof value !== "object" || value === null) return value;
+  if (isResourceRef(value)) {
+    return {
       source_id: value.source_id,
       stream: value.stream,
       redacted: true,
     };
   }
-  return out ?? data;
+  let out: Record<string, unknown> | undefined;
+  for (const [key, member] of Object.entries(value)) {
+    const next = redactValue(member);
+    if (next !== member) (out ??= { ...(value as Record<string, unknown>) })[key] = next;
+  }
+  return out ?? value;
 }
 
 /**

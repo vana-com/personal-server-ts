@@ -485,6 +485,8 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
     // The owner reads whole records, so an overwrite needs no h0 body: the
     // record is returned when it was written between the horizons.
     const removals = options.removals === true;
+    // An owner session's effective `fields`/`view` projection, if any.
+    const projected = options.fields !== undefined;
     const targets: { instance: string; id: string; generation: number }[] = [];
     for (const instance of instances) {
       const resolved = link(instance, stream);
@@ -582,7 +584,11 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           controlScope(resolved.connector, resolved.namespace) !== target.id
         )
           throw new CursorExpiredError();
-        if (currentClock.floor > 0) {
+        // A whole-record owner session decides h0 visibility from the
+        // retained log below (tombstones) and returns every record written
+        // between the horizons, so compaction before `since` leaves it
+        // exact; every other session needs the earlier changes themselves.
+        if (currentClock.floor > 0 && !(removals && !projected)) {
           // Compaction removed the proof that a changed key was absent at the
           // earlier horizon. Current bodies cannot establish that old visibility.
           const uncertain = await db.query<{ seq: number }>(
@@ -609,8 +615,20 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
         const missing = await db.query<{ seq: number }>(
           `SELECT later.seq FROM record_changes later WHERE later.connection_id=? AND later.stream=?
           AND ((later.seq>? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))
-          ${since === null || removals ? "" : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"}) LIMIT 1`,
-          since === null || removals
+          ${
+            since === null || (removals && !projected)
+              ? ""
+              : removals
+                ? // Owner session with a `fields`/`view` projection: a record
+                  // visible at h0 and written between the horizons needs its
+                  // h0 body to tell whether the projection changed, and the
+                  // local DB keeps none. Fail the session (410) instead of
+                  // returning it (spec-core §9 RS items 7, 20). A removal
+                  // needs no body: it stays a tombstone.
+                  "OR (later.op='upsert' AND later.seq>? AND later.seq<=? AND (SELECT prior.op FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=? ORDER BY prior.seq DESC LIMIT 1)='upsert')"
+                : "OR (later.seq>? AND later.seq<=? AND EXISTS (SELECT 1 FROM record_changes prior WHERE prior.connection_id=later.connection_id AND prior.stream=later.stream AND prior.pk_hash=later.pk_hash AND prior.seq<=?))"
+          }) LIMIT 1`,
+          since === null || (removals && !projected)
             ? [target.id, stream, horizon, horizon]
             : [target.id, stream, horizon, horizon, since, horizon, since],
         );
@@ -700,22 +718,43 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
         record_key: string;
         pk_hash: string;
         stamp_o: number;
+        seq: number;
       }>(
         `WITH targets(instance,connection_id) AS (VALUES ${targets.map(() => "(?,?)").join(",")})
-         SELECT t.instance,c.connection_id,c.record_key,c.pk_hash,c.stamp_o FROM record_changes c JOIN targets t ON t.connection_id=c.connection_id
+         SELECT t.instance,c.connection_id,c.record_key,c.pk_hash,c.stamp_o,c.seq FROM record_changes c JOIN targets t ON t.connection_id=c.connection_id
          WHERE c.stream=? AND c.op='remove' AND c.seq>? AND c.seq<=?
-           AND c.seq=(SELECT MAX(c2.seq) FROM record_changes c2 WHERE c2.connection_id=c.connection_id AND c2.stream=c.stream AND c2.pk_hash=c.pk_hash AND c2.seq<=?)
-           AND (SELECT c3.op FROM record_changes c3 WHERE c3.connection_id=c.connection_id AND c3.stream=c.stream AND c3.pk_hash=c.pk_hash AND c3.seq<=? ORDER BY c3.seq DESC LIMIT 1)='upsert'`,
+           AND c.seq=(SELECT MAX(c2.seq) FROM record_changes c2 WHERE c2.connection_id=c.connection_id AND c2.stream=c.stream AND c2.pk_hash=c.pk_hash AND c2.seq<=?)`,
         [
           ...targets.flatMap((t) => [t.instance, t.id]),
           stream,
           since,
           horizon,
           horizon,
-          since,
         ],
       );
+      const floor = (await clock()).floor;
+      const visibleAtSince = async (row: (typeof removed)[number]) => {
+        const keyed = [row.connection_id, stream, row.pk_hash];
+        const [prior] = await db.query<{ op: string }>(
+          "SELECT op FROM record_changes WHERE connection_id=? AND stream=? AND pk_hash=? AND seq<=? ORDER BY seq DESC LIMIT 1",
+          [...keyed, since],
+        );
+        if (prior) return prior.op === "upsert";
+        // No retained change at or before h0. Without compaction the key was
+        // absent then. After compaction (floor <= since, checked above) a key
+        // whose first change after h0 is this removal existed at h0; one
+        // written in between is ambiguous (created after h0, or updated), so
+        // the session cannot be answered exactly (spec-core §4: 410).
+        if (floor === 0) return false;
+        const between = await db.query<{ seq: number }>(
+          "SELECT seq FROM record_changes WHERE connection_id=? AND stream=? AND pk_hash=? AND seq>? AND seq<? LIMIT 1",
+          [...keyed, since, row.seq],
+        );
+        if (between.length) throw new CursorExpiredError();
+        return true;
+      };
       for (const row of removed) {
+        if (!(await visibleAtSince(row))) continue;
         positions.push({
           sortKey: null,
           instance: row.instance,

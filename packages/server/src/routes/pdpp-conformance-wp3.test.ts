@@ -627,6 +627,65 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
     ]);
   });
 
+  it("RS 23: references inside arrays and nested objects, and with an invalid record_id, are redacted too", async () => {
+    const { ingest, get } = setup(backend);
+    const ref = (id: unknown) => ({ source_id: "src", stream: "other", record_id: id });
+    const redacted = { source_id: "src", stream: "other", redacted: true };
+    ingest([
+      {
+        instance: A,
+        id: "deep",
+        name: "n",
+        target: {
+          list: [ref("x1"), { note: "keep", inner: ref(["a", "b"]) }],
+          nested: { inner: ref(42) },
+          plain: { source_id: "src", stream: "other" },
+        },
+      },
+    ]);
+    const start = await (
+      await get("/streams/s/records?changes_since=beginning", "refs")
+    ).json();
+    for (const token of ["refs", "owner"]) {
+      for (const path of [
+        "/streams/s/records",
+        `/streams/s/records/deep?instance_id=${A}`,
+        "/streams/s/records?changes_since=beginning",
+      ]) {
+        const body = await (await get(path, token)).json();
+        const record = body.data?.[0] ?? body;
+        expect(record.data.target).toEqual({
+          list: [redacted, { note: "keep", inner: redacted }],
+          nested: { inner: redacted },
+          // Not a reference (no record_id): served as stored.
+          plain: { source_id: "src", stream: "other" },
+        });
+        expect(JSON.stringify(body)).not.toContain("x1");
+      }
+    }
+    // A change to a nested hidden record_id leaves the served form unchanged,
+    // so the referrer is not returned again.
+    ingest([
+      {
+        instance: A,
+        id: "deep",
+        name: "n",
+        target: {
+          list: [ref("x2"), { note: "keep", inner: ref(["a", "c"]) }],
+          nested: { inner: ref(43) },
+          plain: { source_id: "src", stream: "other" },
+        },
+      },
+    ]);
+    const next = await (
+      await get(
+        `/streams/s/records?changes_since=${encodeURIComponent(start.next_changes_since)}`,
+        "refs",
+      )
+    ).json();
+    expect(next.data).toEqual([]);
+  });
+
   it("RS 18: a served blob_ref carries a fetch_url with its instance_id", async () => {
     const { ingest, get } = setup(backend);
     ingest([

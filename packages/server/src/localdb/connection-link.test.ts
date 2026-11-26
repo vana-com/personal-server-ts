@@ -760,3 +760,48 @@ it("owner change sessions follow the two-horizon rules on a switched account (RS
     "kept",
   ]);
 });
+
+it("an owner change session with a fields projection fails closed (410) when a record visible at h0 was written, and keeps tombstones (RS items 7, 20)", async () => {
+  const { db, id } = await fixture();
+  await run(
+    db,
+    "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run','{\"a\":1}','h1')",
+    [id, "selected", "kept", "kept"],
+  );
+  const read = createGrantHistory(db, () => ({
+    connector: "fixture",
+    namespace: "",
+  }));
+  const session = (changesSince?: string, fields?: string[]) =>
+    read("selected", {
+      instanceIds: ["handle-a"],
+      limit: 100,
+      changesSince,
+      removals: true,
+      ...(fields && { fields }),
+    });
+  const projectedStart = await session(undefined, ["a"]);
+  const wholeStart = await session();
+  // A removal alone: still a tombstone with a projection.
+  await run(db, "DELETE FROM records WHERE connection_id=? AND record_key='allowed'", [id]);
+  const removedOnly = await session(projectedStart.nextChangesSince, ["a"]);
+  expect(removedOnly.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+    ["allowed", true],
+  ]);
+  // A write to a record visible at h0: the h0 body is gone, so the
+  // projected session cannot compare and expires; a whole-record owner
+  // session returns the record.
+  await run(
+    db,
+    "UPDATE records SET body='{\"a\":1,\"b\":2}', body_sha256='h2', stamp_o=2 WHERE connection_id=? AND record_key='kept'",
+    [id],
+  );
+  await expect(
+    session(projectedStart.nextChangesSince, ["a"]),
+  ).rejects.toThrow(/expired/i);
+  const whole = await session(wholeStart.nextChangesSince);
+  expect(whole.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+    ["allowed", true],
+    ["kept", false],
+  ]);
+});

@@ -1,4 +1,5 @@
 import { grantUsesLockedRules } from "@opendatalabs/personal-server-ts-core/pdpp";
+import type { OwnerRecordDeleteResult } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   listPdppRecords,
   resolveOwnerSource,
@@ -311,6 +312,16 @@ export interface PdppRecordsRouteDeps {
    * random key and its tokens stop opening when the process ends.
    */
   cursorSealKey?: Uint8Array;
+  /**
+   * Owner record delete on a switched account, written as a run that
+   * reaches every device (core localdb/owner-delete.ts). Absent: a switched
+   * account refuses DELETE with `update_required`.
+   */
+  switchedDelete?: (input: {
+    instance: string;
+    stream: string;
+    recordKey: string;
+  }) => Promise<OwnerRecordDeleteResult>;
 }
 
 export interface PdppRouteLogger {
@@ -1450,23 +1461,52 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
       // A §8 endpoint answers the unified error body (RS item 6), not the
-      // legacy-write refusal body. A switched (stream-sync) account cannot
-      // delete one record here: its records come from connector runs and
-      // are published to the owner's other devices, and the local database
-      // offers no per-record owner delete outside a run (`deleteRunRecords`
-      // in core/src/localdb/merge.ts). Deleting only locally would be undone
-      // by the next sync, so the RS refuses instead of pretending.
-      switch (deps.accountStorageMode?.read() ?? "unknown") {
-        case "switched":
+      // legacy-write refusal body.
+      const mode = deps.accountStorageMode?.read() ?? "unknown";
+      if (mode === "unknown")
+        throw new PdppError(
+          "ACCOUNT_MODE_UNKNOWN",
+          "The account mode is not known yet",
+        );
+      if (mode === "switched") {
+        // A switched (stream-sync) account's records travel to the owner's
+        // other devices, so a delete is written as a run through the same
+        // intake and publication a connector's explicit delete uses
+        // (core localdb/owner-delete.ts). A host without that port refuses.
+        if (!deps.switchedDelete)
           throw new PdppError(
             "update_required",
-            "This account uses stream sync; delete the record at its source or with the connector",
+            "This server cannot write a delete run for a stream-sync account",
           );
-        case "unknown":
-          throw new PdppError(
-            "ACCOUNT_MODE_UNKNOWN",
-            "The account mode is not known yet",
-          );
+        const stream = c.req.param("stream");
+        const recordKey = c.req.param("id");
+        if (!deps.declarations.declares(stream)) {
+          throw new PdppError("not_found", "Stream not found");
+        }
+        const instances = selectRecordInstances(
+          ownerInstances(context!).filter((instance) =>
+            deps.declarations.forInstance(instance, stream),
+          ),
+          query.instanceId,
+        );
+        for (const instance of instances) {
+          const result = await deps.switchedDelete({
+            instance,
+            stream,
+            recordKey,
+          });
+          if (result.kind === "not_found") continue;
+          if (result.kind === "refused")
+            throw new PdppError(
+              result.retryable ? "STREAM_READ_UNAVAILABLE" : "conflict",
+              result.reason,
+            );
+          return c.body(null, 204, {
+            "Request-Id": reqId,
+            "PDPP-Version": PDPP_VERSION,
+          });
+        }
+        throw new PdppError("not_found", "Record not found");
       }
       const stream = c.req.param("stream");
       // Decoded once, by the router (spec-core §4; RS item 2).

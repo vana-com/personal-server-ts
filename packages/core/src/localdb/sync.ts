@@ -62,6 +62,10 @@ import { onConnectionPurged } from "./purge.js";
 import { ELIGIBLE_CHANGE, PENDING_RUN } from "./publication-work.js";
 import { createRunEndStore } from "./run-end.js";
 import { createRunIntakeStore } from "./run-intake.js";
+import {
+  createOwnerRecordDelete,
+  type OwnerRecordDeleteDeps,
+} from "./owner-delete.js";
 
 /**
  * The one facade a host holds for a switched owner's stream sync on the
@@ -82,6 +86,14 @@ export interface LocalSync {
   readonly query: RecordQuery;
   recordsFor(link: ConnectionLink): RecordQuery;
   changesFor(link: ConnectionLink): ReturnType<typeof createGrantHistory>;
+  /**
+   * The owner's §8 record delete on this switched account, written as a run
+   * so it reaches every device (owner-delete.ts).
+   */
+  ownerRecordDelete(
+    link: ConnectionLink,
+    artifactDigestFor: OwnerRecordDeleteDeps["artifactDigestFor"],
+  ): ReturnType<typeof createOwnerRecordDelete>;
   readonly history: LocalHistory;
   /** What connections here declare: the one source both hosts read it from. */
   readonly declarations: {
@@ -585,6 +597,18 @@ export function createLocalSync(
     query,
     recordsFor: (link) => createLinkedRecordQuery(readerOf(deps.db), link),
     changesFor: (link) => createGrantHistory(readerOf(deps.db), link),
+    ownerRecordDelete: (link, artifactDigestFor) =>
+      createOwnerRecordDelete(
+        {
+          db: readerOf(deps.db),
+          intake: runIntake,
+          ownerAddress: deps.ownerAddress,
+          newRunId: deps.newOp,
+          now: deps.now,
+          artifactDigestFor,
+        },
+        link,
+      ),
     history: createLocalHistory(deps, {
       aliasScopes: options.aliasScopes,
       aliasTargets: options.aliasTargets,
