@@ -837,3 +837,37 @@ it("a stream refused before its rows were counted is still reported when a later
     rows: 0,
   });
 });
+
+it("publishes a completed empty import with the injected finish time", async () => {
+  const { intake, puts } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: memoryStorage(new Map()),
+    intake: async () => intake,
+    manifests: () => [manifest],
+    now: () => 123,
+  });
+  expect(live.report()).toBeNull();
+  await live.run(new AbortController().signal);
+  expect(live.report()).toMatchObject({ finishedAt: 123, stopped: false, rows: { legacy: 0, staged: 0 } });
+  expect(puts).toEqual([]);
+});
+
+it("does not replace the last completed report when the next intake is unavailable", async () => {
+  const { intake } = recordingIntake();
+  const notReady = new Error("synthetic intake unavailable");
+  let available = true;
+  const live = createLiteLegacyStoreRunner({
+    storage: memoryStorage(new Map()),
+    intake: async () => {
+      if (!available) throw notReady;
+      return intake;
+    },
+    manifests: () => [manifest],
+  });
+  await live.run(new AbortController().signal);
+  const completed = live.report();
+  expect(completed).not.toBeNull();
+  available = false;
+  await expect(live.run(new AbortController().signal)).rejects.toBe(notReady);
+  expect(live.report()).toEqual(completed);
+});
