@@ -347,16 +347,22 @@ export function createGatewayStreamSyncRegistry(
       const envelope = (await bodyForRead(res)) as {
         data?: { dataPoints?: RegistryRow[] };
         pagination?: { hasMore?: boolean; nextCursor?: string | null };
-      };
-      for (const row of envelope.data?.dataPoints ?? []) {
-        if (typeof row.scope !== "string") continue;
+      } | null;
+      const rows = envelope?.data?.dataPoints;
+      if (!Array.isArray(rows)) {
+        throw new Error("registry listing has no data point array");
+      }
+      for (const row of rows) {
+        if (!row || typeof row.scope !== "string" || row.scope.trim() === "") {
+          throw new Error("registry listing has a row without a scope");
+        }
         out.push({ scope: row.scope, read: toControlRead(row) });
       }
       // A delete depends on the whole listing: a missing or inconsistent page
       // marker must fail, not end the listing early.
-      const page = envelope.pagination;
-      if (page === undefined || page === null) {
-        throw new Error("registry listing has no pagination marker");
+      const page = envelope?.pagination;
+      if (typeof page?.hasMore !== "boolean") {
+        throw new Error("registry listing has no valid pagination marker");
       }
       if (page.hasMore === false) {
         cursor = null;
