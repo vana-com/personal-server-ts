@@ -1043,6 +1043,69 @@ describe("a retirement's destructive steps run only under live write authority a
       expect(f.legacy.storage.countVersions(scope)).toBe(0);
   });
 
+  it("keeps a malformed acknowledgement blocked after revocation and restart with the pinned live head", async () => {
+    let ready = true;
+    let entered!: () => void;
+    const inFlight = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let deletes = 0;
+    const f = await reconnected({
+      dbFile: tempDbFile(),
+      writeReady: () => ready,
+      host: {
+        wrapFetch: (fetchImpl) => async (input, init) => {
+          if (
+            init?.method !== "DELETE" ||
+            !String(input).startsWith(FAKE_GATEWAY)
+          )
+            return fetchImpl(input, init);
+          deletes++;
+          entered();
+          await released;
+          // No gateway mutation: a malformed response leaves the pinned head live.
+          return new Response(
+            JSON.stringify({ data: { expectedVersion: "9" } }),
+            { status: 200 },
+          );
+        },
+      },
+    });
+    placeLocalEntries(f);
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    await inFlight;
+    ready = false;
+    release();
+    // Closing waits for the pending response to be consumed before restart.
+    await f.a.sync.legacyRetirer.close();
+    const [stored] = await f.a.db.query<{ manifest: string }>(
+      "SELECT manifest FROM legacy_retire_manifests WHERE retire_id = ?",
+      [retireId],
+    );
+    expect(JSON.parse(stored.manifest).scopes[0].acknowledgement).toBe(
+      "blocked",
+    );
+    expect(f.fake.isLive(SCOPES[0])).toBe(true);
+    ready = true;
+    const restarted = await f.a.restart();
+    await restarted.sync.cycle();
+    await vi.waitFor(async () =>
+      expect(await restarted.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: { state: "blocked", reason: "legacy_tombstone_unacknowledged" },
+      }),
+    );
+    await restarted.sync.legacyRetirer.close();
+    expect(deletes).toBe(1);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES)
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+  });
+
   it.each(["9", undefined])(
     "a malformed echo %s stays blocked across a restart, even though the gateway shows the tombstone",
     async (echo) => {
@@ -1207,50 +1270,69 @@ describe("a connector with no bound legacy scope", () => {
   });
 });
 
-it("GET reports a stored blocked acknowledgement while write readiness is false", async () => {
-  let ready = true;
-  const f = await reconnected({
-    dbFile: tempDbFile(),
-    writeReady: () => ready,
-    wrapLegacy: (ports) => ({
-      ...ports,
-      tombstone: async () => {
-        throw new LegacyTombstoneUnacknowledged();
-      },
-    }),
-  });
-  const { retireId } = await f.a.sync.legacyRetirer.request(GH);
-  const expected = {
-    retireId,
-    legacy: { state: "blocked", reason: "legacy_tombstone_unacknowledged" },
-  };
-  await vi.waitFor(async () =>
-    expect(await f.a.sync.legacyRetirer.status(GH)).toEqual(expected),
-  );
-  await f.a.sync.legacyRetirer.close();
-  ready = false;
-  const restarted = await f.a.restart();
-  const get = () =>
-    handleOwnerLegacyRetireStatus(
-      new Request("https://example.test/v1/owner/connectors/github/legacy"),
-      GH,
-      {
-        authorizeOwner: async () => {},
-        mode: { read: () => "switched" },
-        connectionDelete: {
-          requestConnectionDelete: vi.fn(),
-          requestLegacyRetire: (connector) =>
-            restarted.sync.legacyRetirer.request(connector),
-          legacyRetireStatus: (connector) =>
-            restarted.sync.legacyRetirer.status(connector),
+it.each(["blocked", undefined, "unexpected"])(
+  "GET reports a stored invalid acknowledgement %s while write readiness is false",
+  async (acknowledgement) => {
+    let ready = true;
+    const f = await reconnected({
+      dbFile: tempDbFile(),
+      writeReady: () => ready,
+      wrapLegacy: (ports) => ({
+        ...ports,
+        tombstone: async () => {
+          throw new LegacyTombstoneUnacknowledged();
         },
-      },
+      }),
+    });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    const expected = {
+      retireId,
+      legacy: { state: "blocked", reason: "legacy_tombstone_unacknowledged" },
+    };
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual(expected),
     );
-  const reply = await get();
-  expect(reply.status).toBe(200);
-  expect(await reply.json()).toEqual(expected);
-  // A paused pass must not hide the durable block on subsequent polls either.
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  expect(await (await get()).json()).toEqual(expected);
-  expect(storageDeletes(f.fake)).toEqual([]);
-});
+    await f.a.sync.legacyRetirer.close();
+    const [stored] = await f.a.db.query<{ manifest: string }>(
+      "SELECT manifest FROM legacy_retire_manifests WHERE retire_id = ?",
+      [retireId],
+    );
+    const manifest = JSON.parse(stored.manifest) as {
+      scopes: { acknowledgement?: string }[];
+    };
+    if (acknowledgement === undefined)
+      delete manifest.scopes[0].acknowledgement;
+    else manifest.scopes[0].acknowledgement = acknowledgement;
+    await f.a.db.batch([
+      {
+        sql: "UPDATE legacy_retire_manifests SET manifest = ? WHERE retire_id = ?",
+        params: [JSON.stringify(manifest), retireId],
+      },
+    ]);
+    ready = false;
+    const restarted = await f.a.restart();
+    const get = () =>
+      handleOwnerLegacyRetireStatus(
+        new Request("https://example.test/v1/owner/connectors/github/legacy"),
+        GH,
+        {
+          authorizeOwner: async () => {},
+          mode: { read: () => "switched" },
+          connectionDelete: {
+            requestConnectionDelete: vi.fn(),
+            requestLegacyRetire: (connector) =>
+              restarted.sync.legacyRetirer.request(connector),
+            legacyRetireStatus: (connector) =>
+              restarted.sync.legacyRetirer.status(connector),
+          },
+        },
+      );
+    const reply = await get();
+    expect(reply.status).toBe(200);
+    expect(await reply.json()).toEqual(expected);
+    // A paused pass must not hide the durable block on subsequent polls either.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(await (await get()).json()).toEqual(expected);
+    expect(storageDeletes(f.fake)).toEqual([]);
+  },
+);

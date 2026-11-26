@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { LegacyTombstoneUnacknowledged } from "./legacy-retire-pipeline.js";
 import { createLegacyRetireRemote } from "./legacy-retire-remote.js";
 import {
   createLegacyGatewayFake,
@@ -7,6 +8,7 @@ import {
   FAKE_STORAGE,
 } from "../test-utils/legacy-gateway-fake.js";
 import { legacyHeadFrom } from "./legacy-delete.js";
+import { GATEWAY_ALREADY_DELETED_CODES } from "../sync/gateway-refusal.js";
 const owner = `0x${"11".repeat(20)}` as const;
 async function fixture() {
   const fake = createLegacyGatewayFake({ owner, cutover: "v3" });
@@ -101,4 +103,75 @@ describe("retirement transport authority", () => {
     ).rejects.toThrow("revoked");
     expect(f.fake.requests).toEqual([]);
   });
+});
+
+it("reports not applied for the exact already-deleted 409 after sending DELETE", async () => {
+  const f = await fixture();
+  f.fake.state.race = "already-deleted";
+  await expect(
+    createLegacyRetireRemote(f.options).tombstone(
+      "github.events",
+      f.head,
+      f.check,
+    ),
+  ).resolves.toBe("not-applied");
+  expect(f.fake.requests.filter((r) => r.method === "DELETE")).toHaveLength(1);
+});
+
+it.each(GATEWAY_ALREADY_DELETED_CODES)(
+  "reports not applied for the 409 code %s the shared already-deleted list admits",
+  async (code) => {
+    const f = await fixture();
+    f.options.fetch = async () =>
+      new Response(JSON.stringify({ code }), { status: 409 });
+    await expect(
+      createLegacyRetireRemote(f.options).tombstone(
+        "github.events",
+        f.head,
+        f.check,
+      ),
+    ).resolves.toBe("not-applied");
+  },
+);
+
+it.each([
+  [400, "owner_stream_head_already_deleted"],
+  [409, "other_conflict"],
+  [409, "owner_stream_head_already_deleted_extra"],
+])("does not classify HTTP %s code %s as not applied", async (status, code) => {
+  const f = await fixture();
+  f.options.fetch = async () =>
+    new Response(JSON.stringify({ code }), { status });
+  await expect(
+    createLegacyRetireRemote(f.options).tombstone(
+      "github.events",
+      f.head,
+      f.check,
+    ),
+  ).rejects.toThrow();
+});
+
+it("propagates an aborted reply body without classifying it as malformed", async () => {
+  const f = await fixture();
+  const abort = new DOMException("reply body aborted", "AbortError");
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(abort);
+      },
+    }),
+    { status: 200 },
+  );
+  const text = vi.spyOn(response, "text");
+  f.options.fetch = async () => response;
+  const attempt = createLegacyRetireRemote(f.options).tombstone(
+    "github.events",
+    f.head,
+    f.check,
+  );
+  await expect(attempt).rejects.not.toBeInstanceOf(
+    LegacyTombstoneUnacknowledged,
+  );
+  await expect(attempt).rejects.toBe(abort);
+  expect(text).toHaveBeenCalledOnce();
 });
