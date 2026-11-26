@@ -213,6 +213,26 @@ describe("Lite canonical outbox", () => {
       "invalid outbox offset",
     );
   });
+  it("refuses a completion read from another owner and leaves the store untouched", async () => {
+    const { adapter, store } = await provisioned();
+    await expect(
+      store.readStreamCompletions(identity.connectionId),
+    ).resolves.toEqual([]);
+    const other = createLiteCanonicalStore({
+      persistence: adapter.port,
+      enabled: true,
+      context: () => ({ owner: "0xOtherOwner", declarations: [] }),
+      newId: () => "other-id",
+    });
+    const before = new Map(adapter.disk.rows);
+    await expect(
+      other.readStreamCompletions(identity.connectionId),
+    ).rejects.toThrow("immutable canonical owner binding");
+    expect(adapter.disk.rows).toEqual(before);
+    await expect(
+      store.readStreamCompletions(identity.connectionId),
+    ).resolves.toEqual([]);
+  });
   it("fails closed on a store written with another layout", async () => {
     for (const [layout, message] of [
       [undefined, "canonical layout 1 is no longer supported"],

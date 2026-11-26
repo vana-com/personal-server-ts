@@ -46,7 +46,8 @@ it("persists bounded JSON-compatible chunks and reopens them in the same owner/n
     skipped: [],
   }));
   let count = 0;
-  for await (const row of source.records("fixture", "items")) {
+  const [listed] = await source.streams("fixture");
+  for await (const row of source.records("fixture", "items", listed!.upload)) {
     expect(row.id).toBe(count++);
     expect(row.text).toHaveLength(4096);
   }

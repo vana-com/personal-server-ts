@@ -401,8 +401,16 @@ it("a host upload that stages while the legacy fold reads survives, and the stre
       receipts: {},
       skipped: [],
     }));
-    for await (const row of source.records("spotify", "saved_tracks"))
-      rows.push(row);
+    const listed = (await source.streams("spotify")).find(
+      (s) => s.stream === "saved_tracks",
+    );
+    if (listed)
+      for await (const row of source.records(
+        "spotify",
+        "saved_tracks",
+        listed.upload,
+      ))
+        rows.push(row);
     return rows;
   };
   // Pause the first stored read: the runner has passed its own pending check.

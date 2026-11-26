@@ -62,16 +62,16 @@ export function createSeedIntake(seed: LocalSeedCapability): SeedIntake {
       checkSeedNames(connector, "s");
       const status = await seed.writer.seedStatus(connector);
       const streams: Record<string, SeedStreamState> = {};
-      for (const [stream, staged] of Object.entries(
-        await seed.staging.staged(connector),
-      ))
+      const listed = await seed.staging.staged(connector);
+      for (const [stream, staged] of Object.entries(listed))
         streams[stream] = {
           state: "staged",
           records: staged.records,
           invalid: staged.invalid,
         };
       for (const [stream, state] of Object.entries(status.receipts)) {
-        if (streams[stream]) await seed.staging.drop(connector, stream);
+        if (streams[stream])
+          await seed.staging.drop(connector, stream, listed[stream]!.upload);
         streams[stream] = { state };
       }
       return { targetKnown: status.targetKnown, streams };
@@ -237,9 +237,22 @@ export function createLocalSeed(options: {
             incremental: declaration.incremental !== false,
           },
           exclusions: [],
-          records: () => source.records(connector, stream),
+          records: () => source.records(connector, stream, upload.upload),
         };
-        const result = await importLegacySource(locked, ledger, imported);
+        let result;
+        try {
+          result = await importLegacySource(locked, ledger, imported);
+        } catch (error) {
+          // A newer upload replaced the listed one before its rows were read.
+          // Nothing was merged: leave the stream without a receipt, and the
+          // next status reads the new upload.
+          if (
+            error instanceof SeedUploadError &&
+            error.errorCode === "SEED_SUPERSEDED"
+          )
+            continue;
+          throw error;
+        }
         if (result.kind === "refused") {
           if (result.reason === "connection_deleted")
             throw new ProtocolError(
@@ -280,8 +293,8 @@ export function createLocalSeed(options: {
             declarationFor(connector, stream, descriptor);
           });
         }),
-      drop: (connector, stream) =>
-        lock(connector, () => staging.drop(connector, stream)),
+      drop: (connector, stream, upload) =>
+        lock(connector, () => staging.drop(connector, stream, upload)),
     },
   };
 }
