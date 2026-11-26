@@ -2,6 +2,13 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AccessLogEntry } from "./access-log.js";
 
+const ACCESS_LOG_ACTIONS = {
+  read: true,
+  write: true,
+  delete: true,
+  lineage: true,
+} satisfies Record<AccessLogEntry["action"], true>;
+
 /**
  * Row-shape guard: a log line is valid JSON but not necessarily an
  * AccessLogEntry (e.g. the single line `null`). Trusting the parsed
@@ -18,13 +25,18 @@ function isAccessLogEntry(value: unknown): value is AccessLogEntry {
     "logId",
     "grantId",
     "builder",
-    "action",
     "scope",
     "timestamp",
   ] as const) {
     if (typeof row[field] !== "string") {
       return false;
     }
+  }
+  if (
+    typeof row.action !== "string" ||
+    !Object.hasOwn(ACCESS_LOG_ACTIONS, row.action)
+  ) {
+    return false;
   }
   // ipAddress and userAgent are optional: the writer omits them when the
   // request carried no metadata. Validate the type only when present.

@@ -216,6 +216,21 @@ describe("AccessLogReader", () => {
     expect(result.logs[0].logId).toBe("valid-1");
   });
 
+  it("skips rows whose access action is not in the catalog", async () => {
+    const valid = makeEntry({ logId: "valid", action: "lineage" });
+    const other = { ...valid, logId: "invalid", action: "erase" };
+    await writeFile(
+      join(tempDir, "access-2026-01-28.log"),
+      [valid, other].map((row) => JSON.stringify(row)).join("\n") + "\n",
+      "utf-8",
+    );
+
+    const result = await createAccessLogReader(tempDir).read();
+
+    expect(result.total).toBe(1);
+    expect(result.logs).toEqual([valid]);
+  });
+
   it("keeps writer-emitted entries that have no request metadata", async () => {
     const logsDir = join(tempDir, "logs");
     const {
