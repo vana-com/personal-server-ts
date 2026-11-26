@@ -1771,6 +1771,61 @@ describe("erasure wired into the connection delete", () => {
   });
 });
 
+describe("alias spool restart and ownership", () => {
+  it("starts from an empty spool after a crash without removing neighbouring state", async () => {
+    const { mkdtemp, readFile, rm, writeFile } =
+      await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { openAliasSpool } = await import("./alias-spool.js");
+    const root = await mkdtemp(join(tmpdir(), "alias-spool-reopen-"));
+    try {
+      const warn = vi.fn();
+      const previous = await openAliasSpool(root, { warn });
+      expect(previous).toBeDefined();
+      if (!previous) throw new Error("fixture spool did not open");
+      await previous.write(
+        "old-response/body",
+        new TextEncoder().encode("fixture"),
+      );
+      await writeFile(join(root, "state.fixture"), "retain");
+      const reopened = await openAliasSpool(root, { warn });
+      expect(reopened).toBeDefined();
+      if (!reopened) throw new Error("fixture spool did not reopen");
+      expect(await reopened.list("")).toEqual([]);
+      expect(await readFile(join(root, "state.fixture"), "utf8")).toBe(
+        "retain",
+      );
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps response spool bodies private",
+    async () => {
+      const { mkdtemp, rm, stat } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const { openAliasSpool } = await import("./alias-spool.js");
+      const root = await mkdtemp(join(tmpdir(), "alias-spool-permissions-"));
+      try {
+        const spool = await openAliasSpool(root, { warn: vi.fn() });
+        expect(spool).toBeDefined();
+        if (!spool) throw new Error("fixture spool did not open");
+        await spool.write("body", new Uint8Array([7]));
+        expect((await stat(join(root, "alias-spool"))).mode & 0o077).toBe(0);
+        expect(
+          (await stat(join(root, "alias-spool", "body"))).mode & 0o077,
+        ).toBe(0);
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+  );
+});
+
 describe("alias spool startup fallback", () => {
   it.each(["storage root", "alias spool"] as const)(
     "continues without a spool when the %s is unexpectedly a file",
