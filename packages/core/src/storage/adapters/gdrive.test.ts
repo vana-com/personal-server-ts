@@ -575,6 +575,50 @@ describe("createGoogleDriveStorageAdapter (loopback Drive v3 HTTP)", () => {
     expect(new TextDecoder().decode(survivor)).toBe("earlier-device-bytes");
   });
 
+  it("resumes an incomplete upload on the same session with only the remaining bytes", async () => {
+    const { provider } = makeCredentials();
+    const total = 5 * 1024 * 1024 + 64 * 1024;
+    const accepted = 256 * 1024;
+    const data = new Uint8Array(total);
+    data[accepted - 1] = 11;
+    data[accepted] = 22;
+    let prefix: Uint8Array | undefined;
+    const ranges: Array<{ url: string; range: string | null }> = [];
+    const transport: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (init?.method !== "PUT" || !url.includes("/upload/resumable/"))
+        return fetch(input, init);
+      const received = new Uint8Array(init.body as ArrayBuffer);
+      ranges.push({ url, range: new Headers(init.headers).get("content-range") });
+      if (!prefix) {
+        prefix = received.slice(0, accepted);
+        return new Response(null, { status: 308, headers: { Range: `bytes=0-${accepted - 1}` } });
+      }
+      expect(received.byteLength).toBe(total - accepted);
+      expect(received[0]).toBe(22);
+      const completed = new Uint8Array(total);
+      completed.set(prefix);
+      completed.set(received, accepted);
+      const headers = new Headers(init.headers);
+      headers.delete("content-range");
+      headers.set("content-length", String(total));
+      return fetch(input, { ...init, headers, body: completed });
+    };
+    const adapter = createGoogleDriveStorageAdapter({
+      folderId,
+      credentials: provider,
+      apiBaseUrl: drive.baseUrl,
+      fetch: transport,
+    });
+    const url = await adapter.upload("large.blob/resume", data);
+    expect(ranges).toHaveLength(2);
+    expect(ranges[1]).toEqual({
+      url: ranges[0]!.url,
+      range: `bytes ${accepted}-${total - 1}/${total}`,
+    });
+    expect(sha256Hex(await adapter.download(url))).toBe(sha256Hex(data));
+  });
+
   it("uses resumable upload for blobs larger than 5 MiB and enforces downloadBounded ByteBudget", async () => {
     const { provider } = makeCredentials();
     const adapter = createGoogleDriveStorageAdapter({
