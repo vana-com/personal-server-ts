@@ -812,12 +812,12 @@ it.each([
         "SELECT checkpoint FROM connections",
       )
     )[0]!.checkpoint;
-    if (safety === "generation") expect(stored).toBeNull();
-    else
-      expect(JSON.parse(stored!)).toEqual({
-        a: safety === "independent" ? "a1" : "a0",
-        b: "b0",
-      });
+    // A generation move keeps the newer generation's checkpoint too: the
+    // fenced run must not clear what that generation committed.
+    expect(JSON.parse(stored!)).toEqual({
+      a: safety === "independent" ? "a1" : "a0",
+      b: "b0",
+    });
     expect(result.streamStatus?.b).toBe("held");
     if (safety === "independent")
       expect(result).toMatchObject({

@@ -569,6 +569,36 @@ describe("the stream cursor at run end", () => {
     });
   });
 
+  it("a fenced end of an older generation's run keeps the newer generation's checkpoint and complete stream", async () => {
+    const { db, store } = await fresh();
+    await begin(db, "r1", 1, 1);
+    // The connection moved to generation 2 and committed there while R1,
+    // admitted under generation 1, was still collecting.
+    await db.batch([
+      {
+        sql: `UPDATE connections SET generation = 2, checkpoint = '{"s":"gen2"}' WHERE connection_id = 'c1'`,
+      },
+      {
+        sql: "UPDATE stream_state SET complete = 1, needs_full = 0 WHERE connection_id = 'c1' AND stream = 's'",
+      },
+    ]);
+    vi.mocked(checkRunFence).mockResolvedValue([
+      { stream: "s", trip: "generation_moved_by_delete" },
+    ]);
+    expect(await store.end("r1", request("live"))).toMatchObject({
+      result: "discarded",
+    });
+    expect(
+      await db.query("SELECT state FROM runs WHERE run_id = 'r1'"),
+    ).toEqual([{ state: "ended" }]);
+    expect(await checkpoint(db)).toBe('{"s":"gen2"}');
+    expect(
+      await db.query(
+        "SELECT complete, needs_full FROM stream_state WHERE stream = 's'",
+      ),
+    ).toEqual([{ complete: 1, needs_full: 0 }]);
+  });
+
   it("every path that clears the checkpoint drops the cursors waiting to be published", async () => {
     // Intake discard, purge and a deleted connection all clear the checkpoint
     // by this one write; none of them may leave a cursor to publish.

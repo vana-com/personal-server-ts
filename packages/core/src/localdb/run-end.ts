@@ -1,3 +1,4 @@
+import { runOwnsConnectionState } from "./run-generation-guard.js";
 import { normalizeRawEnd } from "../stream-sync/normalize-raw-end.js";
 import { readRawRecordEvidence } from "./raw-end-evidence.js";
 import { readEndReceipt } from "./run-receipts.js";
@@ -313,8 +314,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           );
           await db.batch([
             {
-              sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
-              params: [run.connection_id],
+              sql: `UPDATE connections SET checkpoint = NULL WHERE ${runOwnsConnectionState("connections")}`,
+              params: [runId],
             },
             {
               sql: "UPDATE run_streams SET decision = 'discarded', reason = 'fence', replace = 0, publication_state = 'superseded', publication_reason = 'fence' WHERE run_id = ?",
@@ -326,8 +327,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             })),
             {
               sql: `UPDATE stream_state SET needs_full = 1, complete = 0
-              WHERE connection_id = ? AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
-              params: [run.connection_id, runId],
+              WHERE ${runOwnsConnectionState("stream_state")}
+                AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
+              params: [runId, runId],
             },
             ...cleanup(fenced),
           ]);
