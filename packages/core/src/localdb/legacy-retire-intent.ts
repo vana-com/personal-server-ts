@@ -11,15 +11,7 @@ import {
   type DeletePart,
 } from "./delete-status.js";
 import type { LocalSyncDeps } from "./deps.js";
-
-/** Stored acknowledgement values that permit a retirement pass to continue. */
-export function isLegacyRetireAcknowledgement(
-  value: unknown,
-): value is "not-sent" | "unconfirmed" | "accepted" {
-  return (
-    value === "not-sent" || value === "unconfirmed" || value === "accepted"
-  );
-}
+import { isLegacyRetireAcknowledgement } from "./legacy-retire-acknowledgement.js";
 
 /** What a request answers: the intent, and what is left of it. */
 export interface LegacyRetireStatus {

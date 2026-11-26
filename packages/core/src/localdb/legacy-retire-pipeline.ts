@@ -3,10 +3,8 @@ import { GatewayRefusalError } from "../sync/delete-data-port.js";
 import { isGatewayRefusalCode } from "../sync/gateway-refusal.js";
 import type { IndexEntry } from "../storage/index/index.js";
 import type { LegacyHead } from "./legacy-delete.js";
-import {
-  isLegacyRetireAcknowledgement,
-  type LegacyRetirerDeps,
-} from "./legacy-retire-intent.js";
+import type { LegacyRetirerDeps } from "./legacy-retire-intent.js";
+import { isLegacyRetireAcknowledgement } from "./legacy-retire-acknowledgement.js";
 import {
   blocked,
   PART_DONE,
