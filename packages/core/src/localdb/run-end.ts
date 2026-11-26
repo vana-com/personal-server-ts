@@ -289,8 +289,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           raw ? "raw-v1" : "legacy",
         );
         const covered = new Set(plan.covered);
-        const trips = await checkRunFence(deps, runId, "end");
-        if (trips.length > 0) {
+        const settleFence = async (
+          trips: Awaited<ReturnType<typeof checkRunFence>>,
+        ) => {
           const fenced = answer(
             raw
               ? {
@@ -332,7 +333,9 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             ...cleanup(fenced),
           ]);
           return fenced;
-        }
+        };
+        const trips = await checkRunFence(deps, runId, "end");
+        if (trips.length > 0) return settleFence(trips);
         // A failed plan with no fence trip is discarded as it is. With a trip,
         // the fenced path above has already reset what the delete left.
         if (plan.outcome === "failed")
@@ -738,9 +741,39 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 })),
                 { sql: "DROP TABLE run_end_delete_check" },
               ];
+        const intentCheck: SqlStatement[] = [
+          {
+            sql: "CREATE TEMP TABLE run_end_intent_check(ok INTEGER CONSTRAINT run_end_delete_intent CHECK(ok=1))",
+          },
+          {
+            sql: `INSERT INTO run_end_intent_check SELECT NOT EXISTS(
+              SELECT 1 FROM delete_intents d JOIN connections c ON c.connector=d.connector
+              WHERE c.connection_id=?)`,
+            params: [run.connection_id],
+          },
+          { sql: "DROP TABLE run_end_intent_check" },
+        ];
         try {
-          await db.batch(withOrigin("local", [...deleteCheck, ...statements]));
+          await db.batch(
+            withOrigin("local", [
+              ...intentCheck,
+              ...deleteCheck,
+              ...statements,
+            ]),
+          );
         } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message.includes(
+              "CHECK constraint failed: run_end_delete_intent",
+            )
+          )
+            return settleFence(
+              streams.map(({ stream }) => ({
+                stream,
+                trip: "control_deleted",
+              })),
+            );
           if (
             skipZeroDeletes &&
             error instanceof Error &&

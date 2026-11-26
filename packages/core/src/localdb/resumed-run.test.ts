@@ -540,4 +540,65 @@ describe("a run resumed from a cursor read before it began", () => {
       await elsewhere.sync.close();
     }
   });
+
+  it("does not merge or save a checkpoint when a delete intent lands just before the END transaction", async () => {
+    const here = await open({ streams: ["items"] });
+    try {
+      await seeded(here);
+      await here.sync.intake.begin("raced-end", { ...connect, connect: false });
+      await here.sync.intake.batch("raced-end", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "late" } }],
+      });
+      const originalBatch = here.db.batch.bind(here.db);
+      let inserted = false;
+      const intercepted = vi
+        .spyOn(here.db, "batch")
+        .mockImplementation(async (statements) => {
+          if (
+            !inserted &&
+            statements.some(({ sql }) =>
+              sql.includes("end_response=?,raw_end=?"),
+            )
+          ) {
+            inserted = true;
+            await originalBatch([
+              {
+                sql: "INSERT INTO delete_intents(connector,delete_id,intent) VALUES (?,?,?)",
+                params: [
+                  "fixture",
+                  "synthetic-delete",
+                  JSON.stringify({ pins: [] }),
+                ],
+              },
+            ]);
+          }
+          return originalBatch(statements);
+        });
+      try {
+        const ended = await here.sync.intake.end("raced-end", {
+          finish: "completed",
+          streams: { items: observed(true) },
+          checkpoints: { items: { cursor: "do-not-save" } },
+          lastBatch: 0,
+        });
+        expect(inserted).toBe(true);
+        expect(ended.result).toBe("discarded");
+        expect(await itemKeys(here)).toEqual(["one"]);
+        expect((await storedCheckpoint(here))?.items).not.toEqual({
+          cursor: "do-not-save",
+        });
+        expect(
+          await here.db.query(
+            "SELECT reason FROM run_streams WHERE run_id = ?",
+            ["raced-end"],
+          ),
+        ).toEqual([{ reason: "control_deleted" }]);
+      } finally {
+        intercepted.mockRestore();
+      }
+    } finally {
+      await here.sync.close();
+    }
+  });
 });

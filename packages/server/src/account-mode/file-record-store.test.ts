@@ -167,4 +167,37 @@ describe("the file mode record store", () => {
     expect((await store.load()).size).toBe(0);
     expect(await readdir(join(dir, "good.json"))).toEqual([]);
   });
+
+  it("loads a valid owner even when reporting invalid JSON throws", async () => {
+    const reported: string[] = [];
+    const store = createFileModeRecordStore(dir, {
+      onCorrupt: (name) => {
+        reported.push(name);
+        throw new Error("synthetic diagnostic failure");
+      },
+    });
+    await writeFile(join(dir, "broken.json"), "{nope");
+    const good = { answer: "off" as const, generation: 2, receivedAt: 1 };
+    await store.save("good", good);
+
+    expect([...(await store.load())]).toEqual([["good", good]]);
+    expect(reported).toEqual(["broken.json"]);
+  });
+
+  it("reports a schema-invalid record exactly once even when the sink throws", async () => {
+    const reported: string[] = [];
+    const store = createFileModeRecordStore(dir, {
+      onCorrupt: (name) => {
+        reported.push(name);
+        throw new Error("synthetic diagnostic failure");
+      },
+    });
+    await writeFile(
+      join(dir, "shape.json"),
+      JSON.stringify({ answer: "maybe" }),
+    );
+
+    expect((await store.load()).size).toBe(0);
+    expect(reported).toEqual(["shape.json"]);
+  });
 });
