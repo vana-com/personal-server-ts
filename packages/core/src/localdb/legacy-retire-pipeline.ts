@@ -307,6 +307,10 @@ export function createLegacyRetirePipeline(
           const history = await ports.versions.list(scope.scope, { signal });
           if (
             history.complete !== true ||
+            (scope.head.state === "live" &&
+              !history.versions.some(
+                (v) => !v.isTombstone && BigInt(v.expectedVersion) === pin,
+              )) ||
             !history.versions.some(
               (v) => v.isTombstone && v.expectedVersion === tombstone,
             )

@@ -272,6 +272,43 @@ describe("a standalone legacy retirement after the switch", () => {
     expect(await f.a.records()).toEqual(['s0/y={"id":"y","v":1}']);
   });
 
+  it("a stable history listing only the tombstone, without the pinned live version, does not complete", async () => {
+    const list = vi.fn();
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        versions: {
+          list: list.mockImplementation(async (scope, options) => {
+            const history = await ports.versions.list(scope, options);
+            return {
+              ...history,
+              versions: history.versions.filter(
+                (version) => version.isTombstone,
+              ),
+            };
+          }),
+        },
+      }),
+    });
+    placeLocalEntries(f);
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    // Observe repeated reads of the same incomplete inventory, beyond the
+    // first pass that previously marked the entire retirement done.
+    await vi.waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(1));
+    expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+      retireId,
+      legacy: PENDING,
+    });
+    expect(await f.a.db.query("SELECT state FROM legacy_retirements")).toEqual([
+      { state: "open" },
+    ]);
+    expect(storageDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(f.fake.blobCount(scope)).toBe(2);
+      expect(f.legacy.storage.countVersions(scope)).toBe(1);
+    }
+  });
+
   it("resumes the same intent and scope set after a repeat request and a restart", async () => {
     const finality = {
       finalized: null as string | null,
