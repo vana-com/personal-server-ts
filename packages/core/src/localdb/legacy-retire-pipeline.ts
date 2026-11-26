@@ -17,6 +17,8 @@ export class LegacyTombstoneUnacknowledged extends Error {}
 
 /** Throws synchronously when the caller no longer owns write authority. */
 export type RetirementAuthority = () => void;
+type RetirementRow = Pick<IndexEntry, "id" | "path" | "scope" | "collectedAt">;
+
 export interface RetirementRows {
   /** Take a detached snapshot under the index writer lock, then save it. */
   capture<T>(
@@ -24,9 +26,9 @@ export interface RetirementRows {
     authority: RetirementAuthority,
     scopes: readonly string[],
   ): Promise<T>;
-  erase(row: IndexEntry, authority: RetirementAuthority): Promise<void>;
+  erase(row: RetirementRow, authority: RetirementAuthority): Promise<void>;
   absent(
-    rows: readonly IndexEntry[],
+    rows: readonly RetirementRow[],
     authority: RetirementAuthority,
   ): Promise<boolean>;
 }
@@ -35,12 +37,13 @@ export interface LegacyRetirePipelinePorts {
   scopesOf(connector: string): readonly string[];
   streamsOf(connector: string, scope: string): readonly string[];
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;
+  /** Resolves void only after the exact echo; not-sent means preflight sent no DELETE. */
   tombstone(
     scope: string,
     head: Extract<LegacyHead, { state: "live" }>,
     authority: RetirementAuthority,
     signal?: AbortSignal,
-  ): Promise<void>;
+  ): Promise<void | "not-sent">;
   eraseBlob(
     scope: string,
     version: string,
@@ -55,7 +58,7 @@ interface Scope {
   scope: string;
   head: LegacyHead;
   streams: readonly string[];
-  rows: readonly IndexEntry[];
+  rows: readonly RetirementRow[];
   acknowledgement?: "unconfirmed" | "accepted" | "blocked";
 }
 interface Manifest {
@@ -131,10 +134,17 @@ export function createLegacyRetirePipeline(
           const manifest: Manifest = {
             scopes: scopes.map((scope) => ({
               ...scope,
-              rows: rows.filter(
-                (row) =>
-                  row.scope === scope.scope && capturedAtPin(row, scope.head),
-              ),
+              rows: rows
+                .filter(
+                  (row) =>
+                    row.scope === scope.scope && capturedAtPin(row, scope.head),
+                )
+                .map(({ id, path, scope, collectedAt }) => ({
+                  id,
+                  path,
+                  scope,
+                  collectedAt,
+                })),
             })),
           };
           const id = deps.newOp();
@@ -220,10 +230,24 @@ export function createLegacyRetirePipeline(
           sameHead(head, scope.head)
         ) {
           check();
+          const previousAcknowledgement = scope.acknowledgement;
           scope.acknowledgement = "unconfirmed";
           await saveManifest();
           try {
-            await ports.tombstone(scope.scope, scope.head, check, signal);
+            const outcome = await ports.tombstone(
+              scope.scope,
+              scope.head,
+              check,
+              signal,
+            );
+            if (outcome === "not-sent") {
+              // This attempt sent nothing; preserve any earlier ambiguous send.
+              if (previousAcknowledgement === undefined)
+                delete scope.acknowledgement;
+              else scope.acknowledgement = previousAcknowledgement;
+              await saveManifest();
+              return PART_PENDING;
+            }
           } catch (error) {
             check();
             if (error instanceof LegacyTombstoneUnacknowledged) {

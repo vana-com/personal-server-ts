@@ -33,7 +33,7 @@ export function createLegacyRetireRemote(
         current.metadataHash.toLowerCase() !==
           head.fence.metadataHash.toLowerCase()
       )
-        throw new Error("legacy_head_changed");
+        return "not-sent";
       authority();
       const version = BigInt(head.fence.expectedVersion) + 1n;
       const signature = await options.signer.signAddData({

@@ -379,6 +379,25 @@ describe("local sync intake adapter", () => {
     ]);
   });
 
+  it("a failing retirement sweep does not stop the ordinary sync cycle", async () => {
+    const { db, deps, sync } = await setup();
+    const query = db.query.bind(db);
+    const error = new Error("retirement query failed");
+    vi.spyOn(db, "query").mockImplementation((sql, params) => {
+      if (sql.includes("SELECT connector FROM legacy_retirements"))
+        return Promise.reject(error);
+      return query(sql, params);
+    });
+    const report = { connections: [] };
+    ports.cycle.mockResolvedValue(report);
+    await expect(sync.cycle()).resolves.toBe(report);
+    expect(ports.cycle).toHaveBeenCalledTimes(1);
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      { error },
+      "stream sync: the legacy retirement sweep failed",
+    );
+  });
+
   it("shares the cycle ports for trigger and single-file sync without a new timer", async () => {
     vi.useFakeTimers();
     const { deps, sync } = await setup();

@@ -295,3 +295,21 @@ Both good controls pass; every retained mutant and reachability probe fails
 its configured invariant or property as expected. The original `Good`
 control remains 62,676,431 generated, 13,846,227 distinct states; depth 27.
 The extended `PipelineGood` control is 63 generated, 55 distinct; depth 22.
+
+### Preflight exits without sending
+
+`NotSent` models a foreign pin+1 tombstone arriving before transport preflight.
+It restores the prior journal state without issuing a new DELETE. `ReadForeign`
+represents the next pass, which can accept the foreign tombstone only when no
+earlier send remains unconfirmed.
+`DefiniteNotSentDoesNotIssue` requires that the not-yet-sent path issued no
+request. `RetryNoReply` models an earlier ambiguous attempt, and
+`NotSentPreservesAmbiguity` requires that a not-sent retry keeps that earlier
+attempt unconfirmed. `AcknowledgedBeforeErase` permits either an accepted echo
+or a foreign head with no earlier attempted send. Ambiguous sends still require
+an accepted echo.
+
+The nine pipeline configurations were rerun with Java, TLC 2.19, four workers,
+nice 19 and the shared heavy-run lock. `PipelineGood` passes with 118 generated
+states, 103 distinct states and depth 22. All eight mutants still fail their
+configured invariants. The original intent model was unchanged in this run.

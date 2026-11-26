@@ -57,6 +57,18 @@ describe("retirement transport authority", () => {
         ),
       ).rejects.toThrow("pin + 1");
     });
+  it("reports not sent when a foreign tombstone wins preflight", async () => {
+    const f = await fixture();
+    f.fake.foreignTombstone("github.events");
+    await expect(
+      createLegacyRetireRemote(f.options).tombstone(
+        "github.events",
+        f.head,
+        f.check,
+      ),
+    ).resolves.toBe("not-sent");
+    expect(f.fake.requests).toEqual([]);
+  });
   it("revokes during tombstone signing before any HTTP request", async () => {
     const f = await fixture();
     f.options.signer = {

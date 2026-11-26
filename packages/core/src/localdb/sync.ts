@@ -621,7 +621,12 @@ export function createLocalSync(
     async cycle(scope) {
       await kickDeletes();
       // A restart resumes an open legacy retirement from its intent row.
-      await legacyRetirer.resume();
+      await legacyRetirer.resume().catch((error: unknown) => {
+        deps.logger.warn(
+          { error },
+          "stream sync: the legacy retirement sweep failed",
+        );
+      });
       let allApplied = true;
       const report = await runCycle(deps, scope, undefined, (outcome) => {
         if (outcome.kind !== "applied") allApplied = false;

@@ -331,6 +331,55 @@ describe("a standalone legacy retirement after the switch", () => {
     for (const scope of SCOPES) expect(f.fake.blobCount(scope)).toBe(3);
   });
 
+  it("a not-sent retry preserves an earlier ambiguous send", async () => {
+    let attempts = 0;
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        tombstone: async (scope, head, check, signal) => {
+          if (++attempts === 1) throw new Error("ambiguous transport failure");
+          f.fake.foreignTombstone(scope);
+          return ports.tombstone(scope, head, check, signal);
+        },
+      }),
+    });
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: { state: "blocked", reason: "legacy_tombstone_unacknowledged" },
+      }),
+    );
+    expect(attempts).toBe(2);
+    expect(storageDeletes(f.fake)).toEqual([]);
+  });
+
+  it("a foreign pin+1 tombstone installed between head read and preflight settles on the next pass", async () => {
+    const f = await reconnected({
+      wrapLegacy: (ports) => ({
+        ...ports,
+        tombstone: async (scope, head, check, signal) => {
+          f.fake.foreignTombstone(scope);
+          return ports.tombstone(scope, head, check, signal);
+        },
+      }),
+    });
+    placeLocalEntries(f);
+    f.fake.requests.length = 0;
+    const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    await vi.waitFor(async () =>
+      expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
+        retireId,
+        legacy: DONE,
+      }),
+    );
+    expect(gatewayDeletes(f.fake)).toEqual([]);
+    for (const scope of SCOPES) {
+      expect(f.fake.blobCount(scope)).toBe(0);
+      expect(f.legacy.storage.countVersions(scope)).toBe(0);
+    }
+  });
+
   // The worker reads the pinned head live, then another device publishes v3
   // and tombstones at v4 before the delete adapter reads the head. The adapter
   // must not take v4 as "already deleted" and clean up through it: that frees

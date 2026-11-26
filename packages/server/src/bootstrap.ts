@@ -762,6 +762,8 @@ async function bootstrapServer(
   let serverAccount: ServerAccount | undefined;
   let serverSigner: ServerSigner | undefined;
   let identity: IdentityInfo | undefined;
+  // Shared with canSync: registration is unknown until a lookup confirms it.
+  const isServerRegistered = () => Boolean(identity?.serverId);
 
   if (masterKeySignature && serverOwner) {
     const recoveredServerOwner = serverOwner;
@@ -1033,6 +1035,7 @@ async function bootstrapServer(
           erasure: () => logErasurePorts,
           legacyDelete: () => legacyDeletePorts,
           legacyRetire: () => legacyRetirePorts,
+          legacyWriteReady: isServerRegistered,
         });
         localSyncDeps = deps;
         localDb = db;
@@ -1393,13 +1396,14 @@ async function bootstrapServer(
             serverAccount.address,
           );
           identity!.serverId = serverInfo?.id ?? null;
-          if (serverInfo?.id) return { ok: true };
+          if (isServerRegistered()) return { ok: true };
           return {
             ok: false,
             reason: "unregistered",
             message: "Register this Personal Server before syncing.",
           };
         } catch (err) {
+          identity!.serverId = null;
           logger.warn({ err }, "Could not verify server registration for sync");
           return {
             ok: false,
@@ -2007,7 +2011,7 @@ async function bootstrapServer(
     getLocalSync: localSyncSource,
     tunnelManager,
     tunnelUrl: undefined,
-    isServerRegistered: () => Boolean(identity?.serverId),
+    isServerRegistered,
     localApprovalPort,
     getLocalApprovalOrigin: () => effectiveLocalApprovalOrigin,
     setLocalApprovalOrigin: (origin?: string) => {

@@ -399,6 +399,34 @@ for (const kind of ["node", "lite"])
       await expect(running).rejects.toThrow("revoked");
       expect(await b.rows.absent([row], () => {})).toBe(false);
     });
+    it("persists only eligible retirement row identities", async () => {
+      const b = await backend(kind);
+      const row = await b.insert({
+        ...base,
+        dataPointId: "registered",
+        version: 2,
+      });
+      await b.insert({
+        ...base,
+        collectedAt: "2026-02-01T00:00:00.000Z",
+        dataPointId: "newer",
+        version: 9,
+      });
+      const f = fixture(b.rows);
+      f.head({ state: "deleted", version: "3" });
+      await f.pipeline.capture("github", f.authority);
+      const [stored] = await f.db.query<{ manifest: string }>(
+        "SELECT manifest FROM legacy_retire_manifests",
+      );
+      expect(JSON.parse(stored!.manifest).scopes[0].rows).toEqual([
+        {
+          id: row.id,
+          path: row.path,
+          scope: row.scope,
+          collectedAt: row.collectedAt,
+        },
+      ]);
+    });
     it("blocks a moved head without erasing any captured identity", async () => {
       const b = await backend(kind);
       const row = await b.insert(base);
