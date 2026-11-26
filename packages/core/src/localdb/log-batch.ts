@@ -622,34 +622,44 @@ export async function stageBatch(
  * of them is committed. A failure writes none of them.
  */
 export async function commitStaged(
-  deps: Pick<LocalSyncDeps, "db">,
+  deps: Pick<LocalSyncDeps, "db" | "logger">,
   batches: readonly StagedBatch[],
   /** The streams whose load has begun: this commit adds the ones it begins. */
   begun: Set<string> = new Set(),
 ): Promise<void> {
-  const statements: SqlStatement[] = [];
-  // One by one: a group's statements can outnumber what a call takes as arguments.
-  const plannedBegins = new Set(begun);
-  for (const batch of batches) {
-    for (const [stream, hide] of batch.begins ?? [])
-      if (!plannedBegins.has(stream)) {
-        plannedBegins.add(stream);
-        for (const statement of hide) statements.push(statement);
-      }
-    for (const statement of batch.statements) statements.push(statement);
-    for (const statement of (await batch.after?.()) ?? [])
-      statements.push(statement);
-  }
   try {
+    const statements: SqlStatement[] = [];
+    // One by one: a group's statements can outnumber what a call takes as arguments.
+    const plannedBegins = new Set(begun);
+    for (const batch of batches) {
+      for (const [stream, hide] of batch.begins ?? [])
+        if (!plannedBegins.has(stream)) {
+          plannedBegins.add(stream);
+          for (const statement of hide) statements.push(statement);
+        }
+      for (const statement of batch.statements) statements.push(statement);
+      for (const statement of (await batch.after?.()) ?? [])
+        statements.push(statement);
+    }
     await deps.db.batch(withOrigin("remote", statements));
     for (const stream of plannedBegins) begun.add(stream);
   } finally {
-    await deps.db.batch(
-      batches.map((batch) => ({
-        sql: "DELETE FROM temp.incoming WHERE op = ?",
-        params: [batch.op],
-      })),
-    );
+    // The temp rows are scratch. Their cleanup is reported, never thrown: it
+    // must not turn a committed operation into a failure, nor replace the
+    // error that ended the commit.
+    try {
+      await deps.db.batch(
+        batches.map((batch) => ({
+          sql: "DELETE FROM temp.incoming WHERE op = ?",
+          params: [batch.op],
+        })),
+      );
+    } catch (error) {
+      deps.logger.warn(
+        { error: String(error) },
+        "stream sync: the temp rows of a commit were not cleaned up",
+      );
+    }
   }
 }
 
