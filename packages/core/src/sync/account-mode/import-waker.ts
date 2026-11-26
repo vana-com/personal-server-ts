@@ -48,10 +48,15 @@ export function createImportWaker(options: ImportWakerOptions): ImportWaker {
     const run = Promise.resolve()
       .then(() => (stopped ? undefined : importer.run(controller.signal)))
       .catch((error: unknown) => {
-        warn(
-          "the legacy import failed; it runs again at the next answer",
-          error,
-        );
+        try {
+          warn(
+            "the legacy import failed; it runs again at the next answer",
+            error,
+          );
+        } catch {
+          // A throwing warning sink must not break the never-rejects
+          // contract on `wake()`; there is nowhere left to report it.
+        }
       })
       .finally(() => {
         if (running === run) running = undefined;
