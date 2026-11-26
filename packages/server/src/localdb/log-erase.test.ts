@@ -34,7 +34,87 @@ import {
   world,
 } from "./log-world.test-utils.js";
 
+import {
+  createCanonicalImportSource,
+  type CanonicalImportPageReader,
+} from "./canonical-import-source.js";
+
 afterEach(closeWorldDrivers);
+
+describe("canonical import source page bounds", () => {
+  async function candidate(page: CanonicalImportPageReader["page"]) {
+    type Options = Parameters<typeof createCanonicalImportSource>[0];
+    const reader: CanonicalImportPageReader = {
+      declarations: [
+        {
+          source_id: "fixture-source",
+          streams: [{ name: "items", primary_key: ["id"] }],
+        },
+      ] as unknown as CanonicalImportPageReader["declarations"],
+      async *inventory() {
+        yield {
+          sourceId: "fixture-source",
+          instance: "fixture-instance",
+          stream: "items",
+          rows: 1,
+        };
+      },
+      assertRevision: async () => {},
+      connections: async () => [
+        { instance: "fixture-instance", deleted: false, lastActive: 1 },
+      ],
+      page,
+    };
+    const entries = createCanonicalImportSource({
+      owner: "fixture-owner",
+      network: "fixture-network",
+      revision: "fixture-revision",
+      reader,
+      bindings: new Map([
+        ["fixture", { connector: "fixture", streams: ["items"] }],
+      ]) as unknown as Options["bindings"],
+      resolveTarget: async () =>
+        ({
+          connectionId: "fixture-connection",
+          connector: "fixture",
+          stream: "items",
+        }) as NonNullable<Awaited<ReturnType<Options["resolveTarget"]>>>,
+    });
+    const first = await entries[Symbol.asyncIterator]().next();
+    if (first.done || !("records" in first.value))
+      throw new Error("fixture lacked a candidate");
+    return first.value;
+  }
+
+  it("does not yield any record from a page exceeding its requested row limit", async () => {
+    const page = vi.fn(async () => ({
+      rows: Array.from({ length: 129 }, (_, id) => ({ id })),
+      next: null,
+    }));
+    const item = await candidate(page);
+    await expect(item.records()[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "invalid_page_size",
+    );
+    expect(page).toHaveBeenCalledWith(
+      "fixture-instance",
+      "items",
+      null,
+      128,
+      4 * 1024 * 1024,
+      "fixture-revision",
+    );
+  });
+
+  it("refuses a cursor on an empty page instead of looping to a second page", async () => {
+    const page = vi.fn(async () => ({ rows: [], next: "would-repeat" }));
+    const item = await candidate(page);
+    await expect(item.records()[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "invalid_page_cursor",
+    );
+    expect(page).toHaveBeenCalledTimes(1);
+  });
+});
+
 /** A database file of one test, on disk (a device can restart). */
 const dbFile = tempDbFile;
 
