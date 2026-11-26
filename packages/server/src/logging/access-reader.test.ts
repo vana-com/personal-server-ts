@@ -3,6 +3,7 @@ import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAccessLogReader } from "./access-reader.js";
+import { createAccessLogWriter } from "./access-log.js";
 import type { AccessLogEntry } from "./access-log.js";
 
 function makeEntry(overrides: Partial<AccessLogEntry> = {}): AccessLogEntry {
@@ -213,5 +214,36 @@ describe("AccessLogReader", () => {
     expect(result.total).toBe(1);
     expect(result.logs).toHaveLength(1);
     expect(result.logs[0].logId).toBe("valid-1");
+  });
+
+  it("keeps writer-emitted entries that have no request metadata", async () => {
+    const logsDir = join(tempDir, "logs");
+    const {
+      ipAddress: _ip,
+      userAgent: _ua,
+      ...bare
+    } = makeEntry({
+      logId: "no-meta",
+    });
+    await createAccessLogWriter(logsDir).write(bare);
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(1);
+    expect(result.logs[0].logId).toBe("no-meta");
+  });
+
+  it("still rejects a present but non-string ipAddress", async () => {
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+    await writeFile(
+      join(logsDir, "access-2026-01-28.log"),
+      JSON.stringify({ ...makeEntry(), ipAddress: 42 }) + "\n",
+      "utf-8",
+    );
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(0);
   });
 });

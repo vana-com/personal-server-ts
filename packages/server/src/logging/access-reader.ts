@@ -21,10 +21,15 @@ function isAccessLogEntry(value: unknown): value is AccessLogEntry {
     "action",
     "scope",
     "timestamp",
-    "ipAddress",
-    "userAgent",
   ] as const) {
     if (typeof row[field] !== "string") {
+      return false;
+    }
+  }
+  // ipAddress and userAgent are optional: the writer omits them when the
+  // request carried no metadata. Validate the type only when present.
+  for (const field of ["ipAddress", "userAgent"] as const) {
+    if (row[field] !== undefined && typeof row[field] !== "string") {
       return false;
     }
   }
