@@ -286,7 +286,10 @@ export async function applyLog(
   if (head.generation < context.generation) {
     if (pending !== null)
       throw unfinishedKeyedLoad(pending, "the log is of an earlier lifetime");
-    // A log of an earlier lifetime holds none of this one.
+    // A log of an earlier lifetime holds none of this one. It moves this
+    // device's lineage only forward, as the tombstone branch does: at or behind
+    // the position it holds, an empty lineage would erase valid references.
+    if (read.version <= local.position) return { applied: 0 };
     await deps.db.batch([
       writeLogState(connectionId, {
         position: read.version,
