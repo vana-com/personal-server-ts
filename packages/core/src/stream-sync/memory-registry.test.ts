@@ -37,23 +37,33 @@ it("a batch whose post-write condition fails is not seen, and does not drop a co
   });
   await reached;
 
-  // A reader does not see a head that the batch would roll back.
-  expect(await registry.read("a")).toEqual({ found: false });
-  // An unrelated write commits while the batch holds.
-  expect(
-    await registry.post({
-      ownerAddress: OWNER,
-      scope: "b",
-      dataHash: hash(2),
-      metadataHash: hash(102),
-      expectedVersion: "1",
-      signature: hash(202),
-    }),
-  ).toEqual({ kind: "committed" });
-  release();
+  // Capture both effects before asserting. Even a thrown read/write must
+  // release and settle the batch, or the failing test leaves it parked.
+  const { visible, unrelated } = await (async () => {
+    try {
+      const visible = await registry.read("a");
+      const unrelated = await registry.post({
+        ownerAddress: OWNER,
+        scope: "b",
+        dataHash: hash(2),
+        metadataHash: hash(102),
+        expectedVersion: "1",
+        signature: hash(202),
+      });
+      return { visible, unrelated };
+    } finally {
+      release();
+      await batch;
+    }
+  })();
 
   const result = await batch;
-  expect(result.kind).toBe("precondition_failed");
+  expect(visible).toEqual({ found: false });
+  expect(unrelated).toEqual({ kind: "committed" });
+  expect(result).toMatchObject({
+    kind: "precondition_failed",
+    failure: { scope: "a", reason: "version-mismatch", latestVersion: "1" },
+  });
   expect(await registry.read("a")).toEqual({ found: false });
   expect((await registry.read("b")).found).toBe(true);
   // The unrelated write's change entry is kept; the batch left none.
