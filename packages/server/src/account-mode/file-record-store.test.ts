@@ -118,4 +118,53 @@ describe("the file mode record store", () => {
       receivedAt: 1,
     });
   });
+
+  it("rejects owner names that only look safe: capitals, dots, empty", async () => {
+    const store = createFileModeRecordStore(dir);
+    const record = { answer: "off" as const, generation: 0, receivedAt: 1 };
+    await expect(store.save("Good", record)).rejects.toThrow("safe file name");
+    await expect(store.save("a.b", record)).rejects.toThrow("safe file name");
+    await expect(store.save("", record)).rejects.toThrow("safe file name");
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it("silently skips record files whose names cannot be owners", async () => {
+    const bad: string[] = [];
+    const store = createFileModeRecordStore(dir, {
+      onCorrupt: (f) => bad.push(f),
+    });
+    const record = { answer: "on" as const, generation: 3, receivedAt: 7 };
+    await writeFile(join(dir, "GOOD.json"), JSON.stringify(record));
+    await writeFile(
+      join(dir, `${"b".repeat(101)}.json`),
+      JSON.stringify(record),
+    );
+    await store.save("good", { answer: "off", generation: 0, receivedAt: 1 });
+    const loaded = await store.load();
+    expect([...loaded.keys()]).toEqual(["good"]);
+    expect(bad).toEqual([]);
+  });
+
+  it("reports binary garbage, an empty file and a JSON scalar as corrupt and keeps the good records", async () => {
+    const bad: string[] = [];
+    const store = createFileModeRecordStore(dir, {
+      onCorrupt: (f) => bad.push(f),
+    });
+    await writeFile(join(dir, "binary.json"), Buffer.from([0xff, 0xfe, 0x7b]));
+    await writeFile(join(dir, "empty.json"), "");
+    await writeFile(join(dir, "scalar.json"), "123");
+    await store.save("good", { answer: "off", generation: 0, receivedAt: 1 });
+    const loaded = await store.load();
+    expect([...loaded.keys()]).toEqual(["good"]);
+    expect(bad.sort()).toEqual(["binary.json", "empty.json", "scalar.json"]);
+  });
+
+  it("refuses to save over a directory wearing a record name and leaves it alone", async () => {
+    const store = createFileModeRecordStore(dir);
+    await mkdir(join(dir, "good.json"));
+    const record = { answer: "on" as const, generation: 0, receivedAt: 0 };
+    await expect(store.save("good", record)).rejects.toThrow();
+    expect((await store.load()).size).toBe(0);
+    expect(await readdir(join(dir, "good.json"))).toEqual([]);
+  });
 });
