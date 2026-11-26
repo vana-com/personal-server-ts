@@ -244,9 +244,9 @@ export async function startMcpRouter(
         return { owners: owners.length };
       }),
     prepareRollback: async (migrationId) => {
-      await close();
       if (env.FLEET_ENABLED !== "true" || !env.NODE_ID || !env.NODE_SECRET)
         throw new Error("Fleet rollback recovery credentials required");
+      await close();
       return state.prepareRollback(migrationId, (binding) =>
         resolveMcpRollbackIdentity(binding, {
           ...deps,

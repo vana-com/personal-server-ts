@@ -366,3 +366,52 @@ it("refuses stale rollback generations and epochs before opening a listener, the
     gatewayFetch.mock.calls.every(([input]) => !String(input).includes("jobs")),
   ).toBe(true);
 });
+
+it("failed rollback preparation leaves the ingress listening while active() stays true", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-service-rollback-"));
+  directories.push(directory);
+  const port = await freePort();
+  const env: NodeJS.ProcessEnv = {
+    FLEET_ENABLED: "true",
+    NODE_ID: "source",
+    NODE_SECRET: "secret",
+    MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
+    MCP_APPROVAL_URL: "https://web.invalid/approve",
+    MCP_STATE_PATH: join(directory, "source.sealed"),
+    MCP_INGRESS_HOST: "127.0.0.1",
+    MCP_INGRESS_PORT: String(port),
+    MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"]',
+  };
+  const control = await startMcpRouter(
+    {
+      client: createFakeDstackClient({ appId: "1".repeat(40) }),
+      gatewayUrl: "https://gateway.invalid",
+      chainId: 14800,
+      contracts: { ...DEFAULTS.gateway.contracts },
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    },
+    env,
+    fetch,
+    () => ({
+      ownerReady: async () => true,
+      dispatch: async () => Response.json({ ok: true }),
+    }),
+  );
+  if (!control) throw new Error("Router disabled");
+  controls.push(control);
+  expect(await control.active()).toBe(true);
+  // Withdraw the rollback credentials after startup: preparation must fail
+  // before it touches the listener.
+  delete env.NODE_SECRET;
+  await expect(control.prepareRollback("rollback-1")).rejects.toThrow(
+    "Fleet rollback recovery credentials required",
+  );
+  expect(await control.active()).toBe(true);
+  expect(
+    (
+      await fetch(
+        `http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp`,
+      )
+    ).status,
+  ).toBe(200);
+});
