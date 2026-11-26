@@ -202,9 +202,9 @@ export function createLegacyRetirePipeline(
         )
       )
         return blocked("legacy_tombstone_unacknowledged");
-      const saveManifest = async (notSent = false) => {
-        // Undoing this attempt's provisional marker grants no write authority.
-        if (!notSent) check();
+      const saveManifest = async (evidenceOnly = false) => {
+        // Recording terminal evidence or undoing a provisional marker grants no authority.
+        if (!evidenceOnly) check();
         await deps.db.batch([
           {
             sql: "UPDATE legacy_retire_manifests SET manifest = ? WHERE retire_id = ?",
@@ -261,12 +261,12 @@ export function createLegacyRetirePipeline(
                 "legacy tombstone acknowledgement missing",
               );
           } catch (error) {
-            check();
             if (error instanceof LegacyTombstoneUnacknowledged) {
               scope.acknowledgement = "blocked";
-              await saveManifest();
+              await saveManifest(true);
               return blocked("legacy_tombstone_unacknowledged");
             }
+            check();
             if (
               error instanceof GatewayRefusalError &&
               isGatewayRefusalCode(error.code)
