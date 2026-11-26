@@ -543,3 +543,57 @@ it("clears a failed step's retry timer when the driver is stopped", async () => 
   expect(steps).toHaveLength(1);
   expect(driver.status().state).toBe("stopped");
 });
+
+it("joins a debounced local write and manual triggers into one follow-up", async () => {
+  const clock = fakeTimers();
+  const { stepper, steps } = manualStepper();
+  const driver = createReplicationDriver({
+    stepper,
+    budget,
+    timers: clock.timers,
+  });
+  driver.start();
+
+  driver.localWrite();
+  const joined = driver.trigger();
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  expect(steps).toHaveLength(1);
+  expect(clock.armed()).toEqual([]);
+
+  const first = report(undefined);
+  steps[0]!.done.resolve(first);
+  expect(await joined).toBe(first);
+  await flush();
+  expect(steps).toHaveLength(2);
+  steps[1]!.done.resolve(report(undefined));
+  await flush();
+  expect(steps).toHaveLength(2);
+  expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+});
+
+it("waits for a non-cooperating step to settle before running after a restart", async () => {
+  const clock = fakeTimers();
+  const { stepper, steps } = manualStepper();
+  const driver = createReplicationDriver({
+    stepper,
+    budget,
+    timers: clock.timers,
+  });
+  driver.start();
+
+  const stopping = driver.stop(5_000);
+  clock.advance(5_000);
+  expect(await stopping).toBe(false);
+  driver.start();
+  expect(steps).toHaveLength(1);
+  expect(steps[0]!.signal.aborted).toBe(true);
+
+  steps[0]!.done.resolve(report(T0 + 6_000));
+  await flush();
+  expect(steps).toHaveLength(2);
+  expect(steps[1]!.signal.aborted).toBe(false);
+  expect(clock.armed()).toEqual([]);
+  steps[1]!.done.resolve(report(undefined));
+  await flush();
+  expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+});
