@@ -59,6 +59,28 @@ it.each(["eventId", "instanceId"])(
   },
 );
 
+it("does not accept an access action as a one-item array", () => {
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    scope: "fixture.scope",
+    grantId: "fixture-grant",
+    builder: "fixture-builder",
+    phase: "served-start",
+  };
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, action: "read" }),
+  ).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      ...event,
+      action: ["read"],
+    }),
+  ).toThrow("Invalid access activity event");
+});
+
 it("rejects an access activity descriptor with an unreadable timestamp", () => {
   const event = {
     schemaVersion: 1,
