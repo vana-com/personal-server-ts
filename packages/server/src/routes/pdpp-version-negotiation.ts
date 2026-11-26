@@ -29,14 +29,11 @@ export function pdppVersionFailure(c: Context): PdppError | undefined {
 
 export function pdppVersionMiddleware(
   requestId: () => string,
-  /** Which request paths are Core RS operations of this router. */
-  appliesTo: (path: string) => boolean,
 ): MiddlewareHandler {
+  // Register it only on a router's own Core paths (see pdppRecordsRoutes):
+  // a "*" registration on a router mounted under a shared prefix also wraps
+  // sibling routers mounted later under that prefix.
   return async (c, next) => {
-    if (!appliesTo(c.req.path)) {
-      await next();
-      return;
-    }
     try {
       assertSupportedPdppVersion(c.req.header("PDPP-Version"));
     } catch (error) {

@@ -126,7 +126,7 @@ async function readContext(response: Response): Promise<unknown> {
  * No credential, grant, token, or revocation state is imported with records.
  * This is explicit experimental host wiring, not ordinary bootstrap wiring.
  * Inactive RFC 7662 results conceal revocation reasons and yield 401; the
- * co-located issuer can distinguish grant_revoked and returns 403 instead.
+ * co-located issuer can distinguish grant_revoked and returns 401 grant_revoked instead.
  * The returned grant is a translated local enforcement view. Its grant_id
  * identifies the immutable issuer grant; never hash this view as consent.
  */

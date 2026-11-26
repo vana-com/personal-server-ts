@@ -348,7 +348,7 @@ export class PdppTokenService {
     // Grant state is checked BEFORE the token's own revocation flag, because
     // revoking a grant also marks its linked tokens revoked. Checking the
     // token first would report `revoked` for what is really a grant
-    // revocation, and the RS keys 403 `grant_revoked` off this exact reason
+    // revocation, and the RS keys 401 `grant_revoked` off this exact reason
     // (§2 revocation propagation) — it would return the wrong error.
     if (record.tokenKind === "client" && record.grantId) {
       const stored = this.store.getGrant(record.grantId);
@@ -403,7 +403,7 @@ export class PdppTokenService {
 
     const inactive = grantInactiveReason(this.store, stored, now);
     if (inactive) {
-      // grant_revoked is the reason the RS turns into 403 grant_revoked.
+      // grant_revoked is the reason the RS turns into 401 grant_revoked.
       return { active: false, inactiveReason: inactive };
     }
 
@@ -423,7 +423,7 @@ export class PdppTokenService {
    * An inactive token yields exactly `{ active: false }`. RFC 7662 §2.2 is
    * clear that the response must not distinguish revoked from expired from
    * never-issued — the reason stays internal (`resolveToken`) for the
-   * co-located RS, which needs it to pick 403 `grant_revoked`.
+   * co-located RS, which needs it to pick 401 `grant_revoked`.
    */
   introspect(
     accessToken: string,

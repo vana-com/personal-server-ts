@@ -91,11 +91,8 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   // like every other one (spec-core §8; RS item 11).
   app.use(
     "*",
-    pdppVersionMiddleware(
-      requestId,
-      // Mounted at /v1/blobs; every path here is the Core blob operation.
-      () => true,
-    ),
+    // Every path of this router is the Core blob operation.
+    pdppVersionMiddleware(requestId),
   );
   const readsFor = deps.reads ?? (() => deps.store);
 

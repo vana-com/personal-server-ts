@@ -208,7 +208,7 @@ export function recordKeyWithinGrantResources(
  * Exported so every route answers an inactive token with the SAME reason.
  * `/v1/streams` previously inlined a flat `authentication_error` while record
  * reads used this mapping, so one revoked grant produced a 401 on one endpoint
- * and a 403 `grant_revoked` on another.
+ * and a 401 `grant_revoked` on another.
  */
 export function mapInactiveToError(context: PdppTokenContext): PdppError {
   switch (context.inactiveReason) {

@@ -863,18 +863,19 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   // PDPP-Version negotiation (spec-core §8 "API versioning"). The outcome is
   // recorded here and reported by `authenticate` once the token is active,
   // so an inactive token still gets its 401 first.
-  app.use(
-    "*",
-    pdppVersionMiddleware(
-      requestId,
-      // This router is mounted at /v1, and Hono applies "*" to everything
-      // mounted under that prefix. Only this router's own Core paths
-      // negotiate; /v1/data, /v1/grants and the other non-PDPP routers
-      // ignore the field.
-      (path) =>
-        /^(\/v1)?\/(streams|records|blobs\/ingest)(\/|$)/.test(path),
-    ),
-  );
+  // Registered on this router's own relative paths, not "*": Hono prefixes
+  // these with the mount point (/v1 in the product app, /pdpp/v1 in the
+  // separated-RS harnesses), whereas "*" mounted at /v1 would also wrap the
+  // non-PDPP routers mounted later under /v1 (/v1/data, /v1/grants, …).
+  const negotiateVersion = pdppVersionMiddleware(requestId);
+  for (const pattern of [
+    "/streams",
+    "/streams/*",
+    "/records/*",
+    "/blobs/ingest",
+  ]) {
+    app.use(pattern, negotiateVersion);
+  }
 
   /**
    * The declaration a read of `stream` is measured against.
@@ -988,7 +989,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
     // An inactive token must report the SAME reason here as on a record read.
     // This branch used to answer a flat `authentication_error` (401) while
-    // `/streams/:stream/records` answered `grant_revoked` (403) for the very
+    // `/streams/:stream/records` answered `grant_revoked` (403 before the RS item 19 fix; 401 now) for the very
     // same token, so a client could not tell a revoked grant from a bad token
     // depending only on which endpoint it happened to call first. Found by
     // driving Context Gateway's real PdppContextClient against this server.

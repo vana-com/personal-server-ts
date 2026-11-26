@@ -1,3 +1,4 @@
+import { Hono } from "hono";
 import Database from "better-sqlite3";
 import {
   createRecordQuery,
@@ -1279,6 +1280,22 @@ describe("pdpp records routes: locked v0.1.0 PDPP-Version rules (spec-core §8)"
       headers: { Authorization: "Bearer dead-tok", "PDPP-Version": "9" },
     });
     expect(res.status).toBe(401);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+});
+
+describe("pdpp records routes: negotiation holds at any mount prefix", () => {
+  it.each(["/v1", "/pdpp/v1"])("refuses 2026-04-06 when mounted at %s", async (prefix) => {
+    const { app } = buildApp({
+      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1", instanceIds: ["inst_1"] },
+    });
+    const root = new Hono();
+    root.route(prefix, app);
+    const res = await root.request(`${prefix}/streams`, {
+      headers: { Authorization: "Bearer owner-tok", "PDPP-Version": "2026-04-06" },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.code).toBe("unsupported_version");
     expect(res.headers.get("PDPP-Version")).toBeNull();
   });
 });

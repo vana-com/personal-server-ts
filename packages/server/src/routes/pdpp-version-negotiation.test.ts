@@ -8,12 +8,8 @@ describe("pdppVersionMiddleware scope (mounted at /v1 like the records router)",
   function app() {
     let mutated = 0;
     const core = new Hono();
-    core.use(
-      "*",
-      pdppVersionMiddleware(report, (path) =>
-        /^(\/v1)?\/(streams|records|blobs\/ingest)(\/|$)/.test(path),
-      ),
-    );
+    core.use("/streams", pdppVersionMiddleware(report));
+    core.use("/streams/*", pdppVersionMiddleware(report));
     core.get("/streams", (c) => c.json({ ok: true }));
     const root = new Hono();
     root.route("/v1", core);
@@ -50,7 +46,7 @@ describe("pdppVersionMiddleware scope (mounted at /v1 like the records router)",
 describe("pdppVersionMiddleware safety net", () => {
   it("replaces a success after a failed negotiation without keeping the refused response's headers", async () => {
     const core = new Hono();
-    core.use("*", pdppVersionMiddleware(report, () => true));
+    core.use("*", pdppVersionMiddleware(report));
     core.get("/blob", (c) =>
       c.redirect("https://signed.example/blob?sig=secret", 302),
     );
