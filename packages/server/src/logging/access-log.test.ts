@@ -398,3 +398,76 @@ describe("AccessLogWriter error paths", () => {
     await expect(readdir(tempDir)).resolves.toEqual(["not-a-dir"]);
   });
 });
+
+describe("AccessLogWriter untested behavior", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "access-log-untested-"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("creates deeply nested missing log directories", async () => {
+    const logsDir = join(tempDir, "a", "b", "c", "logs");
+    const writer = createAccessLogWriter(logsDir);
+
+    await writer.write(makeEntry());
+
+    const files = await readdir(logsDir);
+    expect(files).toEqual(["access-2026-01-28.log"]);
+  });
+
+  it("appends to a pre-existing log file without clobbering it", async () => {
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+    const existing = `${JSON.stringify(makeEntry({ logId: "pre-existing" }))}\n`;
+    await writeFile(join(logsDir, "access-2026-01-28.log"), existing, "utf-8");
+
+    const writer = createAccessLogWriter(logsDir);
+    await writer.write(makeEntry({ logId: "appended" }));
+
+    const content = await readFile(
+      join(logsDir, "access-2026-01-28.log"),
+      "utf-8",
+    );
+    const ids = content
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line).logId);
+    expect(ids).toEqual(["pre-existing", "appended"]);
+  });
+});
+
+describe("AccessLogReader untested behavior", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "access-reader-untested-"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns at most the default 50 entries while reporting the full total", async () => {
+    const logsDir = join(tempDir, "logs");
+    const writer = createAccessLogWriter(logsDir);
+    for (let i = 0; i < 55; i++) {
+      await writer.write(
+        makeEntry({
+          logId: `entry-${String(i).padStart(2, "0")}`,
+          timestamp: `2026-01-28T00:${String(i).padStart(2, "0")}:00Z`,
+        }),
+      );
+    }
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(55);
+    expect(result.logs).toHaveLength(50);
+    expect(result.limit).toBe(50);
+  });
+});
