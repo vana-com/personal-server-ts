@@ -375,6 +375,38 @@ describe("access reporter batching", () => {
     );
   });
 
+  it("keeps the whole-batch refusal when an index is supplied as text", async () => {
+    const send = vi.fn(async () => refusal(400, { index: "0" }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(logIdsOf(send.mock.calls[0])).toEqual(["log-1", "log-2"]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "refused_400", count: 2, attempts: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("resends every record when a transient error body names a record index", async () => {
+    const send = okFetch();
+    send.mockResolvedValueOnce(refusal(503, { index: 0 }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+
+    const flushed = instance.flush();
+    await vi.advanceTimersByTimeAsync(500);
+    await flushed;
+
+    expect(send.mock.calls.map(logIdsOf)).toEqual([
+      ["log-1", "log-2"],
+      ["log-1", "log-2"],
+    ]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("retries a transient failure with backoff before giving up", async () => {
     const send = vi.fn(async () => {
       throw new Error("connect ECONNREFUSED");
