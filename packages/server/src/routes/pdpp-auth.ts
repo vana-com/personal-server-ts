@@ -1469,12 +1469,19 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         }
         return c.json(recovered.issued, 200, NO_STORE);
       }
-      const result = deps.tokens.redeemAuthorizationCode({
-        code,
-        clientId,
-        redirectUri,
-        codeVerifier: asString(body.code_verifier) ?? undefined,
-      });
+      let result: ReturnType<typeof deps.tokens.redeemAuthorizationCode>;
+      try {
+        result = deps.tokens.redeemAuthorizationCode({
+          code,
+          clientId,
+          redirectUri,
+          codeVerifier: asString(body.code_verifier) ?? undefined,
+        });
+      } catch (err) {
+        // AS item 44: the evidence could not be advanced; issue nothing.
+        deps.logger.error({ err }, "PDPP token issuance not recorded");
+        return unavailable(c, "the token could not be recorded; retry", 5);
+      }
       if (!result.ok) {
         if (result.failure.code === "temporarily_unavailable")
           return unavailable(c, result.failure.message);
@@ -1498,7 +1505,13 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           "refresh_token is required",
         );
       }
-      const result = deps.tokens.refresh({ refreshToken });
+      let result: ReturnType<typeof deps.tokens.refresh>;
+      try {
+        result = deps.tokens.refresh({ refreshToken });
+      } catch (err) {
+        deps.logger.error({ err }, "PDPP token refresh not recorded");
+        return unavailable(c, "the token could not be recorded; retry", 5);
+      }
       if (!result.ok && result.failure.code === "temporarily_unavailable") {
         return unavailable(c, result.failure.message);
       }
@@ -1702,7 +1715,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       });
     } catch (err) {
       // spec-core L2787: 200 only once every ending and disposition is
-      // durable; otherwise 503 with Retry-After. The transaction rolled back.
+      // durable; otherwise 503 with Retry-After. Either the transaction
+      // rolled back, or it committed but the evidence could not be advanced;
+      // in the second case a matching retry advances it and completes the
+      // revocation without moving any clock.
       deps.logger.error({ err }, "PDPP client token revocation not recorded");
       return c.json(
         {
@@ -2205,11 +2221,16 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           (d): d is string => typeof d === "string" && inScopeDigests.has(d),
         )
       : [];
-    const disabled = lifecycle.disableForLifecycle({
-      clientId: body.client_id,
-      grantIds,
-      tokenDigests: digests,
-    });
+    let disabled: number;
+    try {
+      disabled = lifecycle.disableForLifecycle({
+        clientId: body.client_id,
+        grantIds,
+        tokenDigests: digests,
+      });
+    } catch {
+      return unavailable(c, "the disabling could not be recorded; retry", 5);
+    }
     return c.json({ disabled }, 200, NO_STORE);
   });
 
@@ -2224,9 +2245,15 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         ...(!status.current && {
           reason: status.reason,
           statement: PENDING_HISTORY_STATEMENT,
-          reestablish_ends: lifecycle.reestablishAffected(),
+          // F7: only the grants inside this owner token's scope.
+          reestablish_ends: lifecycle.reestablishAffected(
+            undefined,
+            ownerScope(caller),
+          ),
         }),
         pending_actions: lifecycle.pendingOwnerActions(caller.subjectId),
+        // F5: actions the re-established store could not apply.
+        unapplied_actions: lifecycle.unappliedOwnerActions(caller.subjectId),
       },
       200,
       NO_STORE,

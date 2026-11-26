@@ -79,15 +79,61 @@ export interface AnchoredErasure {
   stop_use_by: string;
   read_state: "revoked" | "expired";
   ended_at: string;
+  /** The grant's owner, so a pending owner action can be matched (L1827). */
+  subject_id?: string;
+  /**
+   * Digests of every token issued to the client for the grant, so the
+   * client can still authenticate the query that delivers the instruction
+   * when the grant's row is missing from a restored store (F5, L1820).
+   */
+  token_digests?: string[];
 }
 
-export interface AnchorDocument {
-  format: 1;
+/** An erasure elected in advance, not yet effective (L1586). */
+export interface AnchoredElection {
+  grant_id: string;
+  client_id: string;
+  instruction_id: string;
+  accepted_at: string;
+  advance: true;
+}
+
+/**
+ * Everything the anchor carries besides the head. Derived from the database
+ * at every advance, so it always covers every effective instruction, advance
+ * election and lifecycle-disabled token up to the anchored position.
+ */
+export interface AnchorEvidence {
+  erasures: Record<string, AnchoredErasure>;
+  elections: Record<string, AnchoredElection>;
+  /** Token digests disabled for lifecycle use (L1716), incl. revoked recovery tokens. */
+  disabled_digests: string[];
+}
+
+export interface AnchorDocument extends AnchorEvidence {
+  format: 1 | 2;
   epoch: string;
   seq: number;
   hash: string;
   updated_at: string;
-  erasures: Record<string, AnchoredErasure>;
+}
+
+const EMPTY_EVIDENCE: AnchorEvidence = {
+  erasures: {},
+  elections: {},
+  disabled_digests: [],
+};
+
+function evidenceKey(e: AnchorEvidence): string {
+  const sorted = <T>(r: Record<string, T>) =>
+    Object.keys(r)
+      .sort()
+      .map((k) => [k, r[k]]);
+  return JSON.stringify([
+    sorted(e.erasures),
+    sorted(e.elections),
+    [...e.disabled_digests].sort(),
+  ]);
 }
 
 /** File I/O the anchor uses. Injectable so tests can fail the advance. */
@@ -113,19 +159,42 @@ export const defaultAnchorIo: AnchorIo = {
     }
     renameSync(tmp, path);
     // The rename is durable only once the directory entry is flushed.
-    try {
-      const dirFd = openSync(dirname(path), "r");
-      try {
-        fsyncSync(dirFd);
-      } finally {
-        closeSync(dirFd);
-      }
-    } catch {
-      // Some platforms refuse fsync on a directory handle; the rename has
-      // still happened and the file content is flushed.
-    }
+    fsyncDirectory(path);
   },
 };
+
+/** Count of directory fsyncs the platform refused (durability statement). */
+export let directoryFsyncFailures = 0;
+
+/**
+ * fsync the directory that holds `path`, so a created or renamed entry is
+ * durable. Some platforms refuse fsync on a directory handle. That is not
+ * swallowed silently: it is counted, a process warning is emitted once, and
+ * the durability statement says that the entry's durability then rests on
+ * the filesystem.
+ */
+export function fsyncDirectory(path: string): boolean {
+  try {
+    const dirFd = openSync(dirname(path), "r");
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+    return true;
+  } catch (err) {
+    directoryFsyncFailures += 1;
+    if (directoryFsyncFailures === 1) {
+      process.emitWarning(
+        `PDPP durability: fsync of directory ${dirname(path)} failed (${
+          err instanceof Error ? err.message : String(err)
+        }); a new or renamed anchor or journal entry may not survive power loss`,
+        "PdppDurabilityWarning",
+      );
+    }
+    return false;
+  }
+}
 
 /** Thrown when the evidence cannot be advanced: the event is NOT acknowledged. */
 export class HistoryEvidenceError extends Error {
@@ -176,16 +245,15 @@ export class HistoryRecorder {
   private epoch: string;
   private status: HistoryStatus = { current: true };
   private anchor: AnchorDocument | null = null;
-  /** Evidence queued by the transaction in progress. */
-  private txErasures: AnchoredErasure[] = [];
   private txAppended = false;
   /**
-   * Evidence of committed events not yet written to the anchor. Kept across
-   * a failed advance, so the next advance (or a retry's empty commit) writes
-   * it before anything is acknowledged.
+   * Committed events (or evidence) not yet written to the anchor. Kept
+   * across a failed advance, and recomputed at open (`catchUp`), so the next
+   * advance writes it before anything is acknowledged (F1).
    */
-  private owedErasures: AnchoredErasure[] = [];
   private owed = false;
+  private evidenceProvider: () => AnchorEvidence = () => EMPTY_EVIDENCE;
+  private anchoredBefore = false;
 
   constructor(
     private readonly db: Database.Database,
@@ -204,7 +272,55 @@ export class HistoryRecorder {
     } else {
       this.epoch = meta.epoch;
     }
-    this.status = this.check(meta?.anchored === 1);
+    this.anchoredBefore = meta?.anchored === 1;
+    this.status = this.check();
+  }
+
+  /** The store supplies the evidence, derived from its tables. */
+  setEvidenceProvider(provider: () => AnchorEvidence): void {
+    this.evidenceProvider = provider;
+  }
+
+  /**
+   * At open, after the provider is set: a current history whose anchor lags
+   * the database head, or lacks evidence the database holds (F1, F3), owes
+   * an advance. It is attempted now; if it fails, it stays owed and the next
+   * acknowledgement writes it first (or fails).
+   */
+  catchUp(now: string): void {
+    if (!this.anchorPath || !this.status.current) return;
+    const head = this.head();
+    if (
+      !this.anchor ||
+      this.anchor.seq !== head.seq ||
+      evidenceKey(this.anchor) !== evidenceKey(this.evidenceProvider())
+    ) {
+      this.owed = true;
+    }
+    if (!this.owed) return;
+    try {
+      this.advance(now);
+    } catch {
+      // stays owed
+    }
+  }
+
+  /** Whether committed evidence is still unwritten (tests and the statement). */
+  evidenceOwed(): boolean {
+    return this.owed;
+  }
+
+  /** The anchored election (usable while the history is not current). */
+  anchoredElection(grantId: string): AnchoredElection | null {
+    return this.anchor?.elections?.[grantId] ?? null;
+  }
+
+  anchoredElections(): AnchoredElection[] {
+    return Object.values(this.anchor?.elections ?? {});
+  }
+
+  anchoredDisabledDigests(): string[] {
+    return this.anchor?.disabled_digests ?? [];
   }
 
   /** Whether the database history is current under the declared mechanism. */
@@ -245,22 +361,14 @@ export class HistoryRecorder {
     this.txAppended = true;
   }
 
-  /** Queue anchor evidence for an instruction made effective in this tx. */
-  queueErasureEvidence(erasure: AnchoredErasure): void {
-    this.txErasures.push(erasure);
-  }
-
-  /** Forget evidence queued by a rolled-back transaction. */
+  /** Forget the append flag of a rolled-back transaction. */
   discardPending(): void {
-    this.txErasures = [];
     this.txAppended = false;
   }
 
-  /** The transaction committed: its evidence is now owed to the anchor. */
+  /** The transaction committed: its events are now owed to the anchor. */
   markCommitted(): void {
-    this.owedErasures.push(...this.txErasures);
     this.owed = this.owed || this.txAppended;
-    this.txErasures = [];
     this.txAppended = false;
   }
 
@@ -269,33 +377,32 @@ export class HistoryRecorder {
    * failure, so the caller does not acknowledge (L1823, case D4).
    */
   advance(now: string): void {
-    const erasures = this.owedErasures;
     if (!this.anchorPath) {
-      this.owedErasures = [];
       this.owed = false;
       return;
     }
-    if (!this.owed && erasures.length === 0) return;
+    if (!this.owed) return;
     // A store that is not current must never re-anchor on its own: that would
     // bless a rolled-back history. Only `reestablish` may do that.
     if (!this.status.current)
       throw new HistoryEvidenceError("history is not current");
     const head = this.head();
     const next: AnchorDocument = {
-      format: 1,
+      format: 2,
       epoch: this.epoch,
       seq: head.seq,
       hash: head.hash,
       updated_at: now,
-      erasures: { ...(this.anchor?.erasures ?? {}) },
+      // F3: derived from the database, so the anchored set always contains
+      // every effective instruction, election and disabled digest up to the
+      // anchored position, whatever an earlier failed advance dropped.
+      ...this.evidenceProvider(),
     };
-    for (const e of erasures) next.erasures[e.grant_id] = e;
     try {
       this.io.writeDurably(this.anchorPath, JSON.stringify(next));
     } catch (err) {
       throw new HistoryEvidenceError(err);
     }
-    this.owedErasures = [];
     this.owed = false;
     this.anchor = next;
     this.db
@@ -309,7 +416,7 @@ export class HistoryRecorder {
    * anchored instruction and pending owner action and invalidate every grant
    * whose terminal events may be missing (L1823).
    */
-  reanchor(now: string, keepErasures: AnchoredErasure[]): void {
+  reanchor(now: string): void {
     this.epoch = newEpoch();
     this.db
       .prepare(
@@ -317,14 +424,6 @@ export class HistoryRecorder {
       )
       .run(this.epoch);
     this.status = { current: true };
-    this.anchor = {
-      format: 1,
-      epoch: this.epoch,
-      seq: -1,
-      hash: "",
-      updated_at: now,
-      erasures: Object.fromEntries(keepErasures.map((e) => [e.grant_id, e])),
-    };
     this.owed = true;
     this.advance(now);
   }
@@ -338,7 +437,8 @@ export class HistoryRecorder {
     return row ?? { seq: 0, hash: GENESIS_HASH };
   }
 
-  private check(anchoredBefore: boolean): HistoryStatus {
+  private check(): HistoryStatus {
+    const anchoredBefore = this.anchoredBefore;
     if (!this.anchorPath) return { current: true };
     let raw: string | null;
     try {
@@ -350,23 +450,19 @@ export class HistoryRecorder {
       if (anchoredBefore) return { current: false, reason: "anchor_missing" };
       // A fresh store, or one created before this mechanism existed: anchor
       // it now. Earlier restores of such a store cannot be detected; the
-      // durability statement says so.
-      this.anchor = {
-        format: 1,
-        epoch: this.epoch,
-        seq: -1,
-        hash: "",
-        updated_at: new Date().toISOString(),
-        erasures: {},
-      };
+      // durability statement says so. `catchUp` writes the first anchor.
       this.owed = true;
-      this.advance(new Date().toISOString());
       return { current: true };
     }
     let doc: AnchorDocument;
     try {
       doc = JSON.parse(raw) as AnchorDocument;
-      if (doc.format !== 1 || typeof doc.seq !== "number") throw new Error();
+      if ((doc.format !== 1 && doc.format !== 2) || typeof doc.seq !== "number")
+        throw new Error();
+      // Format 1 (first WP6 build) carried erasures only.
+      doc.elections ??= {};
+      doc.disabled_digests ??= [];
+      doc.erasures ??= {};
     } catch {
       return { current: false, reason: "anchor_unreadable" };
     }
@@ -427,6 +523,7 @@ export interface PendingJournalIo {
 export const defaultPendingJournalIo: PendingJournalIo = {
   read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : null),
   appendDurably(path, line) {
+    const created = !existsSync(path);
     const fd = openSync(path, "a", 0o600);
     try {
       writeSync(fd, line);
@@ -434,6 +531,9 @@ export const defaultPendingJournalIo: PendingJournalIo = {
     } finally {
       closeSync(fd);
     }
+    // F6: a new journal file's directory entry must be durable before the
+    // first 202 that relies on it.
+    if (created) fsyncDirectory(path);
   },
   writeDurably: (path, content) => defaultAnchorIo.writeDurably(path, content),
 };

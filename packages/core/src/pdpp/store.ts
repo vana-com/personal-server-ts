@@ -27,7 +27,9 @@ import Database from "better-sqlite3";
 import {
   HistoryRecorder,
   PendingActionJournal,
+  type AnchorEvidence,
   type AnchorIo,
+  type AnchoredElection,
   type AnchoredErasure,
   type PendingJournalIo,
 } from "./history.js";
@@ -320,7 +322,11 @@ export function openPdppAuthStore(
     journalPath,
     options.pendingJournalIo,
   );
-  return new PdppAuthStore(db, history, journal);
+  const store = new PdppAuthStore(db, history, journal);
+  // F1/F3: a current history whose anchor lags the database owes an advance,
+  // written now (or before the next acknowledgement).
+  history.catchUp(new Date().toISOString());
+  return store;
 }
 
 /** How a grant ended, for the owner surface (L1572). */
@@ -343,6 +349,61 @@ export class PdppAuthStore {
     ),
   ) {
     this.lifecycle = new LifecycleRecords(db, history);
+    history.setEvidenceProvider(() => this.anchorEvidence());
+  }
+
+  /**
+   * The anchor's evidence, derived from the tables at every advance (F2-F4):
+   * every effective instruction with its grant-ending facts, subject and
+   * token digests; every advance election; every token digest disabled for
+   * lifecycle use; and erasures restored for grants a restore lost.
+   */
+  anchorEvidence(): AnchorEvidence {
+    const erasures: Record<string, AnchoredErasure> = {};
+    const elections: Record<string, AnchoredElection> = {};
+    for (const i of this.lifecycle.listInstructions()) {
+      if (!i.effectiveAt) {
+        elections[i.grantId] = {
+          grant_id: i.grantId,
+          client_id: i.clientId,
+          instruction_id: i.instructionId,
+          accepted_at: i.acceptedAt,
+          advance: true,
+        };
+        continue;
+      }
+      const stored = this.getGrant(i.grantId);
+      const ending = stored
+        ? this.endingOf(
+            stored,
+            new Date(Math.max(Date.now(), Date.parse(i.effectiveAt))),
+          )
+        : null;
+      erasures[i.grantId] = {
+        grant_id: i.grantId,
+        client_id: i.clientId,
+        instruction_id: i.instructionId,
+        accepted_at: i.acceptedAt,
+        effective_at: i.effectiveAt,
+        stop_use_by: new Date(
+          Date.parse(i.effectiveAt) + STOP_USE_BOUND_MS,
+        ).toISOString(),
+        read_state: ending?.readState ?? "revoked",
+        ended_at: ending?.endedAt ?? i.effectiveAt,
+        ...(stored && { subject_id: stored.subjectId }),
+        token_digests: this.lifecycle
+          .tokenDigestsFor(i.clientId, [i.grantId])
+          .sort(),
+      };
+    }
+    for (const o of this.lifecycle.listOrphanErasures()) {
+      erasures[o.grant_id] ??= o;
+    }
+    return {
+      erasures,
+      elections,
+      disabled_digests: this.lifecycle.listDisabledDigests().sort(),
+    };
   }
 
   /**
@@ -545,7 +606,7 @@ export class PdppAuthStore {
       throw err;
     }
     this.history.markCommitted();
-    this.history.reanchor(now.toISOString(), this.history.anchoredErasures());
+    this.history.reanchor(now.toISOString());
   }
 
   /** Restore one anchored instruction and its grant-ending facts (L1820). */
@@ -723,30 +784,7 @@ export class PdppAuthStore {
       ending.endedAt,
       now.toISOString(),
     );
-    const effective = this.lifecycle.getInstruction(grantId)!;
-    this.queueErasureEvidence(effective, ending);
-    return effective;
-  }
-
-  /** Put an effective instruction's complete record into the anchor (L1820). */
-  queueErasureEvidence(
-    instruction: ErasureInstructionRecord,
-    ending: { readState: "revoked" | "expired"; endedAt: string },
-  ): void {
-    if (!instruction.effectiveAt) return;
-    const evidence: AnchoredErasure = {
-      grant_id: instruction.grantId,
-      client_id: instruction.clientId,
-      instruction_id: instruction.instructionId,
-      accepted_at: instruction.acceptedAt,
-      effective_at: instruction.effectiveAt,
-      stop_use_by: new Date(
-        Date.parse(instruction.effectiveAt) + STOP_USE_BOUND_MS,
-      ).toISOString(),
-      read_state: ending.readState,
-      ended_at: ending.endedAt,
-    };
-    this.history.queueErasureEvidence(evidence);
+    return this.lifecycle.getInstruction(grantId)!;
   }
 
   /**
@@ -783,7 +821,6 @@ export class PdppAuthStore {
     instruction = this.lifecycle.getInstruction(input.grantId)!;
     const stored = this.getGrant(input.grantId)!;
     const ending = this.endingOf(stored, input.now);
-    if (ending) this.queueErasureEvidence(instruction, ending);
     if (input.receiptReportedAt) {
       this.lifecycle.recordReceipt(
         instruction.instructionId,

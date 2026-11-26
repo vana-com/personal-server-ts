@@ -42,7 +42,7 @@ import {
   RECOVERY_STATEMENT,
   stageSummary,
 } from "./held-data-statements.js";
-import type { PendingOwnerAction } from "./history.js";
+import type { AnchoredErasure, PendingOwnerAction } from "./history.js";
 
 export {
   DELETION_BOUND_MS,
@@ -53,6 +53,9 @@ export {
 
 /** L1802: the lifecycle recovery authorization-details type (AS items 33, 47). */
 export const PDPP_GRANT_LIFECYCLE_TYPE = "https://pdpp.dev/grant-lifecycle";
+
+/** Rate-limit windows kept in memory at most (one per client and grant). */
+export const MAX_RATE_WINDOWS = 10_000;
 
 /** Seconds a client should wait after a 503 from an unavailable history. */
 export const HISTORY_RETRY_AFTER_SECONDS = 300;
@@ -253,6 +256,7 @@ export class GrantLifecycleService {
     { start: number; count: number }
   >();
   private readonly recoverySessions = new Map<string, RecoverySession>();
+  private readonly journaledFirstReturns = new Set<string>();
 
   constructor(
     private readonly store: PdppAuthStore,
@@ -383,10 +387,43 @@ export class GrantLifecycleService {
       };
     }
     const credential = this.lookupCredential(token, hint);
+    const digest = hashToken(token);
+    const disabled =
+      this.store.lifecycle.isDigestDisabled(digest) ||
+      // While not current, disablings the stale store lost still hold (F4).
+      (!this.store.history.isCurrent() &&
+        this.store.history.anchoredDisabledDigests().includes(digest));
+    // F5: a grant a restore lost. Its anchored instruction still reaches the
+    // client through a token whose digest the evidence carries.
+    if (!credential && !disabled && grantIds.length === 1) {
+      const evidence = this.evidenceErasureFor(grantIds[0]!);
+      if (
+        evidence?.token_digests?.includes(digest) &&
+        (clientIdParam === undefined || clientIdParam === evidence.client_id)
+      ) {
+        if (write) {
+          return {
+            status: 200,
+            body: {
+              grants: [
+                {
+                  grant_id: evidence.grant_id,
+                  error: "current_authentication_required",
+                },
+              ],
+            },
+          };
+        }
+        return {
+          status: 200,
+          body: { grants: [this.evidenceAnswer(evidence, now)] },
+        };
+      }
+    }
     // L1736: unknown, malformed, another client's, or disabled → invalid_token.
     if (
       !credential ||
-      this.store.lifecycle.isDigestDisabled(credential.digest) ||
+      disabled ||
       (clientIdParam !== undefined && clientIdParam !== credential.clientId)
     ) {
       return {
@@ -417,26 +454,9 @@ export class GrantLifecycleService {
       if (!write && covered) {
         const anchored = this.store.history.anchoredErasure(grantId);
         if (anchored && anchored.client_id === credential.clientId) {
-          this.journalFirstReturn(anchored.instruction_id, grantId, now);
           return {
             status: 200,
-            body: {
-              grants: [
-                {
-                  grant_id: grantId,
-                  assessed_at: now.toISOString(),
-                  read_state: anchored.read_state,
-                  ended_at: anchored.ended_at,
-                  held_data: "erase",
-                  erasure: {
-                    instruction_id: anchored.instruction_id,
-                    accepted_at: anchored.accepted_at,
-                    effective_at: anchored.effective_at,
-                    stop_use_by: anchored.stop_use_by,
-                  },
-                },
-              ],
-            },
+            body: { grants: [this.evidenceAnswer(anchored, now)] },
           };
         }
       }
@@ -541,6 +561,38 @@ export class GrantLifecycleService {
         retryAfterSeconds: 5,
       };
     }
+  }
+
+  /**
+   * The evidence-held instruction for a grant: the anchor while the history
+   * is not current; after re-establishment, the orphan record for a grant
+   * the restored store lacks.
+   */
+  private evidenceErasureFor(grantId: string): AnchoredErasure | null {
+    if (!this.store.history.isCurrent())
+      return this.store.history.anchoredErasure(grantId);
+    if (this.store.getGrant(grantId)) return null;
+    return this.store.lifecycle.getOrphanErasure(grantId);
+  }
+
+  /** An `erase` answer from evidence (L1820); its first return is recorded. */
+  private evidenceAnswer(e: AnchoredErasure, now: Date): LifecycleAnswer {
+    if (!this.store.history.isCurrent()) {
+      this.journalFirstReturn(e.instruction_id, e.grant_id, now);
+    }
+    return {
+      grant_id: e.grant_id,
+      assessed_at: now.toISOString(),
+      read_state: e.read_state,
+      ended_at: e.ended_at,
+      held_data: "erase",
+      erasure: {
+        instruction_id: e.instruction_id,
+        accepted_at: e.accepted_at,
+        effective_at: e.effective_at,
+        stop_use_by: e.stop_use_by,
+      },
+    };
   }
 
   /**
@@ -714,6 +766,18 @@ export class GrantLifecycleService {
   ): LifecycleHttpResult | null {
     const key = `${clientId}\u0000${grantId}`;
     const t = now.getTime();
+    // Bound the map: drop expired windows, then the oldest, past the cap.
+    if (this.windows.size >= MAX_RATE_WINDOWS && !this.windows.has(key)) {
+      for (const [k, w] of this.windows) {
+        if (t - w.start >= RETRY_INTERVAL_MS || t < w.start)
+          this.windows.delete(k);
+      }
+      while (this.windows.size >= MAX_RATE_WINDOWS) {
+        const oldest = this.windows.keys().next().value;
+        if (oldest === undefined) break;
+        this.windows.delete(oldest);
+      }
+    }
     const window = this.windows.get(key);
     if (!window || t - window.start >= RETRY_INTERVAL_MS || t < window.start) {
       this.windows.set(key, { start: t, count: 1 });
@@ -742,7 +806,16 @@ export class GrantLifecycleService {
     now: Date,
   ) {
     // L1820: "The AS still records its first return of an instruction". The
-    // stale store cannot be written, so the fact waits in the journal.
+    // stale store cannot be written, so the fact waits in the journal, once.
+    if (this.journaledFirstReturns.has(instructionId)) return;
+    if (
+      this.store.pendingActions
+        .list()
+        .some((a) => a.kind === "first_return" && a.action === instructionId)
+    ) {
+      this.journaledFirstReturns.add(instructionId);
+      return;
+    }
     try {
       this.store.pendingActions.append({
         action_id: `fr_${instructionId}`,
@@ -753,6 +826,7 @@ export class GrantLifecycleService {
         grant_ids: [grantId],
         dispositions: {},
       });
+      this.journaledFirstReturns.add(instructionId);
     } catch {
       // Best effort: without the journal the AS cannot record the first
       // return; the answer is still the durable instruction.
@@ -1021,6 +1095,12 @@ export class GrantLifecycleService {
               });
             }
           }, now);
+        } else {
+          // F1: a retry of a recorded action is acknowledged only once the
+          // evidence for it is written: flush any owed advance (it throws,
+          // and the grant stays pending, if the anchor still cannot be
+          // written).
+          this.store.commit(() => undefined, now);
         }
         results.push({
           grant_id: grantId,
@@ -1493,13 +1573,19 @@ export class GrantLifecycleService {
     // The owner's ceiling still applies: a grant must be the owner's and in
     // the token's scope as far as the readable (possibly stale) store shows.
     // This rejects for scope, never for the unavailable history (L1827).
+    // F5: a grant the stale store lacks (issued after the restored backup)
+    // is still accepted and journaled; only one that the store or the
+    // evidence shows belongs to another owner, or lies outside the token's
+    // scope, is refused.
     for (const g of input.grantIds) {
       const stored = this.store.getGrant(g);
-      if (
-        !stored ||
-        stored.subjectId !== input.subjectId ||
-        !input.inScope(stored)
-      )
+      if (stored) {
+        if (stored.subjectId !== input.subjectId || !input.inScope(stored))
+          return { ok: false, code: "not_found", message: "grant not found" };
+        continue;
+      }
+      const evidence = this.store.history.anchoredErasure(g);
+      if (evidence?.subject_id && evidence.subject_id !== input.subjectId)
         return { ok: false, code: "not_found", message: "grant not found" };
     }
     // The scope of a whole-client action cannot be listed from a history that
@@ -1561,12 +1647,20 @@ export class GrantLifecycleService {
   /**
    * The grants re-establishment would end: active in the (possibly stale)
    * store, with no anchored erasure and no pending owner ending. Each needs
-   * an explicit disposition (AS item 41), because ending them is an owner
-   * action like any other.
+   * an explicit disposition (AS item 41), except a grant with an anchored or
+   * recorded advance election: its choice is locked to `delete` (F2, L1622
+   * "A later `keep` [...] MUST NOT cancel it"). `inScope` filters what a
+   * caller sees (F7); re-establishment itself always covers every grant.
    */
-  reestablishAffected(now: Date = this.clock()): AffectedGrant[] {
+  reestablishAffected(
+    now: Date = this.clock(),
+    inScope: (stored: StoredGrant) => boolean = () => true,
+  ): AffectedGrant[] {
     const anchored = new Set(
       this.store.history.anchoredErasures().map((e) => e.grant_id),
+    );
+    const elected = new Set(
+      this.store.history.anchoredElections().map((e) => e.grant_id),
     );
     const pending = new Set(
       this.store.pendingActions
@@ -1581,18 +1675,44 @@ export class GrantLifecycleService {
         (g) =>
           !anchored.has(g.grant.grant_id) && !pending.has(g.grant.grant_id),
       )
-      .map((g) => this.affectedEntry(g, "revoke", now));
+      .filter(inScope)
+      .map((g) => {
+        const entry = this.affectedEntry(g, "revoke", now);
+        const locked =
+          elected.has(g.grant.grant_id) ||
+          !!this.store.lifecycle.getInstruction(g.grant.grant_id);
+        return locked
+          ? {
+              ...entry,
+              disposition_locked: "delete" as const,
+              disposition_required: false,
+            }
+          : entry;
+      });
+  }
+
+  /** Pending actions the re-established store could not apply (F5). */
+  unappliedOwnerActions(subjectId: string) {
+    return this.store.lifecycle.listUnappliedActions(subjectId);
   }
 
   /**
    * Re-establish the history after the declared mechanism found it not
-   * current (L1823, L1827). In one transaction: restore every anchored
-   * erasure instruction the database lacks; apply every pending owner action
-   * in order; then end every grant that is still active, because its
-   * terminal events may be missing ("invalidation on restore of every grant
-   * whose terminal events may be missing", L1823), each with the owner's
-   * explicit disposition. Only then does the store become current under a
-   * new epoch. Every client then needs a new grant.
+   * current (L1823, L1827). In one transaction:
+   *
+   *   1. restore every anchored erasure instruction and advance election the
+   *      database lacks, with its original identifier and clocks (F2); for a
+   *      grant the database lacks, keep the anchored instruction as an
+   *      orphan record so the client can still receive it (F5);
+   *   2. re-disable every token digest the anchor shows disabled, and revoke
+   *      and disable every lifecycle recovery token (F4);
+   *   3. apply every pending owner action in order; one naming a grant the
+   *      store lacks is kept as unapplied, for the owner to see (F5);
+   *   4. end every grant that is still active, because its terminal events
+   *      may be missing (L1823), each with the owner's explicit disposition,
+   *      or `delete` where an advance election locks it.
+   *
+   * Only then does the store become current under a new epoch.
    */
   reestablishHistory(input: {
     dispositions: Record<string, "keep" | "delete">;
@@ -1604,6 +1724,9 @@ export class GrantLifecycleService {
         restoredInstructions: number;
         appliedActions: number;
         invalidatedGrants: string[];
+        orphanedInstructions: string[];
+        unappliedActions: number;
+        disabledTokens: number;
       }
     | {
         ok: false;
@@ -1618,10 +1741,14 @@ export class GrantLifecycleService {
         restoredInstructions: 0,
         appliedActions: 0,
         invalidatedGrants: [],
+        orphanedInstructions: [],
+        unappliedActions: 0,
+        disabledTokens: 0,
       };
     }
     const toEnd = this.reestablishAffected(now);
     const missing = toEnd
+      .filter((g) => g.disposition_required)
       .map((g) => g.grant_id)
       .filter(
         (g) =>
@@ -1639,13 +1766,43 @@ export class GrantLifecycleService {
     }
     let restored = 0;
     let applied = 0;
+    let unapplied = 0;
+    let disabledTokens = 0;
+    const orphaned: string[] = [];
     const invalidated: string[] = [];
+    const at = now.toISOString();
     const actions = this.store.pendingActions.list();
     this.store.reestablishHistory(() => {
+      // 1. instructions and elections
       for (const e of this.store.history.anchoredErasures()) {
-        if (!this.store.getGrant(e.grant_id)) continue;
+        if (!this.store.getGrant(e.grant_id)) {
+          if (!this.store.lifecycle.getOrphanErasure(e.grant_id)) {
+            this.store.lifecycle.insertOrphanErasure(e, at);
+            orphaned.push(e.grant_id);
+          }
+          continue;
+        }
         if (this.store.restoreAnchoredInstructionInTx(e, now)) restored += 1;
       }
+      for (const e of this.store.history.anchoredElections()) {
+        if (!this.store.getGrant(e.grant_id)) continue;
+        if (
+          this.store.lifecycle.restoreInstruction(
+            { ...e, effective_at: null, advance: true },
+            at,
+          )
+        )
+          restored += 1;
+      }
+      // 2. lifecycle-disabled digests and recovery tokens
+      for (const d of this.store.history.anchoredDisabledDigests()) {
+        if (this.store.lifecycle.disableDigest(d, at)) disabledTokens += 1;
+      }
+      for (const d of this.store.lifecycle.listRecoveryTokenDigests()) {
+        this.store.lifecycle.revokeRecoveryToken(d, at);
+        if (this.store.lifecycle.disableDigest(d, at)) disabledTokens += 1;
+      }
+      // 3. pending owner actions
       for (const a of actions) {
         if (a.kind === "first_return") {
           const instruction = this.store.lifecycle.getInstruction(
@@ -1657,9 +1814,25 @@ export class GrantLifecycleService {
         }
         for (const grantId of a.grant_ids) {
           const stored = this.store.getGrant(grantId);
-          if (!stored || stored.subjectId !== a.subject_id) continue;
           const d = a.dispositions[grantId];
-          if (!d) continue;
+          if (!stored) {
+            this.store.lifecycle.insertUnappliedAction({
+              actionId: a.action_id,
+              grantId,
+              subjectId: a.subject_id,
+              kind: a.kind,
+              action: a.action,
+              disposition: d ?? null,
+              recordedAt: a.recorded_at,
+              outcome: this.store.lifecycle.getOrphanErasure(grantId)
+                ? "grant_not_in_restored_store_instruction_delivered_from_evidence"
+                : "grant_not_in_restored_store",
+              at,
+            });
+            unapplied += 1;
+            continue;
+          }
+          if (stored.subjectId !== a.subject_id || !d) continue;
           this.store.lifecycle.insertOwnerDisposition({
             grantId,
             disposition: d,
@@ -1667,11 +1840,11 @@ export class GrantLifecycleService {
             actionId: a.action_id,
             at: a.recorded_at,
           });
-          const at = new Date(a.recorded_at);
+          const actedAt = new Date(a.recorded_at);
           if (
             a.kind === "erasure" &&
             a.action === "advance" &&
-            !this.store.endingOf(stored, at) &&
+            !this.store.endingOf(stored, actedAt) &&
             !this.store.lifecycle.getInstruction(grantId)
           ) {
             this.store.lifecycle.insertInstruction({
@@ -1687,7 +1860,7 @@ export class GrantLifecycleService {
               grantId,
               clientId: stored.clientId,
               origin: "owner",
-              now: at,
+              now: actedAt,
               ending: {
                 reason:
                   a.kind === "erasure" ? "erasure_request" : "owner_withdrawal",
@@ -1695,7 +1868,7 @@ export class GrantLifecycleService {
               },
             });
           } else {
-            this.store.endGrantInTx(grantId, at, {
+            this.store.endGrantInTx(grantId, actedAt, {
               reason: "owner_withdrawal",
               detail: a.action,
             });
@@ -1703,21 +1876,22 @@ export class GrantLifecycleService {
         }
         applied += 1;
       }
+      // 4. end what is still active
+      const ending = {
+        reason: "history_restore" as const,
+        detail:
+          "the server could not confirm its authorization history was complete",
+      };
       for (const entry of toEnd) {
         const grantId = entry.grant_id;
-        const d = input.dispositions[grantId]!;
+        const d = entry.disposition_locked ?? input.dispositions[grantId]!;
         this.store.lifecycle.insertOwnerDisposition({
           grantId,
           disposition: d,
           path: "history_restore",
           actionId: input.actionId,
-          at: now.toISOString(),
+          at,
         });
-        const ending = {
-          reason: "history_restore" as const,
-          detail:
-            "the server could not confirm its authorization history was complete",
-        };
         const ended =
           d === "delete"
             ? this.store.requestErasureInTx({
@@ -1730,14 +1904,10 @@ export class GrantLifecycleService {
             : this.store.endGrantInTx(grantId, now, ending);
         if (ended) invalidated.push(grantId);
       }
-      // Anything a pending action reopened cannot exist, but no grant may
-      // leave this transaction active.
+      // No grant may leave this transaction active, and an advance election
+      // on any grant ends with it (settled inside endGrantInTx).
       for (const g of this.store.listAllGrants()) {
-        if (
-          this.store.endGrantInTx(g.grant.grant_id, now, {
-            reason: "history_restore",
-          })
-        )
+        if (this.store.endGrantInTx(g.grant.grant_id, now, ending))
           invalidated.push(g.grant.grant_id);
       }
     }, now);
@@ -1747,6 +1917,9 @@ export class GrantLifecycleService {
       restoredInstructions: restored,
       appliedActions: applied,
       invalidatedGrants: invalidated,
+      orphanedInstructions: orphaned,
+      unappliedActions: unapplied,
+      disabledTokens,
     };
   }
 
@@ -1947,22 +2120,26 @@ export class GrantLifecycleService {
     if (!this.store.history.isCurrent())
       return { ok: false, code: "temporarily_unavailable" };
     const code = `pdpp_lrc_${randomBytes(24).toString("hex")}`;
-    this.store.commit(() => {
-      this.store.lifecycle.insertRecoveryApproval({
-        approvalId: `lra_${randomBytes(16).toString("hex")}`,
-        subjectId: session.subject_id,
-        clientId: session.client_id,
-        grantIds: session.grant_ids,
-        reviewDigest: session.review_digest,
-        statement: RECOVERY_STATEMENT,
-        at: now.toISOString(),
-        codeHash: hashToken(code),
-        redirectUri: session.redirect_uri,
-        codeChallenge: session.code_challenge ?? null,
-        codeChallengeMethod: session.code_challenge_method ?? null,
-        codeExpiresAt: iso(now.getTime() + 60_000),
-      });
-    }, now);
+    try {
+      this.store.commit(() => {
+        this.store.lifecycle.insertRecoveryApproval({
+          approvalId: `lra_${randomBytes(16).toString("hex")}`,
+          subjectId: session.subject_id,
+          clientId: session.client_id,
+          grantIds: session.grant_ids,
+          reviewDigest: session.review_digest,
+          statement: RECOVERY_STATEMENT,
+          at: now.toISOString(),
+          codeHash: hashToken(code),
+          redirectUri: session.redirect_uri,
+          codeChallenge: session.code_challenge ?? null,
+          codeChallengeMethod: session.code_challenge_method ?? null,
+          codeExpiresAt: iso(now.getTime() + 60_000),
+        });
+      }, now);
+    } catch {
+      return { ok: false, code: "temporarily_unavailable" };
+    }
     session.status = "approved";
     const redirect = new URL(session.redirect_uri);
     redirect.searchParams.set("code", code);
@@ -2031,35 +2208,45 @@ export class GrantLifecycleService {
       message: "authorization code is invalid, expired, or already redeemed",
     };
     const token = newOpaqueToken("pdpp_lt");
-    const result = this.store.commit(() => {
-      const record = this.store.lifecycle.consumeRecoveryCode(
-        hashToken(input.code),
-        now.toISOString(),
-      );
-      if (!record) return null;
-      if (
-        record.clientId !== input.clientId ||
-        record.redirectUri !== input.redirectUri
-      )
-        return "mismatch" as const;
-      if (
-        verifyCodeVerifier(
-          input.codeVerifier,
-          record.codeChallenge,
-          record.codeChallengeMethod,
+    let result:
+      ReturnType<typeof this.store.lifecycle.consumeRecoveryCode> | "mismatch";
+    try {
+      result = this.store.commit(() => {
+        const record = this.store.lifecycle.consumeRecoveryCode(
+          hashToken(input.code),
+          now.toISOString(),
+        );
+        if (!record) return null;
+        if (
+          record.clientId !== input.clientId ||
+          record.redirectUri !== input.redirectUri
         )
-      )
-        return "mismatch" as const;
-      this.store.lifecycle.insertRecoveryToken({
-        tokenHash: hashToken(token),
-        approvalId: record.approvalId,
-        clientId: record.clientId,
-        subjectId: record.subjectId,
-        grantIds: record.grantIds,
-        at: now.toISOString(),
-      });
-      return record;
-    }, now);
+          return "mismatch" as const;
+        if (
+          verifyCodeVerifier(
+            input.codeVerifier,
+            record.codeChallenge,
+            record.codeChallengeMethod,
+          )
+        )
+          return "mismatch" as const;
+        this.store.lifecycle.insertRecoveryToken({
+          tokenHash: hashToken(token),
+          approvalId: record.approvalId,
+          clientId: record.clientId,
+          subjectId: record.subjectId,
+          grantIds: record.grantIds,
+          at: now.toISOString(),
+        });
+        return record;
+      }, now);
+    } catch {
+      return {
+        ok: false,
+        code: "temporarily_unavailable",
+        message: "the recovery token could not be recorded",
+      };
+    }
     if (!result || result === "mismatch") return invalid;
     return {
       ok: true,

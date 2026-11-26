@@ -731,6 +731,17 @@ describe("AS item 44 / D4 — routes while the history is not current", () => {
       reason: "history_behind_anchor",
     });
     expect(status.reestablish_ends.map((x) => x.grant_id)).toEqual([h.grantId]);
+    // F7: a token scoped to another source sees none of these grants.
+    const otherSource = tokens.issueOwnerToken({
+      subjectId: OWNER,
+      sourceId: "https://registry.pdpp.dev/connectors/other",
+    }).access_token;
+    const scoped = (await (
+      await app.request("/pdpp/v1/owner/lifecycle/history", {
+        headers: auth(otherSource),
+      })
+    ).json()) as { reestablish_ends: unknown[] };
+    expect(scoped.reestablish_ends).toEqual([]);
 
     const missing = await postJson("/pdpp/v1/owner/lifecycle/reestablish", {});
     expect(missing.status).toBe(400);

@@ -43,12 +43,31 @@ The AS declares one mechanism (`packages/core/src/pdpp/history.ts`):
    history before it.
 2. **Anchor file outside the SQLite file.**
    `<storageRoot>/pdpp-auth.db.history-anchor.json` holds the history epoch,
-   the head `(seq, hash)`, and the complete record of every effective erasure
-   instruction (identifier, acceptance, effective time, stop-use time, and the
-   grant's ending). It is replaced atomically (temporary file, fsync, rename,
+   the head `(seq, hash)`, and evidence derived from the database at every
+   write:
+   - the complete record of every effective erasure instruction
+     (identifier, acceptance, effective time, stop-use time, the grant's
+     ending, its owner, and the digests of every token issued to the client
+     for the grant);
+   - every advance erasure election (identifier, acceptance time, advance
+     flag);
+   - every token digest disabled for lifecycle use, including revoked
+     recovery tokens.
+
+   Because the evidence is recomputed from the tables each time, the
+   anchored set always holds every effective instruction, election and
+   disabling up to the anchored position, even after an earlier write
+   failed. The file is replaced atomically (temporary file, fsync, rename,
    directory fsync) after each commit and before the AS acknowledges
    anything. If this write fails, the AS does not acknowledge: the route
-   answers 503, and the evidence is written before the next acknowledgement.
+   answers 503 and the evidence stays owed. Every later acknowledgement
+   writes the owed evidence first, or is refused. That includes a retry of
+   an action already recorded, a lifecycle answer, and a token response.
+   When the store opens and the history is current, the AS writes the
+   evidence at once if the anchor lags the database or lacks evidence the
+   database holds. If that write also fails, the evidence stays owed under
+   the same rule.
+
 3. **Check at open.** The history is current only when the anchor's epoch
    equals the database's epoch and the database holds the anchored head with
    the anchored hash. A database **behind** the anchor
@@ -90,27 +109,57 @@ shows the reason):
   `Retry-After`, except that a query for a grant whose complete erasure
   instruction is in the anchor returns that `erase` answer (L1820); lifecycle
   writes and client RFC 7009 revocations answer 503;
-- owner revocations, dispositions and erasure requests are **accepted**:
-  each is appended and fsync'd to
-  `<storageRoot>/pdpp-auth.db.pending-owner-actions.jsonl` (outside the
-  unavailable database) before the AS answers 202, and the owner sees each
-  grant as `pending` with the statement that the AS issues no tokens and
+- a token whose digest the anchor shows disabled for lifecycle use is
+  refused (401) even if the restored database lost the disabling;
+- a client whose grant the restored database lacks (issued after the
+  backup) still receives that grant's anchored `erase` answer, because the
+  anchor carries the digests of its tokens; writes for it get
+  `current_authentication_required`;
+- owner revocations, dispositions and erasure requests are **accepted**,
+  including for grant ids the restored database lacks. Each is appended and
+  fsync'd to `<storageRoot>/pdpp-auth.db.pending-owner-actions.jsonl`
+  (outside the unavailable database) before the AS answers 202. When the
+  journal file is created, its directory is fsync'd too. The owner sees each
+  grant as `pending`, with the statement that the AS issues no tokens and
   returns no positive answers meanwhile (L1827). A request without an
-  explicit disposition is still rejected.
+  explicit disposition is still rejected. A grant the database shows to
+  belong to another owner, or to lie outside the owner token's scope, is
+  refused as `not_found`.
 
 Re-establishing the history (`POST /pdpp/v1/owner/lifecycle/reestablish`)
 needs the owner, and in one transaction:
 
-1. restores every anchored erasure instruction the database lacks, with its
-   original identifier and clocks, and the grant's ending;
-2. applies every pending owner action, in order;
-3. ends every grant that is still active, because its terminal events may be
+1. restores every anchored erasure instruction and advance election the
+   database lacks, with its original identifier and clocks, and the grant's
+   ending. If the database has no row for the grant, the anchored
+   instruction is kept as an orphan record: the client still receives the
+   `erase` answer with a token whose digest the evidence carries. It cannot
+   report receipt or completion for that grant, and the owner surface does
+   not list the grant;
+2. re-disables every token digest the anchor shows disabled, and revokes
+   and disables for lifecycle use every lifecycle recovery token in the
+   database. A client that needs recovery asks the owner again;
+3. applies every pending owner action, in order. An action that names a
+   grant the database lacks is kept as unapplied, and
+   `GET /pdpp/v1/owner/lifecycle/history` shows it in `unapplied_actions`
+   with its outcome. If the anchor held an instruction for that grant, the
+   outcome says the instruction is still delivered. Otherwise the owner's
+   choice cannot reach the client: the grant's tokens are unknown to the
+   restored store, so the client gets 401 and, under the spec, keeps its
+   data (silence is not an erasure instruction);
+4. ends every grant that is still active, because its terminal events may be
    missing ("invalidation on restore of every grant whose terminal events may
    be missing", L1823). Each such grant needs the owner's explicit `keep` or
-   `delete`; the request is rejected without them.
+   `delete`; the request is rejected without them. A grant with an anchored
+   or recorded advance election is locked to `delete`, and a `keep` sent for
+   it does not cancel the election.
 
 Only then does the history become current, under a new epoch. Consequence:
-after a detected restore, every client must obtain a new grant. Revoked
+after a detected restore, every client must obtain a new grant. Grants
+issued after the restored backup are gone from the store: their apps get
+401, and only an anchored instruction for them still reaches the client.
+The owner's `GET /pdpp/v1/owner/lifecycle/history` lists only the grants
+inside the calling owner token's scope. Revoked
 grants, consumed `single_use` grants, redeemed codes and superseded refresh
 tokens in the restored file are never revived.
 
@@ -124,6 +173,11 @@ tokens in the restored file are never revived.
 - **A disk or virtual disk that acknowledges a flush it has not made.** A
   power loss can then drop commits, anchor writes, or journal lines that were
   reported durable.
+- **A platform that refuses fsync on a directory handle.** The AS then
+  emits a `PdppDurabilityWarning` process warning (once) and continues. The
+  durability of a renamed anchor or a newly created journal file then
+  rests on the filesystem's own ordering, and a power loss may lose that
+  entry.
 
 ## Restore and rollback paths the mechanism does NOT detect
 

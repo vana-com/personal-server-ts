@@ -11,7 +11,7 @@
 
 import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { HistoryRecorder } from "./history.js";
+import type { AnchoredErasure, HistoryRecorder } from "./history.js";
 
 /**
  * Core's held-data time limits (spec-core L1547-L1556). Elapsed time; a day
@@ -121,6 +121,29 @@ CREATE TABLE IF NOT EXISTS pdpp_recovery_tokens (
   FOREIGN KEY (approval_id) REFERENCES pdpp_recovery_approvals (approval_id)
 );
 
+-- Erasure instructions restored from the anchor for grants a restore lost
+-- (F5): the database has no grant row, but the client can still query and
+-- receive the instruction with a token whose digest the evidence carries.
+CREATE TABLE IF NOT EXISTS pdpp_orphan_erasures (
+  grant_id TEXT PRIMARY KEY,
+  evidence_json TEXT NOT NULL,
+  restored_at TEXT NOT NULL
+);
+
+-- Owner actions accepted while the history was unavailable that named a
+-- grant the re-established store does not hold (F5). Kept for the owner.
+CREATE TABLE IF NOT EXISTS pdpp_unapplied_owner_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action_id TEXT NOT NULL,
+  grant_id TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  action TEXT NOT NULL,
+  disposition TEXT,
+  recorded_at TEXT NOT NULL,
+  outcome TEXT NOT NULL
+);
+
 -- AS decommission (L1574): when the owner confirmed it.
 CREATE TABLE IF NOT EXISTS pdpp_decommission (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -220,6 +243,118 @@ export class LifecycleRecords {
 
   // -- instructions --------------------------------------------------------
 
+  listInstructions(): ErasureInstructionRecord[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM pdpp_erasure_instructions ORDER BY rowid")
+        .all() as InstructionRow[]
+    ).map(toInstruction);
+  }
+
+  listDisabledDigests(): string[] {
+    return (
+      this.db
+        .prepare("SELECT token_hash FROM pdpp_lifecycle_disabled_tokens")
+        .all() as { token_hash: string }[]
+    ).map((r) => r.token_hash);
+  }
+
+  /** Every recovery token digest (re-establishment disables them all, F4). */
+  listRecoveryTokenDigests(): string[] {
+    return (
+      this.db.prepare("SELECT token_hash FROM pdpp_recovery_tokens").all() as {
+        token_hash: string;
+      }[]
+    ).map((r) => r.token_hash);
+  }
+
+  insertOrphanErasure(e: AnchoredErasure, at: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO pdpp_orphan_erasures (grant_id, evidence_json, restored_at)
+         VALUES (?, ?, ?) ON CONFLICT (grant_id) DO NOTHING`,
+      )
+      .run(e.grant_id, JSON.stringify(e), at);
+    this.history.append("orphan_erasure_restored", e.grant_id, e, at);
+  }
+
+  listOrphanErasures(): AnchoredErasure[] {
+    return (
+      this.db
+        .prepare("SELECT evidence_json FROM pdpp_orphan_erasures")
+        .all() as { evidence_json: string }[]
+    ).map((r) => JSON.parse(r.evidence_json) as AnchoredErasure);
+  }
+
+  getOrphanErasure(grantId: string): AnchoredErasure | null {
+    const row = this.db
+      .prepare(
+        "SELECT evidence_json FROM pdpp_orphan_erasures WHERE grant_id = ?",
+      )
+      .get(grantId) as { evidence_json: string } | undefined;
+    return row ? (JSON.parse(row.evidence_json) as AnchoredErasure) : null;
+  }
+
+  insertUnappliedAction(input: {
+    actionId: string;
+    grantId: string;
+    subjectId: string;
+    kind: string;
+    action: string;
+    disposition: string | null;
+    recordedAt: string;
+    outcome: string;
+    at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO pdpp_unapplied_owner_actions
+           (action_id, grant_id, subject_id, kind, action, disposition, recorded_at, outcome)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.actionId,
+        input.grantId,
+        input.subjectId,
+        input.kind,
+        input.action,
+        input.disposition,
+        input.recordedAt,
+        input.outcome,
+      );
+    this.history.append(
+      "owner_action_unapplied",
+      input.grantId,
+      { action_id: input.actionId, outcome: input.outcome },
+      input.at,
+    );
+  }
+
+  listUnappliedActions(subjectId: string): Array<{
+    action_id: string;
+    grant_id: string;
+    kind: string;
+    action: string;
+    disposition: string | null;
+    recorded_at: string;
+    outcome: string;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT action_id, grant_id, kind, action, disposition, recorded_at, outcome
+         FROM pdpp_unapplied_owner_actions WHERE subject_id = ? ORDER BY id`,
+      )
+      .all(subjectId) as Array<{
+      action_id: string;
+      grant_id: string;
+      kind: string;
+      action: string;
+      disposition: string | null;
+      recorded_at: string;
+      outcome: string;
+    }>;
+  }
+
   getInstruction(grantId: string): ErasureInstructionRecord | null {
     const row = this.db
       .prepare("SELECT * FROM pdpp_erasure_instructions WHERE grant_id = ?")
@@ -277,13 +412,15 @@ export class LifecycleRecords {
       grant_id: string;
       client_id: string;
       accepted_at: string;
-      effective_at: string;
+      /** Null for an advance election (F2). */
+      effective_at: string | null;
+      advance?: boolean;
     },
     at: string,
   ): boolean {
     const existing = this.getInstruction(e.grant_id);
     if (existing) {
-      if (!existing.effectiveAt)
+      if (!existing.effectiveAt && e.effective_at)
         this.makeEffective(existing.instructionId, e.effective_at, at);
       return false;
     }
@@ -291,12 +428,13 @@ export class LifecycleRecords {
       .prepare(
         `INSERT INTO pdpp_erasure_instructions
            (instruction_id, grant_id, client_id, origin, advance, accepted_at, effective_at)
-         VALUES (?, ?, ?, 'owner', 0, ?, ?)`,
+         VALUES (?, ?, ?, 'owner', ?, ?, ?)`,
       )
       .run(
         e.instruction_id,
         e.grant_id,
         e.client_id,
+        e.advance ? 1 : 0,
         e.accepted_at,
         e.effective_at,
       );
