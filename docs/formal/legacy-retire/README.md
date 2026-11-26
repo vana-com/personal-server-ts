@@ -233,8 +233,9 @@ Two captured rows and a replacement row are distinct identities. Signing,
 HTTP issuance, blob erasure, receipt writes, individual local mutations,
 observation, and completion are separate actions. Revocation can occur between
 any two actions. `PipelineGood.cfg` checks `CapturedOnly`,
-`DoneImpliesObservedAbsence`, `NoRetirementHooks`, and `AuthorityAtEveryEffect`.
-The six `Pipeline*.cfg` mutants remove one of those controls. The original
+`DoneImpliesObservedAbsence`, `NoRetirementHooks`, `AuthorityAtEveryEffect`,
+`AcknowledgedBeforeErase` and `UnsyncedCaptured`.
+The eight `Pipeline*.cfg` mutants remove one of those controls. The original
 `LegacyRetire.tla` configurations remain as controls for the route's intent,
 head fencing, current connection isolation, and permanent import fence.
 
@@ -253,15 +254,44 @@ TLC 2.19, four workers, `MaxB = MaxW = 1`, run under `nice -n 19`:
 
 | Configuration                     | Result                                            |
 | --------------------------------- | ------------------------------------------------- |
-| `PipelineGood`                    | Pass: 51 generated, 45 distinct states; depth 20. |
+| `PipelineGood`                    | Pass: 63 generated, 55 distinct states; depth 22. |
 | `PipelineCaptureReadds`           | Fails `CapturedOnly`.                             |
 | `PipelineAbsentMeansDone`         | Fails `DoneImpliesObservedAbsence`.               |
 | `PipelineSkippedMeansClean`       | Fails `DoneImpliesObservedAbsence`.               |
 | `PipelineRunAdditionsAfterRevoke` | Fails `NoRetirementHooks`.                        |
 | `PipelineGateBlobBatchOnce`       | Fails `AuthorityAtEveryEffect`.                   |
 | `PipelineGateLocalLoopOnce`       | Fails `AuthorityAtEveryEffect`.                   |
+| `PipelineMalformedEchoRetried`    | Fails `AcknowledgedBeforeErase`.                  |
+| `PipelineUnsyncedByCounter`       | Fails `UnsyncedCaptured`.                         |
 
 The retained original `Good` control was rerun with the same worker and import
 bounds: 62,676,431 generated, 13,846,227 distinct states; depth 27; no errors.
 The pipeline model fixes two captured rows, one replacement identity and two
 remote keys. It does not model file generations or claim artifact absence.
+
+### Durable acknowledgement and causal capture
+
+The journal records an unconfirmed send before issuing the tombstone, then an
+accepted acknowledgement only after the exact version echo. A malformed echo
+records a blocked acknowledgement. A restart that finds an unconfirmed send
+and the tombstone blocks too; observing the gateway head cannot substitute
+for the missing echo. If the original live head remains, the send can retry.
+Captured row identities stay fixed while acknowledgement fields advance.
+
+The pipeline model separates journal issuance, gateway commit, reply and
+restart. `AcknowledgedBeforeErase` requires an accepted acknowledgement before
+any erase or completion. `PipelineMalformedEchoRetried` bypasses the restart
+guard and violates it (72 generated, 63 distinct states; depth 22).
+
+Capture now models a registered row at gateway version 2, an unsynced row at
+device-local counter 99 without a re-add marker, and an unsynced re-add whose
+marker is tombstone version 3. Only the registered row uses the gateway
+counter bound. `UnsyncedCaptured` requires the original unsynced row in the
+manifest. `PipelineUnsyncedByCounter` wrongly applies the counter bound to
+every row and violates it (2 generated, 2 distinct states; depth 2).
+
+All configurations were rerun with Java, TLC 2.19, four workers and nice 19.
+Both good controls pass; every retained mutant and reachability probe fails
+its configured invariant or property as expected. The original `Good`
+control remains 62,676,431 generated, 13,846,227 distinct states; depth 27.
+The extended `PipelineGood` control is 63 generated, 55 distinct; depth 22.
