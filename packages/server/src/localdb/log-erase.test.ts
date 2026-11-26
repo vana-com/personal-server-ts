@@ -1770,3 +1770,43 @@ describe("erasure wired into the connection delete", () => {
     });
   });
 });
+
+describe("alias spool startup fallback", () => {
+  it.each(["storage root", "alias spool"] as const)(
+    "continues without a spool when the %s is unexpectedly a file",
+    async (obstruction) => {
+      const { mkdtemp, readFile, rm, writeFile } =
+        await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const { openAliasSpool } = await import("./alias-spool.js");
+      const scratch = await mkdtemp(join(tmpdir(), "alias-spool-fallback-"));
+      try {
+        const storageRoot =
+          obstruction === "storage root"
+            ? join(scratch, "not-a-directory")
+            : scratch;
+        const blocked =
+          obstruction === "storage root"
+            ? storageRoot
+            : join(storageRoot, "alias-spool");
+        await writeFile(blocked, "owned fixture marker");
+        const warn = vi.fn();
+
+        await expect(
+          openAliasSpool(storageRoot, { warn }),
+        ).resolves.toBeUndefined();
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({ error: expect.any(String) }),
+          "alias spool could not be opened; large alias reads use the in-memory path",
+        );
+        await expect(readFile(blocked, "utf8")).resolves.toBe(
+          "owned fixture marker",
+        );
+      } finally {
+        await rm(scratch, { force: true, recursive: true });
+      }
+    },
+  );
+});
