@@ -151,6 +151,89 @@ describe("migrateLocalState", () => {
     ).resolves.toContain('"version": 1');
   });
 
+  it("leaves existing state untouched when legacy config is malformed", async () => {
+    const statePath = join(storageRoot, "state.json");
+    const priorState = JSON.stringify({ version: 1, migratedAt: "prior" });
+    await writeFile(statePath, priorState);
+    await writeFile(configPath, "{truncated");
+
+    await expect(
+      migrateLocalState({
+        storageRoot,
+        dataDir,
+        configPath,
+        syncCursorPath,
+        tokensPath,
+      }),
+    ).rejects.toThrow(SyntaxError);
+
+    await expect(readFile(statePath, "utf-8")).resolves.toBe(priorState);
+    await expect(readFile(syncCursorPath, "utf-8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("propagates a non-missing legacy config read failure", async () => {
+    const nonDirectory = join(storageRoot, "not-a-directory");
+    await writeFile(nonDirectory, "fixture");
+
+    await expect(
+      migrateLocalState({
+        storageRoot,
+        dataDir,
+        configPath: join(nonDirectory, "config.json"),
+        syncCursorPath,
+        tokensPath,
+      }),
+    ).rejects.toMatchObject({ code: "ENOTDIR" });
+
+    await expect(
+      readFile(join(storageRoot, "state.json"), "utf-8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves state when staging the write fails and does not replay the cursor on retry", async () => {
+    const statePath = join(storageRoot, "state.json");
+    const stagePath = `${statePath}.tmp`;
+    const priorState = JSON.stringify({ version: 1, migratedAt: "prior" });
+    const timestamp = "2026-01-21T10:00:00.000Z";
+    await writeFile(statePath, priorState);
+    await writeFile(
+      configPath,
+      JSON.stringify({ sync: { lastProcessedTimestamp: timestamp } }),
+    );
+    await mkdir(stagePath);
+
+    const options = {
+      storageRoot,
+      dataDir,
+      configPath,
+      syncCursorPath,
+      tokensPath,
+    };
+    await expect(migrateLocalState(options)).rejects.toMatchObject({
+      code: "EISDIR",
+      path: stagePath,
+    });
+    await expect(readFile(statePath, "utf-8")).resolves.toBe(priorState);
+    const cursor = await readFile(syncCursorPath, "utf-8");
+    expect(JSON.parse(cursor)).toEqual({
+      version: 1,
+      lastProcessedTimestamp: timestamp,
+    });
+
+    await rm(stagePath, { recursive: true });
+    await expect(migrateLocalState(options)).resolves.toMatchObject({
+      statePath,
+      syncCursorCreated: false,
+    });
+    await expect(readFile(syncCursorPath, "utf-8")).resolves.toBe(cursor);
+    expect(JSON.parse(await readFile(statePath, "utf-8"))).toMatchObject({
+      version: 1,
+      components: { syncCursor: 1 },
+    });
+  });
+
   it("preserves the migration journal during a file-only run at a custom state path", async () => {
     const stateDir = join(storageRoot, "custom");
     const statePath = join(stateDir, "state.json");
