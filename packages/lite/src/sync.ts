@@ -583,11 +583,18 @@ export async function createPsLiteSyncManager(
   };
   // Only this host's registration observations may authorize retirement.
   let registrationConfirmed = false;
+  let registrationGeneration = 0;
+  function setRegistrationConfirmed(confirmed: boolean, generation: number) {
+    if (generation === registrationGeneration)
+      registrationConfirmed = confirmed;
+  }
   async function checkRegistration(): Promise<boolean> {
-    registrationConfirmed = false;
+    const generation = ++registrationGeneration;
+    setRegistrationConfirmed(false, generation);
     const serverInfo = await gateway.getServer(options.serverAccount.address);
-    registrationConfirmed = Boolean(serverInfo?.id);
-    return registrationConfirmed;
+    const confirmed = Boolean(serverInfo?.id);
+    setRegistrationConfirmed(confirmed, generation);
+    return confirmed;
   }
   const retirementWriteReady = () =>
     registrationConfirmed &&
@@ -777,7 +784,8 @@ export async function createPsLiteSyncManager(
       // this runtime verifies registration, then resumes without a sync cycle.
       if (options.registrationReady?.() === true) {
         void (async () => {
-          if (options.ownerSyncSigner) registrationConfirmed = true;
+          if (options.ownerSyncSigner)
+            setRegistrationConfirmed(true, ++registrationGeneration);
           else await checkRegistration();
           if (!closed && retirementWriteReady())
             await sync?.legacyRetirer.resume();
@@ -868,9 +876,9 @@ export async function createPsLiteSyncManager(
           : undefined,
         tombstoneFinality,
         async canSync() {
-          registrationConfirmed = false;
+          setRegistrationConfirmed(false, ++registrationGeneration);
           if (options.ownerSyncSigner) {
-            registrationConfirmed = true;
+            setRegistrationConfirmed(true, ++registrationGeneration);
             return { ok: true };
           }
           if (

@@ -149,3 +149,68 @@ it.each([false, true])(
     }
   },
 );
+
+it("keeps retirement closed when an older startup lookup confirms after a missing registration", async () => {
+  const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+  const ownerSignature = await owner.signMessage({
+    message: "Retirement fixture",
+  });
+  const stateStore = createMemoryPsLiteStateStore();
+  const identity = await loadOrCreatePsLiteServerIdentity({
+    store: stateStore,
+    ownerSignature,
+  });
+  const storage = await createOpenPersistentPsLiteStorage(
+    { kind: "custom" },
+    createMemoryPsLitePersistence(),
+  );
+  const capture = vi.spyOn(storage.retirementRows!, "capture");
+  const db = openBetterSqlite3(":memory:");
+  let confirmRegistration!: (value: { id: string }) => void;
+  const startupRegistration = new Promise<{ id: string }>((resolve) => {
+    confirmRegistration = resolve;
+  });
+  const getServer = vi
+    .fn()
+    .mockReturnValueOnce(startupRegistration)
+    .mockResolvedValue(null);
+  const lite = await createPsLiteSyncManager({
+    config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+    autoStartSync: false,
+    registrationReady: () => true,
+    localDb: { openDriver: async () => db },
+    accountStorageMode: { owner: owner.address, read: () => "switched" },
+    stateStore,
+    storage,
+    ownerSignature,
+    serverAccount: identity.account,
+    gateway: { getServer } as never,
+    dataPointFeed: {
+      getDataPoint: async () => null,
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+    },
+  });
+  try {
+    expect(getServer).toHaveBeenCalledOnce();
+    const resume = vi.spyOn(lite.localSync!.legacyRetirer, "resume");
+    await lite.syncManager.trigger();
+    expect(getServer).toHaveBeenCalledTimes(2);
+    await expect(
+      lite.localSync!.legacyRetirer.request("github"),
+    ).rejects.toThrow("write authority");
+
+    confirmRegistration({ id: "registered" });
+    await startupRegistration;
+    await Promise.resolve();
+
+    expect(resume).not.toHaveBeenCalled();
+    await expect(
+      lite.localSync!.legacyRetirer.request("github"),
+    ).rejects.toThrow("write authority");
+    expect(capture).not.toHaveBeenCalled();
+    expect(await db.query("SELECT * FROM legacy_retirements")).toEqual([]);
+  } finally {
+    await lite.syncManager.stop();
+    await lite.closeStreamSync();
+  }
+});
