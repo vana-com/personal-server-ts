@@ -79,8 +79,8 @@ async function fixture() {
   };
   const pipeline = createLegacyRetirePipeline(a.deps, ports);
   const id = await pipeline.capture("github", check);
-  const advance = () =>
-    pipeline.advance(id, check, new AbortController().signal);
+  const advance = (signal = new AbortController().signal) =>
+    pipeline.advance(id, check, signal);
   const acknowledgement = async () => {
     const [row] = await a.db.query<{ manifest: string }>(
       "SELECT manifest FROM legacy_retire_manifests WHERE retire_id = ?",
@@ -158,3 +158,62 @@ for (const failure of ["timeout", "unrelated-409", "already-deleted"] as const)
     expect(f.erase).not.toHaveBeenCalled();
     expect(f.fake.blobCount(scope)).toBe(2);
   });
+
+it("keeps shutdown during a reply body unconfirmed and permits a later authorized pass", async () => {
+  const f = await fixture();
+  const shutdown = new AbortController();
+  let reading!: () => void;
+  const bodyRead = new Promise<void>((resolve) => {
+    reading = resolve;
+  });
+  f.ports.tombstone = createLegacyRetireRemote({
+    ...f.options,
+    fetch: async (_input, init) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            init!.signal!.addEventListener(
+              "abort",
+              () => {
+                controller.error(init!.signal!.reason);
+              },
+              { once: true },
+            );
+          },
+          pull() {
+            reading();
+          },
+        }),
+        { status: 200 },
+      ),
+  }).tombstone;
+  const attempt = f.advance(shutdown.signal);
+  await bodyRead;
+  shutdown.abort();
+  await expect(attempt).rejects.toMatchObject({ name: "AbortError" });
+  expect(await f.acknowledgement()).toBe("unconfirmed");
+  expect(f.erase).not.toHaveBeenCalled();
+  expect(f.fake.isLive(scope)).toBe(true);
+
+  f.ports.tombstone = createLegacyRetireRemote(f.options).tombstone;
+  f.finality.finalized = "3";
+  f.finality.settling = false;
+  await expect(f.advance()).resolves.toEqual({ state: "done" });
+  expect(await f.acknowledgement()).toBe("accepted");
+  expect(f.fake.blobCount(scope)).toBe(0);
+  expect(f.erase).toHaveBeenCalledOnce();
+});
+
+it("blocks a fully read successful reply without the pin+1 echo", async () => {
+  const f = await fixture();
+  f.ports.tombstone = createLegacyRetireRemote({
+    ...f.options,
+    fetch: async () => new Response("{}", { status: 200 }),
+  }).tombstone;
+  await expect(f.advance()).resolves.toEqual({
+    state: "blocked",
+    reason: "legacy_tombstone_unacknowledged",
+  });
+  expect(await f.acknowledgement()).toBe("blocked");
+  expect(f.erase).not.toHaveBeenCalled();
+});

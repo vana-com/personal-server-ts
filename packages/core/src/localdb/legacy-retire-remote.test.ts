@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { LegacyTombstoneUnacknowledged } from "./legacy-retire-pipeline.js";
 import { createLegacyRetireRemote } from "./legacy-retire-remote.js";
 import {
   createLegacyGatewayFake,
@@ -131,4 +132,29 @@ it.each([
       f.check,
     ),
   ).rejects.toThrow();
+});
+
+it("propagates an aborted reply body without classifying it as malformed", async () => {
+  const f = await fixture();
+  const abort = new DOMException("reply body aborted", "AbortError");
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(abort);
+      },
+    }),
+    { status: 200 },
+  );
+  const text = vi.spyOn(response, "text");
+  f.options.fetch = async () => response;
+  const attempt = createLegacyRetireRemote(f.options).tombstone(
+    "github.events",
+    f.head,
+    f.check,
+  );
+  await expect(attempt).rejects.not.toBeInstanceOf(
+    LegacyTombstoneUnacknowledged,
+  );
+  await expect(attempt).rejects.toBe(abort);
+  expect(text).toHaveBeenCalledOnce();
 });
