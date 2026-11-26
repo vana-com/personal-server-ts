@@ -35,6 +35,19 @@ export function createSyncStorageAdapter(
 ): BoundedStorageAdapter {
   const backend = params.config.storage.backend;
 
+  // Every `StorageBackend` value is named here; an unnamed one has no adapter
+  // and must not fall through to Vana Hosted Storage.
+  if (backend === "local" || backend === "vana") {
+    return createVanaSyncStorageAdapter({
+      config: params.config,
+      serverOwner: params.serverOwner,
+      serverAccount: params.serverAccount,
+      reads: params.reads,
+      audience: params.audience,
+      fetch: params.fetch,
+    });
+  }
+
   if (backend === "gdrive") {
     const gdriveConfig = params.config.storage.config.gdrive;
     if (!gdriveConfig?.folderId) {
@@ -73,14 +86,7 @@ export function createSyncStorageAdapter(
     );
   }
 
-  return createVanaSyncStorageAdapter({
-    config: params.config,
-    serverOwner: params.serverOwner,
-    serverAccount: params.serverAccount,
-    reads: params.reads,
-    audience: params.audience,
-    fetch: params.fetch,
-  });
+  throw new Error(`No sync storage adapter for storage backend "${backend}"`);
 }
 
 function withVanaReadFallback(
