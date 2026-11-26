@@ -327,6 +327,41 @@ describe("a run resumed from a cursor read before it began", () => {
     }
   });
 
+  it("an end that finds a delete intent pending is fenced as control_deleted, though the connection is still active", async () => {
+    const here = await open({ streams: ["items"] });
+    try {
+      await seeded(here);
+      await here.sync.intake.begin("run-2", { ...connect, connect: false });
+      await here.sync.intake.batch("run-2", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "two" } }],
+      });
+      await here.db.batch([
+        {
+          sql: "INSERT INTO delete_intents(connector, delete_id, intent) VALUES ('fixture', 'd1', '{}')",
+          params: [],
+        },
+      ]);
+      expect(
+        await here.db.query("SELECT control_state FROM connections"),
+      ).toEqual([{ control_state: "active" }]);
+      await here.sync.intake.end("run-2", {
+        finish: "completed",
+        streams: { items: observed(true) },
+        checkpoints: { items: { cursor: "c" } },
+        lastBatch: 0,
+      });
+      expect(
+        await here.db.query(
+          "SELECT decision, reason FROM run_streams WHERE run_id = 'run-2'",
+        ),
+      ).toEqual([{ decision: "discarded", reason: "control_deleted" }]);
+      expect(await storedCheckpoint(here)).toBeNull();
+    } finally {
+      await here.sync.close();
+    }
+  });
+
   it("saves no cursor when the connection was deleted after the cursor was read: the reconnect is a new lifetime without the rows before the cursor", async () => {
     const { here, elsewhere } = await deletedMeanwhile();
     try {
