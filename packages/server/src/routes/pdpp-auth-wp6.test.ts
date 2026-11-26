@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AuthorizationSessionStore,
   computeS256Challenge,
+  defaultAnchorIo,
   GrantLifecycleService,
   openPdppAuthStore,
   PDPP_DATA_ACCESS_TYPE,
@@ -803,5 +804,71 @@ describe("whole-server owner actions take the wallet proof when it is wired", ()
       });
       expect(res.status).toBe(401);
     }
+  });
+});
+
+describe("R1 — owner read routes while evidence is owed", () => {
+  it("refuses GET /grants with 503 and reports /revoke as pending until the evidence is written", async () => {
+    store.close();
+    let fail = false;
+    store = openPdppAuthStore(dbPath, {
+      anchorIo: {
+        read: defaultAnchorIo.read,
+        writeDurably(path, content) {
+          if (fail) throw new Error("injected");
+          defaultAnchorIo.writeDurably(path, content);
+        },
+      },
+    });
+    tokens = new PdppTokenService(store);
+    const lifecycle = new GrantLifecycleService(store);
+    app = new Hono();
+    app.route(
+      "/pdpp/v1",
+      pdppAuthRoutes({
+        logger,
+        store,
+        tokens,
+        lifecycle,
+        sessions: new AuthorizationSessionStore(),
+        issuer: "https://ps.example",
+        resolveDeclaration: (id) => (id === SOURCE_ID ? snapshot : null),
+        inventoryFor: () => ({
+          eligibleFor: (s) => (s === "top_artists" ? [INSTANCE] : []),
+        }),
+        currentSubjectId: (c: Context) =>
+          c.req.header("authorization") ? OWNER : null,
+        registeredClient: (id) =>
+          id === CLIENT ? { client_id: id, redirect_uris: [REDIRECT] } : null,
+      }),
+    );
+    const g = await issueGrant();
+    const token = ownerToken();
+    fail = true;
+    const revoked = await postForm(
+      "/pdpp/v1/revoke",
+      { grant_id: g.grantId, disposition: "delete" },
+      auth(token),
+    );
+    expect(revoked.status).toBe(503);
+    expect(((await revoked.json()) as { status: string }).status).toBe(
+      "pending",
+    );
+    const listed = await app.request("/pdpp/v1/grants", {
+      headers: auth(token),
+    });
+    expect(listed.status).toBe(503);
+    fail = false;
+    const ok = await app.request("/pdpp/v1/grants", { headers: auth(token) });
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as {
+      grants: Array<{
+        grant_id: string;
+        lifecycle: { evidence: string; read_state: string };
+      }>;
+    };
+    expect(
+      body.grants.find((x) => x.grant_id === g.grantId)!.lifecycle,
+    ).toMatchObject({ evidence: "recorded", read_state: "revoked" });
   });
 });

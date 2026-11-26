@@ -127,7 +127,8 @@ CREATE TABLE IF NOT EXISTS pdpp_recovery_tokens (
 CREATE TABLE IF NOT EXISTS pdpp_orphan_erasures (
   grant_id TEXT PRIMARY KEY,
   evidence_json TEXT NOT NULL,
-  restored_at TEXT NOT NULL
+  restored_at TEXT NOT NULL,
+  first_returned_at TEXT
 );
 
 -- Owner actions accepted while the history was unavailable that named a
@@ -239,6 +240,15 @@ export class LifecycleRecords {
     private readonly history: HistoryRecorder,
   ) {
     db.exec(LIFECYCLE_SCHEMA_SQL);
+    // Additive: round-2 stores created the orphan table without this column.
+    const orphanColumns = db
+      .prepare("PRAGMA table_info(pdpp_orphan_erasures)")
+      .all() as { name: string }[];
+    if (!orphanColumns.some((c) => c.name === "first_returned_at")) {
+      db.exec(
+        "ALTER TABLE pdpp_orphan_erasures ADD COLUMN first_returned_at TEXT",
+      );
+    }
   }
 
   // -- instructions --------------------------------------------------------
@@ -284,6 +294,28 @@ export class LifecycleRecords {
         .prepare("SELECT evidence_json FROM pdpp_orphan_erasures")
         .all() as { evidence_json: string }[]
     ).map((r) => JSON.parse(r.evidence_json) as AnchoredErasure);
+  }
+
+  /** First return of an orphan instruction in a lifecycle answer (L1660). */
+  recordOrphanFirstReturn(grantId: string, at: string): void {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_orphan_erasures SET first_returned_at = ?
+         WHERE grant_id = ? AND first_returned_at IS NULL`,
+      )
+      .run(at, grantId);
+    if (result.changes > 0) {
+      this.history.append("orphan_erasure_first_returned", grantId, {}, at);
+    }
+  }
+
+  getOrphanFirstReturn(grantId: string): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT first_returned_at FROM pdpp_orphan_erasures WHERE grant_id = ?",
+      )
+      .get(grantId) as { first_returned_at: string | null } | undefined;
+    return row?.first_returned_at ?? null;
   }
 
   getOrphanErasure(grantId: string): AnchoredErasure | null {
@@ -699,6 +731,49 @@ export class LifecycleRecords {
         )
         .get(tokenHash) !== undefined
     );
+  }
+
+  /**
+   * The newest `limit` token digests issued to `clientId` for one grant
+   * (access, refresh and recovery tokens together, by issue time).
+   */
+  recentTokenDigestsFor(
+    clientId: string,
+    grantId: string,
+    limit: number,
+  ): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT token_hash, issued_at FROM (
+           SELECT token_hash, issued_at FROM pdpp_access_tokens
+             WHERE grant_id = ? AND client_id = ? AND token_kind = 'client'
+           UNION ALL
+           SELECT t.token_hash, t.issued_at FROM pdpp_refresh_tokens t
+             JOIN pdpp_refresh_families f ON f.family_id = t.family_id
+             JOIN pdpp_grants g ON g.grant_id = f.grant_id
+             WHERE f.grant_id = ? AND g.client_id = ?
+         ) ORDER BY issued_at DESC LIMIT ?`,
+      )
+      .all(grantId, clientId, grantId, clientId, limit) as {
+      token_hash: string;
+    }[];
+    const recovery = (
+      this.db
+        .prepare(
+          "SELECT token_hash, grant_ids_json FROM pdpp_recovery_tokens WHERE client_id = ? ORDER BY issued_at DESC",
+        )
+        .all(clientId) as { token_hash: string; grant_ids_json: string }[]
+    )
+      .filter((r) =>
+        (JSON.parse(r.grant_ids_json) as string[]).includes(grantId),
+      )
+      .slice(0, limit);
+    return Array.from(
+      new Set([
+        ...rows.map((r) => r.token_hash),
+        ...recovery.map((r) => r.token_hash),
+      ]),
+    ).slice(0, limit);
   }
 
   /** Digests of every data token issued to `clientId` for these grants. */

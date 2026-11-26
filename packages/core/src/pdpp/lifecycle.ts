@@ -214,6 +214,11 @@ export interface ErasureOwnerView {
 }
 
 export interface OwnerGrantLifecycleView {
+  /**
+   * R1 / L1829: "recorded" once every terminal event shown here is durable
+   * with its evidence; "pending" while an evidence write is owed.
+   */
+  evidence: "recorded" | "pending";
   read_state: ReadState;
   ended_at?: string;
   ending?: { reason: string; detail?: string };
@@ -414,10 +419,21 @@ export class GrantLifecycleService {
             },
           };
         }
-        return {
-          status: 200,
-          body: { grants: [this.evidenceAnswer(evidence, now)] },
-        };
+        try {
+          return {
+            status: 200,
+            body: { grants: [this.evidenceAnswer(evidence, now)] },
+          };
+        } catch {
+          return {
+            status: 503,
+            body: {
+              error: "temporarily_unavailable",
+              error_description: "the lifecycle state could not be recorded",
+            },
+            retryAfterSeconds: 5,
+          };
+        }
       }
     }
     // L1736: unknown, malformed, another client's, or disabled → invalid_token.
@@ -579,6 +595,17 @@ export class GrantLifecycleService {
   private evidenceAnswer(e: AnchoredErasure, now: Date): LifecycleAnswer {
     if (!this.store.history.isCurrent()) {
       this.journalFirstReturn(e.instruction_id, e.grant_id, now);
+    } else {
+      // An orphan record's first return is recorded before the answer
+      // leaves (L1660); a failed evidence write throws to the caller (503).
+      this.store.commit(
+        () =>
+          this.store.lifecycle.recordOrphanFirstReturn(
+            e.grant_id,
+            now.toISOString(),
+          ),
+        now,
+      );
     }
     return {
       grant_id: e.grant_id,
@@ -1289,7 +1316,13 @@ export class GrantLifecycleService {
     const disposition = this.store.lifecycle.latestDisposition(grantId);
     const active =
       state.read_state === "active" || state.read_state === "window_closed";
+    // R1: a terminal event is shown as recorded only once its evidence is
+    // written; otherwise the whole view is marked pending.
+    const evidence: "recorded" | "pending" = this.flushEvidence(now)
+      ? "recorded"
+      : "pending";
     return {
+      evidence,
       ...state,
       ...(ending &&
         (state.read_state === "revoked" || ending.reason === "security") && {
@@ -1691,6 +1724,37 @@ export class GrantLifecycleService {
       });
   }
 
+  /**
+   * The owner of an anchored election's grant. Elections carry no subject,
+   * so this is read from the subject of any anchored erasure for the same
+   * client; on a single-owner server that is the owner.
+   */
+  private anchoredSubject(grantId: string): string | undefined {
+    const election = this.store.history.anchoredElection(grantId);
+    return (
+      election?.subject_id ??
+      this.store.history.anchoredErasures().find((x) => x.subject_id)
+        ?.subject_id ??
+      this.store.listAllGrants()[0]?.subjectId
+    );
+  }
+
+  /**
+   * R1: before the owner surface renders a terminal event, write any owed
+   * evidence. Returns false when it is still owed: the caller then shows
+   * the events as pending or refuses the read.
+   */
+  flushEvidence(now: Date = this.clock()): boolean {
+    if (!this.store.history.isCurrent()) return true;
+    if (!this.store.history.evidenceOwed()) return true;
+    try {
+      this.store.commit(() => undefined, now);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Pending actions the re-established store could not apply (F5). */
   unappliedOwnerActions(subjectId: string) {
     return this.store.lifecycle.listUnappliedActions(subjectId);
@@ -1785,7 +1849,24 @@ export class GrantLifecycleService {
         if (this.store.restoreAnchoredInstructionInTx(e, now)) restored += 1;
       }
       for (const e of this.store.history.anchoredElections()) {
-        if (!this.store.getGrant(e.grant_id)) continue;
+        if (!this.store.getGrant(e.grant_id)) {
+          // R2: an election cannot be promoted from stale state (L1820),
+          // and its grant is gone, so it cannot take effect. Keep a record
+          // the owner sees instead of dropping it.
+          this.store.lifecycle.insertUnappliedAction({
+            actionId: e.instruction_id,
+            grantId: e.grant_id,
+            subjectId: this.anchoredSubject(e.grant_id) ?? "",
+            kind: "advance_election",
+            action: "advance",
+            disposition: "delete",
+            recordedAt: e.accepted_at,
+            outcome: "advance_election_grant_not_in_restored_store",
+            at,
+          });
+          unapplied += 1;
+          continue;
+        }
         if (
           this.store.lifecycle.restoreInstruction(
             { ...e, effective_at: null, advance: true },
@@ -1810,6 +1891,14 @@ export class GrantLifecycleService {
           );
           if (instruction?.instructionId === a.action)
             this.store.lifecycle.recordFirstReturn(a.action, a.recorded_at);
+          else if (
+            this.store.lifecycle.getOrphanErasure(a.grant_ids[0] ?? "")
+              ?.instruction_id === a.action
+          )
+            this.store.lifecycle.recordOrphanFirstReturn(
+              a.grant_ids[0]!,
+              a.recorded_at,
+            );
           continue;
         }
         for (const grantId of a.grant_ids) {

@@ -47,12 +47,16 @@ The AS declares one mechanism (`packages/core/src/pdpp/history.ts`):
    write:
    - the complete record of every effective erasure instruction
      (identifier, acceptance, effective time, stop-use time, the grant's
-     ending, its owner, and the digests of every token issued to the client
-     for the grant);
+     ending, its owner, and the digests of the newest 64 tokens issued to
+     the client for the grant. Once the client reports completed deletion,
+     no digests are kept for that grant, because nothing is left to
+     deliver);
    - every advance erasure election (identifier, acceptance time, advance
-     flag);
-   - every token digest disabled for lifecycle use, including revoked
-     recovery tokens.
+     flag, owner);
+   - every token digest disabled for lifecycle use. A revoked recovery token
+     is not in this list: revoking it is recorded in the database only, and
+     re-establishment revokes and disables every recovery token anyway (step
+     2 below).
 
    Because the evidence is recomputed from the tables each time, the
    anchored set always holds every effective instruction, election and
@@ -63,6 +67,11 @@ The AS declares one mechanism (`packages/core/src/pdpp/history.ts`):
    answers 503 and the evidence stays owed. Every later acknowledgement
    writes the owed evidence first, or is refused. That includes a retry of
    an action already recorded, a lifecycle answer, and a token response.
+   The owner read surface follows the same rule: `GET /pdpp/v1/grants`,
+   `GET /pdpp/v1/owner/grants/affected` and `GET /pdpp/v1/owner/decommission`
+   write owed evidence before they render, and answer 503 if it still cannot
+   be written. Each grant's `lifecycle.evidence` is `recorded` or `pending`,
+   and the `/revoke` body reports `status: "pending"` while evidence is owed.
    When the store opens and the history is current, the AS writes the
    evidence at once if the anchor lags the database or lacks evidence the
    database holds. If that write also fails, the evidence stays owed under
@@ -133,9 +142,17 @@ needs the owner, and in one transaction:
    database lacks, with its original identifier and clocks, and the grant's
    ending. If the database has no row for the grant, the anchored
    instruction is kept as an orphan record: the client still receives the
-   `erase` answer with a token whose digest the evidence carries. It cannot
+   `erase` answer with a token whose digest the evidence carries (among the
+   newest 64), and the AS records the first such return. The client cannot
    report receipt or completion for that grant, and the owner surface does
-   not list the grant;
+   not list the grant. An anchored **advance election** whose grant the
+   database lacks cannot take effect: an election is never promoted from
+   stale state (L1820), and the grant's ending is unknown. It is kept as an
+   unapplied record (`kind: "advance_election"`, outcome
+   `advance_election_grant_not_in_restored_store`), which the owner sees in
+   `GET /pdpp/v1/owner/lifecycle/history` under `unapplied_actions`. The
+   client's tokens for that grant are unknown, so the client gets 401 and is
+   never told to delete;
 2. re-disables every token digest the anchor shows disabled, and revokes
    and disables for lifecycle use every lifecycle recovery token in the
    database. A client that needs recovery asks the owner again;

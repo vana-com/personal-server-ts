@@ -1770,6 +1770,11 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   app.get("/grants", (c) => {
     const caller = resolveOwner(c);
     if (!caller.ok) return caller.response;
+    // R1: never render a terminal event as recorded while its evidence is
+    // owed. Write it first; if that still fails, refuse the read.
+    if (!lifecycle.flushEvidence()) {
+      return unavailable(c, "recorded events are not yet durable; retry", 5);
+    }
 
     const clientFilter = c.req.query("client_id");
     const at = now();
@@ -1899,6 +1904,11 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   app.get("/owner/grants/affected", (c) => {
     const caller = resolveOwner(c);
     if (!caller.ok) return caller.response;
+    // R1: never render a terminal event as recorded while its evidence is
+    // owed. Write it first; if that still fails, refuse the read.
+    if (!lifecycle.flushEvidence()) {
+      return unavailable(c, "recorded events are not yet durable; retry", 5);
+    }
     const url = new URL(c.req.url);
     const action = url.searchParams.get("action") ?? "revoke";
     if (!["revoke", "narrowing", "disconnect_client"].includes(action)) {
@@ -2091,6 +2101,11 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   app.get("/owner/decommission", (c) => {
     const caller = resolveOwner(c);
     if (!caller.ok) return caller.response;
+    // R1: never render a terminal event as recorded while its evidence is
+    // owed. Write it first; if that still fails, refuse the read.
+    if (!lifecycle.flushEvidence()) {
+      return unavailable(c, "recorded events are not yet durable; retry", 5);
+    }
     if (!deps.store.history.isCurrent()) {
       return unavailable(
         c,
@@ -2478,16 +2493,21 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     const legacy = input.legacyGrantId
       ? (() => {
           const stored = deps.store.getGrant(input.legacyGrantId);
+          const view = stored ? lifecycle.ownerView(stored, now()) : undefined;
           return {
             grant_id: input.legacyGrantId,
             // Back-compatible field: the grant is ended; `lifecycle` has the detail.
-            status: !result.result.complete
-              ? "pending"
-              : stored &&
-                  lifecycle.readStateOf(stored, now()).read_state === "expired"
-                ? "expired"
-                : "revoked",
-            ...(stored && { lifecycle: lifecycle.ownerView(stored, now()) }),
+            // R1: "pending" unless the action is complete and the view's
+            // evidence is written.
+            status:
+              !result.result.complete || view?.evidence === "pending"
+                ? "pending"
+                : stored &&
+                    lifecycle.readStateOf(stored, now()).read_state ===
+                      "expired"
+                  ? "expired"
+                  : "revoked",
+            ...(view && { lifecycle: view }),
           };
         })()
       : {};

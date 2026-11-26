@@ -2324,3 +2324,136 @@ describe("review probes — AS item 44 durability regressions", () => {
     expect(windows.size).toBeLessThanOrEqual(MAX_RATE_WINDOWS);
   });
 });
+
+// ===========================================================================
+// WP6 review round 3 (probe3.mjs R1-R3 and the non-blocking extras).
+// ===========================================================================
+
+describe("review round 3 — owner surface and evidence bounds", () => {
+  const anchorDoc = () =>
+    JSON.parse(readFileSync(`${dbPath}.history-anchor.json`, "utf8"));
+
+  it("R1: while evidence is owed, the owner view shows pending; once written, recorded", () => {
+    const g = issued();
+    failAllAnchorWrites = true;
+    const r = ownerEnd(
+      "revoke",
+      { [g.grant.grant_id]: "delete" },
+      { grantIds: [g.grant.grant_id], actionId: "X" },
+    );
+    expect(r.ok && r.result.grants[0]!.state).toBe("pending");
+    expect(store.history.evidenceOwed()).toBe(true);
+    expect(lifecycle.flushEvidence()).toBe(false);
+    expect(view(g.grant.grant_id).evidence).toBe("pending");
+    failAllAnchorWrites = false;
+    expect(view(g.grant.grant_id).evidence).toBe("recorded");
+    expect(store.history.evidenceOwed()).toBe(false);
+    expect(Object.keys(anchorDoc().erasures)).toEqual([g.grant.grant_id]);
+  });
+
+  it("R2: an anchored advance election for a grant the restored store lacks is shown to the owner", () => {
+    const old = issued();
+    const { db } = backup("b");
+    const g = issued("continuous", {
+      expires_at: new Date(clockMs + 10 * H).toISOString(),
+    });
+    lifecycle.requestErasureForOwner({
+      subjectId: OWNER,
+      grantId: g.grant.grant_id,
+      advance: true,
+      actionId: "adv",
+      inScope: all,
+    });
+    expect(anchorDoc().elections[g.grant.grant_id].subject_id).toBe(OWNER);
+    restoreFrom(db);
+    advance(20 * H);
+    const re = lifecycle.reestablishHistory({
+      dispositions: { [old.grant.grant_id]: "keep" },
+      actionId: "re",
+    });
+    expect(re).toMatchObject({ ok: true, unappliedActions: 1 });
+    expect(lifecycle.unappliedOwnerActions(OWNER)).toEqual([
+      expect.objectContaining({
+        grant_id: g.grant.grant_id,
+        kind: "advance_election",
+        disposition: "delete",
+        outcome: "advance_election_grant_not_in_restored_store",
+      }),
+    ]);
+    // Never promoted from stale state: the client is refused, not told erase.
+    expect(
+      call({ grant_id: g.grant.grant_id, token: g.access_token }).status,
+    ).toBe(401);
+  });
+
+  it("bounds anchored token digests per erased grant, and drops them once completion is reported", async () => {
+    const { MAX_ANCHORED_TOKEN_DIGESTS } = await import("./store.js");
+    const g = issued();
+    let rt = g.refresh_token!;
+    for (let i = 0; i < MAX_ANCHORED_TOKEN_DIGESTS + 10; i++) {
+      advance(1000);
+      const r = tokens.refresh({ refreshToken: rt });
+      if (!r.ok) throw new Error(r.failure.message);
+      rt = r.issued.refresh_token!;
+    }
+    ownerEnd(
+      "revoke",
+      { [g.grant.grant_id]: "delete" },
+      { grantIds: [g.grant.grant_id] },
+    );
+    const digests: string[] =
+      anchorDoc().erasures[g.grant.grant_id].token_digests;
+    expect(digests).toHaveLength(MAX_ANCHORED_TOKEN_DIGESTS);
+    expect(digests).toContain(hashToken(rt)); // the newest token is kept
+    const recovery = recover([g.grant.grant_id]);
+    const id = answer(recovery, g.grant.grant_id).erasure!.instruction_id;
+    answer(recovery, g.grant.grant_id, {
+      report: "completed",
+      instruction_id: id,
+      reported_at: clock().toISOString(),
+    });
+    expect(anchorDoc().erasures[g.grant.grant_id].token_digests).toEqual([]);
+  });
+
+  it("records the first return of an orphan answer after re-establishment", () => {
+    const old = issued();
+    const { db } = backup("b");
+    const g = issued();
+    ownerEnd(
+      "revoke",
+      { [g.grant.grant_id]: "delete" },
+      { grantIds: [g.grant.grant_id] },
+    );
+    restoreFrom(db);
+    lifecycle.reestablishHistory({
+      dispositions: { [old.grant.grant_id]: "keep" },
+      actionId: "re",
+    });
+    expect(store.lifecycle.getOrphanFirstReturn(g.grant.grant_id)).toBeNull();
+    advance(H);
+    expect(answer(g.access_token, g.grant.grant_id).held_data).toBe("erase");
+    const first = store.lifecycle.getOrphanFirstReturn(g.grant.grant_id);
+    expect(first).toBe(clock().toISOString());
+    advance(H);
+    answer(g.access_token, g.grant.grant_id);
+    expect(store.lifecycle.getOrphanFirstReturn(g.grant.grant_id)).toBe(first);
+  });
+
+  it("derives evidence with the injected clock", () => {
+    const g = issued("continuous", {
+      expires_at: new Date(clockMs + H).toISOString(),
+    });
+    lifecycle.requestErasureForOwner({
+      subjectId: OWNER,
+      grantId: g.grant.grant_id,
+      advance: true,
+      actionId: "a",
+      inScope: all,
+    });
+    advance(2 * H);
+    answer(g.access_token, g.grant.grant_id);
+    expect(
+      store.anchorEvidence(clock()).erasures[g.grant.grant_id],
+    ).toMatchObject({ read_state: "expired", ended_at: g.grant.expires_at });
+  });
+});

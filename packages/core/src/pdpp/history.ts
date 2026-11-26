@@ -96,6 +96,8 @@ export interface AnchoredElection {
   instruction_id: string;
   accepted_at: string;
   advance: true;
+  /** The grant's owner (R2), so a lost election can be shown to them. */
+  subject_id?: string;
 }
 
 /**
@@ -252,7 +254,8 @@ export class HistoryRecorder {
    * advance writes it before anything is acknowledged (F1).
    */
   private owed = false;
-  private evidenceProvider: () => AnchorEvidence = () => EMPTY_EVIDENCE;
+  private evidenceProvider: (now: string) => AnchorEvidence = () =>
+    EMPTY_EVIDENCE;
   private anchoredBefore = false;
 
   constructor(
@@ -277,7 +280,7 @@ export class HistoryRecorder {
   }
 
   /** The store supplies the evidence, derived from its tables. */
-  setEvidenceProvider(provider: () => AnchorEvidence): void {
+  setEvidenceProvider(provider: (now: string) => AnchorEvidence): void {
     this.evidenceProvider = provider;
   }
 
@@ -293,7 +296,7 @@ export class HistoryRecorder {
     if (
       !this.anchor ||
       this.anchor.seq !== head.seq ||
-      evidenceKey(this.anchor) !== evidenceKey(this.evidenceProvider())
+      evidenceKey(this.anchor) !== evidenceKey(this.evidenceProvider(now))
     ) {
       this.owed = true;
     }
@@ -396,7 +399,7 @@ export class HistoryRecorder {
       // F3: derived from the database, so the anchored set always contains
       // every effective instruction, election and disabled digest up to the
       // anchored position, whatever an earlier failed advance dropped.
-      ...this.evidenceProvider(),
+      ...this.evidenceProvider(now),
     };
     try {
       this.io.writeDurably(this.anchorPath, JSON.stringify(next));

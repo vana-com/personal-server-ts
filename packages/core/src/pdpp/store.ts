@@ -338,6 +338,9 @@ export type GrantEndingReason =
   | "security"
   | "history_restore";
 
+/** Token digests the anchor keeps per erased grant (newest first, then sorted). */
+export const MAX_ANCHORED_TOKEN_DIGESTS = 64;
+
 export class PdppAuthStore {
   readonly lifecycle: LifecycleRecords;
 
@@ -349,7 +352,7 @@ export class PdppAuthStore {
     ),
   ) {
     this.lifecycle = new LifecycleRecords(db, history);
-    history.setEvidenceProvider(() => this.anchorEvidence());
+    history.setEvidenceProvider((now) => this.anchorEvidence(new Date(now)));
   }
 
   /**
@@ -358,7 +361,7 @@ export class PdppAuthStore {
    * token digests; every advance election; every token digest disabled for
    * lifecycle use; and erasures restored for grants a restore lost.
    */
-  anchorEvidence(): AnchorEvidence {
+  anchorEvidence(now: Date = new Date()): AnchorEvidence {
     const erasures: Record<string, AnchoredErasure> = {};
     const elections: Record<string, AnchoredElection> = {};
     for (const i of this.lifecycle.listInstructions()) {
@@ -369,6 +372,9 @@ export class PdppAuthStore {
           instruction_id: i.instructionId,
           accepted_at: i.acceptedAt,
           advance: true,
+          ...(this.getGrant(i.grantId) && {
+            subject_id: this.getGrant(i.grantId)!.subjectId,
+          }),
         };
         continue;
       }
@@ -376,7 +382,7 @@ export class PdppAuthStore {
       const ending = stored
         ? this.endingOf(
             stored,
-            new Date(Math.max(Date.now(), Date.parse(i.effectiveAt))),
+            new Date(Math.max(now.getTime(), Date.parse(i.effectiveAt))),
           )
         : null;
       erasures[i.grantId] = {
@@ -391,9 +397,19 @@ export class PdppAuthStore {
         read_state: ending?.readState ?? "revoked",
         ended_at: ending?.endedAt ?? i.effectiveAt,
         ...(stored && { subject_id: stored.subjectId }),
-        token_digests: this.lifecycle
-          .tokenDigestsFor(i.clientId, [i.grantId])
-          .sort(),
+        // Bounded (extra item): none once the client reported completion
+        // (nothing is left to deliver), otherwise the newest
+        // MAX_ANCHORED_TOKEN_DIGESTS tokens issued for the grant. The tokens
+        // a client still holds are its newest ones.
+        token_digests: i.completedReportedAt
+          ? []
+          : this.lifecycle
+              .recentTokenDigestsFor(
+                i.clientId,
+                i.grantId,
+                MAX_ANCHORED_TOKEN_DIGESTS,
+              )
+              .sort(),
       };
     }
     for (const o of this.lifecycle.listOrphanErasures()) {
