@@ -1,3 +1,7 @@
+import {
+  createLegacyRetireRemote,
+  type RetirementRows,
+} from "@opendatalabs/personal-server-ts-core/localdb";
 import { createPsLiteSeedStaging } from "./seed-staging.js";
 import {
   LEGACY_SCOPE_BINDINGS,
@@ -667,24 +671,43 @@ export async function createPsLiteSyncManager(
           eraseLegacy: (connector) =>
             eraseLegacyScopesOf(connector, options.storage),
           erasure: () => logErasurePorts,
-          // The legacy copy of a deleted connection is retired at the gateway
-          // and in storage by this runtime's own scope delete: the manager is
-          // read when the stage runs, not when the database opens.
-          legacyDelete: () => ({
-            scopesOf: legacyScopesOfConnector,
-            streamsOf: legacyStreamsOfScope,
-            mode: modeOfAccount(() => mode.read()),
-            head: legacyHeadFrom(dataPointFeed, serverOwner),
-            retire: (scope, head, options) =>
-              syncManager.deleteScope(scope, undefined, {
-                fence: {
-                  head,
-                  pinned: options?.pinned === true,
-                  ...(options?.writeReady && {
-                    writeReady: options.writeReady,
-                  }),
+          // Standalone retirement owns its transport, receipts and row leaves.
+          legacyRetire: () => {
+            const rows = (
+              options.storage as DataStoragePort & {
+                retirementRows?: RetirementRows;
+              }
+            ).retirementRows;
+            if (!rows) return undefined;
+            return {
+              scopesOf: legacyScopesOfConnector,
+              streamsOf: legacyStreamsOfScope,
+              mode: modeOfAccount(() => mode.read()),
+              head: legacyHeadFrom(dataPointFeed, serverOwner),
+              finality: tombstoneFinality,
+              versions: logErasurePorts.versions,
+              rows,
+              ...createLegacyRetireRemote({
+                gatewayUrl: options.config.gateway.url,
+                dataPointFeed,
+                serverOwner,
+                signer,
+                storage: {
+                  endpoint: resolveVanaStorageEndpoint(options.config),
+                  audience: options.storageAudience,
+                  chainId: options.config.gateway.chainId,
+                  signMessage: (message) => syncAccount.signMessage(message),
                 },
               }),
+            };
+          },
+          // Ordinary connector DELETE retains the scope-delete worker.
+          legacyDelete: () => ({
+            scopesOf: legacyScopesOfConnector,
+            mode: modeOfAccount(() => mode.read()),
+            head: legacyHeadFrom(dataPointFeed, serverOwner),
+            retire: (scope, head) =>
+              syncManager.deleteScope(scope, undefined, { fence: { head } }),
             pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
             finality: tombstoneFinality,
             versions: logErasurePorts.versions,

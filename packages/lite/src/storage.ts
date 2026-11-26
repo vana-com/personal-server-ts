@@ -1,3 +1,4 @@
+import type { RetirementRows } from "@opendatalabs/personal-server-ts-core/localdb";
 import type {
   DataStoragePort,
   DataVersionWriter,
@@ -103,6 +104,7 @@ export interface PsLiteStorageCapabilities {
 /** Persistent Lite storage with its public backend capability report. */
 export interface PsLiteStoragePort extends DataStoragePort {
   readonly capabilities: PsLiteStorageCapabilities;
+  readonly retirementRows: RetirementRows;
   /**
    * The seal every legacy write of this storage runs inside, and every
    * removal under its shared lock. Given at construction; see
@@ -824,6 +826,56 @@ export async function createPersistentPsLiteStorage(
   const storagePort: PsLiteStoragePort = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
+    retirementRows: {
+      capture: (save, authority) =>
+        enqueue(async () => {
+          authority();
+          return save(state.entries.map((row) => ({ ...row })));
+        }),
+      absent: (rows, authority) =>
+        enqueue(async () => {
+          authority();
+          return rows.every(
+            (row) => !state.entries.some((entry) => entry.id === row.id),
+          );
+        }),
+      erase: (row, authority) =>
+        legacyWriteSeal.remove(() =>
+          withPathLock(row.path, async () => {
+            const found = await enqueue(async () => {
+              authority();
+              return state.entries.some(
+                (entry) =>
+                  entry.id === row.id &&
+                  entry.path === row.path &&
+                  entry.scope === row.scope &&
+                  entry.collectedAt === row.collectedAt,
+              );
+            });
+            if (!found) return;
+            // Keep the row on failure so restart retries every artifact.
+            const tree = blockTreePath(row.scope, row.collectedAt);
+            authority();
+            await fileStore.deleteEnvelope(row.path);
+            authority();
+            await fallbackStore.deleteEnvelope(row.path);
+            authority();
+            await fileStore.deleteBlockTree?.(tree);
+            authority();
+            await fallbackStore.deleteBlockTree?.(tree);
+            await enqueue(async () => {
+              authority();
+              readyBlockManifests.delete(
+                blockManifestPath(row.scope, row.collectedAt),
+              );
+              await publish({
+                ...state,
+                entries: state.entries.filter((entry) => entry.id !== row.id),
+              });
+            });
+          }),
+        ),
+    },
     legacyWriteSeal,
     ...createStorageReadMethods(() => state.entries, entriesForScope),
 

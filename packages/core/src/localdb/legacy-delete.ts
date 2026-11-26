@@ -83,28 +83,11 @@ export type LegacyHead =
 export interface LegacyDeletePorts {
   /** The legacy scopes bound to `connector` (the host owns the binding table). */
   scopesOf(connector: string): readonly string[];
-  /**
-   * The streams of `connector` that legacy `scope` feeds. A retirement records
-   * them, so a retired scope keeps refusing the imports it would feed.
-   */
-  streamsOf?(connector: string, scope: string): readonly string[];
   /** What a legacy write would get now: `allow` is an account that has not switched. */
   mode(): "allow" | LegacyWriteVerdict;
   head(scope: string, signal?: AbortSignal): Promise<LegacyHead>;
   /** The durable scope delete, fenced to `fence`: tombstone, blobs, local erase. */
-  retire(
-    scope: string,
-    fence: TombstoneFence,
-    options?: {
-      readonly pinned: boolean;
-      /**
-       * The caller's live write authority. The host hands it to the delete
-       * worker, which reads it right before the tombstone post, the blob queue
-       * write and the local erase.
-       */
-      readonly writeReady?: () => boolean;
-    },
-  ): Promise<DeleteScopeResult>;
+  retire(scope: string, fence: TombstoneFence): Promise<DeleteScopeResult>;
   /** Blob deletions of `scope` still queued on this device behind its tombstone. */
   pendingBlobs(scope: string): Promise<number>;
   finality: Pick<TombstoneFinalityPort, "tombstoneState">;
@@ -124,12 +107,6 @@ export interface LegacyMemory {
   readonly refused: Map<string, DeleteBlockReason>;
   /** Slots storage answered for, by `<scope>@<tombstone version>`. */
   readonly erased: Map<string, Set<string>>;
-  /**
-   * `<scope>@<tombstone version>` whose fenced local cleanup this process saw
-   * finish. Only a spared request: a restart cleans again, and that costs one
-   * idempotent delete.
-   */
-  readonly localCleaned?: Set<string>;
   /**
    * The control tombstone this delete confirmed, by namespace (its registry
    * version). The delete is judged against these, not against whatever head
@@ -153,17 +130,14 @@ export interface LegacyOutcome {
 }
 
 /** One scope: what to show, and whether a later pass can change it. */
-export interface LegacyScopeOutcome {
+interface ScopeOutcome {
   readonly part: DeletePart;
   readonly retry: boolean;
 }
-const settled = (part: DeletePart): LegacyScopeOutcome => ({
-  part,
-  retry: false,
-});
-const waiting: LegacyScopeOutcome = { part: PART_PENDING, retry: true };
+const settled = (part: DeletePart): ScopeOutcome => ({ part, retry: false });
+const waiting: ScopeOutcome = { part: PART_PENDING, retry: true };
 
-export const worst = (a: DeletePart, b: DeletePart): DeletePart => {
+const worst = (a: DeletePart, b: DeletePart): DeletePart => {
   const rank = (p: DeletePart) =>
     p.state === "blocked" ? 2 : p.state === "pending" ? 1 : 0;
   return rank(b) > rank(a) ? b : a;
@@ -279,24 +253,20 @@ export async function retireLegacyOf(
       signal?.throwIfAborted();
       // One scope's failed read says nothing of the others: it waits and is
       // retried, and the scopes after it still retire.
-      const outcome = await retireLegacyScope(
-        deps,
-        ports,
-        scope,
-        undefined,
-        signal,
-      ).catch((error: unknown) => {
-        if (signal?.aborted) throw error;
-        deps.logger.warn(
-          {
-            connector,
-            scope,
-            error: error instanceof Error ? error.message : String(error),
-          },
-          "stream sync: a legacy scope could not be retired yet",
-        );
-        return waiting;
-      });
+      const outcome = await retireScope(deps, ports, scope, signal).catch(
+        (error: unknown) => {
+          if (signal?.aborted) throw error;
+          deps.logger.warn(
+            {
+              connector,
+              scope,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "stream sync: a legacy scope could not be retired yet",
+          );
+          return waiting;
+        },
+      );
       part = worst(part, outcome.part);
       retry ||= outcome.retry;
     }
@@ -361,59 +331,17 @@ async function finalControl(
   return rolledBack === tombstones.size ? "rolled-back" : "waiting";
 }
 
-/**
- * What a scope's retirement is held to: the gateway head the request read
- * when it was made. A head that is not this one is not retired on a guess.
- */
-export type LegacyPin = LegacyHead;
-
-/** Whether `head` is the head `pin` named, or the tombstone of it. */
-function pinHolds(pin: LegacyPin, head: LegacyHead): boolean {
-  if (pin.state === "absent") return head.state === "absent";
-  if (pin.state === "deleted")
-    return head.state === "deleted" && head.version === pin.version;
-  // A live pin: still that head, or already tombstoned by this device, a
-  // device of the account that retired it, or a retry of ours. A tombstone
-  // is the pinned head's own only if it is the next version: a later one sits
-  // over a version the pin never named, and erasing it frees that version's blob.
-  if (head.state === "deleted")
-    return BigInt(head.version) === BigInt(pin.fence.expectedVersion) + 1n;
-  return (
-    head.state === "live" &&
-    head.fence.expectedVersion === pin.fence.expectedVersion &&
-    head.fence.dataHash === pin.fence.dataHash &&
-    head.fence.metadataHash === pin.fence.metadataHash
-  );
-}
-
-/** What the worker needs of a pass: the memory it keeps between passes. */
-export type LegacyScopeDeps = Pick<LegacyStageDeps, "memory">;
-
-/**
- * One legacy scope, retired and confirmed: the worker of a connector's delete
- * and of a standalone legacy retirement. With a `pin` it also holds the scope
- * to the head it named: a head that is not that one blocks the scope
- * (`legacy_head_changed`), before and after the tombstone, and the tombstone
- * is fenced to the pinned head.
- */
-export async function retireLegacyScope(
-  deps: LegacyScopeDeps,
+async function retireScope(
+  deps: LegacyStageDeps,
   ports: LegacyDeletePorts,
   scope: string,
-  pin: LegacyPin | undefined,
   signal?: AbortSignal,
-): Promise<LegacyScopeOutcome> {
+): Promise<ScopeOutcome> {
   const refused = deps.memory?.refused.get(scope);
   if (refused) return settled(blocked(refused));
   let head = await ports.head(scope, signal);
-  if (pin && !pinHolds(pin, head))
-    return settled(blocked("legacy_head_changed"));
-  // Whether this call's own delete finished the local copy.
-  let cleanedHere = false;
   if (head.state === "live") {
-    const result = await ports.retire(scope, head.fence, {
-      pinned: pin !== undefined,
-    });
+    const result = await ports.retire(scope, head.fence);
     const { gateway } = result.steps;
     // data-gateway #212: a tombstone aimed at a head that is already deleted
     // gets a distinct answer (`gateway-refusal.ts`). The scope is retired
@@ -422,14 +350,7 @@ export async function retireLegacyScope(
       gateway.status === "failed" &&
       !isGatewayAlreadyDeletedCode(gateway.code)
     ) {
-      if (!isGatewayRefusalCode(gateway.code)) {
-        // A fenced delete that failed may have failed because the head moved:
-        // read it again, so a head that is not the pin's blocks the scope
-        // instead of being waited on for good.
-        if (pin && !pinHolds(pin, await ports.head(scope, signal)))
-          return settled(blocked("legacy_head_changed"));
-        return waiting;
-      }
+      if (!isGatewayRefusalCode(gateway.code)) return waiting;
       // The gateway's answer will not change: ask once, show it, and do not
       // let it hold back a scope that is only waiting.
       deps.memory?.refused.set(scope, gateway.code);
@@ -440,67 +361,15 @@ export async function retireLegacyScope(
       deps.memory?.refused.set(scope, "needs_another_device");
       return settled(blocked("needs_another_device"));
     }
-    cleanedHere = result.steps.local.status === "ok";
     head = await ports.head(scope, signal);
-    if (pin && !pinHolds(pin, head))
-      return settled(blocked("legacy_head_changed"));
   }
   // Never registered, or an account that has nothing here to retire.
   if (head.state === "absent") return settled(PART_DONE);
   // A head that moved, or a tombstone the registry has not kept: read again.
   if (head.state === "live") return waiting;
-  // A pinned retirement is done only when the local copy is gone too. The
-  // tombstone may have landed in an earlier pass or process that stopped (or
-  // failed) before its local erase, so a deleted head is not evidence of it:
-  // the fenced delete runs again, bounded by the pinned tombstone.
-  if (pin && !cleanedHere && !(await cleanLocal(deps, ports, scope, pin, head)))
-    return waiting;
   // Work this device queued is still being drained by its sync manager.
   if ((await ports.pendingBlobs(scope)) > 0) return waiting;
   return confirmErased(deps, ports, scope, head.version, signal);
-}
-
-/**
- * The fence for a deleted head: the live head `pin` named, or, for a pin that
- * was a tombstone already, the version just below it. The adapter reads only
- * the version of a fence it finds a deleted head under, and a head that moved
- * past the tombstone (a re-add) fails the same version check.
- */
-function fenceOfPinnedTombstone(pin: LegacyPin, tombstone: string) {
-  return pin.state === "live"
-    ? pin.fence
-    : {
-        expectedVersion: (BigInt(tombstone) - 1n).toString(),
-        dataHash: "",
-        metadataHash: "",
-      };
-}
-
-/**
- * Run the fenced delete again over the pinned tombstone, so its local erase and
- * blob queue are decided from this device's own files, not from the gateway.
- * `true` once the local copy of every version the tombstone covers is gone.
- * The delete is idempotent: queued blob work is not queued twice.
- */
-async function cleanLocal(
-  deps: LegacyScopeDeps,
-  ports: LegacyDeletePorts,
-  scope: string,
-  pin: LegacyPin,
-  head: Extract<LegacyHead, { state: "deleted" }>,
-): Promise<boolean> {
-  const key = `${scope}@${head.version}`;
-  const cleaned = deps.memory?.localCleaned;
-  if (cleaned?.has(key)) return true;
-  const result = await ports.retire(
-    scope,
-    fenceOfPinnedTombstone(pin, head.version),
-    { pinned: true },
-  );
-  if (result.steps.gateway.status === "failed") return false;
-  if (result.steps.local.status !== "ok") return false;
-  cleaned?.add(key);
-  return true;
 }
 
 /** The legacy delete's batch: vana-storage rate-limits DELETE per owner. */
@@ -513,12 +382,12 @@ const SWEEP_BATCH = 15;
  * repeating them is safe and an absent object (404) is the confirmation.
  */
 async function confirmErased(
-  deps: LegacyScopeDeps,
+  deps: LegacyStageDeps,
   ports: LegacyDeletePorts,
   scope: string,
   tombstone: string,
   signal?: AbortSignal,
-): Promise<LegacyScopeOutcome> {
+): Promise<ScopeOutcome> {
   const version = BigInt(tombstone);
   // Blobs are freed only by a final tombstone: a failed one rolls the head
   // back to live data whose blobs must still be there.

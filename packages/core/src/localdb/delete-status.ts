@@ -54,7 +54,8 @@ export type DeleteBlockReason =
    * absent or deleted is live), so the retirement does not tombstone it. It
    * never widens to the head it finds.
    */
-  | "legacy_head_changed";
+  | "legacy_head_changed"
+  | "legacy_manifest_missing";
 
 export type DeletePart =
   | { readonly state: "done" }

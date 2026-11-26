@@ -1,4 +1,9 @@
 import {
+  createLegacyRetireRemote,
+  type LegacyRetirePipelinePorts,
+} from "@opendatalabs/personal-server-ts-core/localdb";
+import { createLegacyRetireRows } from "./storage/legacy-retire-rows.js";
+import {
   createViewChanges,
   inventoryVersionLister,
   legacyHeadFrom,
@@ -949,6 +954,7 @@ async function bootstrapServer(
    * manager exists; absent where sync is off or the server cannot delete.
    */
   let legacyDeletePorts: LegacyDeletePorts | undefined;
+  let legacyRetirePorts: LegacyRetirePipelinePorts | undefined;
   async function getLocalSync(): Promise<LocalSync> {
     requireStreamMode();
     if (localSync) return localSync;
@@ -1026,6 +1032,7 @@ async function bootstrapServer(
           // (see `logErasurePorts`); the ports are read when an erasure runs.
           erasure: () => logErasurePorts,
           legacyDelete: () => legacyDeletePorts,
+          legacyRetire: () => legacyRetirePorts,
         });
         localSyncDeps = deps;
         localDb = db;
@@ -1406,17 +1413,10 @@ async function bootstrapServer(
       const manager = syncManager;
       legacyDeletePorts = {
         scopesOf: legacyScopesOfConnector,
-        streamsOf: legacyStreamsOfScope,
         mode: modeFrom(legacyWriteSeal),
         head: legacyHeadFrom(dataPointFeed, serverOwner),
-        retire: (scope, head, options) =>
-          manager.deleteScope(scope, undefined, {
-            fence: {
-              head,
-              pinned: options?.pinned === true,
-              ...(options?.writeReady && { writeReady: options.writeReady }),
-            },
-          }),
+        retire: (scope, head) =>
+          manager.deleteScope(scope, undefined, { fence: { head } }),
         pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),
         finality: tombstoneFinality,
         // Done is re-derived from the gateway's history and storage's own
@@ -1425,6 +1425,33 @@ async function bootstrapServer(
         objects: deleteData,
       };
     }
+    if (legacyDeletePorts && tombstoneFinality && logErasurePorts)
+      legacyRetirePorts = {
+        scopesOf: legacyScopesOfConnector,
+        streamsOf: legacyStreamsOfScope,
+        mode: modeFrom(legacyWriteSeal),
+        head: legacyHeadFrom(dataPointFeed, serverOwner),
+        finality: tombstoneFinality,
+        versions: logErasurePorts.versions,
+        rows: createLegacyRetireRows(
+          db,
+          indexManager,
+          hierarchyOptions,
+          legacyWriteSeal,
+        ),
+        ...createLegacyRetireRemote({
+          gatewayUrl: config.gateway.url,
+          dataPointFeed,
+          serverOwner,
+          signer: serverSigner,
+          fetch: outboundFetch,
+          storage: {
+            endpoint: resolveVanaStorageEndpoint(config),
+            chainId: config.gateway.chainId,
+            signMessage: (message) => serverAccount.signMessage(message),
+          },
+        }),
+      };
     syncManager.start();
     logger.info("Sync engine started");
   } else if (config.sync.enabled) {

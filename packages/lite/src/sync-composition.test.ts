@@ -1,3 +1,5 @@
+import { createOpenPersistentPsLiteStorage } from "./test-support/open-storage.js";
+import { createMemoryPsLitePersistence } from "./test-support/memory.js";
 import type * as LocalDbModule from "@opendatalabs/personal-server-ts-core/localdb";
 import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
 import "fake-indexeddb/auto";
@@ -384,13 +386,14 @@ describe("PS Lite local database composition", () => {
   async function setup(
     localDb: LiteLocalDbOptions,
     readMode: () => "switched" | "unswitched" | "unknown" = () => "switched",
+    storage = createMemoryPsLiteStorage(),
   ) {
     const owner = (await recoverServerOwner(OWNER_SIGNATURE)).toLowerCase();
     const stateStore = namedState("indexeddb:localdb-composition/state");
     const { identity, gateway } = await fixture(stateStore, owner);
     const lite = await openLite({
       stateStore,
-      storage: createMemoryPsLiteStorage(),
+      storage,
       identity,
       gateway,
       localDb,
@@ -570,7 +573,14 @@ describe("PS Lite local database composition", () => {
   it("gives the local sync the erasure and legacy-delete ports of Lite's own delete path", async () => {
     const db = driver();
     facade(db);
-    const { lite } = await setup({ openDriver: vi.fn().mockResolvedValue(db) });
+    const { lite } = await setup(
+      { openDriver: vi.fn().mockResolvedValue(db) },
+      undefined,
+      await createOpenPersistentPsLiteStorage(
+        { kind: "custom" },
+        createMemoryPsLitePersistence(),
+      ),
+    );
     try {
       const options = vi.mocked(createLocalSync).mock.calls[0]![1];
       // A Web or phone delete erases storage objects and retires the legacy
@@ -589,15 +599,14 @@ describe("PS Lite local database composition", () => {
         metadataHash: "0xbb",
       };
       await legacy!.retire("notes.entries", head);
-      // The tombstone is fenced to the head the stage read.
+      // Ordinary connector deletion retains its main-branch fence contract.
       expect(deleteScope).toHaveBeenCalledWith("notes.entries", undefined, {
-        fence: { head, pinned: false },
+        fence: { head },
       });
-      // A retirement held to a pin says so: an absent head is not "nothing".
-      await legacy!.retire("notes.entries", head, { pinned: true });
-      expect(deleteScope).toHaveBeenLastCalledWith("notes.entries", undefined, {
-        fence: { head, pinned: true },
-      });
+      const retirement = options.legacyRetire?.();
+      expect(retirement?.rows.capture).toEqual(expect.any(Function));
+      expect(retirement?.tombstone).toEqual(expect.any(Function));
+      expect(retirement?.eraseBlob).toEqual(expect.any(Function));
     } finally {
       await lite.syncManager.stop();
       await lite.closeStreamSync();

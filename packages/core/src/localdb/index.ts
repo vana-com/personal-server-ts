@@ -170,3 +170,11 @@ export {
   systemStreamIdentity,
   type SystemStreamDescriptor,
 } from "./system-stream-descriptor.js";
+
+export { createLegacyRetireRemote } from "./legacy-retire-remote.js";
+export {
+  createLegacyRetirePipeline,
+  type LegacyRetirePipelinePorts,
+  type RetirementRows,
+  type RetirementAuthority,
+} from "./legacy-retire-pipeline.js";

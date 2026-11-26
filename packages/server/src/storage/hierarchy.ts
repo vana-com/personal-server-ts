@@ -159,6 +159,27 @@ export function deleteDataFileSync(
   });
 }
 
+/** Retirement's exact file leaves; ordinary delete keeps its own orchestration. */
+export function retireDataFileSync(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+  authority: () => void,
+): void {
+  const path = buildDataFilePath(options.dataDir, scope, collectedAt);
+  authority();
+  rmSync(path, { force: true });
+  if (existsSync(dirname(path))) {
+    authority();
+    syncDirectory(dirname(path));
+  }
+  authority();
+  rmSync(buildBlockDir(options.dataDir, scope, collectedAt), {
+    recursive: true,
+    force: true,
+  });
+}
+
 export function deleteFirstSeenLedgerSync(
   options: HierarchyManagerOptions,
   scope: string,

@@ -4,7 +4,6 @@ import type {
   DeleteBlobVersionsOutcome,
   DeleteDataPort,
   TombstoneOutcome,
-  TombstoneDeleteFence,
   TombstoneFence,
 } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
@@ -39,50 +38,6 @@ export class GatewayRefusalError extends Error {
     super(`Gateway error: ${status} ${detail}`);
     this.name = "GatewayRefusalError";
   }
-}
-
-/** The host's write authority closed before a destructive step: nothing was sent. */
-export class WriteAuthorityLostError extends Error {
-  constructor() {
-    super("the host has no write authority now; nothing was sent");
-    this.name = "WriteAuthorityLostError";
-  }
-}
-
-/**
- * A fenced delete cleans storage through the tombstone's version, so it may
- * count a deleted head as its own only at the version right after the fenced
- * head. A later tombstone sits over versions the fence never named; the caller
- * must write nothing for it.
- */
-function assertFencedTombstone(
-  fence: { head: TombstoneFence } | undefined,
-  version: string | null,
-): void {
-  if (!fence) return;
-  if (
-    version === null ||
-    BigInt(version) !== BigInt(fence.head.expectedVersion) + 1n
-  )
-    throw new Error(
-      `Scope is deleted at v${version ?? "?"}, not directly after the fenced head (v${fence.head.expectedVersion})`,
-    );
-}
-
-/**
- * A pinned fence names a live head the retirement just read. An absent head is
- * not that head: the caller would erase local entries and queue blob keys for a
- * point it never saw gone, so a pinned delete throws instead of reporting it.
- * Other fenced deletes (a connector delete, a rollback re-submission) keep
- * "not registered": their local copy goes with it.
- */
-function assertFenceNotAbsent(
-  fence: { head: TombstoneFence; pinned?: boolean } | undefined,
-): void {
-  if (fence?.pinned)
-    throw new Error(
-      `Scope head is absent, not the one the fenced delete saw (v${fence.head.expectedVersion})`,
-    );
 }
 
 /** The terminal refusal a response body names, or null. */
@@ -191,7 +146,6 @@ export function createGatewayDeleteDataPort(
     scope: string,
     dataPointId: string,
     version: bigint,
-    fence: TombstoneDeleteFence | undefined,
   ): Promise<Response> {
     const signature = await options.signer.signAddData({
       ownerAddress: options.serverOwner,
@@ -200,10 +154,6 @@ export function createGatewayDeleteDataPort(
       metadataHash: TOMBSTONE_METADATA_HASH,
       expectedVersion: version,
     });
-    // The head read and the signing are awaits: the host's authority is read
-    // again right before the post, the one call here that deletes.
-    if (fence?.writeReady && !fence.writeReady())
-      throw new WriteAuthorityLostError();
     return fetchImpl(`${gatewayBase}/v1/data/${dataPointId}`, {
       method: "DELETE",
       headers: {
@@ -324,18 +274,14 @@ export function createGatewayDeleteDataPort(
     ...(options.reservedHead ? { head: options.reservedHead } : {}),
     async tombstone(
       scope: string,
-      fence?: TombstoneDeleteFence,
+      fence?: { head: TombstoneFence },
     ): Promise<TombstoneOutcome> {
       const dataPointId = computeDataPointId(options.serverOwner, scope);
       const current = await currentHead(scope);
       if (current === null) {
-        assertFenceNotAbsent(fence);
         return { status: "not-registered", dataPointId };
       }
       if (current.deletedAt !== null) {
-        // A fenced delete may call a head deleted only when it is the pinned
-        // head's own tombstone: the caller cleans storage through that version.
-        assertFencedTombstone(fence, current.expectedVersion);
         return {
           status: "already-deleted",
           dataPointId,
@@ -365,7 +311,7 @@ export function createGatewayDeleteDataPort(
       let answer = await readTombstoneAnswer(
         scope,
         dataPointId,
-        await sendTombstone(scope, dataPointId, version, fence),
+        await sendTombstone(scope, dataPointId, version),
       );
       if (answer.kind === "version-conflict") {
         if (fence) {
@@ -413,16 +359,10 @@ export function createGatewayDeleteDataPort(
         answer = await readTombstoneAnswer(
           scope,
           dataPointId,
-          await sendTombstone(scope, dataPointId, version, fence),
+          await sendTombstone(scope, dataPointId, version),
         );
       }
-      if (answer.kind === "outcome") {
-        if (answer.outcome.status === "not-registered")
-          assertFenceNotAbsent(fence);
-        if (answer.outcome.status === "already-deleted")
-          assertFencedTombstone(fence, answer.outcome.version);
-        return answer.outcome;
-      }
+      if (answer.kind === "outcome") return answer.outcome;
       if (answer.kind === "version-conflict") {
         // A second conflict: the re-sign is once, not forever.
         throw new Error(
@@ -430,14 +370,10 @@ export function createGatewayDeleteDataPort(
         );
       }
       const row = unwrap(answer.body);
-      const echoed = stringField(row, "expectedVersion");
-      // A fenced delete's cleanup is bounded by the version it signed, never by
-      // an echo: a later one would free versions the pin never named.
-      assertFencedTombstone(fence, echoed ?? String(version));
       return {
         status: "tombstoned",
         dataPointId: stringField(row, "dataPointId") ?? dataPointId,
-        version: echoed ?? String(version),
+        version: stringField(row, "expectedVersion") ?? String(version),
         replaced,
         deletedAt: stringField(row, "deletedAt"),
       };

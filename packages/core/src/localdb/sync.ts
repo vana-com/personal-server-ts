@@ -1,3 +1,4 @@
+import type { LegacyRetirePipelinePorts } from "./legacy-retire-pipeline.js";
 import { createAccessActivity } from "../logging/activity-stream.js";
 import { isReservedSystemConnector } from "../policy/reserved-scopes.js";
 import type {
@@ -145,6 +146,8 @@ export function createLocalSync(
      * delete status says another device must.
      */
     readonly legacyDelete?: () => LegacyDeletePorts | undefined;
+    /** Standalone retirement, composed from its own transport and row leaves. */
+    readonly legacyRetire?: () => LegacyRetirePipelinePorts | undefined;
     /**
      * The host's write authority for a legacy retirement; false while a
      * registration is held. Absent: always ready.
@@ -531,7 +534,7 @@ export function createLocalSync(
     erasureOwed: () => deletes().erasureOwed(),
   };
   const legacyRetirer = createLegacyRetirer(deps, {
-    ports: () => options.legacyDelete?.(),
+    ports: () => options.legacyRetire?.(),
     ...(options.legacyWriteReady && { writeReady: options.legacyWriteReady }),
     retryMs: { first: retryFirst, max: retryMax },
   });

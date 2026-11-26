@@ -774,4 +774,8 @@ END`,
       scopes TEXT NOT NULL, created_at INTEGER NOT NULL,
       PRIMARY KEY (owner, connector)) WITHOUT ROWID`,
   ],
+  [
+    `CREATE TABLE legacy_retire_manifests (retire_id TEXT PRIMARY KEY, manifest TEXT NOT NULL) WITHOUT ROWID`,
+    `CREATE TABLE legacy_retire_receipts (retire_id TEXT NOT NULL, scope TEXT NOT NULL, version TEXT NOT NULL, PRIMARY KEY (retire_id, scope, version)) WITHOUT ROWID`,
+  ],
 ];

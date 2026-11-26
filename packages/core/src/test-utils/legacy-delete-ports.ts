@@ -3,10 +3,7 @@
  * legacy stage: the real seal and storage, the real gateway delete port and
  * the real `deleteScope` worker, over the fake's gateway and storage.
  */
-import {
-  legacyScopesOfConnector,
-  legacyStreamsOfScope,
-} from "../legacy-projection/erase-connector.js";
+import { legacyScopesOfConnector } from "../legacy-projection/erase-connector.js";
 import { createLegacyWriteSeal } from "../storage/legacy-write-seal.js";
 import { deleteScope } from "../sync/workers/delete.js";
 import { createGatewayDeleteDataPort } from "../sync/delete-data-port.js";
@@ -42,10 +39,6 @@ export async function legacyPortsOver(
      * next N writes to this device's queue throw, after the tombstone landed.
      */
     queueWritesLost?: number;
-    /** Runs after the tombstone adapter read a head, before it decides anything. */
-    onAdapterHeadRead?: () => void;
-    /** Wraps the gateway fetch the delete adapter posts through. */
-    wrapFetch?: (fetch: typeof globalThis.fetch) => typeof globalThis.fetch;
   } = {},
 ) {
   const owner = fake.owner;
@@ -77,16 +70,7 @@ export async function legacyPortsOver(
   };
   const deleteData = createGatewayDeleteDataPort({
     gatewayUrl: FAKE_GATEWAY,
-    dataPointFeed: options.onAdapterHeadRead
-      ? {
-          ...fake.feed,
-          getDataPoint: async (...args) => {
-            const head = await fake.feed.getDataPoint(...args);
-            options.onAdapterHeadRead!();
-            return head;
-          },
-        }
-      : fake.feed,
+    dataPointFeed: fake.feed,
     serverOwner: owner as `0x${string}`,
     signer: fake.signer,
     storage: {
@@ -94,7 +78,7 @@ export async function legacyPortsOver(
       chainId: FAKE_CHAIN_ID,
       signMessage: async () => `0x${"ab".repeat(65)}` as `0x${string}`,
     },
-    fetch: options.wrapFetch ? options.wrapFetch(fake.fetch) : fake.fetch,
+    fetch: fake.fetch,
   });
   const finalityOf = (scope: string) => {
     const f = options.finality;
@@ -108,10 +92,9 @@ export async function legacyPortsOver(
   const retired: string[] = [];
   const ports: LegacyDeletePorts = {
     scopesOf: legacyScopesOfConnector,
-    streamsOf: legacyStreamsOfScope,
     mode: modeFrom(seal),
     head: legacyHeadFrom(fake.feed, owner),
-    retire: async (scope, fence, retireOptions) => {
+    retire: async (scope, fence) => {
       retired.push(scope);
       return deleteScope(
         {
@@ -129,15 +112,7 @@ export async function legacyPortsOver(
           } as never,
         },
         scope,
-        {
-          fence: {
-            head: fence,
-            pinned: retireOptions?.pinned === true,
-            ...(retireOptions?.writeReady && {
-              writeReady: retireOptions.writeReady,
-            }),
-          },
-        },
+        { fence: { head: fence } },
       );
     },
     pendingBlobs: pendingBlobsFrom(pendingBlobDeletions),

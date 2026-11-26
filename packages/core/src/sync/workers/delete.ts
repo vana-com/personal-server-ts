@@ -9,7 +9,6 @@ import type {
   DeleteDataPort,
   PendingBlobDeletion,
   PendingBlobDeletionStore,
-  TombstoneDeleteFence,
   TombstoneFence,
   TombstoneFinalityPort,
   TombstoneFinalityState,
@@ -334,7 +333,7 @@ export interface DeleteScopeOptions {
    * only over exactly this head (the one the failed tombstone replaced), so a
    * write that landed after the rollback is never deleted.
    */
-  fence?: TombstoneDeleteFence;
+  fence?: { head: TombstoneFence };
   /**
    * False records the storage work but sends no batch in this call; the
    * caller's own pass already used this cycle's storage budget.
@@ -367,27 +366,6 @@ function sealedTombstone<T>(
 ): Promise<T> {
   const seal = storage.legacyWriteSeal;
   return hold || !seal ? send() : seal.remove(send);
-}
-
-/** The caller's write authority closed (`fence.writeReady` answers false). */
-function authorityLost(options: DeleteScopeOptions): boolean {
-  const ready = options.fence?.writeReady;
-  return ready !== undefined && !ready();
-}
-
-/**
- * The pass stops where it is: the tombstone may have landed, and nothing
- * after it ran. The caller repeats the delete once its authority is back; the
- * local copy and the blob work are still there to resume from.
- */
-function heldForAuthority(result: DeleteScopeResult): DeleteScopeResult {
-  if (result.steps.storage.status === "skipped")
-    result.steps.storage = {
-      status: "skipped",
-      reason: "write-authority-lost",
-    };
-  result.steps.local = { status: "skipped", reason: "write-authority-lost" };
-  return result;
 }
 
 export async function deleteScope(
@@ -539,9 +517,6 @@ export async function deleteScope(
           covered.push(entry);
       }
     }
-    // The authority is read again before the queue write and the blob
-    // deletes: the tombstone call above awaited the gateway.
-    if (authorityLost(options)) return heldForAuthority(result);
     const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
     const storageStep = await deleteScopeBlobs(
       {
@@ -559,10 +534,6 @@ export async function deleteScope(
     result.steps.storage = storageStep.step;
     result.pendingBlobDeletion = storageStep.pending > 0;
   }
-
-  // The authority is read once more before the one step that cannot be undone
-  // here: the storage step awaited the gateway too.
-  if (authorityLost(options)) return heldForAuthority(result);
 
   // 3. Local copy. Safe now: the registry row is a tombstone (or the point
   // was never registered / sync is off), so nothing can re-pull it. Only the

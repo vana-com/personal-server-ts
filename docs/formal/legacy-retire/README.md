@@ -1,3 +1,14 @@
+# Legacy retirement proofs
+
+The current implementation is `legacy-retire-pipeline.ts`. Its model is
+`RetirementPipeline.tla`, described under **Dedicated pipeline model** below.
+The original `LegacyRetire.tla` and its controls are retained as historical
+regressions for intent, import-fence, and head-fence behavior. The following
+original analysis describes the former ordinary-worker implementation, not the
+current pipeline's call graph.
+
+## Historical worker model and controls
+
 # Legacy retire: retiring a connector's legacy copy on its own
 
 `LegacyRetire.tla` models `DELETE /v1/owner/connectors/:id/legacy`. The route
@@ -214,3 +225,43 @@ feeds still imports (`Probe-NotFreeMergedAfterDone`). A repeated request after
 This is bounded model evidence. It is not a refinement proof of the SQL. Tests
 in `packages/core/src/localdb/legacy-retire-intent.test.ts` run the invariants
 against the real code.
+
+## Dedicated pipeline model
+
+`RetirementPipeline.tla` models the retirement-owned manifest and receipts.
+Two captured rows and a replacement row are distinct identities. Signing,
+HTTP issuance, blob erasure, receipt writes, individual local mutations,
+observation, and completion are separate actions. Revocation can occur between
+any two actions. `PipelineGood.cfg` checks `CapturedOnly`,
+`DoneImpliesObservedAbsence`, `NoRetirementHooks`, and `AuthorityAtEveryEffect`.
+The six `Pipeline*.cfg` mutants remove one of those controls. The original
+`LegacyRetire.tla` configurations remain as controls for the route's intent,
+head fencing, current connection isolation, and permanent import fence.
+
+The model's authority boundary is issuance: an HTTP request or SQLite batch
+already issued may finish after revocation. Each journal batch is one step.
+An already-posted batch may wait behind the worker's SQLite lock and commit
+later. The pipeline checks authority before posting the next step.
+
+Local completion proves absence of captured index identities. File and block
+erasure has the same best-effort bar as ordinary connector deletion. Neither
+path can prove full artifact absence without generation-tagged storage.
+
+### Pipeline verification results
+
+TLC 2.19, four workers, `MaxB = MaxW = 1`, run under `nice -n 19`:
+
+| Configuration                     | Result                                            |
+| --------------------------------- | ------------------------------------------------- |
+| `PipelineGood`                    | Pass: 51 generated, 45 distinct states; depth 20. |
+| `PipelineCaptureReadds`           | Fails `CapturedOnly`.                             |
+| `PipelineAbsentMeansDone`         | Fails `DoneImpliesObservedAbsence`.               |
+| `PipelineSkippedMeansClean`       | Fails `DoneImpliesObservedAbsence`.               |
+| `PipelineRunAdditionsAfterRevoke` | Fails `NoRetirementHooks`.                        |
+| `PipelineGateBlobBatchOnce`       | Fails `AuthorityAtEveryEffect`.                   |
+| `PipelineGateLocalLoopOnce`       | Fails `AuthorityAtEveryEffect`.                   |
+
+The retained original `Good` control was rerun with the same worker and import
+bounds: 62,676,431 generated, 13,846,227 distinct states; depth 27; no errors.
+The pipeline model fixes two captured rows, one replacement identity and two
+remote keys. It does not model file generations or claim artifact absence.

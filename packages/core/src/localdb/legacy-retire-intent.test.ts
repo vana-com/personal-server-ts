@@ -1,5 +1,9 @@
-// The standalone legacy retirement through the real local sync, the real seal,
-// the real `deleteScope` worker and real SQLite, over a fake legacy gateway:
+import { createLegacyRetireRemote } from "./legacy-retire-remote.js";
+import type { LegacyRetirePipelinePorts } from "./legacy-retire-pipeline.js";
+import { legacyStreamsOfScope } from "../legacy-projection/erase-connector.js";
+import { FAKE_CHAIN_ID } from "../test-utils/legacy-gateway-fake.js";
+// Standalone retirement through the real local sync and its dedicated pipeline,
+// with real SQLite and a fake legacy gateway:
 // a source whose delete was never sent, connected again while its legacy scopes
 // are still listed.
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +29,6 @@ import {
   FAKE_GATEWAY,
   FAKE_STORAGE,
 } from "../test-utils/legacy-gateway-fake.js";
-import type { LegacyDeletePorts } from "./legacy-delete.js";
 
 afterEach(closeWorldDrivers);
 
@@ -45,14 +48,16 @@ async function reconnected(
         ? F
         : never
       : never;
-    wrapLegacy?: (ports: LegacyDeletePorts) => LegacyDeletePorts;
+    wrapLegacy?: (
+      ports: LegacyRetirePipelinePorts,
+    ) => LegacyRetirePipelinePorts;
     dbFile?: string;
     writeReady?: () => boolean;
     /** Extra options of the fake host's ports (see `legacyPortsOver`). */
-    host?: Pick<
-      NonNullable<Parameters<typeof legacyPortsOver>[1]>,
-      "onAdapterHeadRead" | "wrapFetch"
-    >;
+    host?: {
+      onAdapterHeadRead?: () => void;
+      wrapFetch?: (fetch: typeof globalThis.fetch) => typeof globalThis.fetch;
+    };
   } = {},
 ) {
   const w = await world({ streams: 1 });
@@ -61,10 +66,59 @@ async function reconnected(
   const legacy = await legacyPortsOver(fake, {
     ...(options.mode && { mode: options.mode }),
     ...(options.finality && { finality: options.finality }),
-    ...options.host,
   });
+  const pipelinePorts: LegacyRetirePipelinePorts = {
+    ...legacy.ports,
+    streamsOf: legacyStreamsOfScope,
+    finality: options.finality
+      ? legacy.ports.finality
+      : {
+          tombstoneState: async () => ({
+            finalized: "3",
+            settling: false,
+            rolledBack: null,
+          }),
+        },
+    rows: {
+      capture: async (save, check) => {
+        check();
+        return save(legacy.storage.entries.map((row) => ({ ...row })));
+      },
+      absent: async (rows, check) => {
+        check();
+        return rows.every(
+          (row) => !legacy.storage.entries.some((entry) => entry.id === row.id),
+        );
+      },
+      erase: async (row, check) => {
+        check();
+        if (legacy.storage.entries.some((entry) => entry.id === row.id))
+          await legacy.storage.deleteVersion(row.scope, row.collectedAt, {
+            id: row.id,
+            path: row.path,
+          });
+      },
+    },
+    ...createLegacyRetireRemote({
+      gatewayUrl: FAKE_GATEWAY,
+      dataPointFeed: {
+        getDataPoint: async (request) => {
+          options.host?.onAdapterHeadRead?.();
+          return fake.feed.getDataPoint(request);
+        },
+      } as never,
+      serverOwner: OWNER,
+      signer: fake.signer,
+      storage: {
+        endpoint: FAKE_STORAGE,
+        chainId: FAKE_CHAIN_ID,
+        signMessage: async () => `0x${"ab".repeat(65)}`,
+      },
+      fetch: options.host?.wrapFetch?.(fake.fetch) ?? fake.fetch,
+    }),
+  };
   const a = await w.device("a", {
-    legacyDelete: () => options.wrapLegacy?.(legacy.ports) ?? legacy.ports,
+    legacyRetire: () => options.wrapLegacy?.(pipelinePorts) ?? pipelinePorts,
     deleteRetryMs: RETRY,
     ...(options.writeReady && { legacyWriteReady: options.writeReady }),
     ...(options.dbFile && { dbFile: options.dbFile }),
@@ -74,7 +128,7 @@ async function reconnected(
     observedAt: 1100,
   });
   await a.cycle();
-  return { w, a, fake, legacy };
+  return { w, a, fake, legacy, pipelinePorts };
 }
 
 type Fixture = Awaited<ReturnType<typeof reconnected>>;
@@ -180,7 +234,7 @@ describe("a standalone legacy retirement after the switch", () => {
       retireId: first.retireId,
       legacy: PENDING,
     });
-    finality.finalized = "99";
+    finality.finalized = "3";
     finality.settling = false;
     await restarted.sync.cycle();
     await vi.waitFor(async () =>
@@ -281,10 +335,10 @@ describe("a standalone legacy retirement after the switch", () => {
     const f = await reconnected({
       wrapLegacy: (ports) => ({
         ...ports,
-        retire: async (scope, fence, options) => {
+        tombstone: async (scope, fence, check, signal) => {
           f.fake.moveHead(scope);
           f.fake.foreignTombstone(scope);
-          return ports.retire(scope, fence, options);
+          return ports.tombstone(scope, fence, check, signal);
         },
       }),
     });
@@ -300,20 +354,20 @@ describe("a standalone legacy retirement after the switch", () => {
     expect(storageDeletes(f.fake)).toEqual([]);
     for (const scope of SCOPES) {
       expect(await f.legacy.ports.pendingBlobs(scope)).toBe(0);
-      expect(f.fake.blobCount(scope)).toBe(3);
+      expect(f.fake.blobCount(scope)).toBe(scope === SCOPES[0] ? 3 : 2);
     }
   });
 
   // The worker reads the pinned head live; the adapter then finds it absent.
-  // The shared delete worker must not queue blob keys or erase local entries
-  // for a point it never saw gone: the pass throws, and the worker blocks.
+  // The retirement transport must not acknowledge an absent head as its pin.
+  // The pipeline blocks without erasing local entries or writing receipts.
   it("a fenced retire whose adapter sees the head absent writes no queue rows and touches no local files", async () => {
     const f = await reconnected({
       wrapLegacy: (ports) => ({
         ...ports,
-        retire: async (scope, fence, options) => {
+        tombstone: async (scope, fence, check, signal) => {
           f.fake.dropHead(scope);
-          return ports.retire(scope, fence, options);
+          return ports.tombstone(scope, fence, check, signal);
         },
       }),
     });
@@ -611,8 +665,8 @@ describe("a standalone legacy retirement after the switch", () => {
       wrapLegacy: (ports) => ({
         ...ports,
         mode: () => (mode === "switched" ? ports.mode() : "unknown"),
-        retire: async (scope, fence, options) => {
-          const result = await ports.retire(scope, fence, options);
+        tombstone: async (scope, fence, check, signal) => {
+          const result = await ports.tombstone(scope, fence, check, signal);
           retired += 1;
           mode = "unknown";
           return result;
@@ -642,12 +696,13 @@ describe("a standalone legacy retirement after the switch", () => {
   });
 
   it("a persisted retirement polled during a registration hold does no destructive work", async () => {
-    let ready = false;
+    let ready = true;
     const f = await reconnected({ writeReady: () => ready });
     f.fake.requests.length = 0;
 
     // The DELETE records the intent and answers pending; a GET reads it.
     const { retireId } = await f.a.sync.legacyRetirer.request(GH);
+    ready = false;
     expect(await f.a.sync.legacyRetirer.status(GH)).toEqual({
       retireId,
       legacy: PENDING,
@@ -694,22 +749,15 @@ describe("a standalone legacy retirement after the switch", () => {
     const f = await reconnected({
       wrapLegacy: (ports) => ({
         ...ports,
-        objects: {
-          ...ports.objects,
-          deleteBlobVersions: async (scope, versions) => {
-            // The last scope's call is the one in flight: the pass has no
-            // scope left to stop at, so only the verdict write is still ahead.
-            if (scope === SCOPES.at(-1)) {
-              entered();
-              await released;
-            }
-            const outcome = await ports.objects.deleteBlobVersions(
-              scope,
-              versions,
-            );
-            storageReturned = true;
-            return outcome;
-          },
+        eraseBlob: async (scope, version, check, signal) => {
+          const outcome = await ports.eraseBlob(scope, version, check, signal);
+          if (scope === SCOPES.at(-1)) {
+            storageReturned = false;
+            entered();
+            await released;
+          }
+          storageReturned = true;
+          return outcome;
         },
       }),
     });
@@ -791,7 +839,7 @@ describe("a standalone legacy retirement after the switch", () => {
       expect.stringContaining("during"),
     );
 
-    finality.finalized = "99";
+    finality.finalized = "3";
     finality.settling = false;
     await vi.waitFor(async () =>
       expect((await f.a.sync.legacyRetirer.status(GH))?.legacy).toEqual(DONE),
