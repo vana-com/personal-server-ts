@@ -772,21 +772,22 @@ export async function createPsLiteSyncManager(
       return sync;
     }
     if (mode.read() === "switched") {
-      // A host callback cannot substitute for this runtime's own write check.
+      const sync = await openDatabase();
+      // Local reads do not wait for the gateway. Retirement stays closed until
+      // this runtime verifies registration, then resumes without a sync cycle.
       if (options.registrationReady?.() === true) {
-        if (options.ownerSyncSigner) registrationConfirmed = true;
-        else {
-          try {
-            await checkRegistration();
-          } catch (error) {
-            logger.warn(
-              { error: String(error) },
-              "Could not verify server registration before retirement",
-            );
-          }
-        }
+        void (async () => {
+          if (options.ownerSyncSigner) registrationConfirmed = true;
+          else await checkRegistration();
+          if (!closed && retirementWriteReady())
+            await sync?.legacyRetirer.resume();
+        })().catch((error: unknown) => {
+          logger.warn(
+            { error: String(error) },
+            "Could not verify server registration before retirement",
+          );
+        });
       }
-      await openDatabase();
     }
     const streamSyncSeed = createSeedIntake(
       createLocalSeed({

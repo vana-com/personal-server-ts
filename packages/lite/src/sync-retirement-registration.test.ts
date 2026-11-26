@@ -67,3 +67,85 @@ it.each([undefined, () => true])(
     }
   },
 );
+
+it.each([false, true])(
+  "switched Lite startup opens the database without waiting for the registration lookup (later confirmed=%s)",
+  async (confirmLater) => {
+    const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+    const ownerSignature = await owner.signMessage({
+      message: "Retirement fixture",
+    });
+    const stateStore = createMemoryPsLiteStateStore();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature,
+    });
+    const storage = await createOpenPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+    );
+    const capture = vi.spyOn(storage.retirementRows!, "capture");
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const db = openBetterSqlite3(":memory:");
+    let confirmRegistration: (value: { id: string }) => void = () => {};
+    const getServer = vi.fn(
+      () =>
+        new Promise<{ id: string }>((resolve) => {
+          confirmRegistration = resolve;
+        }),
+    );
+    const starting = createPsLiteSyncManager({
+      config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+      autoStartSync: false,
+      registrationReady: () => true,
+      localDb: { openDriver: async () => db },
+      accountStorageMode: { owner: owner.address, read: () => "switched" },
+      stateStore,
+      storage,
+      ownerSignature,
+      serverAccount: identity.account,
+      gateway: { getServer } as never,
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      },
+    });
+    let lite: Awaited<typeof starting> | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      lite = await Promise.race([
+        starting,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("startup waited for registration")),
+            2000,
+          );
+        }),
+      ]);
+      expect(getServer).toHaveBeenCalledOnce();
+      expect(
+        await lite.localSync!.query.listRecords({
+          connectionId: "missing",
+          stream: "items",
+        }),
+      ).toEqual({ records: [], nextCursor: null });
+      await expect(
+        lite.localSync!.legacyRetirer.request("github"),
+      ).rejects.toThrow("write authority");
+      expect(capture).not.toHaveBeenCalled();
+      const resume = vi.spyOn(lite.localSync!.legacyRetirer, "resume");
+      if (confirmLater) {
+        confirmRegistration({ id: "registered" });
+        await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+      } else {
+        expect(resume).not.toHaveBeenCalled();
+      }
+    } finally {
+      clearTimeout(timeout);
+      await lite?.syncManager.stop();
+      if (lite) await lite.closeStreamSync();
+      else await db.close();
+      fetch.mockRestore();
+    }
+  },
+);
