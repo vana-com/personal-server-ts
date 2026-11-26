@@ -1725,9 +1725,11 @@ export class GrantLifecycleService {
   }
 
   /**
-   * The owner of an anchored election's grant. Elections carry no subject,
-   * so this is read from the subject of any anchored erasure for the same
-   * client; on a single-owner server that is the owner.
+   * The owner of an anchored election's grant: the election's own
+   * `subject_id` (anchored since round 3). For an anchor written before
+   * elections carried it, fall back to any anchored erasure's subject, then
+   * to the first grant's subject; on a single-owner server that is the
+   * owner.
    */
   private anchoredSubject(grantId: string): string | undefined {
     const election = this.store.history.anchoredElection(grantId);

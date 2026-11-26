@@ -742,38 +742,43 @@ export class LifecycleRecords {
     grantId: string,
     limit: number,
   ): string[] {
-    const rows = this.db
+    // T2: every token kind in one ordering by issue time, then the cut, so
+    // "the newest `limit` tokens" holds exactly (a recovery token is kept
+    // when it is among the newest, whatever the number of data tokens).
+    const data = this.db
       .prepare(
-        `SELECT token_hash, issued_at FROM (
-           SELECT token_hash, issued_at FROM pdpp_access_tokens
-             WHERE grant_id = ? AND client_id = ? AND token_kind = 'client'
-           UNION ALL
-           SELECT t.token_hash, t.issued_at FROM pdpp_refresh_tokens t
-             JOIN pdpp_refresh_families f ON f.family_id = t.family_id
-             JOIN pdpp_grants g ON g.grant_id = f.grant_id
-             WHERE f.grant_id = ? AND g.client_id = ?
-         ) ORDER BY issued_at DESC LIMIT ?`,
+        `SELECT token_hash, issued_at FROM pdpp_access_tokens
+           WHERE grant_id = ? AND client_id = ? AND token_kind = 'client'
+         UNION ALL
+         SELECT t.token_hash, t.issued_at FROM pdpp_refresh_tokens t
+           JOIN pdpp_refresh_families f ON f.family_id = t.family_id
+           JOIN pdpp_grants g ON g.grant_id = f.grant_id
+           WHERE f.grant_id = ? AND g.client_id = ?
+         ORDER BY issued_at DESC LIMIT ?`,
       )
       .all(grantId, clientId, grantId, clientId, limit) as {
       token_hash: string;
+      issued_at: string;
     }[];
     const recovery = (
       this.db
         .prepare(
-          "SELECT token_hash, grant_ids_json FROM pdpp_recovery_tokens WHERE client_id = ? ORDER BY issued_at DESC",
+          "SELECT token_hash, issued_at, grant_ids_json FROM pdpp_recovery_tokens WHERE client_id = ? ORDER BY issued_at DESC",
         )
-        .all(clientId) as { token_hash: string; grant_ids_json: string }[]
+        .all(clientId) as {
+        token_hash: string;
+        issued_at: string;
+        grant_ids_json: string;
+      }[]
     )
       .filter((r) =>
         (JSON.parse(r.grant_ids_json) as string[]).includes(grantId),
       )
       .slice(0, limit);
-    return Array.from(
-      new Set([
-        ...rows.map((r) => r.token_hash),
-        ...recovery.map((r) => r.token_hash),
-      ]),
-    ).slice(0, limit);
+    const all = [...data, ...recovery].sort((x, y) =>
+      x.issued_at < y.issued_at ? 1 : x.issued_at > y.issued_at ? -1 : 0,
+    );
+    return Array.from(new Set(all.map((r) => r.token_hash))).slice(0, limit);
   }
 
   /** Digests of every data token issued to `clientId` for these grants. */

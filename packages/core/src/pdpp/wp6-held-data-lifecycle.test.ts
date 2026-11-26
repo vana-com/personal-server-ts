@@ -2457,3 +2457,48 @@ describe("review round 3 — owner surface and evidence bounds", () => {
     ).toMatchObject({ read_state: "expired", ended_at: g.grant.expires_at });
   });
 });
+
+describe("review round 4 — newest-64 digests across token kinds (T2)", () => {
+  it("keeps a recovery token issued after more than 64 data tokens, and a lost grant still answers erase to it", async () => {
+    const { MAX_ANCHORED_TOKEN_DIGESTS } = await import("./store.js");
+    const old = issued();
+    const { db } = backup("b");
+    const g = issued();
+    let rt = g.refresh_token!;
+    let at = g.access_token;
+    for (let i = 0; i < 100; i++) {
+      advance(1000);
+      const r = tokens.refresh({ refreshToken: rt });
+      if (!r.ok) throw new Error(r.failure.message);
+      rt = r.issued.refresh_token!;
+      at = r.issued.access_token;
+    }
+    ownerEnd(
+      "revoke",
+      { [g.grant.grant_id]: "delete" },
+      { grantIds: [g.grant.grant_id] },
+    );
+    advance(1000);
+    const rec = recover([g.grant.grant_id]);
+    const digests: string[] = JSON.parse(
+      readFileSync(`${dbPath}.history-anchor.json`, "utf8"),
+    ).erasures[g.grant.grant_id].token_digests;
+    expect(digests).toHaveLength(MAX_ANCHORED_TOKEN_DIGESTS);
+    expect(digests).toContain(hashToken(rec));
+    expect(digests).toContain(hashToken(rt));
+    expect(digests).toContain(hashToken(at));
+    expect(digests).not.toContain(hashToken(g.access_token));
+    restoreFrom(db);
+    expect(answer(rec, g.grant.grant_id).held_data).toBe("erase");
+    lifecycle.reestablishHistory({
+      dispositions: { [old.grant.grant_id]: "keep" },
+      actionId: "re",
+    });
+    // Recovery tokens are disabled at re-establishment; the newest data
+    // token still receives the orphan answer.
+    expect(answer(at, g.grant.grant_id).held_data).toBe("erase");
+    expect(
+      call({ grant_id: g.grant.grant_id, token: g.access_token }).status,
+    ).toBe(401);
+  });
+});
