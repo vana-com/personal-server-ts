@@ -155,51 +155,51 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
     const refusal = gatewayBatchRefusal(request, batch.policy);
     if (refusal !== null)
       throw new RegistryRefusedError(`batch POST refused: ${refusal}`, 400);
-    const failed = async (
+    // The hook runs once per condition, as a row read would; every wait is
+    // here. From the first check to the publish there is no `await`, so no
+    // read or post runs between the conditions and the write, and nothing
+    // that is not committed is ever visible.
+    for (const need of request.requires) await this.beforeRead?.(need.scope);
+    const written = new Set(request.rows.map((row) => row.scope));
+    const candidate = new Map<string, Version[]>();
+    const stored = (scope: string) =>
+      candidate.get(scope) ?? this.versions.get(scope) ?? [];
+    const failed = (
       need: RegistryRequirement,
-    ): Promise<RegistryRequirementFailure | null> => {
-      const row = await this.read(need.scope);
+    ): RegistryRequirementFailure | null => {
+      const rowsOf = stored(need.scope);
+      const head = rowsOf.at(-1);
       const fail = (
         reason: NonNullable<RegistryRequirementFailure["reason"]>,
       ): RegistryRequirementFailure => ({
         scope: need.scope,
         reason,
-        latestVersion: row.found ? String(row.version) : null,
-        deleted: row.found && isTombstone(row.dataHash),
+        latestVersion: head ? String(rowsOf.length) : null,
+        deleted: head !== undefined && isTombstone(head.dataHash),
       });
-      if (!row.found) return fail("absent");
-      if (need.notDeleted && isTombstone(row.dataHash)) return fail("deleted");
-      if (String(row.version) !== need.expectedVersion)
+      if (!head) return fail("absent");
+      if (need.notDeleted && isTombstone(head.dataHash)) return fail("deleted");
+      if (String(rowsOf.length) !== need.expectedVersion)
         return fail("version-mismatch");
       if (
         need.expectedDataHash !== undefined &&
-        row.dataHash.toLowerCase() !== need.expectedDataHash.toLowerCase()
+        head.dataHash.toLowerCase() !== need.expectedDataHash.toLowerCase()
       )
         return fail("data-hash-mismatch");
       return null;
     };
-    const written = new Set(request.rows.map((row) => row.scope));
     // Conditions on rows the request does not write: the state before it,
     // which is the state it commits.
     for (const need of request.requires) {
       if (written.has(need.scope)) continue;
-      const failure = await failed(need);
+      const failure = failed(need);
       if (failure) return { kind: "precondition_failed", failure };
     }
-    const before = new Map(
-      [...written].map((scope) => [scope, this.versions.get(scope)?.slice()]),
-    );
-    const logged = this.log.length;
-    const rollBack = () => {
-      for (const [scope, kept] of before)
-        if (kept === undefined) this.versions.delete(scope);
-        else this.versions.set(scope, kept);
-      this.log.length = logged;
-    };
+    const added: { scope: string; version: number; dataHash: string }[] = [];
     const rows: (RegistryBatchRow & { written?: true })[] = [];
     for (const row of request.rows) {
-      const stored = this.versions.get(row.scope) ?? [];
-      const at = stored[Number(row.expectedVersion) - 1];
+      const current = stored(row.scope);
+      const at = current[Number(row.expectedVersion) - 1];
       if (
         at !== undefined &&
         at.dataHash.toLowerCase() === row.dataHash.toLowerCase() &&
@@ -211,10 +211,10 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
         rows.push({ kind: "committed" });
         continue;
       }
-      const head = stored.at(-1);
+      const head = current.at(-1);
       if (
-        (Number(row.expectedVersion) !== stored.length + 1 &&
-          (Number(row.expectedVersion) !== stored.length ||
+        (Number(row.expectedVersion) !== current.length + 1 &&
+          (Number(row.expectedVersion) !== current.length ||
             this.settled.get(row.scope) === Number(row.expectedVersion) ||
             (head !== undefined && isTombstone(head.dataHash)))) ||
         (row.expectedHeadAbsent === true && head !== undefined) ||
@@ -224,7 +224,7 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       ) {
         rows.push({
           kind: "conflict",
-          latestVersion: stored.length > 0 ? String(stored.length) : null,
+          latestVersion: current.length > 0 ? String(current.length) : null,
           latestDataHash: head?.dataHash ?? null,
         });
         continue;
@@ -232,7 +232,8 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
       // Like a pending, unsubmitted gateway slot: a same-version refresh
       // replaces it unless a head precondition refuses it. Replays above
       // retain their original acknowledgement.
-      stored[Number(row.expectedVersion) - 1] = {
+      const next = candidate.get(row.scope) ?? current.slice();
+      next[Number(row.expectedVersion) - 1] = {
         dataHash: row.dataHash,
         metadataHash: row.metadataHash,
         signature: row.signature,
@@ -240,32 +241,30 @@ export class MemoryStreamSyncRegistry implements StreamSyncRegistry {
           this.baseMs + (Number(row.expectedVersion) - 1) * 1000,
         ).toISOString(),
       };
-      this.versions.set(row.scope, stored);
-      this.log.push({
+      candidate.set(row.scope, next);
+      added.push({
         scope: row.scope,
-        version: stored.length,
+        version: next.length,
         dataHash: row.dataHash,
       });
       rows.push({ kind: "committed", written: true });
     }
-    if (rows.some((row) => row.kind === "conflict")) {
-      rollBack();
+    if (rows.some((row) => row.kind === "conflict"))
       return {
         kind: "refused",
         rows: rows.map(({ written, ...row }) =>
           written ? { kind: "not_written" } : row,
         ),
       };
-    }
     // Conditions on rows it writes: the state after its writes.
     for (const need of request.requires) {
       if (!written.has(need.scope)) continue;
-      const failure = await failed(need);
-      if (failure) {
-        rollBack();
-        return { kind: "precondition_failed", failure };
-      }
+      const failure = failed(need);
+      if (failure) return { kind: "precondition_failed", failure };
     }
+    // Publish the rows and their change entries together.
+    for (const [scope, next] of candidate) this.versions.set(scope, next);
+    this.log.push(...added);
     // Committed. A test may hold the caller after the commit, per row.
     for (const [i, row] of request.rows.entries())
       if (rows[i]!.written)

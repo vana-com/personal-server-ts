@@ -377,7 +377,11 @@ describe("log first load, key by key", () => {
       onCommit(d, async (_s, index) => {
         if (armed && index >= stopAt) throw new Error("stopped");
       });
-      await expect(applyConnection(d.deps, CONNECTION_ID)).rejects.toThrow();
+      const loading = applyConnection(d.deps, CONNECTION_ID);
+      // The clean-up after the last commit is scratch: its failure is
+      // reported, and the load that had committed succeeds.
+      if (stopAt === commits - 1) await loading;
+      else await expect(loading).rejects.toThrow();
       armed = false;
       // A reader trusts the streams only with the position: both or neither
       // (the last stop is the clean-up after the last commit).
