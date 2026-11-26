@@ -92,15 +92,23 @@ describe("conditional ingest never falls back to a two-step write", () => {
     const storage = twoStepStorage(new Error("index should not be called"));
     storage.commitEnvelope = undefined;
     let wrote = false;
-    storage.writeEnvelope = async () => { wrote = true; throw new Error("blob should not be called"); };
-    await expect(conditional(storage)).rejects.toThrow("Conditional legacy writes require atomic storage support");
+    storage.writeEnvelope = async () => {
+      wrote = true;
+      throw new Error("blob should not be called");
+    };
+    await expect(conditional(storage)).rejects.toThrow(
+      "Conditional legacy writes require atomic storage support",
+    );
     expect(wrote).toBe(false);
   });
 
   it("returns the authoritative 412 rather than attempting a fallback write", async () => {
     const storage = twoStepStorage(new Error("index should not be called"));
     let wrote = false;
-    storage.writeEnvelope = async () => { wrote = true; throw new Error("blob should not be called"); };
+    storage.writeEnvelope = async () => {
+      wrote = true;
+      throw new Error("blob should not be called");
+    };
     storage.commitEnvelope = async (_envelope, _entry, precondition) => {
       expect(precondition).toEqual({ kind: "match", version: 1 });
       return { ok: false, currentVersion: 2, currentProducer: null };
@@ -108,7 +116,11 @@ describe("conditional ingest never falls back to a two-step write", () => {
     await expect(conditional(storage)).resolves.toMatchObject({
       ok: false,
       status: 412,
-      body: { error: "PRECONDITION_FAILED", current_version: 2, current_producer: null },
+      body: {
+        error: "PRECONDITION_FAILED",
+        current_version: 2,
+        current_producer: null,
+      },
     });
     expect(wrote).toBe(false);
   });

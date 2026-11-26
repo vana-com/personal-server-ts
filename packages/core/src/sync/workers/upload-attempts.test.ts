@@ -62,7 +62,11 @@ describe("portable core config", () => {
   });
 
   it("does not expand environment syntax or normalize a foreign host path in core", () => {
-    for (const path of ["$HOME/collector", "%USERPROFILE%/collector", "C:\\Users\\fixture\\..\\collector"]) {
+    for (const path of [
+      "$HOME/collector",
+      "%USERPROFILE%/collector",
+      "C:\\Users\\fixture\\..\\collector",
+    ]) {
       expect(expandHomePath(path)).toBe(path);
       expect(resolveRootPath(path)).toBe(path);
     }

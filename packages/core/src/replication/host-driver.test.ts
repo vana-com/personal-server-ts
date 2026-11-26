@@ -115,8 +115,9 @@ describe("createReplicationDriver", () => {
     (deadlineMs) => {
       const { timers, armed } = fakeTimers();
       const { stepper, steps } = manualStepper();
-      expect(() => createReplicationDriver({ stepper, timers, budget, deadlineMs }))
-        .toThrow("invalid replication step deadline");
+      expect(() =>
+        createReplicationDriver({ stepper, timers, budget, deadlineMs }),
+      ).toThrow("invalid replication step deadline");
       expect(steps).toHaveLength(0);
       expect(armed()).toEqual([]);
     },
@@ -125,10 +126,17 @@ describe("createReplicationDriver", () => {
   it("refuses an invalid stop grace without interrupting the running step", async () => {
     const { timers, armed } = fakeTimers();
     const { stepper, steps } = manualStepper();
-    const driver = createReplicationDriver({ stepper, timers, budget, deadlineMs: 1000 });
+    const driver = createReplicationDriver({
+      stepper,
+      timers,
+      budget,
+      deadlineMs: 1000,
+    });
     driver.start();
     const before = armed();
-    await expect(driver.stop(Number.NaN)).rejects.toThrow("invalid replication stop grace");
+    await expect(driver.stop(Number.NaN)).rejects.toThrow(
+      "invalid replication stop grace",
+    );
     expect(driver.status()).toMatchObject({ state: "running", stepping: true });
     expect(steps[0]?.signal.aborted).toBe(false);
     expect(armed()).toEqual(before);
