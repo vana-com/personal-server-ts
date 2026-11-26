@@ -914,7 +914,8 @@ export async function createPsLiteSyncManager(
               return {
                 ok: false,
                 reason: "registration_check_failed",
-                message: "A newer server registration check is in progress. Retry syncing.",
+                message:
+                  "A newer server registration check is in progress. Retry syncing.",
               };
             }
             if (check.confirmed) return { ok: true };

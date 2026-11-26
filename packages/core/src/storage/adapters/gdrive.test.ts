@@ -589,10 +589,16 @@ describe("createGoogleDriveStorageAdapter (loopback Drive v3 HTTP)", () => {
       if (init?.method !== "PUT" || !url.includes("/upload/resumable/"))
         return fetch(input, init);
       const received = new Uint8Array(init.body as ArrayBuffer);
-      ranges.push({ url, range: new Headers(init.headers).get("content-range") });
+      ranges.push({
+        url,
+        range: new Headers(init.headers).get("content-range"),
+      });
       if (!prefix) {
         prefix = received.slice(0, accepted);
-        return new Response(null, { status: 308, headers: { Range: `bytes=0-${accepted - 1}` } });
+        return new Response(null, {
+          status: 308,
+          headers: { Range: `bytes=0-${accepted - 1}` },
+        });
       }
       expect(received.byteLength).toBe(total - accepted);
       expect(received[0]).toBe(22);

@@ -456,7 +456,9 @@ export function createGoogleDriveStorageAdapter(
       session.password ||
       session.hash
     ) {
-      throw new Error("Google Drive resumable upload returned an invalid session URL");
+      throw new Error(
+        "Google Drive resumable upload returned an invalid session URL",
+      );
     }
 
     let offset = 0;
@@ -479,16 +481,27 @@ export function createGoogleDriveStorageAdapter(
         signal,
       );
       if (putRes.ok) return (await putRes.json()) as DriveFileRecord;
-      if (putRes.status !== 308) throw await classifyHttpError(putRes, "upload");
+      if (putRes.status !== 308)
+        throw await classifyHttpError(putRes, "upload");
 
-      const acknowledged = /^bytes=0-(\d+)$/.exec(putRes.headers.get("range") ?? "");
+      const acknowledged = /^bytes=0-(\d+)$/.exec(
+        putRes.headers.get("range") ?? "",
+      );
       await putRes.body?.cancel();
       const next = acknowledged ? Number(acknowledged[1]) + 1 : 0;
-      if (!Number.isSafeInteger(next) || next <= offset || next >= data.byteLength)
-        throw new Error("Google Drive resumable upload did not acknowledge a valid advancing range");
+      if (
+        !Number.isSafeInteger(next) ||
+        next <= offset ||
+        next >= data.byteLength
+      )
+        throw new Error(
+          "Google Drive resumable upload did not acknowledge a valid advancing range",
+        );
       offset = next;
     }
-    throw new Error("Google Drive resumable upload exceeded its continuation limit");
+    throw new Error(
+      "Google Drive resumable upload exceeded its continuation limit",
+    );
   }
 
   return {
