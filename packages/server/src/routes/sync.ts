@@ -76,22 +76,42 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     deps.accountStorageMode
       ? deps.accountStorageMode.read() === "unswitched"
       : !deps.localSync;
+  // The stream routes serve a switched account only. The mode can move across
+  // any await, so each route asks again after its awaits.
+  const requireStreamMode = () => {
+    if (
+      deps.accountStorageMode &&
+      deps.accountStorageMode.read() !== "switched"
+    )
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "The account storage mode is not switched",
+      );
+  };
   app.post("/trigger", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
+    requireStreamMode();
     // A signal, not a sync request: through the manager, which coalesces it
     // with the cycle that is running and cycles only if the registry moved.
     if (c.req.query("when") === "changed" && deps.syncManager) {
       void deps.syncManager.requestPull().catch(() => undefined);
       return c.json({ status: "started", message: "Sync triggered" }, 202);
     }
-    await (await local()).cycle();
+    const sync = await local();
+    requireStreamMode();
+    await sync.cycle();
     return c.json({ status: "started", message: "Sync triggered" }, 202);
   });
   app.get("/status", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
-    const status = await (await local()).listing.status();
+    requireStreamMode();
+    const sync = await local();
+    requireStreamMode();
+    const status = await sync.listing.status();
+    requireStreamMode();
     // The probe period is how a client learns this server answers
     // `?when=changed` with a pull and not a full cycle.
     return c.json({

@@ -263,6 +263,55 @@ describe("stream-sync read status route", () => {
     });
   });
 
+  it("answers 503 and no streams when the mode leaves switched while the count is in flight", async () => {
+    let mode: "switched" | "unswitched" = "switched";
+    let release!: (status: unknown) => void;
+    const held = new Promise((resolve) => (release = resolve));
+    const localSync = {
+      listing: { status: vi.fn(() => held) },
+    } as unknown as LocalSync;
+    const route = streamSyncReadStatusRoutes({
+      serverOrigin: "http://127.0.0.1",
+      serverOwner: OWNER,
+      gateway: {} as GatewayClient,
+      accessToken: TOKEN,
+      localSync,
+      accountStorageMode: { owner: OWNER, read: () => mode },
+      streamSyncRead: undefined,
+    });
+    route.onError((err, c) =>
+      err instanceof ProtocolError
+        ? c.json(err.toJSON(), err.code as 503)
+        : c.json({ error: String(err) }, 500),
+    );
+    const pending = route.request("/", {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    await vi.waitFor(() =>
+      expect(localSync.listing.status).toHaveBeenCalledTimes(1),
+    );
+    mode = "unswitched";
+    release({
+      listed: true,
+      issues: [],
+      connections: [
+        {
+          connectionId: "c1",
+          connector: "x",
+          ns: "n",
+          streams: [],
+        },
+      ],
+    });
+    const response = await pending;
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      error: { errorCode: "ACCOUNT_MODE_UNKNOWN" },
+    });
+    expect(body).not.toHaveProperty("streams");
+  });
+
   it("answers 404 when stream sync reading is off", async () => {
     const response = await app(undefined)();
     expect(response.status).toBe(404);
