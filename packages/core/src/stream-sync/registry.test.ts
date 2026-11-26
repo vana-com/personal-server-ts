@@ -1426,6 +1426,25 @@ describe("Batch-Policy", () => {
     }
   });
 
+  it("rejects a required policy limit above the safe integer boundary", () => {
+    const overflow = "9007199254740992";
+    for (const header of [
+      `rows=${overflow};bytes=100;requires=3`,
+      `rows=2;bytes=${overflow};requires=3`,
+      `rows=2;bytes=100;requires=${overflow}`,
+    ]) {
+      expect(parseBatchPolicy(header)).toBeUndefined();
+    }
+  });
+
+  it("keeps required limits when only the optional lock limit is out of range", () => {
+    expect(
+      parseBatchPolicy(
+        "rows=2;bytes=9007199254740991;requires=3;lockedScopes=9007199254740992",
+      ),
+    ).toEqual({ rows: 2, bytes: Number.MAX_SAFE_INTEGER, requires: 3 });
+  });
+
   it("reads known policy fields regardless of their order and separator spacing", () => {
     expect(parseBatchPolicy(" requires=3;  bytes=100 ; rows=2 ")).toEqual({
       rows: 2,
