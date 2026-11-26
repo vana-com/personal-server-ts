@@ -110,6 +110,34 @@ describe("createReplicationDriver", () => {
     expect(steps).toHaveLength(0);
   });
 
+  it.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses an invalid step deadline (%s) before scheduling or stepping",
+    (deadlineMs) => {
+      const { timers, armed } = fakeTimers();
+      const { stepper, steps } = manualStepper();
+      expect(() => createReplicationDriver({ stepper, timers, budget, deadlineMs }))
+        .toThrow("invalid replication step deadline");
+      expect(steps).toHaveLength(0);
+      expect(armed()).toEqual([]);
+    },
+  );
+
+  it("refuses an invalid stop grace without interrupting the running step", async () => {
+    const { timers, armed } = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({ stepper, timers, budget, deadlineMs: 1000 });
+    driver.start();
+    const before = armed();
+    await expect(driver.stop(Number.NaN)).rejects.toThrow("invalid replication stop grace");
+    expect(driver.status()).toMatchObject({ state: "running", stepping: true });
+    expect(steps[0]?.signal.aborted).toBe(false);
+    expect(armed()).toEqual(before);
+    steps[0]?.done.resolve(report());
+    await flush();
+    expect(await driver.stop(0)).toBe(true);
+    expect(armed()).toEqual([]);
+  });
+
   it("does nothing until started, then steps once and arms one timer at nextWake", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();
