@@ -147,6 +147,11 @@ import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
+import { createDesign2ChainGrants } from "./pdpp/chain-grants.js";
+import {
+  logScope as streamSyncLogScope,
+  streamScope as streamSyncStreamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import {
   createPdppRecordsDeps,
   legacyScopeRecords,
@@ -1663,6 +1668,43 @@ async function bootstrapServer(
       reads: replicaHost.reads,
     },
   });
+
+  // Design 2 (Vana-6.1 / 6.2): chain-enforced PDPP grants, opt-in. Issued
+  // grants are registered as salted entries in the owner's PermissionsV2 slot
+  // for the app, signed by this server as the owner's registered server, and
+  // client reads require the entry live on chain (pdpp/chain-grants.ts).
+  if (pdppAuth && config.pdpp.chainGrants.enabled) {
+    const chain = createDesign2ChainGrants({
+      store: pdppAuth.store,
+      logger,
+      ready:
+        pdppRecords && serverOwner && serverAccount && serverSigner
+          ? {
+              gatewayUrl: config.gateway.url,
+              ...(outboundFetch && { fetch: outboundFetch }),
+              owner: serverOwner,
+              deployment: {
+                chainId: config.gateway.chainId,
+                contractAddress: config.gateway.contracts
+                  .dataPortabilityPermissions as `0x${string}`,
+              },
+              signMessage: (message) => serverAccount!.signMessage(message),
+              signGrantRegistration: (msg) =>
+                serverSigner!.signGrantRegistration(msg),
+              clients: config.pdpp.clients,
+              link: pdppRecords.connectionLink,
+              declaredStreams: (sourceId) =>
+                pdppAuth.retainedDeclarations
+                  .find((d) => d.source_id === sourceId)
+                  ?.streams.map((st) => st.name) ?? [],
+              logScope: streamSyncLogScope,
+              streamScope: streamSyncStreamScope,
+            }
+          : null,
+    });
+    pdppAuth.chainRegistrar = chain.registrar;
+    if (pdppRecords) pdppRecords.chainEnforcement = chain.gate;
+  }
 
   const pdppConnections = pdppAuth
     ? {

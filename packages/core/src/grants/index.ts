@@ -46,3 +46,13 @@ export {
   permissionKey,
   type PdppGrantBindingStore,
 } from "./pdpp-binding-store.js";
+// Design 2: the salted grant fingerprint listed in the PermissionsV2 slot.
+export {
+  computePdppGrantEntry,
+  isPdppGrantEntry,
+  newPdppGrantSalt,
+  pdppCanonicalJson,
+  PdppCanonicalJsonError,
+  PDPP_ENTRY_DOMAIN,
+  PDPP_ENTRY_PREFIX,
+} from "./pdpp-chain-entry.js";

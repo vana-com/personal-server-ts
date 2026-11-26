@@ -65,6 +65,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { CanonicalLegacyReadStore } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import { pdppIssuerIdentifier, type PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
+import type { PdppChainEnforcementPort } from "../routes/pdpp-records.js";
 import {
   createSqliteRecordStore,
   PdppBindingError,
@@ -127,6 +128,8 @@ export function resolveReplication(
 
 export interface PdppRecordsDeps {
   connectionLink?: ConnectionLink;
+  /** Design 2 read gate, set by the host when `pdpp.chainGrants` is on. */
+  chainEnforcement?: PdppChainEnforcementPort;
   store: PdppRecordStore;
   /** See `AppDeps.pdpp.reads`. */
   reads: PdppReplicaReads;

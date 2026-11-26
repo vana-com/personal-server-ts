@@ -184,6 +184,7 @@ export {
 export type {
   AccessTokenRecord,
   AuthCodeRecord,
+  ChainRegistration,
   GrantEndingReason,
   OpenPdppAuthStoreOptions,
   StoredGrant,

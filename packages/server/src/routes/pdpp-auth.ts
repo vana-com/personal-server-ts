@@ -68,6 +68,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
   AuthorizationSessionStore,
+  Grant,
   PdppTokenService,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
@@ -218,6 +219,13 @@ export interface PdppAuthRouteDeps {
    * and falls back to configuration.
    */
   issuer?: string | (() => string);
+  /**
+   * Design 2 (Vana-6.1 / 6.2): chain registration of issued grants. When
+   * set, approval refuses a client with no grantee address, writes a pending
+   * registration with each grant, and starts its registration; any POST to
+   * this router then reconciles registrations of grants that ended.
+   */
+  chainRegistrar?: PdppChainRegistrarPort;
   /**
    * The held-data lifecycle service (AS items 39-47). Defaults to one over
    * `store`, using the token service's clock.
@@ -494,8 +502,34 @@ export function pdppAsMetadataHandler(
   };
 }
 
+/** The slice of `PdppChainRegistrar` (pdpp/chain-grants.ts) the AS uses. */
+export interface PdppChainRegistrarPort {
+  prepare(
+    grant: Grant,
+  ): { granteeAddress: string; salt: string; entry: string } | null;
+  register(grantId: string): Promise<unknown>;
+  reconcile(): Promise<void>;
+}
+
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
+  // Design 2: a grant that ended on any path (owner end, client revocation,
+  // erasure, narrowing) has its chain entry removed after the response. The
+  // write is async and retried by the next reconcile; the grant itself is
+  // already unusable locally the moment it ends.
+  if (deps.chainRegistrar) {
+    const registrar = deps.chainRegistrar;
+    app.use("*", async (c, next) => {
+      await next();
+      if (c.req.method !== "POST") return;
+      void registrar.reconcile().catch((err: unknown) =>
+        deps.logger.warn(
+          { err: (err as Error).message },
+          "PDPP chain reconcile failed; it is retried on the next write",
+        ),
+      );
+    });
+  }
   const lifecycle =
     deps.lifecycle ??
     new GrantLifecycleService(deps.store, {
@@ -1325,6 +1359,21 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       ),
     );
 
+    // Design 2: a chain-enforced grant needs a slot to live in, which needs
+    // the app's grantee (builder) address. Without one the grant could never
+    // be read, so it is refused rather than issued dead.
+    const chainRegistration = deps.chainRegistrar
+      ? deps.chainRegistrar.prepare(issued.grant)
+      : undefined;
+    if (chainRegistration === null) {
+      return errorResponse(
+        c,
+        403,
+        "access_denied",
+        "this app has no Vana grantee identity, so its grant cannot be registered on chain",
+      );
+    }
+
     // Persist the grant and its authorization code as one durable unit
     // before marking this session complete. Only
     // once this succeeds does the session move to "approved" — if the write
@@ -1337,6 +1386,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       subjectId: session!.subject_id,
       reviewDigest: issued.consentEvidence.review_digest,
       consentEvidence: issued.consentEvidence,
+      ...(chainRegistration && { chainRegistration }),
       code,
       authCode: {
         grantId: result.grant.grant_id,
@@ -1351,6 +1401,18 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     });
 
     deps.sessions.setStatus(session!.session_id, "approved");
+
+    // Register on chain after the response path is settled; until it lands
+    // the read gate denies with a retry and retries it (fail closed).
+    if (deps.chainRegistrar && chainRegistration) {
+      const grantId = issued.grant.grant_id;
+      void deps.chainRegistrar.register(grantId).catch((err: unknown) =>
+        deps.logger.warn(
+          { grant_id: grantId, err: (err as Error).message },
+          "PDPP chain registration deferred; the read gate retries it",
+        ),
+      );
+    }
 
     const redirect = new URL(session!.redirect_uri);
     redirect.searchParams.set("code", code);

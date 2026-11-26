@@ -123,7 +123,10 @@ import type { Logger } from "pino";
 import { enclaveJobRoutes } from "./routes/enclave-jobs.js";
 import type { JobRequestEnvelope } from "@opendatalabs/vana-sdk/protocol/jobs";
 import type { JobExecuteResponse } from "./jobs/types.js";
-import { pdppRecordsRoutes } from "./routes/pdpp-records.js";
+import {
+  pdppRecordsRoutes,
+  type PdppChainEnforcementPort,
+} from "./routes/pdpp-records.js";
 import { pdppInstanceBindingRoutes } from "./routes/pdpp-instance-bindings.js";
 import {
   pdppConnectionRoutes,
@@ -362,6 +365,8 @@ export interface AppDeps {
     authorizationServers?: string[];
     /** Seals RS page cursors and `changes_since` tokens (RS item 21). */
     cursorSealKey?: Uint8Array;
+    /** Design 2: client reads must hold a live chain entry (Vana-6.1). */
+    chainEnforcement?: PdppChainEnforcementPort;
     /** A verified connector artifact digest, for an owner delete run. */
     artifactDigestFor?: (
       connector: string,
@@ -573,6 +578,7 @@ export function createApp(deps: AppDeps): Hono {
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         cursorSealKey: deps.pdpp.cursorSealKey,
+        chainEnforcement: deps.pdpp.chainEnforcement,
         // spec-core §8 "Delete a record" on a switched account: a run, so the
         // removal reaches every device (core localdb/owner-delete.ts).
         switchedDelete:

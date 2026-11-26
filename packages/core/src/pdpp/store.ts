@@ -172,6 +172,33 @@ CREATE TABLE IF NOT EXISTS pdpp_revocation_dispositions (
   FOREIGN KEY (grant_id) REFERENCES pdpp_grants (grant_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pdpp_dispositions_grant ON pdpp_revocation_dispositions (grant_id);
+-- Design 2 (Vana-6.1 / 6.2): the chain registration of each PDPP grant. Written
+-- in the same transaction as the grant when the deployment enforces chain
+-- permissions, so a grant never exists without its registration state. The
+-- salt is the secret that keeps the grant terms off the public chain; it must
+-- never be logged. status: pending (not yet on the gateway) -> bound (entry
+-- registered; reads are chain-checked) -> ending (removal owed) -> ended.
+CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
+  grant_id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  grantee_address TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  entry TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (status IN ('pending','bound','ending','ended')),
+  chain_id INTEGER,
+  contract_address TEXT,
+  permission_id TEXT,
+  grantee_id TEXT,
+  registered_version TEXT,
+  ended_version TEXT,
+  -- how the entry leaves the slot: 'removal' (removal-only upsert keeping the
+  -- other entries) or 'revocation' (V2 revocation: the slot holds nothing else)
+  ending_kind TEXT CHECK (ending_kind IN ('removal','revocation')),
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (grant_id) REFERENCES pdpp_grants (grant_id)
+);
 -- AS item 29 / spec-core L1427-L1435: the pairwise subject identifier each
 -- client receives as grant \`subject.id\`. Random (so no client can reverse it
 -- to the internal subject or to another client's value), assigned once per
@@ -204,6 +231,66 @@ export interface StoredGrant {
   expiresAt: string | null;
   revokedAt: string | null;
   consumedAt: string | null;
+}
+
+/** Design 2: one PDPP grant's chain registration (see the table comment). */
+export interface ChainRegistration {
+  grantId: string;
+  clientId: string;
+  granteeAddress: string;
+  salt: string;
+  entry: string;
+  status: "pending" | "bound" | "ending" | "ended";
+  chainId: number | null;
+  contractAddress: string | null;
+  permissionId: string | null;
+  granteeId: string | null;
+  registeredVersion: string | null;
+  endedVersion: string | null;
+  endingKind: "removal" | "revocation" | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ChainRegistrationRow {
+  grant_id: string;
+  client_id: string;
+  grantee_address: string;
+  salt: string;
+  entry: string;
+  status: ChainRegistration["status"];
+  chain_id: number | null;
+  contract_address: string | null;
+  permission_id: string | null;
+  grantee_id: string | null;
+  registered_version: string | null;
+  ended_version: string | null;
+  ending_kind: "removal" | "revocation" | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function chainRegistrationFromRow(row: ChainRegistrationRow): ChainRegistration {
+  return {
+    grantId: row.grant_id,
+    clientId: row.client_id,
+    granteeAddress: row.grantee_address,
+    salt: row.salt,
+    entry: row.entry,
+    status: row.status,
+    chainId: row.chain_id,
+    contractAddress: row.contract_address,
+    permissionId: row.permission_id,
+    granteeId: row.grantee_id,
+    registeredVersion: row.registered_version,
+    endedVersion: row.ended_version,
+    endingKind: row.ending_kind,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 export interface AccessTokenRecord {
@@ -633,6 +720,16 @@ export class PdppAuthStore {
     consentEvidence?: unknown;
     code: string;
     authCode: AuthCodeRecord;
+    /**
+     * Design 2: the pending chain registration, written in the same
+     * transaction so a chain-enforced grant always has one (the read gate
+     * denies a grant with none).
+     */
+    chainRegistration?: {
+      granteeAddress: string;
+      salt: string;
+      entry: string;
+    };
   }): void {
     this.commit(() => {
       this.insertGrant({
@@ -641,8 +738,135 @@ export class PdppAuthStore {
         reviewDigest: input.reviewDigest,
         consentEvidence: input.consentEvidence,
       });
+      if (input.chainRegistration) {
+        const at = input.grant.issued_at;
+        this.db
+          .prepare(
+            `INSERT INTO pdpp_chain_registrations
+               (grant_id, client_id, grantee_address, salt, entry, status,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+          )
+          .run(
+            input.grant.grant_id,
+            input.grant.client.client_id,
+            input.chainRegistration.granteeAddress,
+            input.chainRegistration.salt,
+            input.chainRegistration.entry,
+            at,
+            at,
+          );
+      }
       this.insertAuthCode(input.code, input.authCode);
     });
+  }
+
+  // -- design-2 chain registrations ----------------------------------------
+
+  getChainRegistration(grantId: string): ChainRegistration | null {
+    const row = this.db
+      .prepare("SELECT * FROM pdpp_chain_registrations WHERE grant_id = ?")
+      .get(grantId) as ChainRegistrationRow | undefined;
+    return row ? chainRegistrationFromRow(row) : null;
+  }
+
+  listChainRegistrations(
+    statuses: ChainRegistration["status"][],
+  ): ChainRegistration[] {
+    if (statuses.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM pdpp_chain_registrations
+         WHERE status IN (${statuses.map(() => "?").join(",")})
+         ORDER BY created_at, grant_id`,
+      )
+      .all(...statuses) as ChainRegistrationRow[];
+    return rows.map(chainRegistrationFromRow);
+  }
+
+  /** Record the gateway's acceptance of the entry. Only from pending. */
+  markChainBound(input: {
+    grantId: string;
+    chainId: number;
+    contractAddress: string;
+    permissionId: string;
+    granteeId: string;
+    registeredVersion: string;
+    now?: Date;
+  }): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET status = 'bound', chain_id = ?, contract_address = ?,
+             permission_id = ?, grantee_id = ?, registered_version = ?,
+             last_error = NULL, updated_at = ?
+         WHERE grant_id = ? AND status = 'pending'`,
+      )
+      .run(
+        input.chainId,
+        input.contractAddress,
+        input.permissionId,
+        input.granteeId,
+        input.registeredVersion,
+        (input.now ?? new Date()).toISOString(),
+        input.grantId,
+      );
+    return result.changes > 0;
+  }
+
+  /** The grant ended: its entry must leave the slot. Never goes backwards. */
+  markChainEnding(grantId: string, now: Date = new Date()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET status = 'ending', updated_at = ?
+         WHERE grant_id = ? AND status IN ('pending','bound')`,
+      )
+      .run(now.toISOString(), grantId);
+    return result.changes > 0;
+  }
+
+  /**
+   * The gateway accepted the upsert that drops the entry, at `version`. The
+   * row stays `ending` until that upsert is final on chain (`markChainEnded`).
+   */
+  noteChainEndingSent(
+    grantId: string,
+    version: string,
+    kind: "removal" | "revocation",
+    now: Date = new Date(),
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET ended_version = ?, ending_kind = ?, last_error = NULL,
+             updated_at = ?
+         WHERE grant_id = ? AND status = 'ending'`,
+      )
+      .run(version, kind, now.toISOString(), grantId);
+    return result.changes > 0;
+  }
+
+  /** The entry is off the slot on chain (or was never there). Terminal. */
+  markChainEnded(grantId: string, now: Date = new Date()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET status = 'ended', last_error = NULL, updated_at = ?
+         WHERE grant_id = ? AND status = 'ending'`,
+      )
+      .run(now.toISOString(), grantId);
+    return result.changes > 0;
+  }
+
+  /** Why the last gateway attempt failed; never the salt or document. */
+  noteChainError(grantId: string, error: string, now: Date = new Date()) {
+    this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations SET last_error = ?, updated_at = ?
+         WHERE grant_id = ?`,
+      )
+      .run(error.slice(0, 500), now.toISOString(), grantId);
   }
 
   getGrant(grantId: string): StoredGrant | null {
