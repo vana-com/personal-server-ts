@@ -44,7 +44,12 @@ import {
 // Config regressions share this registered check selector.
 describe("portable core config", () => {
   it("defers host path expansion and resolution to the runtime", () => {
-    for (const input of ["~", "~/alternate/data", "./portable", "/absolute/path"]) {
+    for (const input of [
+      "~",
+      "~/alternate/data",
+      "./portable",
+      "/absolute/path",
+    ]) {
       expect(expandHomePath(input)).toBe(input);
       expect(resolveRootPath(input)).toBe(input);
     }
