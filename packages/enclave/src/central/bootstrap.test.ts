@@ -102,13 +102,25 @@ it("does not report a failed MCP shutdown before the listener cleanup settles", 
   const primary = new Error("synthetic MCP shutdown failure");
   let enter!: () => void;
   let release!: () => void;
-  const entered = new Promise<void>((resolve) => { enter = resolve; });
-  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   let reported = false;
   const closing = closeFleetListeners(
-    async () => { throw primary; },
-    async () => { enter(); await hold; },
-  ).catch((error: unknown) => { reported = true; throw error; });
+    async () => {
+      throw primary;
+    },
+    async () => {
+      enter();
+      await hold;
+    },
+  ).catch((error: unknown) => {
+    reported = true;
+    throw error;
+  });
   const outcome = expect(closing).rejects.toBe(primary);
   try {
     await entered;
@@ -122,10 +134,17 @@ it("does not report a failed MCP shutdown before the listener cleanup settles", 
 it("surfaces a synchronous listener close error after MCP shutdown succeeds", async () => {
   const failure = new Error("synthetic listener close throw");
   const states: string[] = [];
-  await expect(closeFleetListeners(
-    async () => { states.push("mcp closed"); },
-    () => { states.push("listener close attempted"); throw failure; },
-  )).rejects.toBe(failure);
+  await expect(
+    closeFleetListeners(
+      async () => {
+        states.push("mcp closed");
+      },
+      () => {
+        states.push("listener close attempted");
+        throw failure;
+      },
+    ),
+  ).rejects.toBe(failure);
   expect(states).toEqual(["mcp closed", "listener close attempted"]);
 });
 

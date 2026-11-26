@@ -62,14 +62,18 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     const files = createFsStreamSyncFiles(root);
     await files.write("reserved-dir/existing", enc.encode("keep"));
     try {
-      await expect(files.appendMany([
-        { path: "kept.bin", bytes: enc.encode("written") },
-        { path: "reserved-dir", bytes: enc.encode("not a regular file") },
-        { path: "never.bin", bytes: enc.encode("not reached") },
-      ])).rejects.toMatchObject({ code: "EISDIR" });
+      await expect(
+        files.appendMany([
+          { path: "kept.bin", bytes: enc.encode("written") },
+          { path: "reserved-dir", bytes: enc.encode("not a regular file") },
+          { path: "never.bin", bytes: enc.encode("not reached") },
+        ]),
+      ).rejects.toMatchObject({ code: "EISDIR" });
       expect(await files.read("kept.bin")).toEqual(enc.encode("written"));
       expect(await files.read("never.bin")).toBeNull();
-      expect(await files.read("reserved-dir/existing")).toEqual(enc.encode("keep"));
+      expect(await files.read("reserved-dir/existing")).toEqual(
+        enc.encode("keep"),
+      );
     } finally {
       await files.sync("");
     }
