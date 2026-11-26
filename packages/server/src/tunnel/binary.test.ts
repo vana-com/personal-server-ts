@@ -220,6 +220,24 @@ describe("tunnel/binary", () => {
       expect(logs.some((l) => l.includes("already installed"))).toBe(true);
     });
 
+    it("shares one installation per root and allows a retry after failure", async () => {
+      const originalFetch = globalThis.fetch;
+      const fetch = vi.fn().mockRejectedValue(new Error("network disabled in test"));
+      globalThis.fetch = fetch;
+      try {
+        const results = await Promise.allSettled([
+          ensureFrpcBinary(tempDir),
+          ensureFrpcBinary(tempDir),
+        ]);
+        expect(results.map(({ status }) => status)).toEqual(["rejected", "rejected"]);
+        expect(fetch).toHaveBeenCalledTimes(1);
+        await expect(ensureFrpcBinary(tempDir)).rejects.toThrow("network disabled in test");
+        expect(fetch).toHaveBeenCalledTimes(2);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     it("attempts download when version file is missing", async () => {
       // No version file, no binary — ensureFrpcBinary should try to download
       // Mock fetch to avoid real network calls
