@@ -594,7 +594,8 @@ export async function createPsLiteSyncManager(
     const serverInfo = await gateway.getServer(options.serverAccount.address);
     const confirmed = Boolean(serverInfo?.id);
     setRegistrationConfirmed(confirmed, generation);
-    return confirmed;
+    // A lookup that a newer one superseded confirms nothing for its caller.
+    return generation === registrationGeneration && confirmed;
   }
   const retirementWriteReady = () =>
     registrationConfirmed &&

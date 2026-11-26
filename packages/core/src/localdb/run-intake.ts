@@ -40,6 +40,7 @@ import type { ConnectionRow } from "./deps.js";
 import { announceRecordsCommitted, type LocalSyncDeps } from "./deps.js";
 import type { SqlStatement } from "./driver.js";
 import { checkRunFence } from "./fence.js";
+import { runOwnsConnectionState } from "./run-generation-guard.js";
 import {
   ADMIT_ROW_OFFSET,
   admitUpserts,
@@ -248,12 +249,15 @@ export function createRunIntakeStore(
         sql: "UPDATE run_streams SET decision='discarded',reason='fence',replace=0 WHERE run_id=?",
         params: [id],
       },
+      // A fenced collector from an old lifetime must not reset the newer
+      // generation's durable discovery and checkpoint state.
       {
-        sql: "UPDATE connections SET checkpoint=NULL WHERE connection_id=(SELECT connection_id FROM runs WHERE run_id=?)",
+        sql: `UPDATE connections SET checkpoint=NULL WHERE ${runOwnsConnectionState("connections")}`,
         params: [id],
       },
       {
-        sql: "UPDATE stream_state SET needs_full=1,complete=0 WHERE connection_id=(SELECT connection_id FROM runs WHERE run_id=?) AND stream IN (SELECT stream FROM run_streams WHERE run_id=?)",
+        sql: `UPDATE stream_state SET needs_full=1,complete=0 WHERE ${runOwnsConnectionState("stream_state")}
+          AND stream IN (SELECT stream FROM run_streams WHERE run_id=?)`,
         params: [id, id],
       },
       { sql: "UPDATE runs SET state='ended' WHERE run_id=?", params: [id] },

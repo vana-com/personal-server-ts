@@ -60,4 +60,23 @@ describe("PdppError", () => {
     }
     expect(new PdppError("not_found", "missing").status).toBe(404);
   });
+
+  it("always uses the catalog status for a known code", () => {
+    const err = new PdppError("not_found", "missing", { status: 500 });
+    expect(err.status).toBe(404);
+    expect(err.type).toBe("not_found_error");
+  });
+
+  it("accepts only an integer HTTP error status for an unknown code", () => {
+    for (const status of [399, 600, 200, 503.5, Number.NaN, 0, -1]) {
+      expect(
+        () => new PdppError("future_code" as never, "x", { status }),
+      ).toThrow(RangeError);
+    }
+    for (const status of [400, 503, 599]) {
+      expect(
+        new PdppError("future_code" as never, "x", { status }).status,
+      ).toBe(status);
+    }
+  });
 });
