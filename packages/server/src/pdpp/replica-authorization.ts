@@ -1,7 +1,11 @@
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { resolveLocalInstance } from "@opendatalabs/personal-server-ts-core/replication/identity";
-import { PDPP_DATA_ACCESS_TYPE_V02 } from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  PDPP_DATA_ACCESS_TYPE,
+  PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_GRANT_VERSION,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
 import { z } from "zod";
 
 export interface ReplicaGrantConnection {
@@ -48,8 +52,64 @@ const stream = z
       .optional(),
   })
   .strict();
-// This adapter accepts the complete frozen v0.2 grant. The v0.1 wire
-// projection omits retained facts; inventing them here would create authority.
+// Locked PDPP Core v0.1.0 stream rows (spec-core §7): the frozen time type,
+// and the optional frozen sort field. Kept separate from the v0.2 row so a
+// v0.2 grant still cannot carry members its revision does not define.
+const lockedStream = z
+  .object({
+    name: nonempty,
+    instance_ids: uniqueNames,
+    fields: uniqueNames,
+    resources: z.array(nonempty).optional(),
+    // AS item 51: every locked stream row carries the frozen floor, possibly
+    // empty. Its absence marks a pre-lock 0.1.0 grant, which stays refused.
+    required_fields: z.array(nonempty),
+    sort_field: nonempty.optional(),
+    time_constraint: z
+      .object({
+        type: z.enum(["date", "date-time"]),
+        field: nonempty,
+        since: date.optional(),
+        until: date.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+function grantShape(
+  version: string,
+  streamShape: typeof stream | typeof lockedStream,
+) {
+  return z
+    .object({
+      version: z.literal(version),
+      grant_id: nonempty,
+      issued_at: date,
+      subject: z.object({ id: nonempty }),
+      client: z.object({ client_id: nonempty }).passthrough(),
+      source: z.object({
+        kind: z.enum(["connector", "provider_native"]),
+        id: nonempty,
+      }),
+      source_declaration: z.object({ version: nonempty }),
+      purpose_code: nonempty,
+      access_mode: z.enum(["single_use", "continuous"]),
+      streams: z
+        .array(streamShape)
+        .min(1)
+        .refine(
+          (streams) =>
+            new Set(streams.map((entry) => entry.name)).size ===
+            streams.length,
+        ),
+      expires_at: date.optional(),
+    })
+    .passthrough();
+}
+// This adapter accepts the complete frozen grant: the v0.2 grant, or the
+// locked v0.1.0 grant (AS item 32: `{ type, grant }` with the complete
+// immutable grant). The pre-lock v0.1 wire projection omits retained facts;
+// inventing them here would create authority, so it stays refused.
 const introspection = z.object({
   active: z.literal(true),
   pdpp_token_kind: z.literal("client"),
@@ -58,34 +118,16 @@ const introspection = z.object({
   client_id: nonempty,
   exp: z.number().int().positive(),
   authorization_details: z.tuple([
-    z.object({
-      type: z.literal(PDPP_DATA_ACCESS_TYPE_V02),
-      grant: z
-        .object({
-          version: z.literal("0.2.0"),
-          grant_id: nonempty,
-          issued_at: date,
-          subject: z.object({ id: nonempty }),
-          client: z.object({ client_id: nonempty }).passthrough(),
-          source: z.object({
-            kind: z.enum(["connector", "provider_native"]),
-            id: nonempty,
-          }),
-          source_declaration: z.object({ version: nonempty }),
-          purpose_code: nonempty,
-          access_mode: z.enum(["single_use", "continuous"]),
-          streams: z
-            .array(stream)
-            .min(1)
-            .refine(
-              (streams) =>
-                new Set(streams.map((entry) => entry.name)).size ===
-                streams.length,
-            ),
-          expires_at: date.optional(),
-        })
-        .passthrough(),
-    }),
+    z.union([
+      z.object({
+        type: z.literal(PDPP_DATA_ACCESS_TYPE_V02),
+        grant: grantShape("0.2.0", stream),
+      }),
+      z.object({
+        type: z.literal(PDPP_DATA_ACCESS_TYPE),
+        grant: grantShape(PDPP_GRANT_VERSION, lockedStream),
+      }),
+    ]),
   ]),
 });
 
@@ -217,9 +259,13 @@ export function createReplicaAuthorizationService(options: {
       if (!parsed.success) return unavailable("invalid_response");
       const context = parsed.data;
       const grant = context.authorization_details[0].grant;
+      // The introspection `subject_id` is the internal subject the RS
+      // enforces against. A locked v0.1.0 grant's `subject.id` is the
+      // client's pairwise identifier (AS item 29), so only a v0.2 grant,
+      // whose `subject.id` is the subject itself, is compared to the owner.
       if (
         context.subject_id !== options.owner ||
-        grant.subject.id !== options.owner
+        (grant.version === "0.2.0" && grant.subject.id !== options.owner)
       )
         return denied("owner_mismatch");
       if (

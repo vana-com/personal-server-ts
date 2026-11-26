@@ -172,6 +172,18 @@ CREATE TABLE IF NOT EXISTS pdpp_revocation_dispositions (
   FOREIGN KEY (grant_id) REFERENCES pdpp_grants (grant_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pdpp_dispositions_grant ON pdpp_revocation_dispositions (grant_id);
+-- AS item 29 / spec-core L1427-L1435: the pairwise subject identifier each
+-- client receives as grant \`subject.id\`. Random (so no client can reverse it
+-- to the internal subject or to another client's value), assigned once per
+-- (subject, client) and never changed or reassigned. Recorded in the history
+-- log before any grant discloses it (L1824).
+CREATE TABLE IF NOT EXISTS pdpp_pairwise_subjects (
+  subject_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  pairwise_id TEXT NOT NULL UNIQUE,
+  assigned_at TEXT NOT NULL,
+  PRIMARY KEY (subject_id, client_id)
+);
 CREATE INDEX IF NOT EXISTS idx_pdpp_access_family ON pdpp_access_tokens (family_id);
 `;
 
@@ -509,6 +521,55 @@ export class PdppAuthStore {
       )
       .get(sourceId, version) as { document: string | null } | undefined;
     return row?.document ?? null;
+  }
+
+  // -- pairwise identifiers (AS item 29) -----------------------------------
+
+  /**
+   * The pairwise `subject.id` for this subject and client, assigning one on
+   * first use. Idempotent: the same pair always yields the same value, and a
+   * value is never given to another pair (UNIQUE). The value is 32 random
+   * bytes, so it carries nothing a client could reverse.
+   */
+  pairwiseSubjectId(
+    subjectId: string,
+    clientId: string,
+    now: Date = new Date(),
+  ): string {
+    const existing = this.findPairwiseSubjectId(subjectId, clientId);
+    if (existing) return existing;
+    return this.commit(() => {
+      const raced = this.findPairwiseSubjectId(subjectId, clientId);
+      if (raced) return raced;
+      const pairwiseId = `pws_${randomBytes(32).toString("base64url")}`;
+      const at = now.toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO pdpp_pairwise_subjects
+             (subject_id, client_id, pairwise_id, assigned_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(subjectId, clientId, pairwiseId, at);
+      // L1824: assignment of a pairwise identifier is a recorded event.
+      this.history.append(
+        "pairwise_subject_assigned",
+        null,
+        { client_id: clientId },
+        at,
+      );
+      return pairwiseId;
+    }, now);
+  }
+
+  /** The assigned pairwise `subject.id`, or null when none was assigned. */
+  findPairwiseSubjectId(subjectId: string, clientId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT pairwise_id FROM pdpp_pairwise_subjects
+         WHERE subject_id = ? AND client_id = ?`,
+      )
+      .get(subjectId, clientId) as { pairwise_id: string } | undefined;
+    return row?.pairwise_id ?? null;
   }
 
   // -- grants -------------------------------------------------------------

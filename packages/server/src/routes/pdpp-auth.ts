@@ -72,6 +72,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   approveAuthorization,
+  withPairwiseSubject,
   denyAuthorization,
   fetchReview,
   PDPP_DATA_ACCESS_TYPE,
@@ -1293,6 +1294,18 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
+    // AS item 29: a locked-rule grant carries this client's pairwise
+    // `subject.id`, assigned durably (and recorded) before anything discloses
+    // it. The stored grant keeps the internal subject for RS enforcement and
+    // owner views; only the RS ever sees that one (introspection subject_id).
+    const issued = withPairwiseSubject(
+      { grant: result.grant, consentEvidence: result.consentEvidence },
+      deps.store.pairwiseSubjectId(
+        session!.subject_id,
+        result.grant.client.client_id,
+      ),
+    );
+
     // Persist the grant and its authorization code as one durable unit
     // before marking this session complete. Only
     // once this succeeds does the session move to "approved" — if the write
@@ -1301,10 +1314,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     // durable behind it.
     const code = `pdpp_code_${crypto.randomUUID().replace(/-/g, "")}`;
     deps.store.insertGrantWithAuthCode({
-      grant: result.grant,
-      subjectId: result.grant.subject.id,
-      reviewDigest: result.consentEvidence.review_digest,
-      consentEvidence: result.consentEvidence,
+      grant: issued.grant,
+      subjectId: session!.subject_id,
+      reviewDigest: issued.consentEvidence.review_digest,
+      consentEvidence: issued.consentEvidence,
       code,
       authCode: {
         grantId: result.grant.grant_id,

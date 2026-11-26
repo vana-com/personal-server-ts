@@ -113,7 +113,7 @@ export type {
   ReviewStream,
 } from "./review.js";
 
-export { issueGrant } from "./issuance.js";
+export { issueGrant, withPairwiseSubject } from "./issuance.js";
 export type {
   ConsentEvidence,
   IssuanceFailure,

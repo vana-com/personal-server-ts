@@ -27,21 +27,34 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function fixture(subject = owner, resourceOwner = owner) {
+function fixture(
+  subject = owner,
+  resourceOwner = owner,
+  options: { locked?: boolean } = {},
+) {
   const store = openPdppAuthStore(":memory:");
   stores.push(store);
   const grant: Grant = {
-    version: "0.2.0",
+    version: options.locked ? "0.1.0" : "0.2.0",
     grant_id: "grant-a",
     issued_at: new Date().toISOString(),
-    subject: { id: subject },
+    // A locked grant carries the client's pairwise subject.id (AS item 29);
+    // the internal subject travels only as introspection subject_id.
+    subject: { id: options.locked ? "pws_pairwise-for-app-a" : subject },
     client: { client_id: "app-a" },
     source: { id: sourceId, kind: "connector" },
     source_declaration: { version: "1" },
     purpose_code: "https://pdpp.dev/purpose/personalization",
     access_mode: "continuous",
     streams: [
-      { name: "messages", instance_ids: ["issuer-handle"], fields: ["text"] },
+      options.locked
+        ? {
+            name: "messages",
+            instance_ids: ["issuer-handle"],
+            fields: ["text"],
+            required_fields: [],
+          }
+        : { name: "messages", instance_ids: ["issuer-handle"], fields: ["text"] },
     ],
   };
   store.insertGrant({
@@ -520,5 +533,48 @@ it("denies two approved issuer handles mapped to the same logical connection and
   expect(f.decisions.at(-1)).toEqual({
     outcome: "denied",
     reason: "mapping_collapsed",
+  });
+});
+
+it("accepts a locked 0.1.0 grant whose subject.id is the client's pairwise identifier", async () => {
+  const f = fixture(owner, owner, { locked: true });
+  const wire = f.wire();
+  expect(wire.subject_id).toBe(owner);
+  const entry = wire.authorization_details![0];
+  expect("grant" in entry && entry.grant.subject.id).toBe(
+    "pws_pairwise-for-app-a",
+  );
+  const response = await f.read();
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.data[0].data).toEqual({ text: "approved" });
+  expect(
+    (await f.auth.resolveToken(f.accessToken)).grant?.streams[0].instance_ids,
+  ).toEqual(["replica-handle"]);
+});
+
+it("still denies a locked grant whose introspection subject is another owner", async () => {
+  const f = fixture("owner-b", owner, { locked: true });
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "owner_mismatch",
+  });
+});
+
+it("refuses a pre-lock 0.1.0 grant shape (no required_fields) as an invalid response", async () => {
+  const f = fixture(owner, owner, { locked: true });
+  const wire = structuredClone(f.wire());
+  const entry = wire.authorization_details![0];
+  if (!("grant" in entry)) throw new Error("fixture must issue a full grant");
+  delete (entry.grant.streams[0] as { required_fields?: string[] })
+    .required_fields;
+  f.setResponse(() => Response.json(wire));
+  const response = await f.read();
+  expect(response.status).toBe(500);
+  expect((await response.json()).error.code).toBe("api_error");
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "unavailable",
+    reason: "invalid_response",
   });
 });

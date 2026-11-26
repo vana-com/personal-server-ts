@@ -30,6 +30,7 @@ import {
 } from "./resolve.js";
 import {
   AI_TRAINING_PURPOSE,
+  grantUsesLockedRules,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   PDPP_GRANT_VERSION_CANDIDATE,
@@ -105,6 +106,12 @@ export interface ConsentEvidence {
     client: RequesterIdentity;
     display_values: DisplayValueShown[];
   };
+  /**
+   * AS item 29: the `subject.id` this client received and how it was chosen.
+   * `pairwise` is the only kind this build assigns; an owner-chosen globally
+   * resolvable identifier (L1433) is not offered.
+   */
+  subject_identifier?: { id: string; client_id: string; kind: "pairwise" };
 }
 
 export interface IssueGrantInput {
@@ -329,6 +336,34 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
   };
 
   return { ok: true, grant, consentEvidence };
+}
+
+/**
+ * AS item 29 / spec-core L1427-L1435: give a locked-rule grant the client's
+ * pairwise `subject.id`, and record it in consent evidence.
+ *
+ * Applied after issuance validation, once the caller has the durable
+ * assignment (`PdppAuthStore.pairwiseSubjectId`). The internal subject stays
+ * the stored grant's `subjectId` and the introspection `subject_id`, which go
+ * only to the RS. v0.2 and pre-lock grants are returned unchanged: their
+ * revisions define `subject.id` as the subject identifier itself.
+ */
+export function withPairwiseSubject(
+  issued: { grant: Grant; consentEvidence: ConsentEvidence },
+  pairwiseId: string,
+): { grant: Grant; consentEvidence: ConsentEvidence } {
+  if (!grantUsesLockedRules(issued.grant)) return issued;
+  return {
+    grant: { ...issued.grant, subject: { id: pairwiseId } },
+    consentEvidence: {
+      ...issued.consentEvidence,
+      subject_identifier: {
+        id: pairwiseId,
+        client_id: issued.grant.client.client_id,
+        kind: "pairwise",
+      },
+    },
+  };
 }
 
 /** Re-export so callers get the digest helper from the issuance seam. */
