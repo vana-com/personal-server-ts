@@ -214,3 +214,87 @@ it("keeps retirement closed when an older startup lookup confirms after a missin
     await lite.closeStreamSync();
   }
 });
+
+async function openSwitchedLite(
+  getServer: () => Promise<{ id: string } | null>,
+) {
+  const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+  const ownerSignature = await owner.signMessage({
+    message: "Retirement fixture",
+  });
+  const stateStore = createMemoryPsLiteStateStore();
+  const identity = await loadOrCreatePsLiteServerIdentity({
+    store: stateStore,
+    ownerSignature,
+  });
+  const storage = await createOpenPersistentPsLiteStorage(
+    { kind: "custom" },
+    createMemoryPsLitePersistence(),
+  );
+  const db = openBetterSqlite3(":memory:");
+  const closeDb = vi.spyOn(db, "close");
+  const lite = await createPsLiteSyncManager({
+    config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+    autoStartSync: false,
+    registrationReady: () => true,
+    localDb: { openDriver: async () => db },
+    accountStorageMode: { owner: owner.address, read: () => "switched" },
+    stateStore,
+    storage,
+    ownerSignature,
+    serverAccount: identity.account,
+    gateway: { getServer: vi.fn(getServer) } as never,
+    dataPointFeed: {
+      getDataPoint: async () => null,
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+    },
+  });
+  return { lite, closeDb };
+}
+
+it("close waits for a retirement step the registration check started", async () => {
+  let confirm!: (value: { id: string }) => void;
+  const { lite, closeDb } = await openSwitchedLite(
+    () =>
+      new Promise<{ id: string }>((resolve) => {
+        confirm = resolve;
+      }),
+  );
+  let releaseStep!: () => void;
+  const step = new Promise<void>((resolve) => {
+    releaseStep = resolve;
+  });
+  const resume = vi
+    .spyOn(lite.localSync!.legacyRetirer, "resume")
+    .mockImplementation(async () => {
+      await step;
+      return [] as never;
+    });
+  confirm({ id: "registered" });
+  await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+  let closed = false;
+  const closing = lite.closeStreamSync().then(() => {
+    closed = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(closed).toBe(false);
+  expect(closeDb).not.toHaveBeenCalled();
+  releaseStep();
+  await closing;
+  expect(closeDb).toHaveBeenCalledOnce();
+});
+
+it("a registration that confirms after close starts no retirement", async () => {
+  let confirm!: (value: { id: string }) => void;
+  const { lite } = await openSwitchedLite(
+    () =>
+      new Promise<{ id: string }>((resolve) => {
+        confirm = resolve;
+      }),
+  );
+  const resume = vi.spyOn(lite.localSync!.legacyRetirer, "resume");
+  const closing = lite.closeStreamSync();
+  confirm({ id: "registered" });
+  await closing;
+  expect(resume).not.toHaveBeenCalled();
+});

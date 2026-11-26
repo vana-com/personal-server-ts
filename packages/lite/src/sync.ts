@@ -654,6 +654,16 @@ export async function createPsLiteSyncManager(
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
     let closed = false;
+    // Retirement tasks started outside a sync cycle. Close settles them before
+    // it closes the database they write to.
+    const retirementTasks = new Set<Promise<unknown>>();
+    const trackRetirement = (task: Promise<unknown>) => {
+      retirementTasks.add(task);
+      void task.then(
+        () => retirementTasks.delete(task),
+        () => retirementTasks.delete(task),
+      );
+    };
     let opening: Promise<LocalSync | null> | undefined;
     async function openDatabase(): Promise<LocalSync | null> {
       if (!options.localDb) return null;
@@ -750,13 +760,15 @@ export async function createPsLiteSyncManager(
         // in a full sync cycle. It sends deletes at the gateway, so it needs
         // the write authority a registered runtime has: a read-only
         // registration waits for the cycle that runs once it is admitted.
-        if (retirementWriteReady())
-          void localSync.legacyRetirer.resume().catch((error: unknown) =>
-            logger.warn(
-              {
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Could not resume the legacy retirement at open",
+        if (retirementWriteReady() && !closed)
+          trackRetirement(
+            localSync.legacyRetirer.resume().catch((error: unknown) =>
+              logger.warn(
+                {
+                  error: error instanceof Error ? error.message : String(error),
+                },
+                "Could not resume the legacy retirement at open",
+              ),
             ),
           );
       }
@@ -808,8 +820,14 @@ export async function createPsLiteSyncManager(
           if (options.ownerSyncSigner)
             setRegistrationConfirmed(true, ++registrationGeneration);
           else await checkRegistration();
-          if (!closed && retirementWriteReady())
-            await sync?.legacyRetirer.resume();
+          // Only the resume is tracked: close must not wait on a gateway
+          // lookup that never answers, and a check that answers after close
+          // starts nothing.
+          if (!closed && retirementWriteReady() && sync) {
+            const resuming = sync.legacyRetirer.resume();
+            trackRetirement(resuming);
+            await resuming;
+          }
         })().catch((error: unknown) => {
           logger.warn(
             { error: String(error) },
@@ -946,6 +964,7 @@ export async function createPsLiteSyncManager(
       closeStreamSync: async () => {
         closed = true;
         await opening;
+        await Promise.allSettled([...retirementTasks]);
         await closeDatabase();
       },
       streamSyncIntake,
