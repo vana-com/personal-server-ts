@@ -81,6 +81,13 @@ export async function checkRunFence(
     [run.connection_id],
   );
   const connection = connections[0];
+  // A delete intent fences every run of its connector, as the in-transaction
+  // triggers do for batches, even while the control row is still active.
+  const intents = await deps.db.query(
+    "SELECT 1 FROM delete_intents d JOIN connections c ON c.connector = d.connector WHERE c.connection_id = ?",
+    [run.connection_id],
+  );
+  const intentPending = intents.length > 0;
   const states = await deps.db.query<{
     stream: string;
     last_delete_version: number;
@@ -94,9 +101,10 @@ export async function checkRunFence(
   const tripped: { stream: string; trip: FenceTrip }[] = [];
   for (const { stream, delete_snapshot } of streams) {
     let trip: FenceTrip | undefined;
-    if (connection?.control_state === "deleted") {
-      // F.5 step 1 set the control row to `deleted`: the connection's data
-      // is gone, so every stream of the run is fenced.
+    if (connection?.control_state === "deleted" || intentPending) {
+      // F.5 step 1 set the control row to `deleted` (or a delete intent is
+      // pending): the connection's data is going or gone, so every stream of
+      // the run is fenced.
       trip = "control_deleted";
     } else {
       trip = streamFenceTrip({

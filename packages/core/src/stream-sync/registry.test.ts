@@ -1022,6 +1022,18 @@ describe("an unreachable registry is told apart from a refusing one", () => {
       );
     },
   );
+  it.each([[true], [[]], ["0x2"], [" 2"], ["2.0"], [2.5], ["1e1"], [null]])(
+    "a point read of a row whose version is %j fails, never an authoritative row",
+    async (expectedVersion) => {
+      const body = {
+        data: { ...row(scope, 1), expectedVersion },
+      };
+      const read = over(async () => new Response(JSON.stringify(body))).read(
+        scope,
+      );
+      await expect(read).rejects.toThrow(/valid version/);
+    },
+  );
   it("a 4xx is not unavailability", async () => {
     for (const status of [400, 401, 403]) {
       const error = await over(refuse(status))
@@ -1352,6 +1364,16 @@ describe("waitForChange with since", () => {
       "for another since (mutation: since not matched)",
       { since: mintCursor(EPOCH_A, 2), reset: true },
     ],
+    ...[true, [], "0x2", 2.5, " 3"].map((expectedVersion) => [
+      `with a row whose version is ${JSON.stringify(expectedVersion)}`,
+      {
+        since: SINCE,
+        reset: false,
+        rows: [{ ...ROW, expectedVersion }],
+        gone: [],
+        serversChanged: false,
+      },
+    ]),
     [
       "with a row whose version is not valid (mutation: rows read loosely)",
       {

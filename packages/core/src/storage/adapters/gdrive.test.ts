@@ -79,6 +79,8 @@ interface FakeDriveServer {
     headers?: Record<string, string>;
   } | null;
   duplicateOnUploadForName: string | null;
+  /** "empty-first": first list page is empty with a continuation; "loop": every page repeats one token. */
+  listPaging: "empty-first" | "loop" | null;
   reset: () => void;
   close: () => Promise<void>;
 }
@@ -90,6 +92,7 @@ async function startFakeDriveServer(): Promise<FakeDriveServer> {
   const validTokens = new Set<string>(["token-v1"]);
   let nextError: FakeDriveServer["nextError"] = null;
   let duplicateOnUploadForName: string | null = null;
+  let listPaging: FakeDriveServer["listPaging"] = null;
   let idCounter = 1;
   let clockCounter = 0;
 
@@ -176,6 +179,17 @@ async function startFakeDriveServer(): Promise<FakeDriveServer> {
             a.createdTime.localeCompare(b.createdTime) ||
             a.id.localeCompare(b.id),
         );
+      const pageToken = url.searchParams.get("pageToken");
+      if (listPaging === "loop") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ files: [], nextPageToken: "same" }));
+        return;
+      }
+      if (listPaging === "empty-first" && !pageToken) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ files: [], nextPageToken: "page-2" }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -371,7 +385,14 @@ async function startFakeDriveServer(): Promise<FakeDriveServer> {
     set duplicateOnUploadForName(value) {
       duplicateOnUploadForName = value;
     },
+    get listPaging() {
+      return listPaging;
+    },
+    set listPaging(value) {
+      listPaging = value;
+    },
     reset() {
+      listPaging = null;
       files.clear();
       sessions.clear();
       requests.length = 0;
@@ -426,6 +447,44 @@ describe("createGoogleDriveStorageAdapter (loopback Drive v3 HTTP)", () => {
       },
     };
   }
+
+  it("delete and upload see an object behind an empty first list page", async () => {
+    const { provider } = makeCredentials();
+    const adapter = createGoogleDriveStorageAdapter({
+      folderId,
+      credentials: provider,
+      apiBaseUrl: drive.baseUrl,
+    });
+    const key = "paged.stream/key/1";
+    const url = adapter.urlForKey(key);
+    await adapter.upload(key, new TextEncoder().encode("one"));
+    expect(drive.files.size).toBe(1);
+
+    drive.listPaging = "empty-first";
+    drive.requests.length = 0;
+    expect(await adapter.delete(url)).toBe(true);
+    expect(drive.files.size).toBe(0);
+    const listPaths = drive.requests
+      .filter(
+        (r) => r.method === "GET" && r.path.startsWith("/drive/v3/files?"),
+      )
+      .map((r) => r.path);
+    expect(listPaths).toHaveLength(2);
+    expect(listPaths[1]).toContain("pageToken=page-2");
+  });
+
+  it("list paging throws when a page token repeats", async () => {
+    const { provider } = makeCredentials();
+    const adapter = createGoogleDriveStorageAdapter({
+      folderId,
+      credentials: provider,
+      apiBaseUrl: drive.baseUrl,
+    });
+    drive.listPaging = "loop";
+    await expect(
+      adapter.delete(adapter.urlForKey("loop/key/1")),
+    ).rejects.toThrow(/page token/i);
+  });
 
   it("urlForKey is synchronous and exact inverse of upload; private blobs round-trip", async () => {
     const { provider } = makeCredentials();
