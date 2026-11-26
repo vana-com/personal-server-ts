@@ -365,3 +365,34 @@ it.each(["invalid JSON", "invalid UTF-8", "wrong format", "nonobject payload"])(
     );
   },
 );
+
+describe("astral character straddling a text cap", () => {
+  it("keeps the valid text instead of rejecting it at the message cap", async () => {
+    const text = "a".repeat(9_999_999) + "\u{1F600}";
+    const input = source(conversation([message("m1", { text })]));
+    const records = await decodeClaudeSourceRecord(input.row, input.contents);
+    expect(records).toMatchObject([
+      {},
+      { data: { content: "a".repeat(9_999_999) } },
+    ]);
+  });
+
+  it("keeps the valid text instead of rejecting it at the title cap", async () => {
+    const input = source({
+      uuid: "chat",
+      name: "a".repeat(3999) + "\u{1F600}",
+      chat_messages: [],
+    });
+    const records = await decodeClaudeSourceRecord(input.row, input.contents);
+    expect(records).toMatchObject([{ data: { title: "a".repeat(3999) } }]);
+  });
+
+  it("still rejects a genuinely lone surrogate", async () => {
+    const input = source(
+      conversation([message("m1", { text: "bad\uD800text" })]),
+    );
+    await expect(
+      decodeClaudeSourceRecord(input.row, input.contents),
+    ).rejects.toThrow("unsafe_source_text");
+  });
+});

@@ -17,7 +17,7 @@ import {
   DerivativeCycleError,
   DerivativeComputeUnavailableError,
 } from "./catalog.js";
-import { PdppError } from "./pdpp-catalog.js";
+import { PdppError, type PdppErrorCode } from "./pdpp-catalog.js";
 
 describe("ProtocolError", () => {
   it("has correct code, errorCode, message, and details", () => {
@@ -198,5 +198,35 @@ describe("PDPP error response", () => {
     expect(unavailable.toJSON("request-three").error).not.toHaveProperty(
       "param",
     );
+  });
+
+  it("fails loudly on an unknown code instead of emitting an error with no status or type", () => {
+    const code = "future_code_not_in_catalog" as unknown as PdppErrorCode;
+    expect(() => new PdppError(code, "Something new happened")).toThrow(
+      RangeError,
+    );
+    expect(() => new PdppError(code, "Something new happened")).toThrow(
+      'Unknown PdppErrorCode "future_code_not_in_catalog"',
+    );
+  });
+
+  it("accepts an explicit status override for a future code, typed as a generic API error", () => {
+    const code = "future_code_not_in_catalog" as unknown as PdppErrorCode;
+    const error = new PdppError(code, "Something new happened", {
+      status: 503,
+    });
+    expect(error.status).toBe(503);
+    expect(error.type).toBe("api_error");
+    expect(error.toJSON("request-four").error).toMatchObject({
+      type: "api_error",
+      code: "future_code_not_in_catalog",
+      request_id: "request-four",
+    });
+  });
+
+  it("honours an explicit status override for a known code", () => {
+    const error = new PdppError("not_found", "Not found", { status: 500 });
+    expect(error.status).toBe(500);
+    expect(error.type).toBe("not_found_error");
   });
 });

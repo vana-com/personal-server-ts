@@ -20,6 +20,7 @@ function setup(
   status: LegacyRetireStatus | null = STATUS,
 ) {
   const requestLegacyRetire = vi.fn(async () => ({ retireId: "retire-1" }));
+  const legacyRetireStatus = vi.fn(async () => status);
   const requestConnectionDelete = vi.fn();
   const deps: OwnerConnectorDeleteDeps = {
     authorizeOwner: vi.fn(async () => {}),
@@ -27,10 +28,15 @@ function setup(
     connectionDelete: {
       requestConnectionDelete,
       requestLegacyRetire,
-      legacyRetireStatus: vi.fn(async () => status),
+      legacyRetireStatus,
     },
   };
-  return { deps, requestLegacyRetire, requestConnectionDelete };
+  return {
+    deps,
+    requestLegacyRetire,
+    requestConnectionDelete,
+    legacyRetireStatus,
+  };
 }
 
 const request = (method: string) =>

@@ -88,6 +88,27 @@ describe("createLiteReplicationRuntime", () => {
         },
         { state: "blocked", reason: "invalid_limits" },
       ],
+      // Missing limits, or a null step, must report invalid_limits, not throw.
+      [
+        {
+          door: on,
+          config: {
+            ...config,
+            limits: undefined,
+          } as unknown as ReplicationBootConfig,
+        },
+        { state: "blocked", reason: "invalid_limits" },
+      ],
+      [
+        {
+          door: on,
+          config: {
+            ...config,
+            limits: { ...config.limits, step: null },
+          } as unknown as ReplicationBootConfig,
+        },
+        { state: "blocked", reason: "invalid_limits" },
+      ],
     ] as const;
     for (const [input, status] of cases) {
       const runtime = createLiteReplicationRuntime({ ...input, engine });

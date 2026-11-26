@@ -3,6 +3,7 @@ import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAccessLogReader } from "./access-reader.js";
+import { createAccessLogWriter } from "./access-log.js";
 import type { AccessLogEntry } from "./access-log.js";
 
 function makeEntry(overrides: Partial<AccessLogEntry> = {}): AccessLogEntry {
@@ -181,5 +182,68 @@ describe("AccessLogReader", () => {
     const logIds = result.logs.map((l) => l.logId);
     expect(logIds).toContain("valid-1");
     expect(logIds).toContain("valid-2");
+  });
+
+  it("skips valid-JSON rows with the wrong shape instead of crashing", async () => {
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+
+    const valid = JSON.stringify(
+      makeEntry({ logId: "valid-1", timestamp: "2026-01-28T10:00:00Z" }),
+    );
+    // Each of these lines is valid JSON but not an AccessLogEntry.
+    // Note: Array.sort only invokes the comparator with 2+ entries, so
+    // the null row crashes read() only alongside a valid entry.
+    const content =
+      [
+        valid,
+        "null",
+        "42",
+        '"just a string"',
+        "[]",
+        "{}",
+        '{"timestamp": 123}',
+        '{"timestamp": "not-a-date"}',
+        '{"timestamp": "2026-01-28T12:00:00Z"}',
+      ].join("\n") + "\n";
+    await writeFile(join(logsDir, "access-2026-01-28.log"), content, "utf-8");
+
+    const reader = createAccessLogReader(logsDir);
+    const result = await reader.read();
+
+    expect(result.total).toBe(1);
+    expect(result.logs).toHaveLength(1);
+    expect(result.logs[0].logId).toBe("valid-1");
+  });
+
+  it("keeps writer-emitted entries that have no request metadata", async () => {
+    const logsDir = join(tempDir, "logs");
+    const {
+      ipAddress: _ip,
+      userAgent: _ua,
+      ...bare
+    } = makeEntry({
+      logId: "no-meta",
+    });
+    await createAccessLogWriter(logsDir).write(bare);
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(1);
+    expect(result.logs[0].logId).toBe("no-meta");
+  });
+
+  it("still rejects a present but non-string ipAddress", async () => {
+    const logsDir = join(tempDir, "logs");
+    await mkdir(logsDir, { recursive: true });
+    await writeFile(
+      join(logsDir, "access-2026-01-28.log"),
+      JSON.stringify({ ...makeEntry(), ipAddress: 42 }) + "\n",
+      "utf-8",
+    );
+
+    const result = await createAccessLogReader(logsDir).read();
+
+    expect(result.total).toBe(0);
   });
 });

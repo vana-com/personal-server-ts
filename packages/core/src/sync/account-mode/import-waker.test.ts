@@ -90,6 +90,25 @@ describe("the import waker", () => {
     expect(calls).toBe(2);
   });
 
+  it("a throwing warning sink does not reject wake(), and the next wake tries again", async () => {
+    let calls = 0;
+    const { importer } = recorder(async () => {
+      calls += 1;
+      throw new Error("disk full");
+    });
+    const waker = createImportWaker({
+      authority: await authorityWith("on"),
+      owner: OWNER,
+      importer,
+      onWarning: () => {
+        throw new Error("sink boom");
+      },
+    });
+    await expect(waker.wake()).resolves.toBeUndefined();
+    await waker.wake();
+    expect(calls).toBe(2);
+  });
+
   it("stop aborts the run in flight and waits for it", async () => {
     const { importer, signals } = recorder(aborted);
     const waker = createImportWaker({

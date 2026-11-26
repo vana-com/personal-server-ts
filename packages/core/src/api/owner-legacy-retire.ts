@@ -56,7 +56,12 @@ export async function handleOwnerLegacyRetire(
     return unavailable();
   try {
     const { retireId } = await port.requestLegacyRetire(connectorId!);
-    const status = await port.legacyRetireStatus(connectorId!);
+    // The intent is already durable once requestLegacyRetire resolves: a
+    // failed status read must not discard the retireId. Report pending;
+    // the status can be re-read with GET.
+    const status = await port
+      .legacyRetireStatus(connectorId!)
+      .catch(() => null);
     return jsonNoStore(202, {
       retireId,
       legacy: status?.legacy ?? { state: "pending" },

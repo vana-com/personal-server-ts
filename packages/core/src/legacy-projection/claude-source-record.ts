@@ -32,7 +32,20 @@ function identity(value: ObjectValue): string {
   return uuid ?? id ?? reject("missing_source_identity");
 }
 function safeText(value: unknown, limit: number): string | null {
-  const text = string(value)?.slice(0, limit) ?? null;
+  const raw = string(value);
+  let text = raw?.slice(0, limit) ?? null;
+  // A cap that lands inside a surrogate pair leaves a dangling high
+  // surrogate; drop it instead of rejecting the valid astral character.
+  // A lone surrogate in the source itself is still rejected below.
+  if (
+    text !== null &&
+    raw !== null &&
+    raw.length > limit &&
+    /[\uD800-\uDBFF]$/.test(text) &&
+    /^[\uDC00-\uDFFF]/.test(raw.slice(limit))
+  ) {
+    text = text.slice(0, -1);
+  }
   if (
     text !== null &&
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(

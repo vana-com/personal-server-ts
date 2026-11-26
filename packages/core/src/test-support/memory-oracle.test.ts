@@ -103,6 +103,21 @@ describe("memory-oracle calibration", () => {
     expect(r.peakBytes).toBeGreaterThanOrEqual(0.9 * HELD_MiB * MiB);
   }, 60_000);
 
+  // The header contract says a retained peak shows in full in both GC
+  // modes: the timer only reclaims garbage, it cannot lower the HWM or
+  // free live data.
+  it('reads a retained accumulation at its full size with gc "none"', async () => {
+    const r = await run(
+      {
+        module: WORKLOADS,
+        exportName: "accumulate",
+        args: { mib: HELD_MiB },
+      },
+      { gc: "none" },
+    );
+    expect(r.peakBytes).toBeGreaterThanOrEqual(0.9 * HELD_MiB * MiB);
+  }, 60_000);
+
   // "€" is three bytes in UTF-8, and a ~300 KiB report line arrives in
   // several stdout chunks. 65536 is not a multiple of 3, so a chunk boundary
   // falls inside a character; decoding each chunk on its own replaces the
@@ -122,6 +137,35 @@ describe("memory-oracle calibration", () => {
         exportName: "unicode",
       });
       expect(measured.result).toBe("€".repeat(100_000));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("passes heapLimitMiB and env through to the child", async () => {
+    const temporary = join(homedir(), ".tmp");
+    mkdirSync(temporary, { recursive: true });
+    const root = mkdtempSync(join(temporary, "memory-oracle-opts-"));
+    try {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        `export function probe() { return { argv: process.execArgv, marker: process.env.MEMORY_ORACLE_TEST_MARKER ?? null }; }`,
+      );
+      const measured = await run<{ argv: string[]; marker: string | null }>({
+        module,
+        exportName: "probe",
+        heapLimitMiB: 512,
+        env: { MEMORY_ORACLE_TEST_MARKER: "oracle-env-ok" },
+      });
+      expect(measured.result.argv).toContain("--max-old-space-size=512");
+      expect(measured.result.marker).toBe("oracle-env-ok");
+      const plain = await run<{ argv: string[]; marker: string | null }>({
+        module,
+        exportName: "probe",
+      });
+      expect(plain.result.argv).toContain("--max-old-space-size=2048");
+      expect(plain.result.marker).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -231,6 +275,27 @@ describe("memory-oracle temp roots", () => {
         expect(existsSync(fresh)).toBe(true);
         expect(existsSync(other)).toBe(true);
         expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      } finally {
+        next.dispose();
+      }
+    });
+  });
+
+  it("keeps a stale root whose owner marker is not a valid pid", () => {
+    withTempParent((parent) => {
+      const yesterday = new Date(Date.now() - 25 * 60 * 60 * 1_000);
+      // A marker that is not "<pid>\n" cannot prove its owner is gone.
+      const garbage = mkdtempSync(join(parent, "oracle-"));
+      writeFileSync(join(garbage, ".memory-oracle-owner"), "not-a-pid\n");
+      utimesSync(garbage, yesterday, yesterday);
+      // A pid outside the valid range cannot be signalled either.
+      const huge = mkdtempSync(join(parent, "oracle-"));
+      writeFileSync(join(huge, ".memory-oracle-owner"), "9999999999\n");
+      utimesSync(huge, yesterday, yesterday);
+      const next = createTempRoot("oracle-", parent);
+      try {
+        expect(existsSync(garbage)).toBe(true);
+        expect(existsSync(huge)).toBe(true);
       } finally {
         next.dispose();
       }

@@ -63,3 +63,16 @@ it("recognizes nested names in the ordinary memory catalog", () => {
   expect(isMemoryScope("memory.project.notes")).toBe(true);
   expect(isMemoryScope("memory.project.decisions")).toBe(true);
 });
+
+it("keeps the platform connector's named streams reserved across both namespaces", () => {
+  expect(isReservedSystemScope("vana.system.catalog.members")).toBe(true);
+  expect(isReservedSystemScope("pdpp.vana-system-catalog.members.active")).toBe(
+    true,
+  );
+});
+
+it("keeps a memory prefix distinct from an actual named snapshot", () => {
+  expect(isMemoryScope("memory.")).toBe(false);
+  expect(isMemoryScope("memory.a")).toBe(true);
+  expect(isMemoryScope("memory.a.notes")).toBe(true);
+});

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { migrateLocalState } from "./local-state.js";
+import { runStateMigrations } from "./state-migrations.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { DETECT_STUCK_VERSION_LEDGER_ID } from "./detect-stuck-version-ledger.js";
@@ -150,6 +151,89 @@ describe("migrateLocalState", () => {
     ).resolves.toContain('"version": 1');
   });
 
+  it("leaves existing state untouched when legacy config is malformed", async () => {
+    const statePath = join(storageRoot, "state.json");
+    const priorState = JSON.stringify({ version: 1, migratedAt: "prior" });
+    await writeFile(statePath, priorState);
+    await writeFile(configPath, "{truncated");
+
+    await expect(
+      migrateLocalState({
+        storageRoot,
+        dataDir,
+        configPath,
+        syncCursorPath,
+        tokensPath,
+      }),
+    ).rejects.toThrow(SyntaxError);
+
+    await expect(readFile(statePath, "utf-8")).resolves.toBe(priorState);
+    await expect(readFile(syncCursorPath, "utf-8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("propagates a non-missing legacy config read failure", async () => {
+    const nonDirectory = join(storageRoot, "not-a-directory");
+    await writeFile(nonDirectory, "fixture");
+
+    await expect(
+      migrateLocalState({
+        storageRoot,
+        dataDir,
+        configPath: join(nonDirectory, "config.json"),
+        syncCursorPath,
+        tokensPath,
+      }),
+    ).rejects.toMatchObject({ code: "ENOTDIR" });
+
+    await expect(
+      readFile(join(storageRoot, "state.json"), "utf-8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves state when staging the write fails and does not replay the cursor on retry", async () => {
+    const statePath = join(storageRoot, "state.json");
+    const stagePath = `${statePath}.tmp`;
+    const priorState = JSON.stringify({ version: 1, migratedAt: "prior" });
+    const timestamp = "2026-01-21T10:00:00.000Z";
+    await writeFile(statePath, priorState);
+    await writeFile(
+      configPath,
+      JSON.stringify({ sync: { lastProcessedTimestamp: timestamp } }),
+    );
+    await mkdir(stagePath);
+
+    const options = {
+      storageRoot,
+      dataDir,
+      configPath,
+      syncCursorPath,
+      tokensPath,
+    };
+    await expect(migrateLocalState(options)).rejects.toMatchObject({
+      code: "EISDIR",
+      path: stagePath,
+    });
+    await expect(readFile(statePath, "utf-8")).resolves.toBe(priorState);
+    const cursor = await readFile(syncCursorPath, "utf-8");
+    expect(JSON.parse(cursor)).toEqual({
+      version: 1,
+      lastProcessedTimestamp: timestamp,
+    });
+
+    await rm(stagePath, { recursive: true });
+    await expect(migrateLocalState(options)).resolves.toMatchObject({
+      statePath,
+      syncCursorCreated: false,
+    });
+    await expect(readFile(syncCursorPath, "utf-8")).resolves.toBe(cursor);
+    expect(JSON.parse(await readFile(statePath, "utf-8"))).toMatchObject({
+      version: 1,
+      components: { syncCursor: 1 },
+    });
+  });
+
   it("preserves the migration journal during a file-only run at a custom state path", async () => {
     const stateDir = join(storageRoot, "custom");
     const statePath = join(stateDir, "state.json");
@@ -252,5 +336,75 @@ describe("migrateLocalState", () => {
     expect(state.migrations.log.at(-1).id).toBe(DETECT_STUCK_VERSION_LEDGER_ID);
 
     db.close();
+  });
+});
+
+describe("local-state migration journal", () => {
+  // These registry-only fixtures never touch a database.
+  const context = {
+    db: {} as Parameters<typeof runStateMigrations>[0]["db"],
+    storageRoot: "unused",
+  };
+
+  it("drops the oldest log entry without dropping applied migration IDs", () => {
+    const originalEntry = { id: "old", ranAt: "2026-01-01", changed: true };
+    const prior = { applied: ["old"], log: [originalEntry] };
+    const result = runStateMigrations(context, prior, {
+      maxLog: 1,
+      now: () => "2026-01-02",
+      migrations: [
+        {
+          id: "new",
+          description: "Synthetic journal entry",
+          check: () => true,
+          run: () => ({ changed: true }),
+        },
+      ],
+    });
+
+    expect(result.applied).toEqual(["old", "new"]);
+    expect(result.log).toEqual([
+      { id: "new", ranAt: "2026-01-02", changed: true, detail: undefined },
+    ]);
+    expect(prior.log).toEqual([originalEntry]);
+  });
+
+  it("keeps a failed check retryable and continues if the warning logger throws", () => {
+    const result = runStateMigrations(
+      {
+        ...context,
+        logger: {
+          info: () => {},
+          warn: () => {
+            throw new Error("synthetic log sink failure");
+          },
+        },
+      },
+      undefined,
+      {
+        now: () => "2026-01-02",
+        migrations: [
+          {
+            id: "retry-next-boot",
+            description: "Transient check failure",
+            check: () => {
+              throw new Error("synthetic check failure");
+            },
+            run: () => {
+              throw new Error("must not run after a failed check");
+            },
+          },
+          {
+            id: "next",
+            description: "Independent migration",
+            check: () => true,
+            run: () => ({ changed: true }),
+          },
+        ],
+      },
+    );
+
+    expect(result.applied).toEqual(["next"]);
+    expect(result.log.map(({ id }) => id)).toEqual(["next"]);
   });
 });
