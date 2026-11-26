@@ -55,6 +55,12 @@ vi.mock(
     const actual = await importOriginal<typeof AdaptersModule>();
     return {
       ...actual,
+      createSyncStorageAdapter: (
+        ...args: Parameters<typeof actual.createSyncStorageAdapter>
+      ) => (
+        record("storage", args[0]),
+        actual.createSyncStorageAdapter(...args)
+      ),
       createVanaSyncStorageAdapter: (
         ...args: Parameters<typeof actual.createVanaSyncStorageAdapter>
       ) => (

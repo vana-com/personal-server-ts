@@ -65,6 +65,7 @@ export interface StartPersonalServerNodeOptions
       | "mcpRequestableScopes"
       | "mcpGrantTtlSeconds"
       | "rotateReplicaWriterIdentity"
+      | "storageCredentials"
     >,
     LoadConfigOptions {
   config?: ServerConfig;
@@ -159,6 +160,7 @@ export async function startPersonalServer(
         mcpRequestableScopes: options.mcpRequestableScopes,
         mcpGrantTtlSeconds: options.mcpGrantTtlSeconds,
         rotateReplicaWriterIdentity: options.rotateReplicaWriterIdentity,
+        storageCredentials: options.storageCredentials,
       });
       appFetch = context.app.fetch;
       return { config, context };

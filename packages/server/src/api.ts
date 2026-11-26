@@ -46,3 +46,10 @@ export {
 
 export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";
 export { REPLICA_WRITER_ROTATION_CONTRACT } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+export {
+  StorageAuthRevokedError,
+  StorageQuotaExceededError,
+  type ExternalOAuthStorageProvider,
+  type StorageAccessTokenRequest,
+  type StorageCredentialProvider,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";

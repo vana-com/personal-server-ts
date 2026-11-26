@@ -15,6 +15,7 @@ import { createGatewayDeleteDataPort } from "@opendatalabs/personal-server-ts-co
 import {
   resolveVanaStorageEndpoint,
   StoredBlobConflictError,
+  type BoundedStorageAdapter,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import {
   publishPreparedVersion,
@@ -74,6 +75,8 @@ export function createPsLiteAdditionsTransport(options: {
   ownerSigner: PsLiteBoundedOwnerSigner;
   /** Authentication origin may differ from a preview Storage endpoint. */
   storageAudience?: string;
+  /** Optional storage adapter override for non-Vana backends (e.g. Google Drive). */
+  storageAdapter?: BoundedStorageAdapter;
   fetch?: typeof globalThis.fetch;
 }) {
   const candidateStore = options.stateStore.bounded;
@@ -333,76 +336,104 @@ export function createPsLiteAdditionsTransport(options: {
               },
             };
           },
-          storageAdapter: {
-            urlForKey: (key) => {
-              const slash = key.lastIndexOf("/");
-              return blobUrl(key.slice(0, slash), key.slice(slash + 1));
-            },
-            async upload(key, bytes) {
-              const version = key.slice(key.lastIndexOf("/") + 1);
-              if (
-                !fingerprints.get(prepared.scope) ||
-                version !== prepared.expectedVersion
-              ) {
-                // Rebase the durable intent before leaving bytes at the new key.
-                prepared = { ...prepared, expectedVersion: version };
-                await persistPending(prepared, budget);
-                fingerprints.set(prepared.scope, fingerprint(prepared));
+          storageAdapter: options.storageAdapter
+            ? {
+                urlForKey: (key) => options.storageAdapter!.urlForKey(key),
+                async upload(key, bytes) {
+                  const version = key.slice(key.lastIndexOf("/") + 1);
+                  if (
+                    !fingerprints.get(prepared.scope) ||
+                    version !== prepared.expectedVersion
+                  ) {
+                    prepared = { ...prepared, expectedVersion: version };
+                    await persistPending(prepared, budget);
+                    fingerprints.set(prepared.scope, fingerprint(prepared));
+                  }
+                  budget.charge(bytes.byteLength);
+                  return options.storageAdapter!.upload(
+                    key,
+                    bytes,
+                    budget.signal,
+                  );
+                },
+                download: (url) =>
+                  options.storageAdapter!.downloadBounded(url, budget),
+                exists: (url) =>
+                  options.storageAdapter!.exists(url, budget.signal),
+                delete: async () => {
+                  throw new Error("Publication cannot delete ciphertext");
+                },
               }
-              const url = blobUrl(prepared.scope, version);
-              const authorization = await signRequest(
-                {
-                  aud: options.storageAudience ?? storage,
-                  method: "PUT",
-                  uri: new URL(url).pathname,
-                  body: bytes,
+            : {
+                urlForKey: (key) => {
+                  const slash = key.lastIndexOf("/");
+                  return blobUrl(key.slice(0, slash), key.slice(slash + 1));
                 },
-                budget.signal,
-              );
-              const response = await fetchBounded(
-                {
-                  url,
-                  method: "PUT",
-                  headers: [
-                    ["authorization", authorization],
-                    ["content-type", "application/octet-stream"],
-                  ],
-                  body: bytes,
+                async upload(key, bytes) {
+                  const version = key.slice(key.lastIndexOf("/") + 1);
+                  if (
+                    !fingerprints.get(prepared.scope) ||
+                    version !== prepared.expectedVersion
+                  ) {
+                    // Rebase the durable intent before leaving bytes at the new key.
+                    prepared = { ...prepared, expectedVersion: version };
+                    await persistPending(prepared, budget);
+                    fingerprints.set(prepared.scope, fingerprint(prepared));
+                  }
+                  const url = blobUrl(prepared.scope, version);
+                  const authorization = await signRequest(
+                    {
+                      aud: options.storageAudience ?? storage,
+                      method: "PUT",
+                      uri: new URL(url).pathname,
+                      body: bytes,
+                    },
+                    budget.signal,
+                  );
+                  const response = await fetchBounded(
+                    {
+                      url,
+                      method: "PUT",
+                      headers: [
+                        ["authorization", authorization],
+                        ["content-type", "application/octet-stream"],
+                      ],
+                      body: bytes,
+                    },
+                    budget,
+                  );
+                  if (response.status === 409)
+                    throw new StoredBlobConflictError(key);
+                  if (response.status < 200 || response.status >= 300)
+                    throw new Error(
+                      `Checkpoint upload failed (${response.status})`,
+                    );
+                  return url;
                 },
-                budget,
-              );
-              if (response.status === 409)
-                throw new StoredBlobConflictError(key);
-              if (response.status < 200 || response.status >= 300)
-                throw new Error(
-                  `Checkpoint upload failed (${response.status})`,
-                );
-              return url;
-            },
-            async download(url) {
-              const response = await fetchBounded({ url }, budget);
-              if (response.status < 200 || response.status >= 300)
-                throw new Error(
-                  `Checkpoint download failed (${response.status})`,
-                );
-              return response.body;
-            },
-            async exists(url) {
-              const response = await fetchBounded(
-                { url, method: "HEAD" },
-                budget,
-              );
-              if (response.status === 404) return false;
-              if (response.status < 200 || response.status >= 300)
-                throw new Error(
-                  `Checkpoint availability check failed (${response.status})`,
-                );
-              return true;
-            },
-            delete: async () => {
-              throw new Error("Publication cannot delete ciphertext");
-            },
-          },
+                async download(url) {
+                  const response = await fetchBounded({ url }, budget);
+                  if (response.status < 200 || response.status >= 300)
+                    throw new Error(
+                      `Checkpoint download failed (${response.status})`,
+                    );
+                  return response.body;
+                },
+                async exists(url) {
+                  const response = await fetchBounded(
+                    { url, method: "HEAD" },
+                    budget,
+                  );
+                  if (response.status === 404) return false;
+                  if (response.status < 200 || response.status >= 300)
+                    throw new Error(
+                      `Checkpoint availability check failed (${response.status})`,
+                    );
+                  return true;
+                },
+                delete: async () => {
+                  throw new Error("Publication cannot delete ciphertext");
+                },
+              },
           signer: {
             async signAddData(message) {
               budget.charge();
@@ -485,6 +516,12 @@ export function createPsLiteAdditionsTransport(options: {
     const version = key.slice(slash + 1);
     if (slash < 1 || !/^[1-9][0-9]*$/.test(version))
       throw new Error("Invalid checkpoint blob key");
+    if (options.storageAdapter) {
+      return options.storageAdapter.downloadBounded(
+        options.storageAdapter.urlForKey(key),
+        budget,
+      );
+    }
     const response = await fetchBounded(
       { url: blobUrl(scope, version) },
       budget,

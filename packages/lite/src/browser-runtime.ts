@@ -141,6 +141,8 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   inferenceProvider?: InferenceProvider;
   ownerSignature: `0x${string}`;
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
+  /** Host-owned short-lived access-token broker for external OAuth storage backends. */
+  storageCredentials?: PsLiteSyncOptions["storageCredentials"];
   /** Closed until incoming-server registration commits; initial sync only pulls. */
   registrationReady?: () => boolean;
   additionsWorkerFactory?: PsLiteSyncOptions["additionsWorkerFactory"];
@@ -462,6 +464,7 @@ export async function createIndexedDbPsLiteRuntime(
       ),
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
+      storageCredentials: options.storageCredentials,
       registrationReady: options.registrationReady,
       additionsWorkerFactory: options.additionsWorkerFactory,
       serverAccount: identity.account,

@@ -300,3 +300,11 @@ export {
   type LiteLegacyStoreRunner,
   type LiteLegacyStoreRunnerOptions,
 } from "./legacy-runner.js";
+
+export {
+  StorageAuthRevokedError,
+  StorageQuotaExceededError,
+  type ExternalOAuthStorageProvider,
+  type StorageAccessTokenRequest,
+  type StorageCredentialProvider,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";
