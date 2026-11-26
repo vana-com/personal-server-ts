@@ -1407,7 +1407,6 @@ async function bootstrapServer(
             message: "Register this Personal Server before syncing.",
           };
         } catch (err) {
-          identity!.serverId = null;
           retirementRegistrationReady = false;
           logger.warn({ err }, "Could not verify server registration for sync");
           return {
