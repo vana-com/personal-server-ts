@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { migrateLocalState } from "./local-state.js";
+import { runStateMigrations } from "./state-migrations.js";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { DETECT_STUCK_VERSION_LEDGER_ID } from "./detect-stuck-version-ledger.js";
@@ -252,5 +253,75 @@ describe("migrateLocalState", () => {
     expect(state.migrations.log.at(-1).id).toBe(DETECT_STUCK_VERSION_LEDGER_ID);
 
     db.close();
+  });
+});
+
+describe("local-state migration journal", () => {
+  // These registry-only fixtures never touch a database.
+  const context = {
+    db: {} as Parameters<typeof runStateMigrations>[0]["db"],
+    storageRoot: "unused",
+  };
+
+  it("drops the oldest log entry without dropping applied migration IDs", () => {
+    const originalEntry = { id: "old", ranAt: "2026-01-01", changed: true };
+    const prior = { applied: ["old"], log: [originalEntry] };
+    const result = runStateMigrations(context, prior, {
+      maxLog: 1,
+      now: () => "2026-01-02",
+      migrations: [
+        {
+          id: "new",
+          description: "Synthetic journal entry",
+          check: () => true,
+          run: () => ({ changed: true }),
+        },
+      ],
+    });
+
+    expect(result.applied).toEqual(["old", "new"]);
+    expect(result.log).toEqual([
+      { id: "new", ranAt: "2026-01-02", changed: true, detail: undefined },
+    ]);
+    expect(prior.log).toEqual([originalEntry]);
+  });
+
+  it("keeps a failed check retryable and continues if the warning logger throws", () => {
+    const result = runStateMigrations(
+      {
+        ...context,
+        logger: {
+          info: () => {},
+          warn: () => {
+            throw new Error("synthetic log sink failure");
+          },
+        },
+      },
+      undefined,
+      {
+        now: () => "2026-01-02",
+        migrations: [
+          {
+            id: "retry-next-boot",
+            description: "Transient check failure",
+            check: () => {
+              throw new Error("synthetic check failure");
+            },
+            run: () => {
+              throw new Error("must not run after a failed check");
+            },
+          },
+          {
+            id: "next",
+            description: "Independent migration",
+            check: () => true,
+            run: () => ({ changed: true }),
+          },
+        ],
+      },
+    );
+
+    expect(result.applied).toEqual(["next"]);
+    expect(result.log.map(({ id }) => id)).toEqual(["next"]);
   });
 });
