@@ -3,7 +3,7 @@ import {
   encodeBase64UrlUtf8,
 } from "../encoding/base64url.js";
 import { negotiatePdppVersion } from "../pdpp-version.js";
-import { grantIsCandidate } from "../pdpp/types.js";
+import { grantUsesLockedRules } from "../pdpp/types.js";
 import type { OwnedAccountStorageMode } from "./account-storage-mode.js";
 import { PdppError } from "../errors/pdpp-catalog.js";
 import {
@@ -435,7 +435,7 @@ export async function listPdppRecords(
     );
   }
 
-  const candidate = grantIsCandidate(context.grant);
+  const candidate = grantUsesLockedRules(context.grant);
   const warnings: { code: string; message: string; param?: string }[] = [];
   if (query.clamped)
     warnings.push({ code: "limit_clamped", message: "limit clamped to 100" });

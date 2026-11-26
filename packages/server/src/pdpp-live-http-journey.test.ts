@@ -55,6 +55,13 @@ const DECLARATION = JSON.stringify({
       fields: ["id", "name", "genres", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
   ],

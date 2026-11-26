@@ -1,4 +1,4 @@
-import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { grantUsesLockedRules } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   listPdppRecords,
   resolveOwnerSource,
@@ -645,15 +645,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const page = reads(context).changesSince(stream, {
         instanceIds,
         changesSince:
-          grantIsCandidate(context.grant) && query.changesSince === "beginning"
+          grantUsesLockedRules(context.grant) && query.changesSince === "beginning"
             ? undefined
             : query.changesSince,
         cursor,
         limit,
-        fields: grantIsCandidate(context.grant)
+        fields: grantUsesLockedRules(context.grant)
           ? scope.streamGrant!.fields
           : fields,
-        ...(grantIsCandidate(context.grant) && {
+        ...(grantUsesLockedRules(context.grant) && {
           expireOnErasure: true,
           isVisible: (row: {
             recordKey: string;
@@ -664,7 +664,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         }),
       });
       const visible = page.data.filter((row) => {
-        if (grantIsCandidate(context.grant)) return true; // store compared both authorized historical states
+        if (grantUsesLockedRules(context.grant)) return true; // store compared both authorized historical states
         if (row.deleted) {
           return recordKeyWithinGrantResources(
             row.recordKey,
@@ -684,7 +684,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           next_changes_since: page.nextChangesSince,
         }),
         data: visible.map((row) =>
-          toRecordJson(stream, row, fields, grantIsCandidate(context.grant)),
+          toRecordJson(stream, row, fields, grantUsesLockedRules(context.grant)),
         ),
         ...(clamped && { meta }),
       };
@@ -708,7 +708,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       has_more: page.hasMore,
       ...(page.nextCursor && { next_cursor: page.nextCursor }),
       data: page.data.map((row) =>
-        toRecordJson(stream, row, fields, grantIsCandidate(context.grant)),
+        toRecordJson(stream, row, fields, grantUsesLockedRules(context.grant)),
       ),
       ...(meta && { meta }),
     };
@@ -1335,7 +1335,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             stream,
             found,
             scope.fields,
-            grantIsCandidate(context!.grant),
+            grantUsesLockedRules(context!.grant),
           ),
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -1369,7 +1369,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ? found
             : { ...found, data: projectFields(found.data, fields) },
           undefined,
-          grantIsCandidate(context?.grant),
+          grantUsesLockedRules(context?.grant),
         ),
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },

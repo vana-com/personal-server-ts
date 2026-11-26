@@ -762,6 +762,9 @@ export function parseDeclaration(
       ...(typeof s.consent_time_field === "string" && {
         consent_time_field: s.consent_time_field,
       }),
+      ...(typeof s.cursor_field === "string" && {
+        cursor_field: s.cursor_field,
+      }),
       primary_key: s.primary_key as string[],
       // Carried verbatim from the normative declaration so §8 metadata can
       // report record shape and selection capability without a second lookup.

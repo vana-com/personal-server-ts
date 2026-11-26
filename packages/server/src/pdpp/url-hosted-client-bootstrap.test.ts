@@ -139,7 +139,7 @@ function authorizeBody(overrides: Record<string, unknown> = {}) {
         source: { id: SOURCE_ID },
         purpose_code: "https://pdpp.dev/purpose/personalization",
         access_mode: "continuous",
-        streams: [{ name: "top_artists" }],
+        streams: [{ name: "top_artists", fields: ["*"] }],
       },
     ],
     ...overrides,

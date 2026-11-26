@@ -45,6 +45,9 @@ const mixed: DeclarationSnapshot = {
       fields: ["date", "amount", "merchant"],
       required_fields: ["date"],
       consent_time_field: "date",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: { properties: { date: { type: "string", format: "date-time" } } },
       primary_key: ["date"],
     },
     {
@@ -113,7 +116,12 @@ describe("review finding 2 — a wildcard time_range is validated per expanded s
 
   it("rejects it identically under v0.1, which has the same §6 rule", () => {
     const result = validateSelectionRequest(
-      request([{ name: "*", time_range: window }], PDPP_DATA_ACCESS_TYPE),
+      // locked v0.1.0: each stream request "MUST carry either `fields` or
+      // `view`" (spec-core L1210).
+      request(
+        [{ name: "*", fields: ["*"], time_range: window }],
+        PDPP_DATA_ACCESS_TYPE,
+      ),
       mixed,
     );
     expect(result.ok).toBe(false);

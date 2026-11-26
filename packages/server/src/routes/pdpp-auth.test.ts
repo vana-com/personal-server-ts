@@ -47,6 +47,13 @@ const snapshot: DeclarationSnapshot = {
       fields: ["id", "name", "genres", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
   ],
@@ -77,7 +84,9 @@ function selectionBody(overrides: Record<string, unknown> = {}) {
         source: { id: snapshot.source_id },
         purpose_code: "https://pdpp.dev/purpose/personalization",
         access_mode: "continuous",
-        streams: [{ name: "top_artists" }],
+        // locked v0.1.0: each stream request carries `fields` or `view`
+        // (spec-core L1210).
+        streams: [{ name: "top_artists", fields: ["*"] }],
         ...overrides,
       },
     ],
@@ -496,7 +505,7 @@ describe("§9 AS item 5 — Source validation failures map to RFC 9396", () => {
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        streams: [{ name: "top_artists" }],
+        streams: [{ name: "top_artists", fields: ["*"] }],
         selection_preset: "anything",
       }),
     );
@@ -732,7 +741,7 @@ describe("the consent review model the UI renders", () => {
     const ownerToken = scopedOwnerToken();
     const created = await post(
       "/pdpp/v1/authorize",
-      selectionBody({ streams: [{ name: "*" }] }),
+      selectionBody({ streams: [{ name: "*", fields: ["*"] }] }),
     );
     const { session_id } = (await created.json()) as { session_id: string };
     const reviewed = await app.request(
@@ -1284,7 +1293,13 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        streams: [{ name: "top_artists", instance_ids: [ACCOUNT_B] }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["*"],
+            instance_ids: [ACCOUNT_B],
+          },
+        ],
       }),
       ownerAuth(scopedOwnerToken()),
     );
@@ -1381,7 +1396,13 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
     const created = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        streams: [{ name: "top_artists", instance_ids: [ACCOUNT_B] }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["*"],
+            instance_ids: [ACCOUNT_B],
+          },
+        ],
       }),
       ownerAuth(source),
     );
@@ -1410,7 +1431,13 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
     const ownerToken = scopedOwnerToken();
     const { sessionId, digest } = await openSessionAndReview(
       selectionBody({
-        streams: [{ name: "top_artists", instance_ids: [OWNER_INSTANCE] }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["*"],
+            instance_ids: [OWNER_INSTANCE],
+          },
+        ],
       }),
       ownerToken,
     );
@@ -1565,6 +1592,7 @@ describe("GET /grants — the owner's own grants, with status", () => {
           name: "top_artists",
           instance_ids: ["spotify-account-a"],
           fields: ["id", "name"],
+          required_fields: ["id"],
         },
       ],
     };

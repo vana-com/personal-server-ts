@@ -86,7 +86,17 @@ export function grantIsV02(grant: Grant | undefined): boolean {
 }
 
 export type PdppInactiveReason =
-  "unknown" | "expired" | "revoked" | "grant_revoked" | "grant_expired";
+  | "unknown"
+  | "expired"
+  | "revoked"
+  | "grant_revoked"
+  | "grant_expired"
+  /**
+   * The token's grant was issued under the pre-lock rules and does not have
+   * the locked v0.1.0 shape. AS item 21: rejected before use; fresh consent
+   * is required.
+   */
+  | "unsupported_legacy_shape";
 
 export interface PdppTokenContext {
   active: boolean;

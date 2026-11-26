@@ -40,6 +40,9 @@ const snapshot: DeclarationSnapshot = {
       fields: ["date", "amount", "merchant", "private_note"],
       required_fields: ["date"],
       consent_time_field: "date",
+      // locked v0.1.0 (AS item 27): the plain type rejects a declaration
+      // whose consent_time_field is not a date or date-time string.
+      schema: { properties: { date: { type: "string", format: "date-time" } } },
       primary_key: ["date"],
     },
     {
@@ -379,16 +382,14 @@ describe("v0.2 selection request shape", () => {
 });
 
 describe("revision isolation", () => {
-  it("rejects a minimum carried on a v0.1 request", () => {
-    // v0.1 has no `minimum`. Silently ignoring it would be the worst outcome:
-    // the client believes it imposed a floor the AS never enforces.
+  it("validates a minimum carried on a locked v0.1.0 request", () => {
+    // locked v0.1.0: "`minimum` | object | Issuance condition | Optional
+    // `{ fields, time_range }` authorization minimum" (spec-core L1189).
     const result = validateSelectionRequest(
       { ...v02([transactionsStream()]), type: PDPP_DATA_ACCESS_TYPE },
       snapshot,
     );
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.failure.code).toBe("unsupported_selection_parameter");
+    expect(result.ok).toBe(true);
   });
 
   it("still accepts an unchanged v0.1 request", () => {

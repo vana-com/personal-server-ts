@@ -222,6 +222,12 @@ export interface StreamGrant {
    * sparse-read floor from this set, never from a later declaration.
    */
   required_fields?: string[];
+  /**
+   * Locked v0.1.0 (AS item 13): the declared `cursor_field`, frozen at
+   * issuance when its schema format is `date` or `date-time` and `fields`
+   * includes it; otherwise absent. Client list reads sort by it.
+   */
+  sort_field?: string;
 }
 
 /**
@@ -346,6 +352,8 @@ export interface DeclaredStream {
    * (§6 "Note on `time_range`").
    */
   consent_time_field?: string;
+  /** §5 `cursor_field`: the declared ordering field, when the stream has one. */
+  cursor_field?: string;
   /** Arity of the primary key; `resources` entries are validated against it. */
   primary_key: string[];
   /** The stream's JSON Schema from a normative §5 declaration, when present. */
@@ -452,7 +460,12 @@ export interface PdppIntrospectionResponse {
 
 /** Why a token did not resolve. Drives the RS error; never echoed to the client. */
 export type InactiveReason =
-  "unknown" | "expired" | "revoked" | "grant_revoked" | "grant_expired";
+  | "unknown"
+  | "expired"
+  | "revoked"
+  | "grant_revoked"
+  | "grant_expired"
+  | "unsupported_legacy_shape";
 
 /**
  * The co-located equivalent of an introspection call. The RS resolves a token
@@ -476,9 +489,54 @@ export interface PdppTokenContext {
 
 export type GrantStatus = "active" | "expired" | "revoked";
 
-/** Explicit opt-in candidate profile; unknown versions retain current behavior. */
-export function grantIsCandidate(
-  grant: { version: string } | undefined,
+/**
+ * Whether a request type resolves under the locked PDPP Core v0.1.0 rules.
+ *
+ * The locked type `https://pdpp.dev/data-access` uses them by default. The
+ * development alias `…/candidate-0.1.0` (behind `protocolProfile:
+ * "candidate-0.1.0"`) uses the same rules. The pre-lock rule set that the
+ * plain type used to select is no longer reachable for new requests.
+ */
+export function usesLockedRules(type: string | undefined): boolean {
+  return (
+    type === PDPP_DATA_ACCESS_TYPE || type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+  );
+}
+
+/**
+ * Whether an issued grant carries the locked v0.1.0 shape.
+ *
+ * Locked grants use `version: "0.1.0"` (spec-core §7: "This contract requires
+ * exactly `0.1.0`"), the same value pre-lock grants carried, so they are told
+ * apart by shape: every StreamGrant of a locked grant carries a
+ * `required_fields` array (AS item 51: "Includes an empty array for an empty
+ * floor"). Candidate-alias grants carry their own version string.
+ */
+export function grantUsesLockedRules(
+  grant:
+    | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }
+    | undefined,
 ): boolean {
-  return grant?.version === PDPP_GRANT_VERSION_CANDIDATE;
+  if (!grant) return false;
+  if (grant.version === PDPP_GRANT_VERSION_CANDIDATE) return true;
+  return (
+    grant.version === PDPP_GRANT_VERSION &&
+    Array.isArray(grant.streams) &&
+    grant.streams.length > 0 &&
+    grant.streams.every((s) => Array.isArray(s.required_fields))
+  );
+}
+
+/**
+ * A persisted grant issued under the pre-lock rules: `0.1.0` without the
+ * locked shape. AS item 21 / §7 "Version layering": such state is rejected
+ * before use, missing facts are not reconstructed from current configuration,
+ * and fresh consent is required.
+ */
+export function isPreLockGrant(
+  grant:
+    | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }
+    | undefined,
+): boolean {
+  return grant?.version === PDPP_GRANT_VERSION && !grantUsesLockedRules(grant);
 }

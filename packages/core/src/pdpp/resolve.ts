@@ -25,6 +25,7 @@ import {
 import {
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  usesLockedRules,
   type DeclarationSnapshot,
   type DeclaredStream,
   type RequestedStream,
@@ -515,10 +516,32 @@ function resolveOneStream(
           fields.includes(f),
         ),
       }),
+      ...(revision === "candidate" &&
+        frozenSortField(declared, fields) !== undefined && {
+          sort_field: frozenSortField(declared, fields),
+        }),
       ...(timeConstraint && { time_constraint: timeConstraint }),
       ...(request.resources && { resources: unique(request.resources) }),
     },
   };
+}
+
+/**
+ * AS item 13: "Freezes `cursor_field` as `sort_field` when its format is
+ * `date` or `date-time` and the grant includes it; otherwise omits
+ * `sort_field`."
+ */
+function frozenSortField(
+  declared: DeclaredStream,
+  fields: string[],
+): string | undefined {
+  const cursor = declared.cursor_field;
+  if (cursor === undefined || !fields.includes(cursor)) return undefined;
+  const type = declaredTimeType({
+    consent_time_field: cursor,
+    schema: declared.schema,
+  });
+  return type === undefined ? undefined : cursor;
 }
 
 /**
@@ -546,7 +569,7 @@ export function expandSelections(
     );
     return !preset
       ? []
-      : request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+      : usesLockedRules(request.type)
         ? expandSelections(
             {
               ...request,
@@ -592,7 +615,7 @@ export function streamIsOmitted(
 ): boolean {
   if (
     request.type !== PDPP_DATA_ACCESS_TYPE_V02 &&
-    request.type !== PDPP_DATA_ACCESS_TYPE_CANDIDATE
+    !usesLockedRules(request.type)
   )
     return false;
   if (
@@ -600,6 +623,10 @@ export function streamIsOmitted(
     choices.declined_streams.includes(selection.name)
   )
     return true;
+  // Only the candidate alias starts optional streams unselected. For the
+  // locked type the spec says optional streams "are presented as user
+  // choices" and "The AS MUST omit a declined optional stream": an optional
+  // stream stays in unless the owner declines it (spec-core §6 necessity).
   return (
     request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE &&
     (selection.necessity ?? "optional") === "optional" &&
@@ -685,7 +712,7 @@ export function resolveSelection(
   choices?: OwnerChoices,
 ): ResolutionResult {
   const revision =
-    request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+    usesLockedRules(request.type)
       ? "candidate"
       : request.type === PDPP_DATA_ACCESS_TYPE_V02
         ? "0.2"

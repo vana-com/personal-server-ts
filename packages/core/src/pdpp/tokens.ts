@@ -24,8 +24,10 @@ import {
 } from "./store.js";
 import {
   isV02Grant,
-  grantIsCandidate,
+  grantUsesLockedRules,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  PDPP_GRANT_VERSION_CANDIDATE,
+  isPreLockGrant,
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   type AccessMode,
@@ -93,10 +95,22 @@ function grantInactiveReason(
   stored: StoredGrant,
   now: Date,
 ): InactiveReason | null {
+  // AS item 21: a grant persisted under the pre-lock rules is unsupported
+  // state. Every issuance, refresh and introspection path asks here, so a
+  // pre-lock code or refresh token redeems to `invalid_grant`, not to a token
+  // that is dead on arrival.
+  if (isPreLockGrant(stored.grant)) return "unsupported_legacy_shape";
   const status = store.grantStatus(stored, now);
   if (status === "revoked") return "grant_revoked";
   if (status === "expired") return "grant_expired";
   return null;
+}
+
+function inactiveGrantMessage(reason: InactiveReason): string {
+  if (reason === "grant_revoked") return "grant is revoked";
+  if (reason === "unsupported_legacy_shape")
+    return "grant predates PDPP Core v0.1.0; fresh consent is required";
+  return "grant is expired";
 }
 
 export interface PdppTokenServiceOptions {
@@ -198,7 +212,7 @@ export class PdppTokenService {
         ok: false,
         failure: {
           code: "invalid_grant",
-          message: `grant is ${inactive === "grant_revoked" ? "revoked" : "expired"}`,
+          message: inactiveGrantMessage(inactive),
         },
       };
     }
@@ -245,7 +259,7 @@ export class PdppTokenService {
         ok: false,
         failure: {
           code: "invalid_grant",
-          message: `grant is ${inactive === "grant_revoked" ? "revoked" : "expired"}`,
+          message: inactiveGrantMessage(inactive),
         },
       };
     }
@@ -543,8 +557,9 @@ export function toAuthorizationEntry(grant: Grant): PdppAuthorizationEntry {
 
 export function toAuthorizationDetail(grant: Grant): PdppAuthorizationDetail {
   return {
-    type: grantIsCandidate(grant)
-      ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
+    type:
+      grant.version === PDPP_GRANT_VERSION_CANDIDATE
+        ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
       : PDPP_DATA_ACCESS_TYPE,
     source: grant.source,
     purpose_code: grant.purpose_code,

@@ -1,4 +1,4 @@
-import { grantIsCandidate } from "../../pdpp/types.js";
+import { grantUsesLockedRules } from "../../pdpp/types.js";
 import { PdppError } from "../../errors/pdpp-catalog.js";
 import {
   findStreamGrant,
@@ -84,7 +84,7 @@ export function resolveReadScope(
   }
 
   if (
-    grantIsCandidate(context.grant) &&
+    grantUsesLockedRules(context.grant) &&
     streamGrant.time_constraint &&
     !["date", "date-time"].includes(streamGrant.time_constraint.type ?? "")
   ) {
@@ -100,7 +100,7 @@ export function resolveReadScope(
   // candidate freezes its floor in the grant itself.
   const schemaRequiredFloor = !grantIsV02(context.grant);
   let requiredFloor = declaration.requiredFields ?? [];
-  if (grantIsCandidate(context.grant)) {
+  if (grantUsesLockedRules(context.grant)) {
     const frozen = streamGrant.required_fields;
     if (
       !Array.isArray(frozen) ||
@@ -216,6 +216,11 @@ export function mapInactiveToError(context: PdppTokenContext): PdppError {
       return new PdppError("grant_revoked", "Grant has been revoked");
     case "grant_expired":
       return new PdppError("grant_expired", "Grant has expired");
+    case "unsupported_legacy_shape":
+      return new PdppError(
+        "authorization_state.unsupported_legacy_shape",
+        "This grant was issued under rules that predate PDPP Core v0.1.0; fresh consent is required",
+      );
     case "expired":
     case "revoked":
     case "unknown":

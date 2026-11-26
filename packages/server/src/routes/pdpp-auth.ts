@@ -57,6 +57,8 @@ import {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  usesLockedRules,
+  isPreLockGrant,
   resolveRequesterIdentity,
   validateCodeChallenge,
   validateRedirectUri,
@@ -852,7 +854,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
     }
 
-    const candidate = session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE;
+    const candidate = usesLockedRules(session?.request.type);
     const ownerChoices = parseOwnerChoices(c, candidate);
     if (ownerChoices === "invalid")
       return errorResponse(
@@ -978,7 +980,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
     }
 
-    if (session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE) {
+    if (session && usesLockedRules(session.request.type)) {
       const invalid = validateCandidateOwnerChoices(
         session.request,
         session.snapshot,
@@ -1458,7 +1460,10 @@ function listedGrantStatus(
   store: PdppAuthStore,
   stored: StoredGrant,
   now: Date,
-): GrantStatus | "consumed" {
+): GrantStatus | "consumed" | "requires_fresh_consent" {
+  // Pre-lock grants no longer authorize anything (AS item 21); the owner sees
+  // that they must approve again rather than a live grant.
+  if (isPreLockGrant(stored.grant)) return "requires_fresh_consent";
   const status = store.grantStatus(stored, now);
   if (
     status === "active" &&

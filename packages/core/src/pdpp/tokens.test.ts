@@ -48,6 +48,9 @@ function makeGrant(overrides: Partial<Grant> = {}): Grant {
         name: "top_artists",
         instance_ids: ["spotify-account-a"],
         fields: ["id", "name"],
+        // locked v0.1.0 grant shape (AS item 51): every StreamGrant carries
+        // its frozen `required_fields`.
+        required_fields: ["id"],
       },
     ],
     ...overrides,
@@ -408,6 +411,25 @@ describe("delivery §2 / §9 AS item 8 — revocation and lifecycle", () => {
     const context = tokens.resolveToken(issued.issued.access_token);
     expect(context.active).toBe(false);
     expect(context.inactiveReason).toBe("grant_revoked");
+  });
+
+  it("refuses to redeem a code for a persisted pre-lock grant (AS item 21)", () => {
+    // A 0.1.0 grant without `required_fields` was issued under the pre-lock
+    // rules. It is rejected before use; fresh consent is required.
+    const { code } = seedGrant("continuous", {
+      streams: [
+        {
+          name: "top_artists",
+          instance_ids: ["spotify-account-a"],
+          fields: ["id", "name"],
+        },
+      ],
+    });
+    // Refused at redemption: no token that is dead on arrival is issued.
+    const issued = redeem(code);
+    expect(issued.ok).toBe(false);
+    if (issued.ok) return;
+    expect(issued.failure.code).toBe("invalid_grant");
   });
 
   it("refuses to refresh after the grant is revoked", () => {
