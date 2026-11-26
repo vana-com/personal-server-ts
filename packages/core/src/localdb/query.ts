@@ -584,16 +584,19 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           controlScope(resolved.connector, resolved.namespace) !== target.id
         )
           throw new CursorExpiredError();
-        // A whole-record owner session decides h0 visibility from the
-        // retained log below (tombstones) and returns every record written
-        // between the horizons, so compaction before `since` leaves it
-        // exact; every other session needs the earlier changes themselves.
-        if (currentClock.floor > 0 && !(removals && !projected)) {
+        if (currentClock.floor > 0) {
           // Compaction removed the proof that a changed key was absent at the
-          // earlier horizon. Current bodies cannot establish that old visibility.
+          // earlier horizon. Current bodies cannot establish that old
+          // visibility. A whole-record owner session decides h0 visibility
+          // from the retained log (tombstones, `visibleAtSince`) and returns
+          // every record written between the horizons, so only the part
+          // between h0 and h1 is relaxed for it. A change after the session
+          // horizon still expires every session: without the earlier log a
+          // later page cannot tell which body the horizon held, and its ranked
+          // set would shift under the page offset (spec-core §4: 410).
           const uncertain = await db.query<{ seq: number }>(
             "SELECT seq FROM record_changes WHERE connection_id=? AND stream=? AND seq>? LIMIT 1",
-            [target.id, stream, since ?? horizon],
+            [target.id, stream, removals && !projected ? horizon : (since ?? horizon)],
           );
           if (uncertain.length) throw new CursorExpiredError();
         }

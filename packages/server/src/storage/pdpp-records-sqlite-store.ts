@@ -1938,7 +1938,9 @@ export function createSqliteRecordStore(
     deletedAt: string,
     streamSemantics: StreamSemantics,
   ): boolean {
-    if (streamSemantics === "append_only") return false;
+    // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+    // permitted" (§8 "Delete a record"; RS item 1). Only re-emitted
+    // duplicates are no-ops, at ingest.
     let result = false;
     const run = () =>
       connectionMutation(instance, () => {

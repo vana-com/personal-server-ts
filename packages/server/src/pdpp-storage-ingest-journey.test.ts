@@ -698,7 +698,7 @@ describe("P3: exact per-index outcomes", () => {
     expect(stored.body.emitted_at).toBe("2026-09-05T00:00:00Z");
   });
 
-  it("append_only: first write stands, conflicts are flagged, deletes are rejected", async () => {
+  it("append_only: first write stands, conflicts are flagged, an explicit delete removes the record", async () => {
     ctx = await bootBoth();
     const token = await ownerToken(ctx);
     const event = (kind: string, emitted_at: string) => ({
@@ -711,21 +711,24 @@ describe("P3: exact per-index outcomes", () => {
       event("wake", "2026-09-01T00:00:00Z"),
       event("wake", "2026-09-02T00:00:00Z"),
       event("sleep", "2026-09-03T00:00:00Z"),
-      { ...event("wake", "2026-09-04T00:00:00Z"), data: null, op: "delete" },
     ]);
     expect(result.body.results).toEqual([
       { index: 0, outcome: "accepted" },
       { index: 1, outcome: "unchanged" },
       { index: 2, outcome: "unchanged", flag: "append_only_conflict" },
-      {
-        index: 3,
-        outcome: "rejected",
-        reason: expect.stringContaining("append_only"),
-      },
     ]);
     const stored = await read(ctx, token, "/v1/streams/events/records/e1");
     expect(stored.body.data).toEqual({ id: "e1", kind: "wake" });
     expect(stored.body.emitted_at).toBe("2026-09-01T00:00:00Z");
+    // spec-core §4: the duplicate rule "does not block `op: delete` or owner
+    // deletion"; `append_only`: "Explicit deletion is permitted."
+    const removed = await ingest(ctx, token, "events", [
+      { ...event("wake", "2026-09-04T00:00:00Z"), data: null, op: "delete" },
+    ]);
+    expect(removed.body.results).toEqual([{ index: 0, outcome: "accepted" }]);
+    expect(
+      (await read(ctx, token, "/v1/streams/events/records/e1")).status,
+    ).toBe(404);
   });
 
   it("treats op: null as absent (an upsert) and still rejects an invalid op", async () => {

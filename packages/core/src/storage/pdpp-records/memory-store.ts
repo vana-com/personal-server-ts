@@ -299,7 +299,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
     deletedAt: string,
     streamSemantics: StreamSemantics,
   ): boolean {
-    if (streamSemantics === "append_only") return false;
+    // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+    // permitted" (§8 "Delete a record"; RS item 1). Only re-emitted
+    // duplicates are no-ops, at ingest.
+    void streamSemantics;
     const key = rowKey(instance, stream, recordKey);
     const existing = current.get(key);
     if (!existing || existing.deleted) return false;

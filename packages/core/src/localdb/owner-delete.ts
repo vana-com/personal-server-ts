@@ -81,14 +81,9 @@ export function createOwnerRecordDelete(
         reason: "This connection cannot be written by a run on this server",
         retryable: false,
       };
+    // Either stream semantics: spec-core §4, `append_only`: "Explicit
+    // deletion is permitted."
     const connectionId = controlScope(target.connector, "");
-    const [stream] = await deps.db.query<{ semantics: string }>(
-      "SELECT semantics FROM stream_state WHERE connection_id=? AND stream=?",
-      [connectionId, input.stream],
-    );
-    // Parity with the canonical store: an append-only record is not removed
-    // by an owner delete (`deleteRecord` returns false there too).
-    if (stream?.semantics === "append_only") return { kind: "not_found" };
     const [last] = await deps.db.query<{ artifact_version: string }>(
       "SELECT artifact_version FROM runs WHERE connection_id=? ORDER BY o DESC LIMIT 1",
       [connectionId],

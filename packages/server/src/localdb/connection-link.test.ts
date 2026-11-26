@@ -805,3 +805,98 @@ it("an owner change session with a fields projection fails closed (410) when a r
     ["kept", false],
   ]);
 });
+
+describe("owner sessions over a compacted change log (RS items 7, 20, 21)", () => {
+  async function compacted() {
+    const { db, id } = await fixture();
+    for (const key of ["b", "c", "d", "e"])
+      await run(
+        db,
+        "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,1,'run','{}','hash')",
+        [id, "selected", key, key],
+      );
+    const compact = () =>
+      run(
+        db,
+        "DELETE FROM record_changes WHERE connection_id=? AND seq<=(SELECT MAX(seq) FROM record_changes)",
+        [id],
+      );
+    const read = createGrantHistory(db, () => ({
+      connector: "fixture",
+      namespace: "",
+    }));
+    return { db, id, compact, read };
+  }
+
+  it.each(["delete", "update"] as const)(
+    "a %s after page one of a paged whole-record session expires it (410) instead of skipping a record",
+    async (mutate) => {
+      const { db, id, compact, read } = await compacted();
+      await compact();
+      const options = {
+        instanceIds: ["handle-a"],
+        limit: 2,
+        order: "asc" as const,
+        removals: true,
+      };
+      const first = await read("selected", options);
+      expect(first.hasMore).toBe(true);
+      await run(
+        db,
+        mutate === "delete"
+          ? "DELETE FROM records WHERE connection_id=? AND record_key='allowed'"
+          : "UPDATE records SET body='{\"x\":1}', body_sha256='h2', stamp_o=2 WHERE connection_id=? AND record_key='allowed'",
+        [id],
+      );
+      await expect(
+        read("selected", { ...options, cursor: first.nextCursor }),
+      ).rejects.toThrow(/expired/i);
+    },
+  );
+
+  it("a key with no retained change at h0, written and then removed between the horizons, expires the session (no tombstone)", async () => {
+    const { db, id, compact, read } = await compacted();
+    const session = (changesSince?: string) =>
+      read("selected", {
+        instanceIds: ["handle-a"],
+        limit: 100,
+        changesSince,
+        removals: true,
+      });
+    const start = await session();
+    await compact();
+    await run(
+      db,
+      "INSERT INTO records(connection_id,stream,pk_hash,record_key,stamp_o,stamp_r,body,body_sha256) VALUES (?,?,?,?,2,'run','{}','hash')",
+      [id, "selected", "n", "n"],
+    );
+    await run(
+      db,
+      "DELETE FROM records WHERE connection_id=? AND record_key='n'",
+      [id],
+    );
+    await expect(session(start.nextChangesSince)).rejects.toThrow(/expired/i);
+  });
+
+  it("a removal whose key has no retained change at h0 and no write since is a tombstone", async () => {
+    const { db, id, compact, read } = await compacted();
+    const session = (changesSince?: string) =>
+      read("selected", {
+        instanceIds: ["handle-a"],
+        limit: 100,
+        changesSince,
+        removals: true,
+      });
+    const start = await session();
+    await compact();
+    await run(
+      db,
+      "DELETE FROM records WHERE connection_id=? AND record_key='c'",
+      [id],
+    );
+    const next = await session(start.nextChangesSince);
+    expect(next.data.map((r) => [r.recordKey, r.deleted])).toEqual([
+      ["c", true],
+    ]);
+  });
+});

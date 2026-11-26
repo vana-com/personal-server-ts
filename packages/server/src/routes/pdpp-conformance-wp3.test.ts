@@ -605,7 +605,10 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
       const sync = await (
         await get("/streams/s/records?changes_since=beginning", token)
       ).json();
-      expect(JSON.stringify(sync)).not.toContain("record_id");
+      // Assert on the served records only: the body also holds a sealed
+      // token, random base64url that can contain any short string.
+      for (const record of sync.data)
+        expect(JSON.stringify(record.data)).not.toContain("record_id");
     }
     const start = await (
       await get("/streams/s/records?changes_since=beginning", "refs")
@@ -660,7 +663,7 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
           // Not a reference (no record_id): served as stored.
           plain: { source_id: "src", stream: "other" },
         });
-        expect(JSON.stringify(body)).not.toContain("x1");
+        expect(JSON.stringify(record.data)).not.toContain("x1");
       }
     }
     // A change to a nested hidden record_id leaves the served form unchanged,
@@ -684,6 +687,29 @@ describe.each<Backend>(["memory", "sqlite"])("RS conformance (%s store)", (backe
       )
     ).json();
     expect(next.data).toEqual([]);
+  });
+
+  it("RS 23: a record whose own top-level fields are source_id, stream and record_id is served intact", async () => {
+    const { ingest, get } = setup(backend);
+    ingest([
+      { instance: A, id: "own", name: "n", source_id: "src", stream: "s", record_id: "r1" } as never,
+    ]);
+    const token = "owner";
+    for (const path of [
+      "/streams/s/records",
+      `/streams/s/records/own?instance_id=${A}`,
+      "/streams/s/records?changes_since=beginning",
+    ]) {
+      const body = await (await get(path, token)).json();
+      const record = body.data?.[0] ?? body;
+      expect(record.data).toEqual({
+        id: "own",
+        name: "n",
+        source_id: "src",
+        stream: "s",
+        record_id: "r1",
+      });
+    }
   });
 
   it("RS 18: a served blob_ref carries a fetch_url with its instance_id", async () => {
@@ -780,5 +806,54 @@ describe("RS 6: owner DELETE refusals by account mode use the unified §8 body",
       },
     });
     expect(res.headers.get("Request-Id")).toBe(body.error.request_id);
+  });
+});
+
+describe.each<Backend>(["memory", "sqlite"])("RS 1: owner DELETE on an append_only stream (%s store)", (backend) => {
+  // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+  // permitted." §8 "Delete a record" makes no exception.
+  it("removes the record and emits an owner tombstone with removal=deleted", async () => {
+    const store =
+      backend === "memory"
+        ? createMemoryRecordStore()
+        : createTestBoundRecordStore(new Database(":memory:"));
+    store.ingestBatch(
+      [{ instance: A, stream: "log", key: "e1", data: { id: "e1" }, emitted_at: "2026-05-01T00:00:00.000Z" }],
+      () => "append_only",
+      () => ["id"],
+    );
+    const app = new Hono();
+    app.route(
+      "/v1",
+      pdppRecordsRoutes({
+        accountStorageMode: explicitLegacyStorageMode("unswitched"),
+        store,
+        auth: createFixtureAuthorizationService({
+          owner: { active: true, tokenKind: "owner", subjectId: "owner", instanceIds: [A] },
+        }),
+        declarations: createStreamDeclarationRegistry([
+          { name: "log", semantics: "append_only", primaryKey: ["id"], requiredFields: ["id"] },
+        ]),
+        instancesForSubject: () => [A],
+      }),
+    );
+    const call = (path: string, method = "GET") =>
+      app.request(`/v1${path}`, { method, headers: { Authorization: "Bearer owner" } });
+    const start = await (await call("/streams/log/records?changes_since=beginning")).json();
+    expect((await call("/streams/log/records/e1", "DELETE")).status).toBe(204);
+    expect((await call("/streams/log/records/e1")).status).toBe(404);
+    const next = await (
+      await call(`/streams/log/records?changes_since=${encodeURIComponent(start.next_changes_since)}`)
+    ).json();
+    expect(next.data).toEqual([
+      expect.objectContaining({
+        id: "e1",
+        instance_id: A,
+        deleted: true,
+        removal: "deleted",
+        deleted_at: expect.any(String),
+        emitted_at: expect.any(String),
+      }),
+    ]);
   });
 });

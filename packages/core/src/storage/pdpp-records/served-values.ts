@@ -51,7 +51,15 @@ export function isBlobRef(
 export function redactResourceRefs(
   data: Record<string, unknown>,
 ): Record<string, unknown> {
-  return redactValue(data) as Record<string, unknown>;
+  // The test applies to values inside `data`, never to `data` itself: a
+  // record whose own fields are `source_id`, `stream` and `record_id` is a
+  // record, not a reference (§4: a `resource_ref` is a field value).
+  let out: Record<string, unknown> | undefined;
+  for (const [field, value] of Object.entries(data)) {
+    const next = redactValue(value);
+    if (next !== value) (out ??= { ...data })[field] = next;
+  }
+  return out ?? data;
 }
 
 function redactValue(value: unknown): unknown {

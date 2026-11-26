@@ -218,18 +218,11 @@ describe("own-write log (replication enabled)", () => {
     },
   );
 
-  it("captures owner deletion as a data-free tombstone and suppresses repeated or forbidden deletes", () => {
+  // An append_only delete is no longer forbidden: spec-core §4, `append_only`:
+  // "Explicit deletion is permitted" (§8 "Delete a record"; RS item 1).
+  it("captures owner deletion as a data-free tombstone and suppresses repeated or missing deletes", () => {
     store.ingestBatch([envelope()], semantics, primaryKey, binding);
     const deletedAt = "2026-10-20T12:00:00.000Z";
-    expect(
-      store.deleteRecord(
-        "account-a",
-        "messages",
-        "same-key",
-        deletedAt,
-        "append_only",
-      ),
-    ).toBe(false);
     expect(
       store.deleteRecord(
         "account-a",

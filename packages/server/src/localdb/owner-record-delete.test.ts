@@ -44,6 +44,7 @@ async function device(
   blobs: ReturnType<typeof createMemoryStreamSyncBlobs>,
   deviceId: string,
   clock: { now: number },
+  semantics: "mutable_state" | "append_only" = "mutable_state",
 ) {
   const db = await openLocalDb(openBetterSqlite3(":memory:"), {
     owner,
@@ -79,7 +80,7 @@ async function device(
               streams: [
                 {
                   name: "items",
-                  semantics: "mutable_state",
+                  semantics,
                   primaryKey: ["id"],
                   coverageStrategy: "checkpoint_window",
                 },
@@ -101,12 +102,14 @@ async function device(
   return { db, sync, keys };
 }
 
-it("an owner DELETE on a switched account runs a delete, answers 204, and the record leaves every device", async () => {
+// spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+// permitted": the same delete works on both semantics.
+it.each(["mutable_state", "append_only"] as const)("an owner DELETE on a switched account (%s) runs a delete, answers 204, and the record leaves every device", async (semantics) => {
   const registry = createMemoryStreamSyncRegistry();
   const blobs = createMemoryStreamSyncBlobs();
   const clock = { now: Date.parse("2026-09-01T00:00:00Z") };
-  const a = await device(registry, blobs, "a", clock);
-  const b = await device(registry, blobs, "b", clock);
+  const a = await device(registry, blobs, "a", clock, semantics);
+  const b = await device(registry, blobs, "b", clock, semantics);
   // A connector run on device a, published and applied on device b.
   await a.sync.intake.begin("seed", {
     connector: "fixture",
@@ -178,7 +181,7 @@ it("an owner DELETE on a switched account runs a delete, answers 204, and the re
       declarations: createStreamDeclarationRegistry([
         {
           name: "items",
-          semantics: "mutable_state",
+          semantics,
           primaryKey: ["id"],
           requiredFields: ["id"],
         },
