@@ -259,7 +259,7 @@ describe("PDPP journey over a real listening HTTP server", () => {
     const after = await fetch(`${baseUrl}/v1/streams/top_artists/records`, {
       headers: { authorization: `Bearer ${accessToken}` },
     });
-    expect(after.status).toBe(403);
+    expect(after.status).toBe(401);
     expect(JSON.stringify(await after.json())).toContain("grant_revoked");
   });
 

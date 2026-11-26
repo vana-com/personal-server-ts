@@ -843,13 +843,13 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     expect(context.active).toBe(false);
     expect(context.inactiveReason).toBe("grant_revoked");
 
-    // And the RS denies the read with 403 grant_revoked. There is no cache to
+    // And the RS denies the read with 401 grant_revoked. There is no cache to
     // wait out here: the RS resolves through the AS on every request, so the
     // 60-second positive-cache bound is satisfied trivially.
     const after = await harness.app.request("/v1/streams/playlists/records", {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    expect(after.status).toBe(403);
+    expect(after.status).toBe(401);
     const error = await after.json();
     expect(JSON.stringify(error)).toContain("grant_revoked");
   });

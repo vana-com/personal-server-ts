@@ -28,9 +28,15 @@ export function pdppVersionFailure(c: Context): PdppError | undefined {
 }
 
 export function pdppVersionMiddleware(
-  reportError: (c: Context, error: PdppError) => Response,
+  requestId: () => string,
+  /** Which request paths are Core RS operations of this router. */
+  appliesTo: (path: string) => boolean,
 ): MiddlewareHandler {
   return async (c, next) => {
+    if (!appliesTo(c.req.path)) {
+      await next();
+      return;
+    }
     try {
       assertSupportedPdppVersion(c.req.header("PDPP-Version"));
     } catch (error) {
@@ -42,8 +48,19 @@ export function pdppVersionMiddleware(
     if (!failure) return;
     if (c.res.status < 400) {
       // A route served the request without passing through authentication
-      // (or ignored the failure). Refuse rather than disclose.
-      c.res = reportError(c, failure);
+      // (or ignored the failure). Refuse rather than disclose. The refusal is
+      // a fresh Response: `c.json` would carry the route's pending headers
+      // (a redirect's Location), and the `c.res` setter copies the refused
+      // response's headers onto its replacement unless `c.res` is cleared.
+      c.res = undefined as unknown as Response;
+      c.res = new Response(JSON.stringify(failure.toJSON(requestId())), {
+        status: failure.status,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "private, no-store",
+          "Request-Id": requestId(),
+        },
+      });
     }
     c.res.headers.delete("PDPP-Version");
   };

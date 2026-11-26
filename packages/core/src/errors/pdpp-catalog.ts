@@ -57,8 +57,10 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   insufficient_scope: 403,
   grant_stream_not_allowed: 403,
   grant_time_range_exceeded: 403,
-  grant_expired: 403,
-  grant_revoked: 403,
+  // spec-core §8 error table: inactive grants are 401 authentication_error
+  // with the Bearer invalid_token challenge (RS item 19), not 403.
+  grant_expired: 401,
+  grant_revoked: 401,
   grant_invalid: 403,
   disclosure_unavailable: 403,
   blob_not_found: 404,
@@ -84,8 +86,8 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   insufficient_scope: "permission_error",
   grant_stream_not_allowed: "permission_error",
   grant_time_range_exceeded: "permission_error",
-  grant_expired: "permission_error",
-  grant_revoked: "permission_error",
+  grant_expired: "authentication_error",
+  grant_revoked: "authentication_error",
   grant_invalid: "permission_error",
   disclosure_unavailable: "permission_error",
   blob_not_found: "not_found_error",

@@ -14,6 +14,7 @@ describe("PDPP-Version negotiation (spec-core §8 API versioning)", () => {
   it("selects 0.1 when sent exactly, ignoring surrounding whitespace", () => {
     expect(negotiatePdppVersion("0.1")).toEqual({ ok: true, selected: "0.1" });
     expect(negotiatePdppVersion(" 0.1 ")).toEqual({ ok: true, selected: "0.1" });
+    expect(negotiatePdppVersion("\t0.1\t")).toEqual({ ok: true, selected: "0.1" });
   });
 
   it.each(["0.1.0", "v0.1", "2026-04-06", "0.2"])(
@@ -25,7 +26,7 @@ describe("PDPP-Version negotiation (spec-core §8 API versioning)", () => {
     },
   );
 
-  it.each(["", '"0.1"', "0.1, 0.1", "0.1,2026-04-06", "0 .1"])(
+  it.each(["", '"0.1"', "0.1, 0.1", "0.1,2026-04-06", "0 .1", "\u00a00.1\u00a0"])(
     "treats %j as an invalid field (invalid_request)",
     (value) => {
       const result = negotiatePdppVersion(value);

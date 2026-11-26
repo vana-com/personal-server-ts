@@ -30,6 +30,9 @@ export const CORS_ALLOW_HEADERS: readonly string[] = [
   "X-PAYMENT",
   // Vana Web loads an MCP scope request with its approval-link token.
   MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  // PDPP Core RS contract selection (spec-core §8 "API versioning": a
+  // deployment supporting browser cross-origin clients MUST permit it).
+  "PDPP-Version",
 ];
 
 /** Response headers a browser client must be able to read back. */
@@ -38,6 +41,10 @@ export const CORS_EXPOSE_HEADERS: readonly string[] = [
   "X-Vana-Data-Source",
   "X-PAYMENT-RESPONSE",
   "Content-Disposition",
+  // A PDPP client MUST verify the selected contract before using a response
+  // (spec-core §8), so a browser client must be able to read it.
+  "PDPP-Version",
+  "Request-Id",
 ];
 
 export const CORS_ALLOW_METHODS: readonly string[] = [

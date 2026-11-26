@@ -247,9 +247,9 @@ describe("v0.2: a revoked grant denies reads across every surface", () => {
     "/streams/transactions/records",
     "/streams/transactions/records/t1",
   ]) {
-    it(`answers 403 grant_revoked on ${path}`, async () => {
+    it(`answers 401 grant_revoked on ${path}`, async () => {
       const res = await revoked().request(path, { headers: AUTH });
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(401);
       expect(
         ((await res.json()) as { error: { code: string } }).error.code,
       ).toBe("grant_revoked");

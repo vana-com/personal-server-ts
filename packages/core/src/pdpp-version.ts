@@ -50,7 +50,10 @@ export function negotiatePdppVersion(
   if (raw === null || raw === undefined) {
     return { ok: true, selected: PDPP_VERSION };
   }
-  const value = raw.trim();
+  // HTTP field parsing removes only optional whitespace (SP / HTAB); any
+  // other leading or trailing character, such as U+00A0, stays part of the
+  // value and makes it an invalid token.
+  const value = raw.replace(/^[ \t]+|[ \t]+$/g, "");
   if (!TOKEN.test(value)) {
     return {
       ok: false,

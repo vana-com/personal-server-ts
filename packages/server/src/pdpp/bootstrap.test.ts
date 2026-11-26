@@ -1146,7 +1146,7 @@ describe("operator per-client grant lifetime policy", () => {
       // The SAME token, unchanged, is now refused reading the SAME record —
       // grant expiry, not a fabricated or alternate token or record.
       const afterRead = await readRecord(shortLived.accessToken, RECORD_ID);
-      expect(afterRead.status).toBe(403);
+      expect(afterRead.status).toBe(401);
       expect((await afterRead.json()).error.code).toBe("grant_expired");
       expect(
         (await introspect(shortLived.ownerAccessToken, shortLived.accessToken))

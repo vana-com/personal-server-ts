@@ -578,7 +578,7 @@ describe("pdpp records routes: authentication", () => {
     expect(body.error.code).toBe("grant_stream_not_allowed");
   });
 
-  it("maps grant_revoked inactiveReason to 403 grant_revoked", async () => {
+  it("maps grant_revoked inactiveReason to 401 grant_revoked", async () => {
     const { app } = buildApp({
       "revoked-tok": {
         active: false,
@@ -590,9 +590,12 @@ describe("pdpp records routes: authentication", () => {
     const res = await app.request("/streams/playlists/records", {
       headers: { Authorization: "Bearer revoked-tok" },
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
+    // RS item 19: every inactive token carries the Bearer invalid_token challenge.
+    expect(res.headers.get("WWW-Authenticate")).toMatch(/^Bearer error="invalid_token"/);
     const body = await res.json();
     expect(body.error.code).toBe("grant_revoked");
+    expect(body.error.type).toBe("authentication_error");
   });
 });
 

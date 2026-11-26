@@ -438,7 +438,7 @@ describe("v0.2 journey: revocation and empty results", () => {
     const after = await rs().request("/v1/streams/transactions/records", {
       headers: bearer(accessToken),
     });
-    expect(after.status).toBe(403);
+    expect(after.status).toBe(401);
     const body = await after.text();
     expect(JSON.parse(body).error.code).toBe("grant_revoked");
     // The refusal discloses nothing the grant used to reach.

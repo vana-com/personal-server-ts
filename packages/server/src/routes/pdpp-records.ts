@@ -865,7 +865,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   // so an inactive token still gets its 401 first.
   app.use(
     "*",
-    pdppVersionMiddleware((c, error) => sendError(c, error, requestId())),
+    pdppVersionMiddleware(
+      requestId,
+      // This router is mounted at /v1, and Hono applies "*" to everything
+      // mounted under that prefix. Only this router's own Core paths
+      // negotiate; /v1/data, /v1/grants and the other non-PDPP routers
+      // ignore the field.
+      (path) =>
+        /^(\/v1)?\/(streams|records|blobs\/ingest)(\/|$)/.test(path),
+    ),
   );
 
   /**
@@ -964,6 +972,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    // An inactive token gets its 401 before any query validation (spec-core
+    // §8: "Every inactive access token produces HTTP 401").
+    if (!context?.active) {
+      return sendError(c, mapInactiveToError(context!), reqId);
+    }
     try {
       parseRecordQuery(c.req.url, "listStreams");
     } catch (err) {
@@ -1131,6 +1144,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    // Every inactive access token gets 401 first (spec-core §8, RS item 19).
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
       parseRecordQuery(c.req.url, "streamMetadata");
@@ -1381,6 +1397,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
+    // Every inactive access token gets 401 first (spec-core §8, RS item 19).
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
 
     try {
       parseRecordQuery(c.req.url, "deleteRecord");
