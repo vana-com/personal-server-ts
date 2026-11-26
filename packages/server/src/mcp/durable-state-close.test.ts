@@ -425,4 +425,35 @@ describe("MCP durable state close", () => {
     }
     expect(firstClosed).toBe(true);
   });
+
+  it("keeps the final connection readable without exposing a mutable reference after close", async () => {
+    const s = await seeded();
+    await s.state.close();
+    const before = await readFile(s.path);
+    const record = await s.state.connections.getById(s.id);
+    if (!record) throw new Error("fixture connection missing");
+    Object.assign(record, { lastUsedAt: "2026-01-02T00:00:00Z" });
+    expect((await s.state.connections.getById(s.id))?.lastUsedAt).not.toBe(
+      record.lastUsedAt,
+    );
+    expect(await readFile(s.path)).toEqual(before);
+  });
+
+  it("exposes an admitted identity write to a read started after close begins", async () => {
+    const s = await emptyTarget();
+    const saving = s.state.rememberIdentity(identity);
+    const closing = s.state.close();
+    await expect(s.state.getIdentity(identity.userPsId)).resolves.toEqual(
+      identity,
+    );
+    await Promise.all([saving, closing]);
+    const reopened = await openMcpDurableState({ path: s.path, key: s.key });
+    try {
+      await expect(reopened.getIdentity(identity.userPsId)).resolves.toEqual(
+        identity,
+      );
+    } finally {
+      await reopened.close();
+    }
+  });
 });
