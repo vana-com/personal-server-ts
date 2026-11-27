@@ -1920,6 +1920,8 @@ function listingVisibility(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  /** The owner's own listing (no grant): it also names orphaned files. */
+  listOrphanedFiles = false,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   const deletion = deps.scopeDeletions
     ? async (scope: string, entry: ReadDeletionEntry) =>
@@ -1936,9 +1938,11 @@ function listingVisibility(
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
     // A stored file whose connection was deleted is still stored, though no
-    // read serves it. List it, so a host that checks for remaining data sees
-    // it until the file's own delete finishes.
+    // read serves it. The owner's listing names it, so a host that checks for
+    // remaining data sees it until the file's own delete finishes. A grant's
+    // listing does not.
     const orphanedFile =
+      listOrphanedFiles &&
       listing.kind === "refused" &&
       listing.refusal !== undefined &&
       "reason" in listing.refusal &&
@@ -2888,7 +2892,7 @@ export async function handlePersonalServerDataRequest(
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: listingVisibility(deps, deletionDeadlineAtMs),
+        isVisible: listingVisibility(deps, deletionDeadlineAtMs, !listAuth),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
