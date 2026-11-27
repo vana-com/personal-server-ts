@@ -415,3 +415,36 @@ it("failed rollback preparation leaves the ingress listening while active() stay
     ).status,
   ).toBe(200);
 });
+
+it("names MCP_REDIRECT_URIS instead of surfacing a bare JSON SyntaxError", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-service-redirect-uris-"));
+  directories.push(directory);
+  const port = await freePort();
+  await expect(
+    startMcpRouter(
+      {
+        client: createFakeDstackClient({ appId: "1".repeat(40) }),
+        gatewayUrl: "https://gateway.invalid",
+        chainId: 14800,
+        contracts: { ...DEFAULTS.gateway.contracts },
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      },
+      {
+        FLEET_ENABLED: "true",
+        NODE_ID: "source",
+        NODE_SECRET: "s".repeat(32),
+        MCP_PUBLIC_ORIGIN: "https://mcp-dev.vana.org",
+        MCP_APPROVAL_URL: "https://web.invalid/approve",
+        MCP_STATE_PATH: join(directory, "source.sealed"),
+        MCP_INGRESS_HOST: "127.0.0.1",
+        MCP_INGRESS_PORT: String(port),
+        MCP_REDIRECT_URIS: '["https://claude.ai/api/mcp/auth_callback"',
+      },
+      fetch,
+      () => ({
+        ownerReady: async () => true,
+        dispatch: async () => Response.json({ ok: true }),
+      }),
+    ),
+  ).rejects.toThrow("MCP_REDIRECT_URIS must be valid JSON");
+});

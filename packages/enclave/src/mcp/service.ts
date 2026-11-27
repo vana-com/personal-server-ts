@@ -99,7 +99,14 @@ export async function startMcpRouter(
     throw new Error("MCP_APPROVAL_URL must be HTTPS");
   if (!env.MCP_STATE_PATH || !isAbsolute(env.MCP_STATE_PATH))
     throw new Error("MCP_STATE_PATH must be an absolute durable-volume path");
-  const redirects: unknown = JSON.parse(env.MCP_REDIRECT_URIS ?? "[]");
+  let redirects: unknown;
+  try {
+    redirects = JSON.parse(env.MCP_REDIRECT_URIS ?? "[]");
+  } catch {
+    throw new Error(
+      "MCP_REDIRECT_URIS must be valid JSON listing the allowed HTTPS callbacks",
+    );
+  }
   if (
     !Array.isArray(redirects) ||
     redirects.length === 0 ||
