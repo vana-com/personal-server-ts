@@ -4226,13 +4226,26 @@ export async function handlePersonalServerDataRequest(
         // sync manager's queue does not nest); a retry deletes what is left.
         if (resetServing && result.steps.gateway.status !== "failed") {
           for (const sibling of resetServing.siblings(parsed.scope)) {
-            if (deps.storage.countVersions(sibling) === 0) continue;
+            // A device may not have pulled a gateway-registered sibling yet.
+            // Ask the durable delete path; only omit a receipt for a true no-op.
             const deleted = await deleteDurably(
               sibling,
               seal.commit.bind(seal),
             );
+            const { gateway, storage, local } = deleted.steps;
+            if (
+              gateway.status === "skipped" &&
+              local.status === "ok" &&
+              local.deletedCount === 0 &&
+              (storage.status === "skipped" || storage.status === "ok") &&
+              !storage.blobsDeleted &&
+              !storage.blobsMissing &&
+              !storage.blobsPending &&
+              !deleted.pendingBlobDeletion
+            )
+              continue;
             alsoDeleted.push(deleted);
-            if (deleted.steps.gateway.status === "failed") break;
+            if (gateway.status === "failed") break;
           }
         }
       } catch (err) {

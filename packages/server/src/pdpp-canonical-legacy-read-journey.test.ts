@@ -38,6 +38,65 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { type CreateServerOptions, type ServerContext } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
+import {
+  deleteScope,
+  type DeleteScopeDeps,
+} from "../../core/src/sync/workers/delete.js";
+import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts-core/api";
+
+// Keep the route, write seal, record store and deletion worker real. Only the
+// gateway/blob transport is synthetic, for these two DELETE journeys.
+let durableDeleteFixture:
+  Pick<DeleteScopeDeps, "deleteData" | "dataPointFeed"> | undefined;
+vi.mock("@opendatalabs/personal-server-ts-core/api", async (importOriginal) => {
+  const api =
+    await importOriginal<
+      typeof import("@opendatalabs/personal-server-ts-core/api")
+    >();
+  return {
+    ...api,
+    handlePersonalServerDataRequest: (
+      request: Request,
+      deps: PersonalServerDataApiDeps,
+      options?: Parameters<typeof api.handlePersonalServerDataRequest>[2],
+    ) => {
+      const remote =
+        request.method === "DELETE" ? durableDeleteFixture : undefined;
+      if (!remote)
+        return api.handlePersonalServerDataRequest(request, deps, options);
+      type Sync = NonNullable<PersonalServerDataApiDeps["syncManager"]>;
+      const syncManager = {
+        ...deps.syncManager,
+        deleteScope: ((scope, commit) => {
+          if (!commit)
+            throw new Error("fixture DELETE must use the legacy write seal");
+          return commit((hold) =>
+            deleteScope(
+              {
+                ...remote,
+                storage: deps.storage,
+                serverOwner: deps.serverOwner,
+                logger: {
+                  debug() {},
+                  info() {},
+                  warn() {},
+                  error() {},
+                } as DeleteScopeDeps["logger"],
+              },
+              scope,
+              { hold },
+            ),
+          );
+        }) satisfies NonNullable<Sync["deleteScope"]>,
+      } as Sync;
+      return api.handlePersonalServerDataRequest(
+        request,
+        { ...deps, syncManager },
+        options,
+      );
+    },
+  };
+});
 
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
@@ -1764,6 +1823,108 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       db.close();
     }
   }
+
+  it.each([false, true])(
+    "tombstones a gateway-only sibling (retry after first failure: %s)",
+    async (failFirst) => {
+      const primary = "oura.activity";
+      const sibling = "oura.readiness";
+      const deletedAt = "2026-09-11T00:00:00.000Z";
+      const attempts: string[] = [];
+      const published = new Set<string>();
+      const registered = new Set([primary, sibling]);
+      const dataPointFeed: NonNullable<DeleteScopeDeps["dataPointFeed"]> = {
+        getDataPoint: async ({ ownerAddress, scope }) => {
+          if (!registered.has(scope)) return null;
+          const tombstoned = published.has(scope);
+          return {
+            id: "fixture-" + scope,
+            ownerAddress,
+            scope,
+            dataHash: `0x${(tombstoned ? "00" : "11").repeat(32)}`,
+            metadataHash: `0x${(tombstoned ? "00" : "11").repeat(32)}`,
+            expectedVersion: tombstoned ? "3" : "2",
+            addedAt: "2026-09-01T00:00:00Z",
+            deletedAt: tombstoned ? deletedAt : null,
+          };
+        },
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      };
+      await ctx!.cleanup();
+      ctx = await boot("oura", { dataPointFeed });
+      await legacyWrite(primary, COVERED_A1);
+      await collectActivity();
+      expect(ctx.indexManager.findLatestByScope(sibling)).toBeUndefined();
+      expect(
+        await dataPointFeed.getDataPoint({
+          ownerAddress: owner,
+          scope: sibling,
+        }),
+      ).toMatchObject({
+        expectedVersion: "2",
+        deletedAt: null,
+      });
+      let failSibling = failFirst;
+      durableDeleteFixture = {
+        dataPointFeed,
+        deleteData: {
+          tombstone: async (scope) => {
+            attempts.push(scope);
+            if (!registered.has(scope)) return { status: "not-registered" };
+            if (scope === sibling && failSibling) {
+              failSibling = false;
+              throw new Error(
+                "fixture gateway refused the first sibling tombstone",
+              );
+            }
+            if (published.has(scope))
+              return { status: "already-deleted", version: "3", deletedAt };
+            published.add(scope);
+            return { status: "tombstoned", version: "3", deletedAt };
+          },
+          deleteBlobVersions: async (_scope, versions) => ({
+            deleted: versions,
+            missing: [],
+            failed: [],
+          }),
+        },
+      };
+      const remove = () =>
+        ctx!.app.request("/v1/data/" + primary, {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+        });
+      try {
+        let response = await remove();
+        if (failFirst) {
+          expect(response.status).toBe(502);
+          expect(await response.json()).toMatchObject({
+            error: {
+              errorCode: "DELETE_TOMBSTONE_FAILED",
+              details: { deleted: [primary] },
+            },
+          });
+          expect([...published]).toEqual([primary]);
+          expect(attempts.filter((scope) => scope === sibling)).toHaveLength(1);
+          response = await remove();
+        }
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          alsoDeleted: [
+            { scope: sibling, steps: { gateway: { status: "ok" } } },
+          ],
+        });
+        expect([...published]).toEqual([primary, sibling]);
+        expect(attempts.filter((scope) => scope === sibling)).toHaveLength(
+          failFirst ? 2 : 1,
+        );
+        expect(ctx.indexManager.findLatestByScope(sibling)).toBeUndefined();
+        expect(connectionRows(accountOne)).toBe(0);
+      } finally {
+        durableDeleteFixture = undefined;
+      }
+    },
+  );
 
   // An unswitched account has no connector delete (it answers NOT_SWITCHED),
   // so the per-scope DELETE is the only way to erase a canonical scope. It
