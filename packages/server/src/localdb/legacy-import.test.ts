@@ -589,7 +589,7 @@ it("import accepts a collection floor without treating it as a delete", async ()
   expect((await f.run()).kind).toBe("already-imported");
 });
 
-it("an import wakes publish once when it imports, and not on a replay or a refusal", async () => {
+it("an import wakes publish once when it imports, once on replay, and never on a refusal", async () => {
   const f = await fixture();
   const wake = vi.fn();
   Object.assign(f.deps, { recordsCommitted: wake });
@@ -602,10 +602,50 @@ it("an import wakes publish once when it imports, and not on a replay or a refus
   expect((await f.run()).kind).toBe("imported");
   expect(wake).toHaveBeenCalledTimes(1);
   expect((await f.run()).kind).toBe("already-imported");
-  expect(wake).toHaveBeenCalledTimes(1);
+  expect(wake).toHaveBeenCalledTimes(2);
   Object.assign(f.source, { owner: "0xdef" });
   expect((await f.run()).kind).toBe("refused");
+  expect(wake).toHaveBeenCalledTimes(2);
+});
+
+it("a committed legacy import still wakes publishing when both result count reads fail", async () => {
+  const f = await fixture();
+  const wake = vi.fn();
+  const warn = vi.fn();
+  Object.assign(f.deps, {
+    recordsCommitted: wake,
+    logger: { info() {}, warn },
+  });
+  const query = f.db.query.bind(f.db);
+  let countReads = 0;
+  const spy = vi
+    .spyOn(f.db, "query")
+    .mockImplementation(async (sql, params) => {
+      if (
+        sql.startsWith("SELECT count(*) AS n FROM log_tombstones WHERE") &&
+        ++countReads > 1
+      ) {
+        expect(await query("SELECT highest_seq FROM import_ledger")).toEqual([
+          { highest_seq: 2 },
+        ]);
+        throw new Error("fixture count unavailable after commit");
+      }
+      return query(sql, params);
+    });
+  try {
+    expect(await f.run()).toMatchObject({ kind: "imported", tombstoned: null });
+    expect(countReads).toBe(3);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(await f.db.query("SELECT highest_seq FROM import_ledger")).toEqual([
+    { highest_seq: 2 },
+  ]);
+  expect(
+    await f.db.query("SELECT record_key FROM records ORDER BY record_key"),
+  ).toEqual([{ record_key: "a" }, { record_key: "b" }]);
   expect(wake).toHaveBeenCalledTimes(1);
+  expect(warn).toHaveBeenCalledTimes(1);
 });
 
 it("a publish wake that throws does not fail the import", async () => {

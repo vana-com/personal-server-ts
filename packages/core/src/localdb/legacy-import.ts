@@ -69,8 +69,8 @@ export type LegacyImportResult =
        * receipt). A stream with some of them still imports the rest. A
        * deletion with no full key counts as `deletion_<reason>`. */
       readonly quarantine: QuarantineCounts;
-      /** Seed tombstones this call wrote (`ImportSource.deletions`). */
-      readonly tombstoned: number;
+      /** Seed tombstones this call wrote, or null if the committed count was unreadable. */
+      readonly tombstoned: number | null;
       /** Staged rows the fill-only rules kept out because the stream holds,
        * or deleted, the key with other content. They are in `receipt.rows`
        * and are not imported: imported = `receipt.rows - blocked`. */
@@ -122,7 +122,7 @@ export async function importLegacySource(
   const result = await importSource(deps, ledger, source);
   // One wake per import, not per chunk: a wake per chunk would start a publish
   // cycle every debounce while the import is still merging.
-  if (result.kind === "imported") announceRecordsCommitted(deps);
+  if (result.kind !== "refused") announceRecordsCommitted(deps);
   return result;
 }
 
@@ -385,11 +385,19 @@ async function importSource(
         ...ledger.statements(receipt),
       ]);
       receiptCommitted = true;
-      // A transient read error here cannot undo the committed receipt. Retry
-      // exactly once for the result count, without re-running the write.
-      const tombstoned =
-        (await countTombstones().catch(() => countTombstones())) -
-        tombstonesBefore;
+      // A transient read error cannot undo the committed receipt. Retry once,
+      // then report an unknown count and let the normal path wake publishing.
+      let tombstoned: number | null = null;
+      try {
+        tombstoned =
+          (await countTombstones().catch(() => countTombstones())) -
+          tombstonesBefore;
+      } catch {
+        deps.logger.warn(
+          { connectionId, stream },
+          "Committed legacy import tombstone count unavailable",
+        );
+      }
       // `already-imported` says an earlier call completed this very revision.
       // A reopened `seed_window_closed` receipt is `excluded`: it completed
       // nothing, so this call writes the first receipt that did, however few
