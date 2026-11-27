@@ -1935,8 +1935,17 @@ function listingVisibility(
   if (!view) return deletion;
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
-    if (listing.kind === "refused") return false;
-    const canonicalOwned = deletionHistoryOf(listing) === "canonical";
+    // A stored file whose connection was deleted is still stored, though no
+    // read serves it. List it, so a host that checks for remaining data sees
+    // it until the file's own delete finishes.
+    const orphanedFile =
+      listing.kind === "refused" &&
+      listing.refusal !== undefined &&
+      "reason" in listing.refusal &&
+      listing.refusal.reason === "no_connection";
+    if (listing.kind === "refused" && !orphanedFile) return false;
+    const canonicalOwned =
+      !orphanedFile && deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
     return (

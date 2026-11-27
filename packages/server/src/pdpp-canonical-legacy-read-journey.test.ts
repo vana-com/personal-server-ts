@@ -1762,6 +1762,15 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     });
     expect(deletion.status).toBe(200);
     expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeFalsy();
+    // The sibling's file is still stored, so the listing still names it
+    // until its own delete; a host reads this to decide what is left.
+    const between = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(between.scopes.map((s) => s.scope).sort()).toEqual([
+      "notes.manual",
+      "oura.readiness",
+    ]);
     const latest = await ownerGet("/v1/data/oura.activity");
     expect(latest.status).toBe(503);
     expect(JSON.parse(latest.text)).toMatchObject({ reason: "no_connection" });
@@ -1773,6 +1782,11 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     });
     expect(sibling.status).toBe(200);
     expect(ctx!.indexManager.findLatestByScope("oura.readiness")).toBeFalsy();
+    // Both deletes done: the listing names no scope of the source.
+    const after = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(after.scopes.map((s) => s.scope)).toEqual(["notes.manual"]);
 
     // A scope the view does not own is still deleted as before.
     const manual = await ctx!.app.request("/v1/data/notes.manual", {
