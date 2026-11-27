@@ -316,6 +316,8 @@ export interface LegacyScopeViewPort {
    * `deletionHistoryOf`.
    */
   ownsScope(scope: string): boolean;
+  /** Erase the live owning connections, inside the caller's legacy write seal. */
+  eraseOwningConnections?(scope: string): number;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -329,6 +331,8 @@ export interface CreateLegacyScopeViewInput {
    * are then refused.
    */
   records?: CanonicalLegacyReadStore;
+  /** Optional synchronous, idempotent deletion of a record-store connection. */
+  deleteConnection?(instance: string): void;
   /** Current trusted declarations; pass the same registry used by canonical ingest. */
   declarations?: ReadCanonicalLegacyScopeInput["declarations"];
   /** Methods this boot configures for a store source id. */
@@ -1371,6 +1375,29 @@ export function createLegacyScopeView(
     ownsScope(scope) {
       return authority.readSnapshot(() => ownsScope(scope));
     },
+    eraseOwningConnections: input.deleteConnection
+      ? (scope) => {
+          const instances = authority.readSnapshot(() => {
+            // Read ownership also considers tombstoned and reset connections.
+            // Those can prevent fallback on GET but have no live rows to erase.
+            if (!ownsScope(scope)) return [];
+            const methods =
+              decide(scope).kind === "file"
+                ? optedOutMethods(scope)
+                : [...scopeMethods(scope).keys()];
+            return [...new Set(authority.listMethodConnections(methods)
+              .filter((connection) =>
+                connection.deletedAt === null &&
+                authority.hasHeldData(connection.instance, null),
+              )
+              .map((connection) => connection.instance))];
+          });
+          // The snapshot is closed before the record-store writes begin.
+          const erase = input.deleteConnection!;
+          for (const instance of instances) erase(instance);
+          return instances.length;
+        }
+      : undefined,
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),
     isReset: (scope) => authority.isReset(scope),

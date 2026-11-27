@@ -4095,21 +4095,9 @@ export async function handlePersonalServerDataRequest(
         throw new LineageCascadeUnavailableError({ scope: parsed.scope });
       }
 
-      // A canonical-owned scope's latest body is its connection's rows. No
-      // store seam deletes one legacy scope's rows (streams can be shared,
-      // and the account and its generation are the unit of erasure), so a
-      // 200 here would leave the data readable. Refuse before any gateway or
-      // file change; the connection's own delete erases its rows.
-      if (deps.legacyScopeView?.ownsScope(parsed.scope)) {
-        return jsonResponse(
-          {
-            error: "CANONICAL_DELETE_UNSUPPORTED",
-            message: `Scope "${parsed.scope}" has connector records that this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
-            scope: parsed.scope,
-          },
-          { status: 409 },
-        );
-      }
+      const canonicalDeleteUnsupported = Symbol("canonical-delete-unsupported");
+      const view = deps.legacyScopeView;
+      let erasedConnections = 0;
 
       // Durable order: gateway tombstone -> storage blobs -> local copy. The
       // sync manager owns the remote ports; without one (sync disabled or
@@ -4123,14 +4111,22 @@ export async function handlePersonalServerDataRequest(
       // retryable 503. An On cannot land between the decision and the delete.
       const seal = deps.storage.legacyWriteSeal;
       if (!seal) return accountModeUnknownResponse();
+      const commitDelete: typeof seal.commit = (operation) =>
+        seal.commit(async (hold) => {
+          if (view?.ownsScope(parsed.scope)) {
+            if (!view.eraseOwningConnections) throw canonicalDeleteUnsupported;
+            // Unswitched hosts express a source deletion as legacy scope
+            // deletes. Erase its owning connections before removing this
+            // file; another request (or a retry) can finish the other files.
+            erasedConnections = view.eraseOwningConnections(parsed.scope);
+          }
+          return operation(hold);
+        });
       let result: DeleteScopeResult;
       try {
         result = deps.syncManager?.deleteScope
-          ? await deps.syncManager.deleteScope(
-              parsed.scope,
-              seal.commit.bind(seal),
-            )
-          : await seal.commit((hold) =>
+          ? await deps.syncManager.deleteScope(parsed.scope, commitDelete)
+          : await commitDelete((hold) =>
               deleteScopeLocally(
                 {
                   storage: deps.storage,
@@ -4143,6 +4139,16 @@ export async function handlePersonalServerDataRequest(
               ),
             );
       } catch (err) {
+        if (err === canonicalDeleteUnsupported) {
+          return jsonResponse(
+            {
+              error: "CANONICAL_DELETE_UNSUPPORTED",
+              message: `Scope "${parsed.scope}" has connector records that this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
+              scope: parsed.scope,
+            },
+            { status: 409 },
+          );
+        }
         if (err instanceof LegacyWriteRefusedError) {
           return err.verdict === "switched"
             ? switchedDeleteRefusalResponse()
@@ -4152,9 +4158,14 @@ export async function handlePersonalServerDataRequest(
       }
 
       if (result.steps.gateway.status === "failed") {
-        // Nothing was deleted: the local copy is kept on purpose so sync
-        // cannot resurrect a half-deleted scope. Surface it as an upstream
-        // failure with the per-step result attached.
+        // Underlying records may already be erased. The local file is kept
+        // when the legacy tombstone fails; a retry can finish the file delete.
+        if (erasedConnections > 0) {
+          deps.logger?.warn?.(
+            { scope: parsed.scope, erasedConnections },
+            "Connection records erased; scope tombstone needs retry",
+          );
+        }
         throw new DeleteTombstoneFailedError({
           scope: parsed.scope,
           result,

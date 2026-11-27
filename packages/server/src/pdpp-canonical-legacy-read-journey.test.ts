@@ -1720,6 +1720,17 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       detail: "method_not_configured",
     });
     expect(read.text).not.toContain("stale-legacy");
+    const before = ctx!.indexManager.findLatestByScope("oura.activity");
+    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+      method: "DELETE",
+      headers: new Headers([["Authorization", `Bearer ${ctx!.devToken!}`]]),
+    });
+    expect(deletion.status).toBe(409);
+    expect(await deletion.json()).toMatchObject({
+      error: "CANONICAL_DELETE_UNSUPPORTED",
+      scope: "oura.activity",
+    });
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(before);
     // Only the owned scope is refused; the others keep their files.
     expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
@@ -1732,30 +1743,32 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     ]);
   });
 
-  it("refuses a local DELETE of a canonical scope and changes nothing", async () => {
+  it("erases the owning connection and both requested legacy files", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
+    await legacyWrite("oura.readiness", { readiness: [] });
     await legacyWrite("notes.manual", { text: "kept" });
     await collectActivity();
-    const before = ctx!.indexManager.findLatestByScope("oura.activity");
-    expect(before).toBeDefined();
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe("canonical");
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
+    expect(ctx!.indexManager.findLatestByScope("oura.readiness")).toBeDefined();
 
     const deletion = await ctx!.app.request("/v1/data/oura.activity", {
       method: "DELETE",
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
-    expect(deletion.status).toBe(409);
-    expect(await deletion.json()).toMatchObject({
-      error: "CANONICAL_DELETE_UNSUPPORTED",
-      scope: "oura.activity",
-    });
-    // Nothing was deleted, and nothing claims it was: the legacy history
-    // and the canonical latest body are both as before.
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
-      before,
-    );
+    expect(deletion.status).toBe(200);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeFalsy();
     const latest = await ownerGet("/v1/data/oura.activity");
-    expect(latest.status).toBe(200);
-    expect(ids(latest.text)).toEqual(["a1"]);
+    expect(latest.status).toBe(503);
+    expect(JSON.parse(latest.text)).toMatchObject({ reason: "no_connection" });
+    expect(latest.text).not.toContain('"id":"a1"');
+
+    const sibling = await ctx!.app.request("/v1/data/oura.readiness", {
+      method: "DELETE",
+      headers: new Headers([["Authorization", `Bearer ${ctx!.devToken!}`]]),
+    });
+    expect(sibling.status).toBe(200);
+    expect(ctx!.indexManager.findLatestByScope("oura.readiness")).toBeFalsy();
 
     // A scope the view does not own is still deleted as before.
     const manual = await ctx!.app.request("/v1/data/notes.manual", {
@@ -1764,6 +1777,26 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     });
     expect(manual.status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(404);
+  });
+
+  it("keeps refusing scope DELETE on a switched account", async () => {
+    await legacyWrite("oura.activity", COVERED_A1);
+    await collectActivity();
+    const before = ctx!.indexManager.findLatestByScope("oura.activity");
+    await ctx!.accountModeAuthority.submitEvidence({
+      owner: ctx!.serverOwner!,
+      state: "on",
+      generation: 1,
+    });
+    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+      method: "DELETE",
+      headers: new Headers([["Authorization", `Bearer ${ctx!.devToken!}`]]),
+    });
+    expect(deletion.status).toBe(409);
+    expect(await deletion.json()).not.toMatchObject({
+      error: "CANONICAL_DELETE_UNSUPPORTED",
+    });
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(before);
   });
 });
 
