@@ -123,6 +123,42 @@ export interface PdppTokenContext {
   clientId?: string;
   expiresAt?: string;
   inactiveReason?: PdppInactiveReason;
+  /**
+   * AS item 29: stored instance → the client's pairwise handle. When set,
+   * every `instance_id` the RS shows this client goes through it, and the
+   * client's `instance_id` parameter is resolved back through it.
+   */
+  clientInstanceHandles?: Record<string, string>;
+}
+
+/** The handle a client sees for a stored instance. */
+export function clientHandleFor(
+  context: Pick<PdppTokenContext, "tokenKind" | "clientInstanceHandles">,
+  instance: string,
+): string {
+  if (context.tokenKind !== "client" || !context.clientInstanceHandles)
+    return instance;
+  const handle = context.clientInstanceHandles[instance];
+  // Fail closed: never fall back to the stored id for a pairwise grant.
+  if (handle === undefined)
+    throw new Error("no pairwise handle for a served instance");
+  return handle;
+}
+
+/**
+ * The stored instance a client's `instance_id` names, or a value no stored
+ * instance has when the handle is not this client's. Owner tokens and older
+ * grants use stored ids directly.
+ */
+export function storedInstanceFor(
+  context: Pick<PdppTokenContext, "tokenKind" | "clientInstanceHandles">,
+  handle: string,
+): string {
+  if (context.tokenKind !== "client" || !context.clientInstanceHandles)
+    return handle;
+  for (const [instance, h] of Object.entries(context.clientInstanceHandles))
+    if (h === handle) return instance;
+  return "\u0000unknown-handle";
 }
 
 /**

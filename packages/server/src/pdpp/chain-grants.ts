@@ -444,7 +444,8 @@ export class PdppChainRegistrar {
           grantVersion: grantVersion.toString(),
           expiresAt: expiresAt.toString(),
           pdppGrants: [
-            { entry: reg.entry, grant: stored.grant, salt: reg.salt },
+            // The document the entry fingerprints: the client's view.
+            { entry: reg.entry, grant: store.clientGrantView(stored), salt: reg.salt },
           ],
         },
         signature,

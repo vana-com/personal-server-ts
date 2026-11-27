@@ -521,6 +521,11 @@ export interface PdppIntrospectionResponse {
    * which is why this is the same projection the token response uses.
    */
   authorization_details?: PdppAuthorizationEntry[];
+  /**
+   * RS-only (spec-core §8, L2002): each handle the token can use → the
+   * instance the RS stores. Never returned to a client.
+   */
+  pdpp_instance_bindings?: PdppInstanceBinding[];
 }
 
 /** Why a token did not resolve. Drives the RS error; never echoed to the client. */
@@ -545,11 +550,33 @@ export interface PdppTokenContext {
   instanceIds?: string[];
   /** Owner tokens only. The AS and RS enforce this source scope directly. */
   sourceId?: string;
-  /** Client tokens only. An owner token carries no grant. */
+  /**
+   * Client tokens only. An owner token carries no grant. This is the RS
+   * enforcement view: its `instance_ids` are the instances the RS stores.
+   */
   grant?: Grant;
   clientId?: string;
   expiresAt?: string;
   inactiveReason?: InactiveReason;
+  /**
+   * AS item 29: stored instance → this client's pairwise handle, for a grant
+   * issued with pairwise handles. The RS shows a client only these handles
+   * (record and tombstone `instance_id`, blob `fetch_url`) and resolves the
+   * client's `instance_id` parameter through them. Absent: the client's
+   * handles are the stored instance ids (owner tokens, older grants).
+   */
+  clientInstanceHandles?: Record<string, string>;
+}
+
+/** spec-core §8 `pdpp_instance_bindings` entry (RS-only). */
+export interface PdppInstanceBinding {
+  source_id: string;
+  /** Client tokens: the stream the handle authorizes. */
+  stream?: string;
+  /** The handle the token's holder uses. */
+  instance_id: string;
+  /** Opaque: the instance the RS stores. */
+  rs_instance: string;
 }
 
 export type GrantStatus = "active" | "expired" | "revoked";

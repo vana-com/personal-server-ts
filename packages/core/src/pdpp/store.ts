@@ -199,6 +199,20 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (grant_id) REFERENCES pdpp_grants (grant_id)
 );
+-- AS item 29 / spec-core L1427-L1435, L2004: the pairwise instance handle
+-- each client receives for one of the subject's instances. Random, assigned
+-- once per (subject, client, instance), never reassigned (UNIQUE), so it
+-- names one instance across all sources for that client. Recorded before any
+-- grant or record discloses it (L1824). The stored grant keeps the internal
+-- instance ids the RS enforces with; clients see these handles.
+CREATE TABLE IF NOT EXISTS pdpp_pairwise_instances (
+  subject_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  instance_id TEXT NOT NULL,
+  handle TEXT NOT NULL UNIQUE,
+  assigned_at TEXT NOT NULL,
+  PRIMARY KEY (subject_id, client_id, instance_id)
+);
 -- AS item 29 / spec-core L1427-L1435: the pairwise subject identifier each
 -- client receives as grant \`subject.id\`. Random (so no client can reverse it
 -- to the internal subject or to another client's value), assigned once per
@@ -213,6 +227,26 @@ CREATE TABLE IF NOT EXISTS pdpp_pairwise_subjects (
 );
 CREATE INDEX IF NOT EXISTS idx_pdpp_access_family ON pdpp_access_tokens (family_id);
 `;
+
+/** A grant with each stream's instance ids replaced through `handles`. */
+export function translateGrantInstances(
+  grant: Grant,
+  handles: Record<string, string> | Map<string, string>,
+): Grant {
+  const get = (i: string) =>
+    handles instanceof Map ? handles.get(i) : handles[i];
+  return {
+    ...grant,
+    streams: grant.streams.map((stream) => ({
+      ...stream,
+      instance_ids: stream.instance_ids.map((i) => {
+        const handle = get(i);
+        if (!handle) throw new Error("no pairwise handle for a grant instance");
+        return handle;
+      }),
+    })),
+  };
+}
 
 export function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
@@ -646,6 +680,122 @@ export class PdppAuthStore {
       );
       return pairwiseId;
     }, now);
+  }
+
+  /**
+   * Assign (once) the pairwise handle of each instance for this client, in
+   * one transaction with its history event. Returns internal → handle.
+   */
+  assignPairwiseInstanceHandles(
+    subjectId: string,
+    clientId: string,
+    instances: readonly string[],
+    now: Date = new Date(),
+  ): Map<string, string> {
+    const missing = [...new Set(instances)].filter(
+      (i) => this.findInstanceHandle(subjectId, clientId, i) === null,
+    );
+    if (missing.length > 0) {
+      this.commit(() => {
+        const at = now.toISOString();
+        let assigned = 0;
+        for (const instance of missing) {
+          if (this.findInstanceHandle(subjectId, clientId, instance)) continue;
+          this.db
+            .prepare(
+              `INSERT INTO pdpp_pairwise_instances
+                 (subject_id, client_id, instance_id, handle, assigned_at)
+               VALUES (?, ?, ?, ?, ?)`,
+            )
+            .run(
+              subjectId,
+              clientId,
+              instance,
+              `pwi_${randomBytes(32).toString("base64url")}`,
+              at,
+            );
+          assigned++;
+        }
+        // L1824: assignment of a pairwise identifier is a recorded event.
+        if (assigned > 0)
+          this.history.append(
+            "pairwise_instance_assigned",
+            null,
+            { client_id: clientId, count: assigned },
+            at,
+          );
+      }, now);
+    }
+    const out = new Map<string, string>();
+    for (const instance of instances) {
+      const handle = this.findInstanceHandle(subjectId, clientId, instance);
+      if (handle) out.set(instance, handle);
+    }
+    return out;
+  }
+
+  findInstanceHandle(
+    subjectId: string,
+    clientId: string,
+    instanceId: string,
+  ): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT handle FROM pdpp_pairwise_instances
+         WHERE subject_id = ? AND client_id = ? AND instance_id = ?`,
+      )
+      .get(subjectId, clientId, instanceId) as { handle: string } | undefined;
+    return row?.handle ?? null;
+  }
+
+  /** The internal instance behind this client's handle, or null. */
+  instanceForHandle(
+    subjectId: string,
+    clientId: string,
+    handle: string,
+  ): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT instance_id FROM pdpp_pairwise_instances
+         WHERE subject_id = ? AND client_id = ? AND handle = ?`,
+      )
+      .get(subjectId, clientId, handle) as { instance_id: string } | undefined;
+    return row?.instance_id ?? null;
+  }
+
+  /**
+   * internal instance → this client's handle, for every instance of a grant
+   * issued with pairwise handles; undefined for a grant issued before them
+   * (its document is immutable and keeps the ids it was issued with).
+   */
+  clientInstanceHandles(stored: StoredGrant): Record<string, string> | undefined {
+    const evidence = this.getConsentEvidence(stored.grant.grant_id);
+    if (evidence?.instance_handles !== "pairwise") return undefined;
+    const out: Record<string, string> = {};
+    for (const stream of stored.grant.streams)
+      for (const instance of stream.instance_ids) {
+        const handle = this.findInstanceHandle(
+          stored.subjectId,
+          stored.clientId,
+          instance,
+        );
+        // Assigned before the grant was stored; a missing row is corrupt
+        // state and must not fall back to disclosing the internal id.
+        if (!handle)
+          throw new Error(
+            `pairwise handle missing for an instance of grant ${stored.grant.grant_id}`,
+          );
+        out[instance] = handle;
+      }
+    return out;
+  }
+
+  /** The grant document as the client receives it (pairwise handles). */
+  clientGrantView(stored: StoredGrant): Grant {
+    const handles = this.clientInstanceHandles(stored);
+    return handles
+      ? translateGrantInstances(stored.grant, handles)
+      : stored.grant;
   }
 
   /** The assigned pairwise `subject.id`, or null when none was assigned. */

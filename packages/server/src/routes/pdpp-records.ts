@@ -37,7 +37,23 @@ import type {
   PdppTokenContext,
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import {
+  clientHandleFor,
+  PdppAuthorizationUnavailableError,
+  storedInstanceFor,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+
+/**
+ * AS item 29: the row as its reader may see it. A client sees its pairwise
+ * handle as `instance_id` (and in `fetch_url`); an owner sees stored ids.
+ */
+function asClientRow<T extends { instance: string }>(
+  context: Pick<PdppTokenContext, "tokenKind" | "clientInstanceHandles">,
+  row: T,
+): T {
+  const handle = clientHandleFor(context, row.instance);
+  return handle === row.instance ? row : { ...row, instance: handle };
+}
 import {
   REPLICA_SOURCE_MAX_BLOB_BYTES,
   REPLICA_SOURCE_MAX_RECORD_JSON_BYTES,
@@ -672,7 +688,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         data: page.data.map((row) =>
           servedRecordJson(
             stream,
-            toServedRow(row),
+            asClientRow(context, toServedRow(row)),
             fields,
             tokenKind,
             plan.blobBase,
@@ -703,7 +719,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       data: page.data.map((row) =>
         servedRecordJson(
           stream,
-          toServedRow(row),
+          asClientRow(context, toServedRow(row)),
           fields,
           tokenKind,
           plan.blobBase,
@@ -1353,9 +1369,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           ? readDeclaration(context!, stream)
           : { ownerInstanceIds: [] };
 
+      // AS item 29: a client names its pairwise handle; resolve it to the
+      // stored instance (a handle that is not this client's matches none).
       const effectiveInstanceIds = selectRecordInstances(
         tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds,
-        query.instanceId,
+        query.instanceId === undefined
+          ? undefined
+          : storedInstanceFor(context!, query.instanceId),
       );
       if (context!.tokenKind === "client") {
         requireRegisteredConnections(effectiveInstanceIds);
@@ -1385,7 +1405,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         const response = c.json(
           localRecordJson(
             stream,
-            found,
+            asClientRow(context!, found),
             scope.fields,
             tokenKind,
             blobBaseFor(c),
@@ -1416,7 +1436,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const response = c.json(
         servedRecordJson(
           stream,
-          toServedRow(found),
+          asClientRow(context!, toServedRow(found)),
           scope.fields,
           tokenKind,
           blobBaseFor(c),

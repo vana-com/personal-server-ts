@@ -73,6 +73,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   approveAuthorization,
+  translateGrantInstances,
   withPairwiseSubject,
   denyAuthorization,
   fetchReview,
@@ -961,7 +962,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(c, 400, "invalid_request", pkceFailure.message);
     }
 
-    const request = details[0];
+    let request = details[0];
 
     // ── Lifecycle recovery (spec-core L1802-L1808, AS item 47) ──────────
     if (
@@ -1028,6 +1029,36 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "invalid_authorization_details",
         publicValidation.failure.message,
       );
+    }
+
+    // AS item 29: a locked-rule client names instances by its own pairwise
+    // handles. Resolve each to the stored instance before any eligibility
+    // check; a handle that is not this client's resolves to nothing and the
+    // stream is then simply ineligible (owner-dependent, so the client sees
+    // the same `access_denied` as any other ineligibility). A stored id
+    // learned from an older grant still names its instance.
+    if (usesLockedRules(request.type)) {
+      const clientId = body.client_id;
+      request = {
+        ...request,
+        ...(request.streams && {
+          streams: request.streams.map((stream) =>
+            stream.instance_ids
+              ? {
+                  ...stream,
+                  instance_ids: stream.instance_ids.map(
+                    (handle) =>
+                      deps.store.instanceForHandle(
+                        subjectId,
+                        clientId,
+                        handle,
+                      ) ?? handle,
+                  ),
+                }
+              : stream,
+          ),
+        }),
+      };
     }
 
     // The owner token deciding this flow must be scoped to the requested
@@ -1433,8 +1464,23 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     // Design 2: a chain-enforced grant needs a slot to live in, which needs
     // the app's grantee (builder) address. Without one the grant could never
     // be read, so it is refused rather than issued dead.
+    // AS item 29: this client's pairwise instance handles, assigned (once)
+    // and recorded before the grant that discloses them is stored. A grant
+    // without the marker (pre-lock types) keeps its stored ids.
+    const clientView =
+      issued.consentEvidence.instance_handles === "pairwise"
+        ? translateGrantInstances(
+            issued.grant,
+            deps.store.assignPairwiseInstanceHandles(
+              session!.subject_id,
+              issued.grant.client.client_id,
+              issued.grant.streams.flatMap((st) => st.instance_ids),
+            ),
+          )
+        : issued.grant;
+    // The chain entry fingerprints the grant document the client holds.
     const chainRegistration = deps.chainRegistrar
-      ? deps.chainRegistrar.prepare(issued.grant)
+      ? deps.chainRegistrar.prepare(clientView)
       : undefined;
     if (chainRegistration === null) {
       return errorResponse(

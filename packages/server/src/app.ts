@@ -680,6 +680,7 @@ export function createApp(deps: AppDeps): Hono {
           return binding.sourceId !== null && binding.deletedAt === null;
         },
         readBlobBytes: deps.pdpp.readBlobBytes,
+        chainEnforcement: deps.pdpp.chainEnforcement,
       }),
     );
     app.route(

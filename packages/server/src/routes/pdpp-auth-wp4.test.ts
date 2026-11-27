@@ -449,7 +449,9 @@ describe("{ type, grant } result (AS items 9, 32)", () => {
         grant: { grant_id: string };
       }>;
     };
-    const stored = store.getGrant(grantId)!.grant;
+    // The complete grant as issued to this client: the stored grant with the
+    // client's pairwise instance handles (AS item 29).
+    const stored = store.clientGrantView(store.getGrant(grantId)!);
     expect(first.authorization_details).toEqual([
       { type: PDPP_DATA_ACCESS_TYPE, grant: stored },
     ]);

@@ -603,11 +603,13 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
       granteeAddress: GRANTEE,
       registeredVersion: "1",
     });
-    // The entry is the gateway's fingerprint of the exact issued grant.
-    const stored = store.getGrant(grantId)!;
-    expect(reg.entry).toBe(computePdppGrantEntry(stored.grant, reg.salt));
+    // The entry is the gateway's fingerprint of the exact issued grant: the
+    // document the client holds (pairwise handles, AS item 29).
+    const issued = store.clientGrantView(store.getGrant(grantId)!);
+    expect(issued.streams[0].instance_ids[0]).toMatch(/^pwi_/);
+    expect(reg.entry).toBe(computePdppGrantEntry(issued, reg.salt));
     expect(gateway.slot!.scopes).toEqual([reg.entry]);
-    expect(gateway.documents.get(reg.entry)!.grant).toEqual(stored.grant);
+    expect(gateway.documents.get(reg.entry)!.grant).toEqual(issued);
     expect(gateway.signedVersions).toEqual([1n]);
   });
 

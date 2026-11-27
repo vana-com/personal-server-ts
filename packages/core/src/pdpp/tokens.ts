@@ -20,6 +20,7 @@ import { verifyCodeVerifier } from "./pkce.js";
 import {
   hashToken,
   newOpaqueToken,
+  translateGrantInstances,
   type PdppAuthStore,
   type StoredGrant,
 } from "./store.js";
@@ -380,7 +381,10 @@ export class PdppTokenService {
         expires_in: expiresIn,
         ...(refreshToken && { refresh_token: refreshToken }),
         grant_id: grant.grant_id,
-        authorization_details: [toAuthorizationEntry(grant)],
+        // AS item 29: the client's document carries its pairwise handles.
+        authorization_details: [
+          toAuthorizationEntry(this.store.clientGrantView(stored)),
+        ],
       },
     };
   }
@@ -468,6 +472,7 @@ export class PdppTokenService {
       // grant_revoked is the reason the RS turns into 401 grant_revoked.
       return { active: false, inactiveReason: inactive };
     }
+    const handles = this.store.clientInstanceHandles(stored);
 
     return {
       active: true,
@@ -476,6 +481,7 @@ export class PdppTokenService {
       grant: stored.grant,
       clientId: stored.grant.client.client_id,
       ...(record.expiresAt && { expiresAt: record.expiresAt }),
+      ...(handles && { clientInstanceHandles: handles }),
     };
   }
 
@@ -511,12 +517,26 @@ export class PdppTokenService {
       return base;
     }
 
+    // The grant as its client holds it (pairwise handles), and the RS-only
+    // bindings from each handle to the stored instance (spec-core §8, L2002).
+    const handles = context.clientInstanceHandles;
+    const clientGrant = handles
+      ? translateGrantInstances(context.grant, handles)
+      : context.grant;
     return {
       ...base,
       grant_id: context.grant.grant_id,
       client_id: context.grant.client.client_id,
       // The complete resolved enforcement context, in one response (§9 item 18).
-      authorization_details: [toAuthorizationEntry(context.grant)],
+      authorization_details: [toAuthorizationEntry(clientGrant)],
+      pdpp_instance_bindings: context.grant.streams.flatMap((stream) =>
+        stream.instance_ids.map((instance) => ({
+          source_id: context.grant!.source.id,
+          stream: stream.name,
+          instance_id: handles?.[instance] ?? instance,
+          rs_instance: instance,
+        })),
+      ),
     };
   }
 

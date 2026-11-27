@@ -623,6 +623,9 @@ export function coLocatedAuthorizationService(
         grant: context.grant as PdppPortGrant | undefined,
         clientId: context.clientId,
         expiresAt: context.expiresAt,
+        ...(context.clientInstanceHandles && {
+          clientInstanceHandles: context.clientInstanceHandles,
+        }),
       };
     },
   };

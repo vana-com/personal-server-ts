@@ -12,6 +12,7 @@ import {
   type StoredRecord,
 } from "../localdb/query.js";
 import type { PdppTokenContext, StreamGrant } from "../ports/pdpp-auth.js";
+import { clientHandleFor } from "../ports/pdpp-auth.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -613,7 +614,8 @@ export async function listPdppRecords(
         data: page.data.map((row) =>
           localRecordJson(
             stream,
-            row,
+            // AS item 29: a client sees its pairwise handle.
+            { ...row, instance: clientHandleFor(context, row.instance) },
             scope.fields,
             owner ? "owner" : "client",
             input.blobBase,

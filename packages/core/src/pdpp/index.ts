@@ -37,6 +37,7 @@ export type {
   PdppAuthorizationResult,
   PdppAuthorizationResultV02,
   PdppIntrospectionResponse,
+  PdppInstanceBinding,
   PdppTokenContext,
   PdppTokenKind,
   OwnerConditions,
@@ -179,6 +180,7 @@ export {
   openPdppAuthStore,
   PdppAuthStore,
   PDPP_AUTH_STATE_VERSION,
+  translateGrantInstances,
   UnsupportedAuthStateError,
 } from "./store.js";
 export type {

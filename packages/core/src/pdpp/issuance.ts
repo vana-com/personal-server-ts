@@ -112,6 +112,12 @@ export interface ConsentEvidence {
    * resolvable identifier (L1433) is not offered.
    */
   subject_identifier?: { id: string; client_id: string; kind: "pairwise" };
+  /**
+   * AS item 29: the client receives pairwise instance handles for this grant
+   * (`pdpp_pairwise_instances`). The stored grant keeps internal ids; the
+   * client's document is derived (`PdppAuthStore.clientGrantView`).
+   */
+  instance_handles?: "pairwise";
 }
 
 export interface IssueGrantInput {
@@ -362,6 +368,7 @@ export function withPairwiseSubject(
         client_id: issued.grant.client.client_id,
         kind: "pairwise",
       },
+      instance_handles: "pairwise",
     },
   };
 }

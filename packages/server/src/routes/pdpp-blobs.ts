@@ -10,7 +10,11 @@ import {
   versionedHeaders,
 } from "./pdpp-version-negotiation.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import {
+  PdppAuthorizationUnavailableError,
+  storedInstanceFor,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { PdppChainEnforcementPort } from "./pdpp-records.js";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import {
@@ -54,6 +58,12 @@ export interface PdppBlobsRouteDeps {
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
+  /**
+   * Design 2 (Vana-6.1): the same chain gate the record routes apply. A
+   * client blob read needs its grant's chain entry live, exactly like a
+   * record read; owner reads are not gated.
+   */
+  chainEnforcement?: PdppChainEnforcementPort;
 }
 
 function requestId(): string {
@@ -179,10 +189,48 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
           { param: "instance_id" },
         );
       }
-      instanceId = query.instanceId;
+      // AS item 29: a client names its pairwise handle.
+      instanceId = storedInstanceFor(context, query.instanceId);
     } catch (error) {
       if (!(error instanceof PdppError)) throw error;
       return { error: jsonError(c, error, reqId) };
+    }
+
+    // Design 2: the chain gate, before any blob metadata is looked at, so a
+    // client whose chain entry is gone learns nothing about the blob.
+    if (deps.chainEnforcement && context.tokenKind === "client") {
+      const grantId = context.grant?.grant_id;
+      const decision = grantId
+        ? await deps.chainEnforcement.authorize({
+            clientId: context.clientId ?? "",
+            pdppGrantId: grantId,
+          })
+        : ({
+            ok: false,
+            retryable: false,
+            reason: "No chain binding for this grant",
+          } as const);
+      if (!decision.ok) {
+        if (decision.retryable)
+          return {
+            error: jsonError(
+              c,
+              new PdppError(
+                "api_error",
+                "Chain authorization could not be verified",
+              ),
+              reqId,
+              { "Retry-After": "5" },
+            ),
+          };
+        return {
+          error: jsonError(
+            c,
+            new PdppError("grant_revoked", decision.reason),
+            reqId,
+          ),
+        };
+      }
     }
 
     // DELETE removes the grant's record references and claim rows. Check its

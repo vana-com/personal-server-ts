@@ -129,6 +129,19 @@ const introspection = z.object({
       }),
     ]),
   ]),
+  // spec-core §8 (L2002-L2014): RS-only handle → stored-instance bindings.
+  pdpp_instance_bindings: z
+    .array(
+      z
+        .object({
+          source_id: nonempty,
+          stream: nonempty.optional(),
+          instance_id: nonempty,
+          rs_instance: nonempty,
+        })
+        .strict(),
+    )
+    .optional(),
 });
 
 async function readContext(response: Response): Promise<unknown> {
@@ -281,9 +294,59 @@ export function createReplicaAuthorizationService(options: {
         return denied("expired");
       const mappings = options.connections();
       let mappingFailure: ReplicaAuthorizationReason | undefined;
+      // A separated RS resolves each handle only through
+      // `pdpp_instance_bindings` (spec-core L2014): handle → the issuer's
+      // stored instance → this replica's local instance. A locked grant
+      // without a binding for a handle fails closed; every entry for one
+      // (source, handle) must name one instance, and no handle may appear
+      // under two sources (L2004).
+      const bindings = context.pdpp_instance_bindings;
+      const locked = grant.version === PDPP_GRANT_VERSION;
+      if (bindings) {
+        const bySourceHandle = new Map<string, string>();
+        const sourceOfHandle = new Map<string, string>();
+        for (const b of bindings) {
+          const key = `${b.source_id}\u0000${b.instance_id}`;
+          const prior = bySourceHandle.get(key);
+          if (prior !== undefined && prior !== b.rs_instance)
+            return denied("mapping_ambiguous");
+          bySourceHandle.set(key, b.rs_instance);
+          const source = sourceOfHandle.get(b.instance_id);
+          if (source !== undefined && source !== b.source_id)
+            return denied("mapping_ambiguous");
+          sourceOfHandle.set(b.instance_id, b.source_id);
+        }
+      } else if (locked) {
+        return denied("mapping_missing");
+      }
+      const issuerInstanceFor = (streamName: string, handle: string) => {
+        if (!bindings) return handle;
+        const entry = bindings.find(
+          (b) =>
+            b.source_id === grant.source.id &&
+            b.instance_id === handle &&
+            (b.stream === undefined || b.stream === streamName),
+        );
+        return entry?.rs_instance;
+      };
+      // local instance → the handle the client holds, for responses.
+      const clientInstanceHandles: Record<string, string> = {};
       const streams = grant.streams.map((stream) => ({
         ...stream,
         instance_ids: stream.instance_ids.map((handle) => {
+          const issuerInstance = issuerInstanceFor(stream.name, handle);
+          if (issuerInstance === undefined) {
+            mappingFailure = "mapping_missing";
+            return "";
+          }
+          const local = localFor(issuerInstance);
+          if (local) clientInstanceHandles[local] = handle;
+          return local ?? "";
+        }),
+      }));
+      function localFor(issuerInstance: string): string | undefined {
+        {
+          const handle = issuerInstance;
           const matches = mappings.filter(
             (entry) =>
               entry.issuerInstanceId === handle &&
@@ -296,7 +359,7 @@ export function createReplicaAuthorizationService(options: {
           if (identities.size !== 1) {
             mappingFailure =
               identities.size === 0 ? "mapping_missing" : "mapping_ambiguous";
-            return "";
+            return undefined;
           }
           let local: string | undefined;
           try {
@@ -312,9 +375,9 @@ export function createReplicaAuthorizationService(options: {
             mappingFailure = "mapping_invalid";
           }
           if (!local) mappingFailure ??= "mapping_missing";
-          return local ?? "";
-        }),
-      }));
+          return local;
+        }
+      }
       if (mappingFailure) return denied(mappingFailure);
       if (
         streams.some(
@@ -330,6 +393,8 @@ export function createReplicaAuthorizationService(options: {
         clientId: context.client_id,
         expiresAt: new Date(context.exp * 1000).toISOString(),
         grant: { ...grant, streams },
+        // A locked grant's client sees its pairwise handles, not local ids.
+        ...(locked && { clientInstanceHandles }),
       };
     },
   };
