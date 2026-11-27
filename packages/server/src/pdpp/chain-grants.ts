@@ -35,12 +35,23 @@ import {
   computePdppGrantEntry,
   newPdppGrantSalt,
 } from "@opendatalabs/personal-server-ts-core/grants";
-import type {
-  ChainRegistration,
-  Grant,
-  PdppAuthStore,
+import {
+  grantUsesLockedRules,
+  type ChainRegistration,
+  type Grant,
+  type PdppAuthStore,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
-import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
+import {
+  buildWeb3SignedHeader,
+  getChainConfig,
+} from "@opendatalabs/vana-sdk/browser";
+import {
+  createPublicClient,
+  encodeAbiParameters,
+  http,
+  keccak256,
+  parseAbi,
+} from "viem";
 import type { Logger } from "pino";
 import type {
   PdppChainDecision,
@@ -138,10 +149,15 @@ export function createPdppChainGateway(options: {
   gatewayUrl: string;
   signer: GatewaySigner;
   fetch?: typeof fetch;
+  /** Per-request timeout, so one hung call cannot stall the queue (F4). */
+  timeoutMs?: number;
 }): PdppChainGateway {
   const base = options.gatewayUrl.replace(/\/+$/u, "");
   const aud = new URL(base).origin;
-  const doFetch = options.fetch ?? globalThis.fetch;
+  const rawFetch = options.fetch ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const doFetch = (url: string, init: RequestInit = {}) =>
+    rawFetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   const signed = (method: string, uri: string, body?: string) =>
     buildWeb3SignedHeader({
       signMessage: (m) => options.signer.signMessage(m),
@@ -254,9 +270,109 @@ export interface GrantRegistrationToSign {
   expiresAt: bigint;
 }
 
+/** A PermissionsV2 slot as the chain holds it. */
+export interface ChainPermission {
+  grantorAddress: string;
+  granteeId: string;
+  scopes: string[];
+  grantVersion: bigint;
+  /** Unix seconds; 0 = no expiry. */
+  expiresAt: bigint;
+}
+
+/**
+ * Reads PermissionsV2 directly (not through the gateway). The registrar
+ * signs nothing it has not verified here: the gateway's slot view is an
+ * unauthenticated answer, so a scope it lists is kept only when this PS owns
+ * it or the FINALIZED chain already lists it (review F2), and an entry is
+ * ended only when the finalized chain no longer lists it (F5).
+ */
+export interface PermissionsV2Reader {
+  /** `PermissionsV2.domainSeparator()`, for the slot id. */
+  domainSeparator(): Promise<`0x${string}`>;
+  /** The slot at the finalized block; null when none. Throws on RPC failure. */
+  readFinalized(
+    slotId: `0x${string}`,
+  ): Promise<{ permission: ChainPermission | null; blockTimestamp: bigint }>;
+}
+
+const PERMISSIONS_V2_ABI = parseAbi([
+  "struct Permission { address grantorAddress; bytes32 granteeId; string[] scopes; uint256 grantVersion; uint256 expiresAt; }",
+  "function permissions(bytes32 id) external view returns (Permission)",
+  "function domainSeparator() external view returns (bytes32)",
+]);
+
+/** The viem reader over the deployment's public RPC. */
+export function createPermissionsV2Reader(input: {
+  chainId: number;
+  contractAddress: `0x${string}`;
+  timeoutMs?: number;
+}): PermissionsV2Reader {
+  const chain = getChainConfig(input.chainId);
+  if (!chain) throw new Error(`no RPC for chain ${input.chainId}`);
+  const client = createPublicClient({
+    chain,
+    transport: http(undefined, { timeout: input.timeoutMs ?? 10_000 }),
+  });
+  let separator: Promise<`0x${string}`> | undefined;
+  return {
+    domainSeparator() {
+      separator ??= client
+        .readContract({
+          address: input.contractAddress,
+          abi: PERMISSIONS_V2_ABI,
+          functionName: "domainSeparator",
+        })
+        .catch((err: unknown) => {
+          separator = undefined;
+          throw err;
+        }) as Promise<`0x${string}`>;
+      return separator;
+    },
+    async readFinalized(slotId) {
+      const block = await client.getBlock({ blockTag: "finalized" });
+      const p = await client.readContract({
+        address: input.contractAddress,
+        abi: PERMISSIONS_V2_ABI,
+        functionName: "permissions",
+        args: [slotId],
+        blockNumber: block.number,
+      });
+      const empty = /^0x0{40}$/iu.test(p.grantorAddress);
+      return {
+        blockTimestamp: block.timestamp,
+        permission: empty
+          ? null
+          : {
+              grantorAddress: p.grantorAddress,
+              granteeId: p.granteeId,
+              scopes: [...p.scopes],
+              grantVersion: p.grantVersion,
+              expiresAt: p.expiresAt,
+            },
+      };
+    },
+  };
+}
+
+/** keccak256(abi.encode(domainSeparator, grantor, granteeId)), as PermissionsV2. */
+export function pdppSlotId(
+  domainSeparator: `0x${string}`,
+  owner: `0x${string}`,
+  granteeId: `0x${string}`,
+): `0x${string}` {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "bytes32" }, { type: "address" }, { type: "bytes32" }],
+      [domainSeparator, owner, granteeId],
+    ),
+  );
+}
+
 export interface PdppChainRegistrarOptions {
   store: PdppAuthStore;
   gateway: PdppChainGateway;
+  chain: PermissionsV2Reader;
   owner: `0x${string}`;
   deployment: { chainId: number; contractAddress: `0x${string}` };
   /** The app's grantee wallet from its client registration; null = none. */
@@ -266,18 +382,30 @@ export interface PdppChainRegistrarOptions {
   signGrantRegistration(msg: GrantRegistrationToSign): Promise<`0x${string}`>;
   logger: Logger;
   now?: () => Date;
+  /** After a failed gateway attempt, wait this long before the next. */
+  retryBackoffMs?: number;
 }
 
 const IN_FLIGHT = new Set(["SETTLEMENT_IN_FLIGHT", "REVOCATION_IN_FLIGHT"]);
+/** The gateway's per-request limits on PUT /v1/pdpp/scope-bindings. */
+const MAX_BINDING_STREAMS = 64;
 
 function grantExpirySeconds(grant: Grant): bigint {
   if (!grant.expires_at) return 0n;
   return BigInt(Math.ceil(Date.parse(grant.expires_at) / 1000));
 }
 
+/** The later of two expiries, 0 meaning none. */
 function laterExpiry(a: bigint, b: bigint): bigint {
   if (a === 0n || b === 0n) return 0n;
   return a > b ? a : b;
+}
+
+/** The earlier of two expiries, 0 meaning none. */
+function earlierExpiry(a: bigint, b: bigint): bigint {
+  if (a === 0n) return b;
+  if (b === 0n) return a;
+  return a < b ? a : b;
 }
 
 function slotLive(slot: GatewaySlot | null): slot is GatewaySlot {
@@ -293,6 +421,7 @@ function describe(answer: GatewayAnswer): string {
 export class PdppChainRegistrar {
   /** One gateway conversation at a time: every write moves one slot version. */
   private queue: Promise<unknown> = Promise.resolve();
+  private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly options: PdppChainRegistrarOptions) {}
 
@@ -312,8 +441,8 @@ export class PdppChainRegistrar {
 
   /**
    * The pending registration for a grant about to be stored: a fresh salt
-   * and the entry over the exact grant document. Null when the client has no
-   * grantee address, so no slot can carry the grant.
+   * and the entry over the exact grant document (the client's view). Null
+   * when the client has no grantee address, so no slot can carry the grant.
    */
   prepare(
     grant: Grant,
@@ -326,35 +455,103 @@ export class PdppChainRegistrar {
     return { granteeAddress, salt, entry: computePdppGrantEntry(grant, salt) };
   }
 
-  /** Register a pending grant. Resolves to its registration state. */
+  /** Register a pending grant now (no backoff). Resolves to its state. */
   register(grantId: string): Promise<ChainRegistration["status"] | null> {
-    return this.serial(() => this.registerNow(grantId));
+    return this.serial(() => this.guarded(grantId, () => this.registerNow(grantId, true)));
+  }
+
+  /** Register a pending grant unless a failed attempt is backing off. */
+  retry(grantId: string): Promise<ChainRegistration["status"] | null> {
+    return this.serial(() =>
+      this.guarded(grantId, () => this.registerNow(grantId, false)),
+    );
+  }
+
+  /**
+   * Turning chain grants on for a server with existing grants: every active
+   * locked-rule grant with no registration gets a pending one (fresh salt,
+   * entry over the client's document), so its reads answer "retry" until it
+   * is on chain instead of `grant_revoked`. A grant whose client has no
+   * grantee address gets none and stays unreadable (stated in the report).
+   */
+  backfill(): number {
+    const { store } = this.options;
+    const now = this.now();
+    let created = 0;
+    for (const stored of store.listAllGrants()) {
+      if (!grantUsesLockedRules(stored.grant)) continue;
+      if (store.grantStatus(stored, now) !== "active") continue;
+      if (store.getChainRegistration(stored.grant.grant_id)) continue;
+      const prepared = this.prepare(store.clientGrantView(stored));
+      if (!prepared) continue;
+      if (
+        store.createChainRegistration({
+          grantId: stored.grant.grant_id,
+          clientId: stored.clientId,
+          ...prepared,
+          now,
+        })
+      )
+        created++;
+    }
+    return created;
+  }
+
+  /** Reconcile now and every `intervalMs` until `stop()` (unref'd timer). */
+  start(intervalMs = 60_000): void {
+    if (this.timer) return;
+    void this.reconcile().catch(() => undefined);
+    this.timer = setInterval(() => {
+      void this.reconcile().catch(() => undefined);
+    }, intervalMs);
+    this.timer.unref?.();
+  }
+
+  /** Stop the timer and wait for the conversation in progress. */
+  async stop(): Promise<void> {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    await this.queue.catch(() => undefined);
+  }
+
+  /** Whether the grant can no longer be read by its client at all. */
+  private grantEnded(grantId: string, now: Date): boolean {
+    const { store } = this.options;
+    const stored = store.getGrant(grantId);
+    if (!stored || store.grantStatus(stored, now) !== "active") return true;
+    // A consumed single-use grant ends once its last access token is gone.
+    return (
+      stored.grant.access_mode === "single_use" &&
+      stored.consumedAt !== null &&
+      !store.hasLiveClientToken(grantId, now)
+    );
   }
 
   /**
    * Move every registration to where its grant is: a grant that ended has
    * its entry removed, a pending one is registered, an ending one is
-   * followed to finality.
+   * followed to finality on chain, and a bound one whose registration failed
+   * at the gateway is registered again.
    */
   reconcile(): Promise<void> {
     return this.serial(async () => {
       const { store } = this.options;
       const now = this.now();
-      for (const reg of store.listChainRegistrations(["pending", "bound"])) {
-        const stored = store.getGrant(reg.grantId);
-        if (!stored || store.grantStatus(stored, now) !== "active")
+      for (const reg of store.listChainRegistrations(["pending", "bound"]))
+        if (this.grantEnded(reg.grantId, now))
           store.markChainEnding(reg.grantId, now);
-      }
+      for (const reg of store.listChainRegistrations(["bound"]))
+        await this.guarded(reg.grantId, () => this.recheckBound(reg));
       for (const reg of store.listChainRegistrations(["pending"]))
-        await this.guard(reg.grantId, () => this.registerNow(reg.grantId));
+        await this.guarded(reg.grantId, () => this.registerNow(reg.grantId, false));
       for (const reg of store.listChainRegistrations(["ending"]))
-        await this.guard(reg.grantId, () => this.endNow(reg.grantId));
+        await this.guarded(reg.grantId, () => this.endNow(reg.grantId, false));
     });
   }
 
-  private async guard(grantId: string, fn: () => Promise<unknown>) {
+  private async guarded<T>(grantId: string, fn: () => Promise<T>): Promise<T | null> {
     try {
-      await fn();
+      return await fn();
     } catch (err) {
       this.options.store.noteChainError(
         grantId,
@@ -363,72 +560,142 @@ export class PdppChainRegistrar {
       );
       this.options.logger.warn(
         { grantId, err: (err as Error).message },
-        "PDPP chain registration: gateway unreachable",
+        "PDPP chain registration: gateway or chain unreachable",
       );
+      return null;
     }
+  }
+
+  /** A failed attempt waits out the backoff, so reads do not spend versions. */
+  private backingOff(reg: ChainRegistration): boolean {
+    if (!reg.lastError) return false;
+    const wait = this.options.retryBackoffMs ?? 30_000;
+    return this.now().getTime() - Date.parse(reg.updatedAt) < wait;
+  }
+
+  private async slotIdFor(granteeId: string): Promise<`0x${string}`> {
+    return pdppSlotId(
+      await this.options.chain.domainSeparator(),
+      this.options.owner,
+      granteeId as `0x${string}`,
+    );
+  }
+
+  /** Entries of this PS's own live grants for this grantee (not ending). */
+  private ownEntries(granteeAddress: string, except?: string): Map<string, Grant> {
+    const { store } = this.options;
+    const out = new Map<string, Grant>();
+    for (const reg of store.listChainRegistrations(["pending", "bound"])) {
+      if (reg.grantId === except) continue;
+      if (reg.granteeAddress.toLowerCase() !== granteeAddress.toLowerCase())
+        continue;
+      const stored = store.getGrant(reg.grantId);
+      if (stored) out.set(reg.entry, stored.grant);
+    }
+    return out;
+  }
+
+  /**
+   * One PUT per label, so a label the gateway already holds with another
+   * stream set (409, bindings are immutable) cannot drop the others. A label
+   * over the gateway's stream limit is not sent. Returns the labels not bound.
+   */
+  private async bindScopes(grantId: string, bindings: PdppScopeBinding[]): Promise<string[]> {
+    const { gateway, owner, logger } = this.options;
+    const unbound: string[] = [];
+    for (const binding of bindings) {
+      if (binding.streams.length > MAX_BINDING_STREAMS) {
+        unbound.push(binding.scope);
+        continue;
+      }
+      const answer = await gateway.putScopeBindings(owner, [binding]);
+      if (answer.status >= 200 && answer.status < 300) continue;
+      unbound.push(binding.scope);
+      if (answer.status === 409)
+        logger.warn(
+          { grantId, scope: binding.scope },
+          "PDPP chain registration: a scope label is already bound to another stream set",
+        );
+      else if (answer.status >= 500 || answer.status === 401 || answer.status === 403)
+        throw new Error(`scope bindings: ${describe(answer)}`);
+    }
+    return unbound;
   }
 
   private async registerNow(
     grantId: string,
+    force: boolean,
   ): Promise<ChainRegistration["status"] | null> {
-    const { store, gateway, owner, logger } = this.options;
+    const { store, gateway, owner, chain } = this.options;
     const reg = store.getChainRegistration(grantId);
     if (!reg || reg.status !== "pending") return reg?.status ?? null;
-    const stored = store.getGrant(grantId);
-    if (!stored || store.grantStatus(stored, this.now()) !== "active") {
+    if (!force && this.backingOff(reg)) return "pending";
+    if (this.grantEnded(grantId, this.now())) {
       store.markChainEnding(grantId, this.now());
       return "ending";
     }
+    const stored = store.getGrant(grantId)!;
+    const document = store.clientGrantView(stored);
 
     const builder = await gateway.getBuilder(reg.granteeAddress);
     if (!builder) {
-      store.noteChainError(grantId, "grantee is not a registered builder");
+      store.noteChainError(grantId, "grantee is not a registered builder", this.now());
       return "pending";
     }
-
-    const bindings = this.options.scopeBindingsFor(stored.grant);
-    if (bindings.length > 0) {
-      const answer = await gateway.putScopeBindings(owner, bindings);
-      // Bindings are immutable at the gateway: 409 means a label is already
-      // bound (to the same or an earlier stream set). Registration goes on;
-      // the conflict is recorded for the operator.
-      if (answer.status === 409) {
-        logger.warn(
-          { grantId, status: answer.status },
-          "PDPP chain registration: a scope label was already bound differently",
-        );
-      } else if (answer.status < 200 || answer.status >= 300) {
-        store.noteChainError(grantId, `scope bindings: ${describe(answer)}`);
-        return "pending";
-      }
-    }
+    const unbound = await this.bindScopes(
+      grantId,
+      this.options.scopeBindingsFor(stored.grant),
+    );
+    const slotId = await this.slotIdFor(builder.id);
 
     for (let attempt = 0; attempt < 2; attempt++) {
-      const slot = await gateway.findSlot(owner, builder.id);
-      const kept = slotLive(slot) ? slot.scopes : [];
-      if (kept.includes(reg.entry)) {
+      const slot = await gateway.getSlot(slotId);
+      if (slot && slot.id.toLowerCase() !== slotId.toLowerCase()) {
+        store.noteChainError(grantId, "gateway answered for another slot id", this.now());
+        return "pending";
+      }
+      const { permission } = await chain.readFinalized(slotId);
+      const listed = slotLive(slot) ? slot.scopes : [];
+      const failedAtGateway = slot?.status === "failed";
+      if (listed.includes(reg.entry) && !failedAtGateway) {
         // An earlier attempt landed and its answer was lost.
         store.markChainBound({
           grantId,
           chainId: this.options.deployment.chainId,
           contractAddress: this.options.deployment.contractAddress,
-          permissionId: slot!.id,
+          permissionId: slotId,
           granteeId: builder.id,
           registeredVersion: slot!.grantVersion,
           now: this.now(),
         });
         return "bound";
       }
+      // F2: keep only what this PS owns or the finalized chain already holds;
+      // a scope only the gateway claims is dropped (never added).
+      const own = this.ownEntries(reg.granteeAddress, grantId);
+      const onChain = new Set(permission?.scopes ?? []);
+      const kept = listed.filter(
+        (s) => s !== reg.entry && (own.has(s) || onChain.has(s)),
+      );
+      const foreign = kept.filter((s) => !own.has(s));
+      // F1: never extend a scope this grant does not cover. With a foreign
+      // scope in the slot, the slot keeps the earliest of its gateway and
+      // finalized-chain expiry, and this grant is cut off on chain at that
+      // time if it would last longer. With only this PS's own entries, the
+      // slot lasts as long as the longest of those grants (each is also
+      // bounded by its own `expires_at` at the PS and at the gateway).
+      const expiresAt =
+        foreign.length > 0
+          ? earlierExpiry(
+              BigInt(slot!.expiresAtSeconds),
+              permission?.expiresAt ?? 0n,
+            )
+          : [...kept.map((e) => own.get(e)!), stored.grant]
+              .map(grantExpirySeconds)
+              .reduce((a, b) => laterExpiry(a, b));
       const scopes = [...kept, reg.entry];
       const grantVersion =
         (slot ? BigInt(slot.currentGrantVersion) : 0n) + 1n;
-      const expiresAt =
-        kept.length > 0
-          ? laterExpiry(
-              BigInt(slot!.expiresAtSeconds),
-              grantExpirySeconds(stored.grant),
-            )
-          : grantExpirySeconds(stored.grant);
       const signature = await this.options.signGrantRegistration({
         grantorAddress: owner,
         granteeId: builder.id as `0x${string}`,
@@ -443,24 +710,16 @@ export class PdppChainRegistrar {
           scopes,
           grantVersion: grantVersion.toString(),
           expiresAt: expiresAt.toString(),
-          pdppGrants: [
-            // The document the entry fingerprints: the client's view.
-            { entry: reg.entry, grant: store.clientGrantView(stored), salt: reg.salt },
-          ],
+          pdppGrants: [{ entry: reg.entry, grant: document, salt: reg.salt }],
         },
         signature,
       );
       if (answer.status === 200 || answer.status === 201) {
-        const permissionId = answer.body.grantId;
-        if (typeof permissionId !== "string") {
-          store.noteChainError(grantId, "gateway returned no grant id");
-          return "pending";
-        }
         store.markChainBound({
           grantId,
           chainId: this.options.deployment.chainId,
           contractAddress: this.options.deployment.contractAddress,
-          permissionId,
+          permissionId: slotId,
           granteeId: builder.id,
           registeredVersion:
             typeof answer.body.grantVersion === "string"
@@ -468,6 +727,12 @@ export class PdppChainRegistrar {
               : grantVersion.toString(),
           now: this.now(),
         });
+        if (unbound.length > 0)
+          store.noteChainError(
+            grantId,
+            `bound; scope labels not bound at the gateway: ${unbound.join(", ")}`,
+            this.now(),
+          );
         return "bound";
       }
       // 409: another write moved the slot; read it again and sign above it.
@@ -477,132 +742,132 @@ export class PdppChainRegistrar {
         IN_FLIGHT.has(String(answer.body.code))
           ? `slot is settling; retry later (${describe(answer)})`
           : `registration: ${describe(answer)}`,
+        this.now(),
       );
       return "pending";
     }
     return "pending";
   }
 
-  private async endNow(grantId: string): Promise<void> {
-    const { store, gateway, owner } = this.options;
-    const reg = store.getChainRegistration(grantId);
-    if (!reg || reg.status !== "ending") return;
-
-    let slot: GatewaySlot | null;
-    if (reg.permissionId) {
-      slot = await gateway.getSlot(reg.permissionId);
-    } else {
-      // Never confirmed bound: the registration may still have landed.
-      const builder = await gateway.getBuilder(reg.granteeAddress);
-      slot = builder ? await gateway.findSlot(owner, builder.id) : null;
-    }
-    if (!slot) {
-      store.markChainEnded(grantId, this.now());
-      return;
-    }
-
-    // Follow an upsert already sent to finality before sending another.
-    if (reg.endedVersion !== null) {
-      const done = this.endingFinal(reg, slot);
-      if (done === "final") {
-        store.markChainEnded(grantId, this.now());
-        return;
-      }
-      if (done === "waiting") return;
-      // "resign": the revocation reverted or was superseded on chain.
-    }
-
-    // Nothing to send: the entry is not in the slot, or the whole slot was
-    // already revoked on chain by someone else (owner, Account).
-    const revokedOnChainForGood =
-      slot.revokedAt !== null &&
-      slot.revocationKind === "v2_upsert" &&
-      slot.revocationOutcome !== "superseded";
-    if (
-      !slot.scopes.includes(reg.entry) ||
-      (reg.endedVersion === null && revokedOnChainForGood)
-    ) {
-      store.markChainEnded(grantId, this.now());
-      return;
-    }
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const current =
-        attempt === 0 ? slot : await gateway.getSlot(slot.id);
-      if (!current) {
-        store.markChainEnded(grantId, this.now());
-        return;
-      }
-      const remaining = current.scopes.filter((e) => e !== reg.entry);
-      const grantVersion = BigInt(current.currentGrantVersion) + 1n;
-      const revocation = remaining.length === 0 || current.revokedAt !== null;
-      // Removal-only upsert: the slot's own expiry is kept (a later one would
-      // count as widening). A V2 revocation keeps every entry (the contract
-      // refuses an empty list) and ends the relationship with a past expiry.
-      const scopes = revocation ? current.scopes : remaining;
-      const expiresAt = revocation
-        ? BigInt(Math.floor(this.now().getTime() / 1000) - 300)
-        : BigInt(current.expiresAtSeconds);
-      const signature = await this.options.signGrantRegistration({
-        grantorAddress: owner,
-        granteeId: current.granteeId as `0x${string}`,
-        scopes,
-        grantVersion,
-        expiresAt,
-      });
-      const body = {
-        grantorAddress: owner,
-        grantVersion: grantVersion.toString(),
-        scopes,
-        expiresAt: expiresAt.toString(),
-      };
-      const answer = revocation
-        ? await gateway.revokeSlot(current.id, body, signature)
-        : await gateway.registerSlot(
-            { ...body, granteeId: current.granteeId },
-            signature,
-          );
-      if (answer.status >= 200 && answer.status < 300) {
-        store.noteChainEndingSent(
-          grantId,
-          grantVersion.toString(),
-          revocation ? "revocation" : "removal",
-          this.now(),
-        );
-        return;
-      }
-      if (answer.status === 409 && attempt === 0) continue;
-      store.noteChainError(grantId, `end: ${describe(answer)}`);
-      return;
-    }
+  /**
+   * A bound grant whose registration failed at the gateway (the transaction
+   * did not land) and that the finalized chain does not list is registered
+   * again.
+   */
+  private async recheckBound(reg: ChainRegistration): Promise<void> {
+    const { store, gateway, chain } = this.options;
+    if (!reg.permissionId) return;
+    const slot = await gateway.getSlot(reg.permissionId);
+    if (slot?.status !== "failed") return;
+    const { permission } = await chain.readFinalized(
+      reg.permissionId as `0x${string}`,
+    );
+    if (permission?.scopes.includes(reg.entry)) return;
+    store.markChainPending(reg.grantId, this.now());
   }
 
-  /** Has the upsert that dropped the entry become final on chain? */
-  private endingFinal(
-    reg: ChainRegistration,
-    slot: GatewaySlot,
-  ): "final" | "waiting" | "resign" {
-    if (reg.endingKind === "revocation") {
-      if (slot.revocationKind === "v2_reverted") return "resign";
-      if (slot.revocationKind !== "v2_upsert") return "resign";
-      if (slot.revocationOutcome === "superseded") return "resign";
-      return slot.revocationFinalizedAt !== null ? "final" : "waiting";
+  /** True when the finalized chain no longer lets the entry authorize. */
+  private static endedOnChain(
+    read: { permission: ChainPermission | null; blockTimestamp: bigint },
+    entry: string,
+  ): boolean {
+    const p = read.permission;
+    if (!p) return true;
+    if (!p.scopes.includes(entry)) return true;
+    return p.expiresAt !== 0n && p.expiresAt <= read.blockTimestamp;
+  }
+
+  private async endNow(grantId: string, force: boolean): Promise<void> {
+    const { store, gateway, owner, chain } = this.options;
+    const reg = store.getChainRegistration(grantId);
+    if (!reg || reg.status !== "ending") return;
+    if (!force && reg.endedVersion === null && this.backingOff(reg)) return;
+
+    let granteeId = reg.granteeId;
+    if (!granteeId) {
+      const builder = await gateway.getBuilder(reg.granteeAddress);
+      if (!builder) {
+        // No builder: no slot can hold the entry, unless the chain says so.
+        store.noteChainError(grantId, "grantee is not a registered builder", this.now());
+        return;
+      }
+      granteeId = builder.id;
     }
-    // The whole slot was revoked on chain for good after the removal: the
-    // entry is gone with it.
-    if (
-      slot.revokedAt !== null &&
-      slot.revocationKind === "v2_upsert" &&
-      slot.revocationOutcome !== "superseded"
-    )
-      return slot.revocationFinalizedAt !== null ? "final" : "waiting";
-    // Removal-only: final once the chain holds a registration at or past the
-    // one that dropped the entry, and the entry is not listed.
-    if (slot.scopes.includes(reg.entry)) return "resign";
-    const settled = slot.status === "confirmed" || slot.status === "finalized";
-    return settled && BigInt(slot.grantVersion) >= BigInt(reg.endedVersion!)
-      ? "final"
-      : "waiting";
+    const slotId = await this.slotIdFor(granteeId);
+    const read = await chain.readFinalized(slotId);
+    // F5: `ended` only when the FINALIZED chain no longer lists the entry.
+    if (PdppChainRegistrar.endedOnChain(read, reg.entry)) {
+      store.markChainEnded(grantId, this.now());
+      return;
+    }
+
+    const slot = await gateway.getSlot(slotId);
+    if (!slot) {
+      store.noteChainError(grantId, "entry on chain but the gateway knows no slot", this.now());
+      return;
+    }
+    const failed =
+      slot.status === "failed" ||
+      slot.revocationKind === "v2_reverted" ||
+      slot.revocationOutcome === "superseded";
+    // Something that drops the entry is already in flight at the gateway (an
+    // upsert this PS sent, possibly before a crash, or an owner revocation):
+    // wait for it to reach the chain. Only a failed one is signed again.
+    const inFlight =
+      !failed &&
+      (reg.endedVersion !== null ||
+        !slot.scopes.includes(reg.entry) ||
+        (slot.revokedAt !== null && slot.revocationKind === "v2_upsert"));
+    if (inFlight) return;
+
+    const own = this.ownEntries(reg.granteeAddress, grantId);
+    const onChain = new Set(read.permission?.scopes ?? []);
+    const verified = (s: string) => own.has(s) || onChain.has(s);
+    const remaining = slot.scopes.filter((e) => e !== reg.entry && verified(e));
+    const revocation = remaining.length === 0 || slot.revokedAt !== null;
+    // A V2 revocation lists a non-empty subset of the gateway's scopes and a
+    // past expiry; a removal-only upsert keeps the earliest known expiry, so
+    // nothing it keeps outlives its terms (F1).
+    const scopes = revocation
+      ? slot.scopes.filter(verified)
+      : remaining;
+    if (scopes.length === 0) {
+      store.noteChainError(grantId, "no verified scope to sign a revocation over", this.now());
+      return;
+    }
+    const expiresAt = revocation
+      ? BigInt(Math.floor(this.now().getTime() / 1000) - 300)
+      : earlierExpiry(
+          BigInt(slot.expiresAtSeconds),
+          read.permission?.expiresAt ?? 0n,
+        );
+    const grantVersion = BigInt(slot.currentGrantVersion) + 1n;
+    const signature = await this.options.signGrantRegistration({
+      grantorAddress: owner,
+      granteeId: granteeId as `0x${string}`,
+      scopes,
+      grantVersion,
+      expiresAt,
+    });
+    const body = {
+      grantorAddress: owner,
+      grantVersion: grantVersion.toString(),
+      scopes,
+      expiresAt: expiresAt.toString(),
+    };
+    const answer = revocation
+      ? await gateway.revokeSlot(slotId, body, signature)
+      : await gateway.registerSlot({ ...body, granteeId }, signature);
+    if (answer.status >= 200 && answer.status < 300) {
+      store.noteChainEndingSent(
+        grantId,
+        grantVersion.toString(),
+        revocation ? "revocation" : "removal",
+        this.now(),
+      );
+      return;
+    }
+    store.noteChainError(grantId, `end: ${describe(answer)}`, this.now());
   }
 }
 
@@ -637,7 +902,7 @@ export function design2ChainEnforcement(options: {
         return deny("Client is not the bound grantee for this grant");
       if (reg.status === "pending") {
         try {
-          await options.registrar.register(pdppGrantId);
+          await options.registrar.retry(pdppGrantId);
         } catch (err) {
           options.logger.warn(
             { pdppGrantId, err: (err as Error).message },
@@ -756,6 +1021,12 @@ export function createDesign2ChainGrants(input: {
     | {
         gatewayUrl: string;
         fetch?: typeof fetch;
+        /** Defaults to the deployment's public RPC (`createPermissionsV2Reader`). */
+        chain?: PermissionsV2Reader;
+        /** See `PdppChainRegistrarOptions.retryBackoffMs` (default 30 s). */
+        retryBackoffMs?: number;
+        /** Per gateway request (default 10 s). */
+        timeoutMs?: number;
         owner: `0x${string}`;
         deployment: { chainId: number; contractAddress: `0x${string}` };
         signMessage(message: string): Promise<`0x${string}`>;
@@ -768,12 +1039,22 @@ export function createDesign2ChainGrants(input: {
           stream: string,
         ) => { connector: string; namespace: string } | null;
         declaredStreams(sourceId: string): string[];
+        /**
+         * Legacy readable scopes this PS projects from a source's PDPP
+         * streams (`LEGACY_SCOPE_BINDINGS`): each is bound to every stream
+         * its projection reads, so a paid read of it needs one grant that
+         * covers all of them (gateway pay rule).
+         */
+        legacyScopes?: (sourceId: string) => Array<{ scope: string; streams: string[] }>;
         logScope(connector: string, ns: string): string;
         streamScope(connector: string, ns: string, stream: string): string;
       }
     | null;
 }): {
-  registrar: Pick<PdppChainRegistrar, "prepare" | "register" | "reconcile">;
+  registrar: Pick<
+    PdppChainRegistrar,
+    "prepare" | "register" | "reconcile" | "backfill" | "start" | "stop"
+  >;
   gate: PdppChainEnforcementPort;
 } {
   const { ready } = input;
@@ -786,6 +1067,9 @@ export function createDesign2ChainGrants(input: {
         prepare: () => null,
         register: async () => null,
         reconcile: async () => undefined,
+        backfill: () => 0,
+        start: () => undefined,
+        stop: async () => undefined,
       },
       gate: {
         authorize: async () => ({
@@ -800,10 +1084,17 @@ export function createDesign2ChainGrants(input: {
     gatewayUrl: ready.gatewayUrl,
     signer: { signMessage: ready.signMessage },
     fetch: ready.fetch,
+    ...(ready.timeoutMs !== undefined && { timeoutMs: ready.timeoutMs }),
   });
   const registrar = new PdppChainRegistrar({
     store: input.store,
     gateway,
+    chain:
+      ready.chain ??
+      createPermissionsV2Reader({
+        chainId: ready.deployment.chainId,
+        contractAddress: ready.deployment.contractAddress,
+      }),
     owner: ready.owner,
     deployment: ready.deployment,
     granteeAddressFor: (clientId) => {
@@ -812,18 +1103,33 @@ export function createDesign2ChainGrants(input: {
       )?.granteeAddress;
       return address ? (address as `0x${string}`) : null;
     },
-    scopeBindingsFor: (grant) =>
-      ready.link
-        ? streamSyncScopeBindings({
-            grant,
-            link: ready.link,
-            declaredStreams: ready.declaredStreams,
-            logScope: ready.logScope,
-            streamScope: ready.streamScope,
-          })
-        : [],
+    scopeBindingsFor: (grant) => {
+      const declared = new Set(ready.declaredStreams(grant.source.id));
+      return [
+        ...(ready.link
+          ? streamSyncScopeBindings({
+              grant,
+              link: ready.link,
+              declaredStreams: ready.declaredStreams,
+              logScope: ready.logScope,
+              streamScope: ready.streamScope,
+            })
+          : []),
+        // Only legacy scopes whose streams the retained declaration has.
+        ...(ready.legacyScopes?.(grant.source.id) ?? [])
+          .filter((l) => l.streams.every((st) => declared.has(st)))
+          .map((l) => ({
+            scope: l.scope,
+            sourceId: grant.source.id,
+            streams: l.streams,
+          })),
+      ];
+    },
     signGrantRegistration: ready.signGrantRegistration,
     logger: input.logger,
+    ...(ready.retryBackoffMs !== undefined && {
+      retryBackoffMs: ready.retryBackoffMs,
+    }),
   });
   return {
     registrar,

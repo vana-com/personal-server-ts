@@ -980,6 +980,62 @@ export class PdppAuthStore {
     return result.changes > 0;
   }
 
+  /**
+   * A pending registration for a grant stored before chain grants were on
+   * (boot backfill). Inserts nothing when one exists. True when created.
+   */
+  createChainRegistration(input: {
+    grantId: string;
+    clientId: string;
+    granteeAddress: string;
+    salt: string;
+    entry: string;
+    now?: Date;
+  }): boolean {
+    const at = (input.now ?? new Date()).toISOString();
+    const result = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO pdpp_chain_registrations
+           (grant_id, client_id, grantee_address, salt, entry, status,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(
+        input.grantId,
+        input.clientId,
+        input.granteeAddress,
+        input.salt,
+        input.entry,
+        at,
+        at,
+      );
+    return result.changes > 0;
+  }
+
+  /** A bound registration whose chain transaction failed: register again. */
+  markChainPending(grantId: string, now: Date = new Date()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET status = 'pending', last_error = 'registration failed on chain; registering again', updated_at = ?
+         WHERE grant_id = ? AND status = 'bound'`,
+      )
+      .run(now.toISOString(), grantId);
+    return result.changes > 0;
+  }
+
+  /** Whether a client access token of this grant is still usable. */
+  hasLiveClientToken(grantId: string, now: Date = new Date()): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM pdpp_access_tokens
+         WHERE grant_id = ? AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`,
+      )
+      .get(grantId, now.toISOString());
+    return row !== undefined;
+  }
+
   /** The grant ended: its entry must leave the slot. Never goes backwards. */
   markChainEnding(grantId: string, now: Date = new Date()): boolean {
     const result = this.db

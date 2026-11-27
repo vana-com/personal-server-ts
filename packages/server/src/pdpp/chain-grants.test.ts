@@ -21,7 +21,12 @@ import { join } from "node:path";
 import { Hono, type Context } from "hono";
 import pino from "pino";
 import { privateKeyToAccount } from "viem/accounts";
-import { recoverTypedDataAddress } from "viem";
+import {
+  domainSeparator as viemDomainSeparator,
+  encodeAbiParameters,
+  keccak256,
+  recoverTypedDataAddress,
+} from "viem";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AuthorizationSessionStore,
@@ -71,6 +76,15 @@ const TYPES = {
   ],
 } as const;
 
+// PermissionsV2's slot id, computed here independently of the PS code.
+const SEPARATOR = viemDomainSeparator({ domain: DOMAIN });
+const SLOT_ID = keccak256(
+  encodeAbiParameters(
+    [{ type: "bytes32" }, { type: "address" }, { type: "bytes32" }],
+    [SEPARATOR, OWNER, BUILDER_ID as `0x${string}`],
+  ),
+);
+
 // ─── Fake gateway ─────────────────────────────────────────────────────────
 
 interface Slot {
@@ -100,6 +114,11 @@ class FakeGateway {
   dropNextRegistrationAnswer = false;
   /** When set, only this many more slot lookups succeed; then 500. */
   slotLookupsAllowed: number | null = null;
+  /** Fields the gateway's GET /v1/grants/:id lies about (F2). */
+  lie: Partial<ReturnType<FakeGateway["view"]>> | null = null;
+  chainDown = false;
+  /** Hang every request (no answer) when set (F4 timeouts). */
+  hang = false;
   requests: Array<{ method: string; path: string; body?: unknown }> = [];
   signedVersions: bigint[] = [];
 
@@ -131,9 +150,14 @@ class FakeGateway {
   }
 
   /** /v1/settle: send what the gateway holds to the chain. */
-  settle(options: { revert?: boolean } = {}) {
+  settle(options: { revert?: boolean; fail?: boolean } = {}) {
     const s = this.slot;
     if (!s) return;
+    if (options.fail && !s.revokedAt) {
+      // The registration transaction reverted: the chain is unchanged.
+      s.status = "failed";
+      return;
+    }
     if (s.revokedAt && s.revocationKind === "v2_upsert") {
       if (options.revert) {
         s.revocationKind = "v2_reverted";
@@ -202,8 +226,35 @@ class FakeGateway {
     return null;
   }
 
+  /** PermissionsV2 at the finalized block. */
+  reader = {
+    domainSeparator: async () => SEPARATOR,
+    readFinalized: async (id: `0x${string}`) => {
+      if (this.chainDown) throw new Error("rpc down");
+      return {
+        blockTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        permission:
+          this.chain && id === SLOT_ID
+            ? {
+                grantorAddress: OWNER,
+                granteeId: BUILDER_ID,
+                scopes: [...this.chain.scopes],
+                grantVersion: this.chain.version,
+                expiresAt: this.chain.expiresAt,
+              }
+            : null,
+      };
+    },
+  };
+
   fetch = async (input: unknown, init?: RequestInit): Promise<Response> => {
     if (this.down) throw new TypeError("fetch failed");
+    if (this.hang)
+      return new Promise<Response>((_, reject) =>
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("timed out", "TimeoutError")),
+        ),
+      );
     const response = await this.handle(input, init);
     if (
       this.dropNextRegistrationAnswer &&
@@ -239,10 +290,14 @@ class FakeGateway {
         data: { grants: this.slot ? [this.view()] : [] },
       });
     }
-    if (method === "GET" && url.pathname.startsWith("/v1/grants/"))
+    if (method === "GET" && url.pathname.startsWith("/v1/grants/")) {
+      if (this.slotLookupsAllowed !== null && this.slotLookupsAllowed-- <= 0)
+        return new Response(null, { status: 500 });
+      if (this.lie) return Response.json({ data: { ...this.view(), ...this.lie } });
       return this.slot && url.pathname.endsWith(this.slot.id)
         ? Response.json({ data: this.view() })
         : new Response(null, { status: 404 });
+    }
 
     if (method === "PUT" && url.pathname === "/v1/pdpp/scope-bindings") {
       expect(auth).toMatch(/^Web3Signed /);
@@ -298,6 +353,7 @@ class FakeGateway {
         (body.scopes as string[]).every((e) => prior.scopes.includes(e));
       if (
         prior &&
+        prior.status !== "failed" &&
         JSON.stringify(prior.scopes) === JSON.stringify(body.scopes) &&
         prior.expiresAtSeconds === body.expiresAt
       ) {
@@ -310,7 +366,7 @@ class FakeGateway {
         });
       }
       this.slot = {
-        id: `0x${"a".repeat(64)}`,
+        id: SLOT_ID,
         scopes: body.scopes,
         grantVersion: body.grantVersion,
         latest: BigInt(body.grantVersion),
@@ -457,6 +513,9 @@ beforeEach(() => {
     ready: {
       gatewayUrl: GATEWAY,
       fetch: gateway.fetch as typeof fetch,
+      chain: gateway.reader,
+      retryBackoffMs: 0,
+      timeoutMs: 200,
       owner: OWNER,
       deployment: { chainId: CHAIN_ID, contractAddress: CONTRACT },
       signMessage: (message) => server.signMessage({ message }),
@@ -474,6 +533,12 @@ beforeEach(() => {
       link: (instance) =>
         instance === INSTANCE ? { connector: "spotify", namespace: "" } : null,
       declaredStreams: () => snapshot.streams.map((st) => st.name),
+      legacyScopes: () => [
+        { scope: "spotify.profile", streams: ["profile"] },
+        { scope: "spotify.overview", streams: ["top_artists", "profile"] },
+        // Names a stream the retained declaration lacks: not bound.
+        { scope: "spotify.playlists", streams: ["playlists"] },
+      ],
       logScope,
       streamScope,
     },
@@ -513,13 +578,15 @@ function ownerToken(): string {
 async function approve(
   clientId = CLIENT,
   streams = [{ name: "top_artists", fields: ["*"] }],
+  opts: { target?: Hono; accessMode?: "continuous" | "single_use" } = {},
 ) {
+  const app_ = opts.target ?? app;
   const token = ownerToken();
   const headers = {
     "content-type": "application/json",
     authorization: `Bearer ${token}`,
   };
-  const created = await app.request("/pdpp/v1/authorize", {
+  const created = await app_.request("/pdpp/v1/authorize", {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -533,7 +600,7 @@ async function approve(
           type: PDPP_DATA_ACCESS_TYPE,
           source: { id: SOURCE_ID },
           purpose_code: "https://pdpp.dev/purpose/personalization",
-          access_mode: "continuous",
+          access_mode: opts.accessMode ?? "continuous",
           streams,
         },
       ],
@@ -541,14 +608,14 @@ async function approve(
   });
   expect(created.status).toBe(201);
   const { session_id } = (await created.json()) as { session_id: string };
-  const reviewed = await app.request(
+  const reviewed = await app_.request(
     `/pdpp/v1/authorize/${session_id}/review`,
     { headers },
   );
   const { review } = (await reviewed.json()) as {
     review: { review_digest: string };
   };
-  return app.request(`/pdpp/v1/authorize/${session_id}/approve`, {
+  return app_.request(`/pdpp/v1/authorize/${session_id}/approve`, {
     method: "POST",
     headers,
     body: JSON.stringify({ review_digest: review.review_digest }),
@@ -598,7 +665,7 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
     expect(reg).toMatchObject({
       chainId: CHAIN_ID,
       contractAddress: CONTRACT,
-      permissionId: `0x${"a".repeat(64)}`,
+      permissionId: SLOT_ID,
       granteeId: BUILDER_ID,
       granteeAddress: GRANTEE,
       registeredVersion: "1",
@@ -624,7 +691,30 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
         sourceId: SOURCE_ID,
         streams: ["top_artists", "profile"],
       },
+      // Legacy readable scopes, each bound to every stream it projects.
+      "spotify.profile": { sourceId: SOURCE_ID, streams: ["profile"] },
+      "spotify.overview": {
+        sourceId: SOURCE_ID,
+        streams: ["top_artists", "profile"],
+      },
     });
+  });
+
+  it("lets a paid read of a legacy scope resolve only through a grant covering all its streams", async () => {
+    const grantId = await approvedGrantId();
+    gateway.settle();
+    // top_artists only: cannot pay for spotify.profile or spotify.overview.
+    expect(gateway.payResolves("spotify.profile")).toBeNull();
+    expect(gateway.payResolves("spotify.overview")).toBeNull();
+    const both = await approvedGrantId([
+      { name: "top_artists", fields: ["*"] },
+      { name: "profile", fields: ["*"] },
+    ]);
+    gateway.settle();
+    expect(gateway.payResolves("spotify.overview")?.grantId).toBe(both);
+    expect(gateway.payResolves("pdpp.spotify~.top_artists")?.grantId).toBe(
+      grantId,
+    );
   });
 
   it("keeps earlier entries when a second grant joins the slot, signing exactly one version above", async () => {
@@ -639,14 +729,13 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
     expect(b.registeredVersion).toBe("2");
   });
 
-  it("re-reads the slot and signs above it after a 409", async () => {
-    // Another writer (e.g. Account) moved the slot to version 5 meanwhile.
+  function legacySlot(expiresAtSeconds: string, scopes = ["instagram.posts"]) {
     gateway.slot = {
-      id: `0x${"a".repeat(64)}`,
-      scopes: ["instagram.posts"],
+      id: SLOT_ID,
+      scopes,
       grantVersion: "3",
       latest: 5n,
-      expiresAtSeconds: "0",
+      expiresAtSeconds,
       revokedAt: null,
       revocationKind: null,
       revocationFinalizedAt: null,
@@ -655,14 +744,73 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
       paymentStatus: "paid",
       removalOnly: false,
     };
+    gateway.chain = {
+      scopes: [...scopes],
+      expiresAt: BigInt(expiresAtSeconds),
+      version: 3n,
+    };
+  }
+
+  function lastRegistration() {
+    return gateway.requests.filter(
+      (r) => r.method === "POST" && r.path === "/v1/grants",
+    ).at(-1)!.body as { scopes: string[]; expiresAt: string; grantVersion: string };
+  }
+
+  it("signs above the gateway's highest answered version, keeping a legacy scope the chain holds", async () => {
+    // Another writer (e.g. Account) moved the slot to version 5 meanwhile.
+    legacySlot("0");
     const grantId = await approvedGrantId();
     expect(gateway.signedVersions).toEqual([6n]);
-    // A legacy scope in the slot is kept beside the new entry.
     expect(gateway.slot!.scopes).toEqual([
       "instagram.posts",
       store.getChainRegistration(grantId)!.entry,
     ]);
   });
+
+  it("F1: never extends a legacy scope's expiry: a perpetual PDPP grant keeps the slot's earlier end", async () => {
+    const dec31 = String(Math.floor(Date.now() / 1000) + 30 * 86_400);
+    legacySlot(dec31);
+    await approvedGrantId();
+    // The grant has no expiry; the signed slot expiry stays the legacy one.
+    expect(lastRegistration().expiresAt).toBe(dec31);
+  });
+
+  it("F1: a slot of only this PS's entries lasts as long as its longest grant", async () => {
+    const first = await approvedGrantId();
+    expect(store.getGrant(first)!.grant.expires_at).toBeUndefined();
+    expect(lastRegistration().expiresAt).toBe("0");
+  });
+
+  it("F2: never signs a scope only the gateway claims (lying gateway)", async () => {
+    legacySlot("0");
+    // The gateway's view adds scopes the finalized chain does not hold.
+    gateway.lie = { scopes: ["instagram.posts", "linkedin.profile", "pdpp:sha256:" + "e".repeat(64)] };
+    const grantId = await approvedGrantId();
+    const signed = lastRegistration().scopes;
+    expect(signed).toEqual([
+      "instagram.posts",
+      store.getChainRegistration(grantId)!.entry,
+    ]);
+    expect(signed).not.toContain("linkedin.profile");
+  });
+
+  it("F2: refuses a gateway that answers for another slot id", async () => {
+    legacySlot("0");
+    gateway.lie = { id: `0x${"c".repeat(64)}` };
+    const grantId = await approvedGrantId();
+    expect(store.getChainRegistration(grantId)).toMatchObject({
+      status: "pending",
+      lastError: "gateway answered for another slot id",
+    });
+    expect(lastRegistrationOrNone()).toBeUndefined();
+  });
+
+  function lastRegistrationOrNone() {
+    return gateway.requests.find(
+      (r) => r.method === "POST" && r.path === "/v1/grants",
+    );
+  }
 
   it("refuses approval for a client with no grantee address, issuing nothing", async () => {
     const res = await approve(NO_GRANTEE_CLIENT);
@@ -874,5 +1022,181 @@ describe("fail closed when chain grants are on but cannot run", () => {
     expect(
       await off.gate.authorize({ clientId: CLIENT, pdppGrantId: "g" }),
     ).toMatchObject({ ok: false, retryable: false });
+  });
+});
+
+describe("review round 2: finality, retries, labels, backfill", () => {
+  async function bound(streams?: Array<{ name: string; fields: string[] }>) {
+    const grantId = await approvedGrantId(streams);
+    gateway.settle();
+    expect(await read(grantId)).toEqual({ ok: true });
+    return grantId;
+  }
+
+  it("F5: a removal whose answer was lost is not ended until the finalized chain drops the entry", async () => {
+    const first = await bound();
+    const second = await bound([{ name: "profile", fields: ["*"] }]);
+    gateway.dropNextRegistrationAnswer = true;
+    await ownerRevoke(first);
+    // The gateway applied the removal (its view no longer lists the entry),
+    // but the PS never saw the answer and the chain has not settled.
+    const a = store.getChainRegistration(first)!;
+    expect(gateway.slot!.scopes).not.toContain(a.entry);
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(first)!.status).toBe("ending");
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(first)!.status).toBe("ended");
+    expect(await read(second)).toEqual({ ok: true });
+  });
+
+  it("F5: re-signs a removal-only upsert whose transaction failed", async () => {
+    const first = await bound();
+    await bound([{ name: "profile", fields: ["*"] }]);
+    await ownerRevoke(first);
+    const sent = store.getChainRegistration(first)!;
+    expect(sent).toMatchObject({ status: "ending", endingKind: "removal" });
+    gateway.settle({ fail: true });
+    await chain.registrar.reconcile();
+    const again = store.getChainRegistration(first)!;
+    expect(again.status).toBe("ending");
+    expect(BigInt(again.endedVersion!)).toBeGreaterThan(
+      BigInt(sent.endedVersion!),
+    );
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(first)!.status).toBe("ended");
+  });
+
+  it("F5: an owner's revocation from elsewhere ends the entry only once final, and is re-signed if it reverts", async () => {
+    const grantId = await bound();
+    // Account revokes the whole relationship (V2 revocation) at the gateway.
+    gateway.slot!.revokedAt = new Date().toISOString();
+    gateway.slot!.revocationKind = "v2_upsert";
+    gateway.slot!.latest = gateway.current() + 1n;
+    await ownerRevoke(grantId);
+    expect(store.getChainRegistration(grantId)!.status).toBe("ending");
+    expect(gateway.requests.some((r) => r.method === "DELETE")).toBe(false);
+    gateway.settle({ revert: true });
+    await chain.registrar.reconcile();
+    expect(gateway.requests.some((r) => r.method === "DELETE")).toBe(true);
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(grantId)!.status).toBe("ended");
+  });
+
+  it("F5: re-registers a bound grant whose registration failed on chain", async () => {
+    const grantId = await approvedGrantId();
+    gateway.settle({ fail: true });
+    await chain.registrar.reconcile();
+    expect(gateway.signedVersions).toEqual([1n, 2n]);
+    expect(store.getChainRegistration(grantId)!.status).toBe("bound");
+    gateway.settle();
+    expect(await read(grantId)).toEqual({ ok: true });
+  });
+
+  it("F4: ends a consumed single-use grant once its access token is gone", async () => {
+    const res = await approve(CLIENT, undefined, { accessMode: "single_use" });
+    const { redirect_uri, grant_id } = (await res.json()) as {
+      redirect_uri: string;
+      grant_id: string;
+    };
+    await chain.registrar.reconcile();
+    gateway.settle();
+    const redeemed = tokens.redeemAuthorizationCode({
+      code: new URL(redirect_uri).searchParams.get("code")!,
+      clientId: CLIENT,
+      redirectUri: REDIRECT,
+      codeVerifier: VERIFIER,
+    });
+    expect(redeemed.ok).toBe(true);
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(grant_id)!.status).toBe("bound");
+    tokens.revokeAccessToken(redeemed.ok ? redeemed.issued.access_token : "");
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(grant_id)!.status).toBe("ending");
+    expect(gateway.requests.some((r) => r.method === "DELETE")).toBe(true);
+  });
+
+  it("F4: a hung gateway times out and does not stall the queue", async () => {
+    gateway.down = true;
+    const grantId = await approvedGrantId();
+    gateway.down = false;
+    gateway.hang = true;
+    const started = Date.now();
+    await chain.registrar.reconcile();
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(store.getChainRegistration(grantId)!.lastError).toMatch(/time|abort/i);
+    gateway.hang = false;
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(grantId)!.status).toBe("bound");
+  });
+
+  it("F4: start() reconciles at once and on a timer; stop() ends it", async () => {
+    gateway.down = true;
+    const grantId = await approvedGrantId();
+    gateway.down = false;
+    chain.registrar.start(20);
+    await new Promise((r) => setTimeout(r, 120));
+    await chain.registrar.stop();
+    expect(store.getChainRegistration(grantId)!.status).toBe("bound");
+  });
+
+  it("F7: one conflicting label does not drop the other bindings", async () => {
+    // The gateway already holds the log label with a smaller stream set.
+    gateway.bindings.set("pdpp.spotify~.~log", {
+      sourceId: SOURCE_ID,
+      streams: ["top_artists"],
+    });
+    const grantId = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    expect(gateway.bindings.get("pdpp.spotify~.profile")).toEqual({
+      sourceId: SOURCE_ID,
+      streams: ["profile"],
+    });
+    expect(gateway.bindings.get("pdpp.spotify~.~log")!.streams).toEqual([
+      "top_artists",
+    ]);
+    const reg = store.getChainRegistration(grantId)!;
+    expect(reg.status).toBe("bound");
+    expect(reg.lastError).toContain("pdpp.spotify~.~log");
+  });
+
+  it("backfill: grants issued while chain grants were off answer retry, not grant_revoked, then bind", async () => {
+    const plain = new Hono();
+    plain.route(
+      "/pdpp/v1",
+      pdppAuthRoutes({
+        logger,
+        store,
+        tokens,
+        sessions: new AuthorizationSessionStore(),
+        issuer: "https://ps.example",
+        resolveDeclaration: (id) => (id === SOURCE_ID ? snapshot : null),
+        inventoryFor: () => ({ eligibleFor: () => [INSTANCE] }),
+        currentSubjectId: (c: Context) =>
+          c.req.header("authorization") ? OWNER : null,
+        registeredClient: (id) =>
+          id === CLIENT ? { client_id: id, redirect_uris: [REDIRECT] } : null,
+      }),
+    );
+    const res = await approve(CLIENT, undefined, { target: plain });
+    const { grant_id } = (await res.json()) as { grant_id: string };
+    expect(store.getChainRegistration(grant_id)).toBeNull();
+    expect(chain.registrar.backfill()).toBe(1);
+    expect(chain.registrar.backfill()).toBe(0);
+    gateway.down = true;
+    expect(await read(grant_id)).toMatchObject({ ok: false, retryable: true });
+    gateway.down = false;
+    await chain.registrar.reconcile();
+    gateway.settle();
+    expect(await read(grant_id)).toEqual({ ok: true });
+    // The entry fingerprints the client's document (pairwise handles).
+    const reg = store.getChainRegistration(grant_id)!;
+    expect(reg.entry).toBe(
+      computePdppGrantEntry(
+        store.clientGrantView(store.getGrant(grant_id)!),
+        reg.salt,
+      ),
+    );
   });
 });

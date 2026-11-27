@@ -147,7 +147,14 @@ import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
-import { createDesign2ChainGrants } from "./pdpp/chain-grants.js";
+import {
+  LEGACY_SCOPE_BINDINGS,
+  legacySourceId,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
+  createDesign2ChainGrants,
+  type PermissionsV2Reader,
+} from "./pdpp/chain-grants.js";
 import {
   logScope as streamSyncLogScope,
   streamScope as streamSyncStreamScope,
@@ -367,6 +374,11 @@ export interface CreateServerOptions {
    * except in an enclave, which uses `globalThis.fetch`. A test passes its own.
    */
   outboundFetch?: typeof fetch;
+  /**
+   * Design 2: how the PS reads PermissionsV2 at the finalized block. Default:
+   * the deployment's public RPC. A test passes its own.
+   */
+  pdppChainReader?: PermissionsV2Reader;
   /**
    * The stream-sync blob store. Default: the storage service at `gateway.url`.
    * A test with no storage service passes its own (for example
@@ -1686,6 +1698,9 @@ async function bootstrapServer(
   // grants are registered as salted entries in the owner's PermissionsV2 slot
   // for the app, signed by this server as the owner's registered server, and
   // client reads require the entry live on chain (pdpp/chain-grants.ts).
+  let chainRegistrar:
+    | ReturnType<typeof createDesign2ChainGrants>["registrar"]
+    | undefined;
   if (pdppAuth && config.pdpp.chainGrants.enabled) {
     const chain = createDesign2ChainGrants({
       store: pdppAuth.store,
@@ -1695,6 +1710,9 @@ async function bootstrapServer(
           ? {
               gatewayUrl: config.gateway.url,
               ...(outboundFetch && { fetch: outboundFetch }),
+              ...(options?.pdppChainReader && {
+                chain: options.pdppChainReader,
+              }),
               owner: serverOwner,
               deployment: {
                 chainId: config.gateway.chainId,
@@ -1710,12 +1728,30 @@ async function bootstrapServer(
                 pdppAuth.retainedDeclarations
                   .find((d) => d.source_id === sourceId)
                   ?.streams.map((st) => st.name) ?? [],
+              legacyScopes: (sourceId) =>
+                [...LEGACY_SCOPE_BINDINGS.values()]
+                  .filter(
+                    (b) =>
+                      b.pdppSource === sourceId ||
+                      legacySourceId(b.pdppSource) === sourceId,
+                  )
+                  .map((b) => ({ scope: b.scope, streams: b.pdppStreams })),
               logScope: streamSyncLogScope,
               streamScope: streamSyncStreamScope,
             }
           : null,
     });
     pdppAuth.chainRegistrar = chain.registrar;
+    chainRegistrar = chain.registrar;
+    // Grants issued while chain grants were off get a pending registration
+    // now, so their reads answer "retry" until they are on chain rather
+    // than `grant_revoked`.
+    const backfilled = chain.registrar.backfill();
+    if (backfilled > 0)
+      logger.info(
+        { backfilled },
+        "PDPP chain grants: existing grants queued for chain registration",
+      );
     if (pdppRecords) pdppRecords.chainEnforcement = chain.gate;
   }
 
@@ -2038,6 +2074,7 @@ async function bootstrapServer(
         logger.warn("Replication step did not settle before shutdown");
     });
     await attempt(() => derivativeScheduler.stop());
+    await attempt(() => chainRegistrar?.stop());
     await attempt(() => tunnelManager?.stop());
     await attempt(() => syncManager?.stop());
     // A request may have started an MCP state write it did not await.
@@ -2104,6 +2141,8 @@ async function bootstrapServer(
       if (!isEnclave) {
         derivativeScheduler.start();
       }
+      // Design 2: reconcile chain registrations now and every minute.
+      if (!backgroundClosed) chainRegistrar?.start();
 
       // --- Gateway registration check (slow: HTTP call) ---
       if (serverAccount && identity) {

@@ -679,11 +679,17 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    */
   /**
    * The owner's sources: every source that holds this owner's connected data
-   * or a grant this owner issued, with its declaration display name. Wallet
-   * proof (the same Web3Signed owner proof `/owner/token` takes, uri
-   * `/pdpp/v1/owner/sources`), because a consent broker needs this list to
-   * know which per-source owner tokens to ask for. Grants and data of other
-   * subjects never appear: both sets are read by the proven subject.
+   * or a grant this owner issued, with its declaration display name.
+   *
+   * Credentials: exactly what `/owner/token` accepts, through the same
+   * `web3-auth` + `owner-check` chain: a Web3Signed request signed by the
+   * server owner's wallet (uri `/pdpp/v1/owner/sources`, aud = this PS's
+   * origin), or one of the server's operator credentials that middleware
+   * also accepts on that path (the dev token, `PS_ACCESS_TOKEN`, and a CLI
+   * session token from the token store), each standing for the server owner.
+   * A PDPP owner or client token is refused (401). Without `ownerAuth` wired
+   * (tests), the deployment's `currentSubjectId` decides. Grants and data of
+   * other subjects never appear: both sets are read by the proven subject.
    */
   app.get("/owner/sources", (c) => {
     const verifiedSigner = (c.get("auth") as { signer?: string } | undefined)
@@ -1449,7 +1455,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
-    // AS item 29: a locked-rule grant carries this client's pairwise
+    // AS item 29 (and review F8): every new grant carries this client's pairwise
     // `subject.id`, assigned durably (and recorded) before anything discloses
     // it. The stored grant keeps the internal subject for RS enforcement and
     // owner views; only the RS ever sees that one (introspection subject_id).

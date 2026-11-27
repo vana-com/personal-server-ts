@@ -358,7 +358,11 @@ export function withPairwiseSubject(
   issued: { grant: Grant; consentEvidence: ConsentEvidence },
   pairwiseId: string,
 ): { grant: Grant; consentEvidence: ConsentEvidence } {
-  if (!grantUsesLockedRules(issued.grant)) return issued;
+  // Every newly issued grant gets the pairwise `subject.id` (review F8: no
+  // new grant carries the internal subject, which on a PS is the owner's
+  // wallet address). Pairwise instance handles are a locked-rule (v0.1.0)
+  // requirement; the private v0.2 revision keeps stored instance ids.
+  const locked = grantUsesLockedRules(issued.grant);
   return {
     grant: { ...issued.grant, subject: { id: pairwiseId } },
     consentEvidence: {
@@ -368,7 +372,7 @@ export function withPairwiseSubject(
         client_id: issued.grant.client.client_id,
         kind: "pairwise",
       },
-      instance_handles: "pairwise",
+      ...(locked && { instance_handles: "pairwise" as const }),
     },
   };
 }

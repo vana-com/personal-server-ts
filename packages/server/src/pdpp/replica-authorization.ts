@@ -276,9 +276,13 @@ export function createReplicaAuthorizationService(options: {
       // enforces against. A locked v0.1.0 grant's `subject.id` is the
       // client's pairwise identifier (AS item 29), so only a v0.2 grant,
       // whose `subject.id` is the subject itself, is compared to the owner.
+      // A v0.2 grant issued before pairwise ids carries the subject itself
+      // and is compared; one issued since carries a `pws_` pairwise id.
       if (
         context.subject_id !== options.owner ||
-        (grant.version === "0.2.0" && grant.subject.id !== options.owner)
+        (grant.version === "0.2.0" &&
+          !grant.subject.id.startsWith("pws_") &&
+          grant.subject.id !== options.owner)
       )
         return denied("owner_mismatch");
       if (
