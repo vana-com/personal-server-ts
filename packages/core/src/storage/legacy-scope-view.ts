@@ -323,8 +323,9 @@ export interface LegacyScopeViewPort {
    */
   connectionsServing?(scope: string): string[];
   /**
-   * The other scopes bound with this one in a connector's bindings: what a
-   * reset of the connection serving this scope also erases. Sorted.
+   * The other scopes bound to a connector method this scope is bound to:
+   * what a reset of the connection serving this scope also erases. Never
+   * another source's scopes. Sorted.
    */
   siblingScopes?(scope: string): string[];
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
@@ -1397,14 +1398,17 @@ export function createLegacyScopeView(
       });
     },
     siblingScopes(scope) {
-      const siblings = new Set<string>();
-      for (const profile of BINDING_PROFILES) {
-        if (!profile.get(scope)) continue;
-        for (const other of profile.keys()) {
-          if (other !== scope) siblings.add(other);
-        }
-      }
-      return [...siblings].sort();
+      // A profile maps every bound scope of every source, so siblings are
+      // the scopes that share a connector method with this one: the scopes
+      // a reset of this scope's connection also erases, and no other
+      // source's.
+      const methods = new Set(scopeMethods(scope).keys());
+      if (methods.size === 0) return [];
+      return boundScopes().filter(
+        (other) =>
+          other !== scope &&
+          [...scopeMethods(other).keys()].some((method) => methods.has(method)),
+      );
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),

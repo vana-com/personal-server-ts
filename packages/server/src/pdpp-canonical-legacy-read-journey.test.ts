@@ -1773,6 +1773,9 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("oura.readiness", { days: [day("r1", "2026-09-01")] });
     await legacyWrite("notes.manual", { text: "kept" });
+    // Other bound sources: a delete of Oura must never reach them.
+    await legacyWrite("github.profile", { login: "kept" });
+    await legacyWrite("instagram.profile", { username: "kept" });
     await collectActivity();
     expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
     expect(connectionRows(accountOne)).toBeGreaterThan(0);
@@ -1794,6 +1797,10 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     // The source's other file goes too (sleep has none); notes.manual is
     // another source and stays.
     expect(receipt.alsoDeleted.map((d) => d.scope)).toEqual(["oura.readiness"]);
+    for (const other of ["github.profile", "instagram.profile"]) {
+      expect(ctx!.indexManager.findLatestByScope(other)).toBeDefined();
+      expect((await ownerGet(`/v1/data/${other}`)).status).toBe(200);
+    }
     expect(
       ctx!.indexManager.findLatestByScope("oura.readiness"),
     ).toBeUndefined();
