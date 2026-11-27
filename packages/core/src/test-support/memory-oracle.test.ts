@@ -457,6 +457,25 @@ describe("memory-oracle error paths", () => {
     });
   }, 30_000);
 
+  it("does not treat a normally exiting workload without a report as a measurement", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(module, 'export function stop() { process.stderr.write("fixture stopped before measuring"); process.exit(0); }');
+      await expect(run({ module, exportName: "stop" }))
+        .rejects.toThrow(/memory-oracle child for stop exited 0: fixture stopped before measuring/);
+    });
+  }, 30_000);
+
+  it("keeps ordinary workload stdout out of the returned measurement", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(module, 'export function work() { console.log("fixture progress"); return { ok: true }; }');
+      const measured = await run({ module, exportName: "work" });
+      expect(measured.result).toEqual({ ok: true });
+      expect(measured.peakBytes).toBe(Math.max(0, measured.rawPeakBytes - measured.baselineBytes));
+    });
+  }, 30_000);
+
   it("rejects an unknown gc mode from the child", async () => {
     await withWorkloadDir(async (root) => {
       const module = join(root, "workload.mjs");
