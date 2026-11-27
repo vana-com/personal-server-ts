@@ -1385,12 +1385,18 @@ export function createLegacyScopeView(
               decide(scope).kind === "file"
                 ? optedOutMethods(scope)
                 : [...scopeMethods(scope).keys()];
-            return [...new Set(authority.listMethodConnections(methods)
-              .filter((connection) =>
-                connection.deletedAt === null &&
-                authority.hasHeldData(connection.instance, null),
-              )
-              .map((connection) => connection.instance))];
+            return [
+              ...new Set(
+                authority
+                  .listMethodConnections(methods)
+                  .filter(
+                    (connection) =>
+                      connection.deletedAt === null &&
+                      authority.hasHeldData(connection.instance, null),
+                  )
+                  .map((connection) => connection.instance),
+              ),
+            ];
           });
           // The snapshot is closed before the record-store writes begin.
           const erase = input.deleteConnection!;

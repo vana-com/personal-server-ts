@@ -1730,7 +1730,9 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       error: "CANONICAL_DELETE_UNSUPPORTED",
       scope: "oura.activity",
     });
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(before);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
+      before,
+    );
     // Only the owned scope is refused; the others keep their files.
     expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
@@ -1748,7 +1750,9 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     await legacyWrite("oura.readiness", { readiness: [] });
     await legacyWrite("notes.manual", { text: "kept" });
     await collectActivity();
-    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe("canonical");
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+      "canonical",
+    );
     expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
     expect(ctx!.indexManager.findLatestByScope("oura.readiness")).toBeDefined();
 
@@ -1796,7 +1800,9 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     expect(await deletion.json()).not.toMatchObject({
       error: "CANONICAL_DELETE_UNSUPPORTED",
     });
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(before);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
+      before,
+    );
   });
 });
 
