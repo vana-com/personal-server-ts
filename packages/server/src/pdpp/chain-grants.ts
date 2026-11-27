@@ -656,44 +656,138 @@ export class PdppChainRegistrar {
     return v !== null && /^\d+$/.test(v) ? BigInt(v) : 0n;
   }
 
-  /** Record every own entry of the slot that this gateway or chain read lists. */
+  /**
+   * P3: raise `seen_version` from the FINALIZED chain only (or from a version
+   * this PS itself signed, recorded where it signs) — never from a gateway
+   * answer, which an unreliable gateway could inflate.
+   */
   private observe(
     slotId: string,
-    slot: GatewaySlot | null,
-    permission: ChainPermission | null,
+    read: { permission: ChainPermission | null; blockTimestamp: bigint },
   ): void {
     const { store } = this.options;
+    const p = read.permission;
+    // A revoked or expired slot keeps its scopes but authorizes nothing: its
+    // listing is not a sighting.
+    if (!p || (p.expiresAt !== 0n && p.expiresAt <= read.blockTimestamp))
+      return;
     for (const r of store.listChainRegistrations(["bound", "ending"])) {
       if (r.permissionId?.toLowerCase() !== slotId.toLowerCase()) continue;
-      if (slot && slot.scopes.includes(r.entry))
-        store.noteChainSeen(r.grantId, slot.grantVersion);
-      if (permission && permission.scopes.includes(r.entry))
-        store.noteChainSeen(r.grantId, permission.grantVersion.toString());
+      if (p.scopes.includes(r.entry))
+        store.noteChainSeen(r.grantId, p.grantVersion.toString());
     }
   }
 
   /**
-   * W2: the slot (the gateway's latest, or the finalized chain) omits the
-   * entry at a version above the highest one it was seen listed at: an
-   * intentional removal by another signer, not a stale view.
+   * The finalized chain decides; the gateway is a hint (decided).
+   *
+   * - `drop`: the FINALIZED chain, at a version above `seen_version`, omits
+   *   the entry or holds the slot revoked/expired (a V2 revocation keeps the
+   *   scopes and sets a past expiry). Another signer removed it: the grant
+   *   ends as `dropped_elsewhere`.
+   * - `suspect`: only the gateway says so (its view omits the entry, or the
+   *   slot is revoked or expired there, at a version above `seen_version`).
+   *   The entry is not carried and reads answer "retry later" until the
+   *   chain confirms (→ drop) or the chain still lists it at a version at
+   *   least the gateway's (→ restored, no permanent effect).
+   * - `ok`: neither.
    */
-  private intentionallyOmitted(
+  private assess(
     r: ChainRegistration,
     slot: GatewaySlot | null,
-    permission: ChainPermission | null,
-  ): boolean {
+    read: { permission: ChainPermission | null; blockTimestamp: bigint },
+  ): "drop" | "suspect" | "ok" {
     const seen = PdppChainRegistrar.seenOf(r);
-    const gatewayOmits =
-      !!slot &&
-      slot.status !== "failed" &&
-      !slot.scopes.includes(r.entry) &&
-      /^\d+$/.test(slot.grantVersion) &&
-      BigInt(slot.grantVersion) > seen;
-    const chainOmits =
-      !!permission &&
-      !permission.scopes.includes(r.entry) &&
-      permission.grantVersion > seen;
-    return gatewayOmits || chainOmits;
+    const p = read.permission;
+    if (
+      p &&
+      p.grantVersion > seen &&
+      (!p.scopes.includes(r.entry) ||
+        (p.expiresAt !== 0n && p.expiresAt <= read.blockTimestamp))
+    )
+      return "drop";
+    if (!slot || slot.status === "failed") return "ok";
+    const numeric = (v: string) => (/^\d+$/.test(v) ? BigInt(v) : 0n);
+    const gatewayVersion =
+      numeric(slot.grantVersion) > numeric(slot.currentGrantVersion)
+        ? numeric(slot.grantVersion)
+        : numeric(slot.currentGrantVersion);
+    const hinted =
+      gatewayVersion > seen &&
+      (!slot.scopes.includes(r.entry) ||
+        slot.revokedAt !== null ||
+        slot.expired);
+    if (!hinted) return "ok";
+    // The chain still lists the entry at a version at least the gateway's:
+    // the gateway's view does not hold (no permanent effect).
+    if (p && p.scopes.includes(r.entry) && p.grantVersion >= gatewayVersion)
+      return "ok";
+    return "suspect";
+  }
+
+  /**
+   * Assess every own bound entry of the slot (except `except`) and apply the
+   * outcome. Returns the entries that may be kept in a write this PS signs.
+   */
+  private assessOwn(
+    slotId: string,
+    granteeAddress: string,
+    except: string,
+    slot: GatewaySlot | null,
+    read: { permission: ChainPermission | null; blockTimestamp: bigint },
+  ): ChainRegistration[] {
+    const { store } = this.options;
+    this.observe(slotId, read);
+    const keep: ChainRegistration[] = [];
+    for (const row of this.ownBoundOf(slotId, granteeAddress, except)) {
+      const r = store.getChainRegistration(row.grantId) ?? row;
+      const outcome = this.assess(r, slot, read);
+      if (outcome === "drop") {
+        store.dropChainEntryElsewhere(r.grantId, this.now());
+        continue;
+      }
+      if (outcome === "suspect") {
+        store.noteChainSuspect(r.grantId, this.now());
+        continue;
+      }
+      if (r.suspectSince) store.noteChainSuspect(r.grantId, null);
+      keep.push(r);
+    }
+    return keep;
+  }
+
+  /** P1: carry an own entry the gateway omits only into a live slot that the
+   * finalized chain holds live and lists it in. */
+  private static carriable(
+    r: ChainRegistration,
+    slot: GatewaySlot | null,
+    read: { permission: ChainPermission | null; blockTimestamp: bigint },
+  ): boolean {
+    const p = read.permission;
+    return (
+      slotLive(slot) &&
+      !!p &&
+      p.scopes.includes(r.entry) &&
+      (p.expiresAt === 0n || p.expiresAt > read.blockTimestamp)
+    );
+  }
+
+  /** P3: own entries listed in a write this PS signed were seen at it. */
+  private noteSigned(slotId: string, scopes: string[], version: bigint): void {
+    const { store } = this.options;
+    for (const r of store.listChainRegistrations(["bound", "pending"]))
+      if (
+        scopes.includes(r.entry) &&
+        (r.permissionId === null ||
+          r.permissionId.toLowerCase() === slotId.toLowerCase())
+      )
+        store.noteChainSeen(r.grantId, version.toString());
+  }
+
+  private isOwnBound(entry: string): boolean {
+    return this.options.store
+      .listChainRegistrations(["bound"])
+      .some((r) => r.entry === entry);
   }
 
   /** Own bound rows of this slot on this deployment (not `except`). */
@@ -895,7 +989,8 @@ export class PdppChainRegistrar {
         );
         return "pending";
       }
-      const { permission } = await chain.readFinalized(slotId);
+      const read = await chain.readFinalized(slotId);
+      const { permission } = read;
       const listed = slotLive(slot) ? slot.scopes : [];
       const failedAtGateway = slot?.status === "failed";
       if (listed.includes(reg.entry) && !failedAtGateway) {
@@ -908,6 +1003,8 @@ export class PdppChainRegistrar {
           permissionId: slotId,
           granteeId: builder.id,
           registeredVersion: slot!.grantVersion,
+          // P3: the version this PS last signed, not the gateway's answer.
+          seenVersion: reg.seenVersion ?? "0",
           now: this.now(),
         });
         return "bound";
@@ -925,20 +1022,31 @@ export class PdppChainRegistrar {
       // omits are carried back (with documents) when the omission is stale,
       // and dropped (`dropped_elsewhere`, grant ended) when it is above the
       // version they were seen at.
-      this.observe(slotId, slot, permission);
-      const carry: ChainRegistration[] = [];
-      for (const row of this.ownBoundOf(slotId, reg.granteeAddress, grantId)) {
-        if (listed.includes(row.entry)) continue;
-        const r = store.getChainRegistration(row.grantId) ?? row;
-        if (this.intentionallyOmitted(r, slot, permission))
-          store.dropChainEntryElsewhere(r.grantId, this.now());
-        else carry.push(r);
-      }
+      const okOwn = this.assessOwn(
+        slotId,
+        reg.granteeAddress,
+        grantId,
+        slot,
+        read,
+      );
+      const okEntries = new Set(okOwn.map((r) => r.entry));
+      const carry = okOwn.filter(
+        (r) =>
+          !listed.includes(r.entry) &&
+          PdppChainRegistrar.carriable(r, slot, read),
+      );
       const ended = this.endedEntries();
+      // A listed own entry is kept only when its assessment is `ok`; a
+      // listed foreign scope only when the finalized chain lists it (F2).
+      const ownNow = this.ownEntries(reg.granteeAddress, grantId);
       const kept = [
         ...listed.filter(
           (s) =>
-            s !== reg.entry && !ended.has(s) && (own.has(s) || onChain.has(s)),
+            s !== reg.entry &&
+            !ended.has(s) &&
+            (ownNow.has(s)
+              ? okEntries.has(s) || !this.isOwnBound(s)
+              : onChain.has(s)),
         ),
         ...carry.map((r) => r.entry).filter((e) => !ended.has(e)),
       ];
@@ -960,6 +1068,8 @@ export class PdppChainRegistrar {
               .reduce((a, b) => laterExpiry(a, b));
       const scopes = [...kept, reg.entry];
       const grantVersion = (slot ? BigInt(slot.currentGrantVersion) : 0n) + 1n;
+      // P3: a version this PS signs that lists its entry.
+      store.noteChainSeen(grantId, grantVersion.toString());
       const signature = await this.options.signGrantRegistration({
         grantorAddress: owner,
         granteeId: builder.id as `0x${string}`,
@@ -993,8 +1103,10 @@ export class PdppChainRegistrar {
         signature,
       );
       if (answer.status === 200 || answer.status === 201) {
+        this.noteSigned(slotId, scopes, grantVersion);
         store.markChainBound({
           grantId,
+          seenVersion: grantVersion.toString(),
           chainId: this.options.deployment.chainId,
           contractAddress: this.options.deployment.contractAddress,
           permissionId: slotId,
@@ -1056,15 +1168,17 @@ export class PdppChainRegistrar {
       store.markChainPending(reg.grantId, this.now());
       return;
     }
-    // W2: drop only on an omission above the highest version at which the
-    // entry was seen listed; a single stale or lagging read never drops it.
-    const { permission } = await chain.readFinalized(
-      reg.permissionId as `0x${string}`,
-    );
-    this.observe(reg.permissionId as `0x${string}`, slot, permission);
+    // P2/W2: the finalized chain decides; a gateway hint only holds the
+    // entry (retry later) until the chain confirms or contradicts it.
+    const read = await chain.readFinalized(reg.permissionId as `0x${string}`);
+    this.observe(reg.permissionId, read);
     const fresh = store.getChainRegistration(reg.grantId) ?? reg;
-    if (this.intentionallyOmitted(fresh, slot, permission))
+    const outcome = this.assess(fresh, slot, read);
+    if (outcome === "drop")
       store.dropChainEntryElsewhere(reg.grantId, this.now());
+    else if (outcome === "suspect")
+      store.noteChainSuspect(reg.grantId, this.now());
+    else if (fresh.suspectSince) store.noteChainSuspect(reg.grantId, null);
   }
 
   /** True when the finalized chain no longer lets the entry authorize. */
@@ -1149,11 +1263,25 @@ export class PdppChainRegistrar {
     // which overtakes that registration: the other grant must be signed
     // again by its surface. The PS's own pending registrations for this
     // slot are re-queued so they register on top of this write.
-    const own = this.ownEntries(reg.granteeAddress, grantId);
+    // The finalized chain decides, the gateway hints (P1-P3): assess every
+    // other own bound entry of the slot first. Confirmed drops end their
+    // grants; hinted ones are held (not carried, reads retry later).
+    const okOwn = this.assessOwn(
+      slotId,
+      reg.granteeAddress,
+      grantId,
+      slot,
+      read,
+    );
+    const okOwnEntries = new Set(okOwn.map((r) => r.entry));
+    const ownAll = this.ownEntries(reg.granteeAddress, grantId);
+    const own = new Map(
+      [...ownAll].filter(([e]) => okOwnEntries.has(e) || !this.isOwnBound(e)),
+    );
     const onChain = new Set(read.permission?.scopes ?? []);
     const ended = this.endedEntries(grantId);
     const verified = (s: string) =>
-      !ended.has(s) && (own.has(s) || onChain.has(s));
+      !ended.has(s) && (own.has(s) || (!ownAll.has(s) && onChain.has(s)));
     const overtaken = slot.scopes.filter(
       (s) => s !== reg.entry && !verified(s),
     );
@@ -1185,14 +1313,10 @@ export class PdppChainRegistrar {
     // becomes `dropped_elsewhere` and its grant ends at once (W3). An
     // omission at the same or a lower version is a stale view: the entry is
     // carried, with its document.
-    this.observe(slotId, slot, read.permission);
-    const carryRows: ChainRegistration[] = [];
-    for (const row of ownBoundRows) {
-      const r = store.getChainRegistration(row.grantId) ?? row;
-      if (this.intentionallyOmitted(r, slot, read.permission))
-        store.dropChainEntryElsewhere(r.grantId, this.now());
-      else carryRows.push(r);
-    }
+    const carryRows: ChainRegistration[] = ownBoundRows
+      .filter((row) => okOwnEntries.has(row.entry))
+      .map((row) => store.getChainRegistration(row.grantId) ?? row)
+      .filter((r) => PdppChainRegistrar.carriable(r, slot, read));
     let current = slot;
     let answer: GatewayAnswer | undefined;
     let revocation = false;
@@ -1281,6 +1405,12 @@ export class PdppChainRegistrar {
       current = (await gateway.getSlot(slotId)) ?? current;
     }
     if (answer && answer.status >= 200 && answer.status < 300) {
+      if (!revocation)
+        this.noteSigned(
+          slotId,
+          [...listedVerified, ...carryRows.map((r) => r.entry)],
+          grantVersion,
+        );
       store.noteChainEndingSent(
         grantId,
         grantVersion.toString(),
@@ -1352,6 +1482,13 @@ export function design2ChainEnforcement(options: {
       }
       if (reg.status !== "bound")
         return deny("Grant's chain entry has been removed");
+      // P2: the gateway hints the entry was removed elsewhere; the chain has
+      // not confirmed it. Not knowing is not permission: retry later.
+      if (reg.suspectSince)
+        return deny(
+          "Grant's chain entry may have been removed elsewhere; waiting for chain confirmation",
+          true,
+        );
       if (
         reg.chainId !== options.deployment.chainId ||
         reg.contractAddress?.toLowerCase() !==

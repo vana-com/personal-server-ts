@@ -209,6 +209,10 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   -- highest slot grantVersion at which the PS saw this entry listed (gateway
   -- or finalized chain); an omission counts only above it (W2)
   seen_version TEXT,
+  -- set while the gateway hints that another signer removed the entry (or
+  -- revoked/expired the slot) and the finalized chain has not confirmed it:
+  -- reads answer retry later and the entry is not carried (P2)
+  suspect_since TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -306,6 +310,8 @@ export interface ChainRegistration {
   droppedElsewhereAt: string | null;
   /** Highest slot version at which the entry was seen listed. */
   seenVersion: string | null;
+  /** The gateway hints a removal the finalized chain has not confirmed. */
+  suspectSince: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
@@ -330,6 +336,7 @@ interface ChainRegistrationRow {
   unbound_labels: string | null;
   dropped_elsewhere_at: string | null;
   seen_version: string | null;
+  suspect_since: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -362,6 +369,7 @@ function chainRegistrationFromRow(
       : [],
     droppedElsewhereAt: row.dropped_elsewhere_at,
     seenVersion: row.seen_version,
+    suspectSince: row.suspect_since,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1019,6 +1027,11 @@ export class PdppAuthStore {
     permissionId: string;
     granteeId: string;
     registeredVersion: string;
+    /**
+     * P3: the version this PS signed that lists the entry (never a gateway
+     * answer). Defaults to `registeredVersion`.
+     */
+    seenVersion?: string;
     now?: Date;
   }): boolean {
     const result = this.db
@@ -1036,7 +1049,7 @@ export class PdppAuthStore {
         input.permissionId,
         input.granteeId,
         input.registeredVersion,
-        input.registeredVersion,
+        input.seenVersion ?? input.registeredVersion,
         (input.now ?? new Date()).toISOString(),
         input.grantId,
       );
@@ -1204,6 +1217,17 @@ export class PdppAuthStore {
       )
       .run(now.toISOString(), now.toISOString(), grantId);
     return result.changes > 0;
+  }
+
+  /** Set (once) or clear the pending-confirmation state (P2). */
+  noteChainSuspect(grantId: string, since: Date | null): void {
+    this.db
+      .prepare(
+        since === null
+          ? "UPDATE pdpp_chain_registrations SET suspect_since = NULL WHERE grant_id = ?"
+          : "UPDATE pdpp_chain_registrations SET suspect_since = COALESCE(suspect_since, ?) WHERE grant_id = ?",
+      )
+      .run(...(since === null ? [grantId] : [since.toISOString(), grantId]));
   }
 
   /** Raise the highest version at which the entry was seen listed. */

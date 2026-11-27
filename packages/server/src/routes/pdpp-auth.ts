@@ -567,6 +567,14 @@ function chainOwnerView(
         ...labels,
       },
     };
+  if (reg.status === "bound" && reg.suspectSince)
+    return {
+      chain: {
+        status: "pending_confirmation",
+        since: reg.suspectSince,
+        ...labels,
+      },
+    };
   if (reg.status === "pending" && reg.deferredSince)
     return {
       chain: {

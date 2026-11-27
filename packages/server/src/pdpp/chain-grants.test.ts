@@ -1945,6 +1945,17 @@ describe("never drops a scope another surface is still settling", () => {
     const a = store.getChainRegistration(first)!.entry;
     secondSigner([a], false); // still settling: the finalized chain lists B
     await chain.registrar.reconcile();
+    // P2: a gateway-only omission holds B (retry later) without ending it.
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "bound",
+      droppedElsewhereAt: null,
+      suspectSince: expect.any(String),
+    });
+    expect(store.grantStatus(store.getGrant(second)!)).toBe("active");
+    expect(await read(second)).toMatchObject({ ok: false, retryable: true });
+    // Once the finalized chain confirms the omission, B ends.
+    gateway.settle();
+    await chain.registrar.reconcile();
     expect(
       store.getChainRegistration(second)!.droppedElsewhereAt,
     ).not.toBeNull();
@@ -1971,10 +1982,9 @@ describe("never drops a scope another surface is still settling", () => {
       .slice(before)
       .map((p) => (p.body as { scopes: string[] }).scopes);
     expect(written[0]).toEqual([c]);
-    expect(
-      store.getChainRegistration(second)!.droppedElsewhereAt,
-    ).not.toBeNull();
-    expect(await read(second)).toMatchObject({ ok: false, retryable: false });
+    // P2: not carried; held until the chain confirms (retry later).
+    expect(store.getChainRegistration(second)!.suspectSince).not.toBeNull();
+    expect(await read(second)).toMatchObject({ ok: false, retryable: true });
   });
 
   it("W4: a dropped entry another signer re-lists is removed by the next write", async () => {
@@ -1996,5 +2006,110 @@ describe("never drops a scope another surface is still settling", () => {
     const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
     expect(signed).toEqual([a, store.getChainRegistration(third)!.entry]);
     expect(signed).not.toContain(b);
+  });
+
+  it("P1 probe: after the slot is revoked elsewhere, a new approval signs only its own entry and the old grant stays off", async () => {
+    const first = await approvedGrantId();
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    expect(await read(first)).toEqual({ ok: true });
+    // The owner ends the relationship from Account: a V2 revocation.
+    gateway.slot!.revokedAt = new Date().toISOString();
+    gateway.slot!.revocationKind = "v2_upsert";
+    gateway.slot!.latest = gateway.current() + 1n;
+    await chain.registrar.reconcile();
+    expect(await read(first)).toMatchObject({ ok: false });
+    // A new approval for the same app, before the revocation is final.
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
+    expect(signed).toEqual([store.getChainRegistration(second)!.entry]);
+    expect(signed).not.toContain(a);
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(gateway.chain!.scopes).not.toContain(a);
+    expect(await read(first)).toMatchObject({ ok: false, retryable: false });
+    expect(
+      store.getChainRegistration(first)!.droppedElsewhereAt,
+    ).not.toBeNull();
+    expect(await read(second)).toEqual({ ok: true });
+  });
+
+  it("P1: a revocation confirmed on the finalized chain ends every own grant of the slot", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    gateway.slot!.revokedAt = new Date().toISOString();
+    gateway.slot!.revocationKind = "v2_upsert";
+    gateway.slot!.latest = gateway.current() + 1n;
+    gateway.settle(); // chain: scopes kept, past expiry, higher version
+    await chain.registrar.reconcile();
+    for (const g of [first, second]) {
+      expect(store.getChainRegistration(g)!.droppedElsewhereAt).not.toBeNull();
+      expect(store.lifecycle.getEnding(g)?.reason).toBe("dropped_elsewhere");
+    }
+  });
+
+  it("P2/P3: an inflated-version lying gateway neither ends nor revives anything", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const [a, b] = [first, second].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    const seenBefore = store.getChainRegistration(second)!.seenVersion;
+    // The gateway lists B at a huge version: seen_version must not move.
+    gateway.lie = {
+      scopes: [a, b],
+      grantVersion: "1000000",
+      currentGrantVersion: "1000000",
+    };
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)!.seenVersion).toBe(seenBefore);
+    // Now it omits B at that inflated version: B is held, not ended.
+    gateway.lie = {
+      scopes: [a],
+      grantVersion: "1000000",
+      currentGrantVersion: "1000000",
+    };
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "bound",
+      droppedElsewhereAt: null,
+    });
+    expect(store.grantStatus(store.getGrant(second)!)).toBe("active");
+    expect(await read(second)).toMatchObject({ ok: false, retryable: true });
+    // The lie ends: B is restored, with no permanent effect.
+    gateway.lie = null;
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)!.suspectSince).toBeNull();
+    expect(await read(second)).toEqual({ ok: true });
+    // A real removal by Account later is still detected (seen not inflated).
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.slot!.status = "pending";
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(
+      store.getChainRegistration(second)!.droppedElsewhereAt,
+    ).not.toBeNull();
+  });
+
+  it("P2: a gateway-only omission is restored when the finalized chain still lists the entry at the gateway's version", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    const chainVersion = String(gateway.chain!.version);
+    // A gateway view omitting B at a version the chain already holds with B.
+    gateway.lie = {
+      scopes: [a],
+      grantVersion: chainVersion,
+      currentGrantVersion: String(gateway.current()),
+    };
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)!.suspectSince).toBeNull();
+    expect(await read(second)).toEqual({ ok: true });
   });
 });

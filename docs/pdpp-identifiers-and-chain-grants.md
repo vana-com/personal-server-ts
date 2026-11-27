@@ -125,27 +125,40 @@ record and blob reads require that entry to be live on chain.
   paid read under a label the PS never bound gets the gateway's
   `SCOPE_UNBOUND`, except the unbound stream-sync physical scopes the
   gateway accepts under a slot that also holds a legacy scope.
-- **An entry dropped elsewhere stays dropped (fail closed).** For each
-  grant the PS records the highest slot `grantVersion` at which it saw the
-  grant's entry listed, at the gateway or on the finalized chain. When the
-  slot (the gateway's latest view, or the finalized chain) omits the entry
-  at a version above that, another signer removed it on purpose (for
-  example the owner dropping one grant through Vana Account), even if that
-  removal is still settling and the finalized chain still lists the entry.
-  The PS then never puts it back: the registration becomes
-  `dropped_elsewhere` and the grant itself ends at once (ending reason
-  `dropped_elsewhere`, no disposition change), so client reads are refused
-  whatever the chain-grants setting, GET /pdpp/v1/grants shows
-  `chain.status: "dropped_elsewhere"`, and nothing registers it again; the
-  owner can approve the app again. If another signer later lists that entry
-  again, the PS's next write leaves it out, which removes it. An omission
-  at the same or a lower version is a stale or lagging view and is
-  ignored: the PS carries the entry (with its document) in its writes. If
-  the gateway refuses such a carried entry (`PDPP_ENTRY_BOUND_ELSEWHERE` or
-  `PDPP_GRANT_DOCUMENT_REQUIRED`), the PS drops it the same way and sends the
-  write without it; this path only ever drops entries. A stale-version 409
-  is not a refusal of the entry: the PS reads the slot again and retries the
-  same write. An entry bound under another slot or contract is never sent.
+- **The finalized chain decides; the gateway is a hint.** For each grant
+  the PS records `seen_version`: the highest slot `grantVersion` at which
+  the finalized chain listed the grant's entry in a live slot, or at which
+  this PS itself signed a write listing it. A gateway answer never raises it.
+  - **Confirmed removal.** When the finalized chain, at a version above
+    `seen_version`, omits the entry or holds the slot revoked or expired (a
+    V2 revocation keeps the scopes and sets a past expiry), another signer
+    removed it (for example the owner dropping one grant, or ending the
+    whole app, through Vana Account). The registration becomes
+    `dropped_elsewhere` and the grant ends (ending reason
+    `dropped_elsewhere`, no disposition change), so client reads are
+    refused whatever the chain-grants setting, GET /pdpp/v1/grants shows
+    `chain.status: "dropped_elsewhere"`, and nothing registers it again; the
+    owner can approve the app again. A whole-slot revocation ends every own
+    grant of that slot this way.
+  - **Hinted removal.** When only the gateway says so (its view omits the
+    entry, or the slot is revoked or expired there, at a version above
+    `seen_version`), the PS does not end anything. It stops carrying the
+    entry, answers its reads "retry later", and shows
+    `chain.status: "pending_confirmation"`. On the reconcile timer it checks
+    the finalized chain again: a confirmation ends the grant as above; a
+    chain that still lists the entry at a version at least the gateway's
+    restores it, with no lasting effect.
+  - **Never into a dead slot.** The PS carries its own entries only into a
+    slot that is live at the gateway and live on the finalized chain, and
+    only entries the finalized chain lists. A new approval for an app whose
+    slot was revoked elsewhere therefore signs only the new grant's entry.
+  - If another signer later lists a dropped entry again, the PS's next
+    write leaves it out, which removes it. If the gateway refuses a carried
+    entry (`PDPP_ENTRY_BOUND_ELSEWHERE` or `PDPP_GRANT_DOCUMENT_REQUIRED`),
+    the PS drops it the same way and sends the write without it; this path
+    only ever drops entries. A stale-version 409 is not a refusal of the
+    entry: the PS reads the slot again and retries the same write. An entry
+    bound under another slot or contract is never sent.
 - **Reads never wait for the gateway.** A read of a grant whose
   registration is pending answers "retry later" at once; the registration
   is retried in the background.
