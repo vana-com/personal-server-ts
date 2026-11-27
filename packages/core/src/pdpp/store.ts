@@ -200,6 +200,8 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   deferred_since TEXT,
   -- the slot's latest registrationOutcome the deferral is waiting on
   deferred_outcome TEXT,
+  -- JSON [{scope, reason}] of scope labels the gateway did not bind
+  unbound_labels TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -291,6 +293,8 @@ export interface ChainRegistration {
   deferredSince: string | null;
   /** The other registration's `registrationOutcome` while deferred. */
   deferredOutcome: string | null;
+  /** Scope labels not bound at the gateway, with why. */
+  unboundLabels: Array<{ scope: string; reason: string }>;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
@@ -312,6 +316,7 @@ interface ChainRegistrationRow {
   ending_kind: "removal" | "revocation" | null;
   deferred_since: string | null;
   deferred_outcome: string | null;
+  unbound_labels: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -336,6 +341,12 @@ function chainRegistrationFromRow(
     endingKind: row.ending_kind,
     deferredSince: row.deferred_since,
     deferredOutcome: row.deferred_outcome,
+    unboundLabels: row.unbound_labels
+      ? (JSON.parse(row.unbound_labels) as Array<{
+          scope: string;
+          reason: string;
+        }>)
+      : [],
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -443,7 +454,11 @@ export function openPdppAuthStore(
   const registrationColumns = db
     .prepare("PRAGMA table_info(pdpp_chain_registrations)")
     .all() as { name: string }[];
-  for (const column of ["deferred_since", "deferred_outcome"]) {
+  for (const column of [
+    "deferred_since",
+    "deferred_outcome",
+    "unbound_labels",
+  ]) {
     if (!registrationColumns.some((existing) => existing.name === column)) {
       db.exec(`ALTER TABLE pdpp_chain_registrations ADD COLUMN ${column} TEXT`);
     }
@@ -1153,6 +1168,18 @@ export class PdppAuthStore {
       )
       .run(since.toISOString(), outcome ?? null, grantId);
     return this.getChainRegistration(grantId)?.deferredSince ?? null;
+  }
+
+  /** Record which scope labels the gateway did not bind, and why. */
+  noteUnboundLabels(
+    grantId: string,
+    labels: Array<{ scope: string; reason: string }>,
+  ): void {
+    this.db
+      .prepare(
+        "UPDATE pdpp_chain_registrations SET unbound_labels = ? WHERE grant_id = ?",
+      )
+      .run(labels.length > 0 ? JSON.stringify(labels) : null, grantId);
   }
 
   /**

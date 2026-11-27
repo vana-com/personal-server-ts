@@ -130,6 +130,9 @@ class FakeGateway {
   omitOutcome = false;
   /** Refuse an upsert listing an entry the gateway view does not list. */
   refuseUnlisted = false;
+  /** Refuse (409 bound elsewhere) any upsert listing one of these. */
+  refuseEntries = new Set<string>();
+  bindingRequests = 0;
   /** Hang every request (no answer) when set (F4 timeouts). */
   hang = false;
   requests: Array<{ method: string; path: string; body?: unknown }> = [];
@@ -327,21 +330,47 @@ class FakeGateway {
     if (method === "PUT" && url.pathname === "/v1/pdpp/scope-bindings") {
       expect(auth).toMatch(/^Web3Signed /);
       expect(body.ownerAddress).toBe(OWNER);
-      for (const b of body.bindings) {
+      this.bindingRequests++;
+      if (body.bindings.length > 100)
+        return Response.json(
+          { code: "PDPP_BINDINGS_TOO_MANY", maxBindings: 100 },
+          { status: 400 },
+        );
+      // gateway 6ae5d92: per-binding results; conflicts do not block others.
+      const results = (
+        body.bindings as Array<{
+          scope: string;
+          sourceId: string;
+          streams: string[];
+        }>
+      ).map((b) => {
+        if (b.streams.length > 256)
+          return { scope: b.scope, result: "invalid" };
         const prior = this.bindings.get(b.scope);
-        if (
-          prior &&
-          JSON.stringify(prior) !==
-            JSON.stringify({ sourceId: b.sourceId, streams: b.streams })
-        )
-          return Response.json({ error: "binding differs" }, { status: 409 });
-      }
-      for (const b of body.bindings)
-        this.bindings.set(b.scope, {
-          sourceId: b.sourceId,
-          streams: b.streams,
-        });
-      return Response.json({ data: { stored: body.bindings.length } });
+        if (!prior) {
+          this.bindings.set(b.scope, {
+            sourceId: b.sourceId,
+            streams: b.streams,
+          });
+          return { scope: b.scope, result: "bound" };
+        }
+        const same =
+          prior.sourceId === b.sourceId &&
+          prior.streams.length === b.streams.length &&
+          b.streams.every((st) => prior.streams.includes(st));
+        return { scope: b.scope, result: same ? "unchanged" : "conflict" };
+      });
+      const conflicts = results.filter((r) => r.result === "conflict");
+      return conflicts.length > 0
+        ? Response.json(
+            {
+              code: "PDPP_SCOPE_BINDING_CONFLICT",
+              scopes: conflicts.map((r) => r.scope),
+              results,
+            },
+            { status: 409 },
+          )
+        : Response.json({ success: true, results });
     }
 
     if (method === "POST" && url.pathname === "/v1/grants") {
@@ -354,6 +383,11 @@ class FakeGateway {
       });
       if (signer.toLowerCase() !== server.address.toLowerCase())
         return Response.json({ error: "bad signer" }, { status: 401 });
+      if ((body.scopes as string[]).some((e) => this.refuseEntries.has(e)))
+        return Response.json(
+          { code: "PDPP_ENTRY_BOUND_ELSEWHERE" },
+          { status: 409 },
+        );
       if (this.refuseUnlisted) {
         const listed =
           (this.lie?.scopes as string[] | undefined) ?? this.slot?.scopes ?? [];
@@ -889,8 +923,10 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
       reason: "Grant is not yet registered on chain",
     });
     gateway.down = false;
-    // The read gate registers it, but the chain has not settled yet.
+    // NEW-8: the read answers "retry later" at once and registers in the
+    // background; the chain has not settled yet.
     expect(await read(grantId)).toMatchObject({ ok: false, retryable: true });
+    await drain();
     expect(store.getChainRegistration(grantId)!.status).toBe("bound");
     gateway.settle();
     expect(await read(grantId)).toEqual({ ok: true });
@@ -1613,16 +1649,20 @@ describe("never drops a scope another surface is still settling", () => {
     const a = store.getChainRegistration(first)!.entry;
     const b = store.getChainRegistration(second)!.entry;
     gateway.lie = { scopes: [a] }; // the view omits B, bound to this slot
-    gateway.refuseUnlisted = true;
+    gateway.refuseEntries = new Set([b]);
     const before = posts().length;
     await ownerRevoke(first);
-    // Attempt 1: removal-only [B], refused 409; attempt 2: nothing remains,
-    // so a V2 revocation over the verified scopes.
+    // Attempt 1: removal-only [B] (with B's document), refused 409;
+    // attempt 2: nothing remains, so a V2 revocation over the verified scopes.
     expect(
       posts()
         .slice(before)
         .map((p) => (p.body as { scopes: string[] }).scopes),
     ).toEqual([[b]]);
+    expect(
+      (posts().at(-1)!.body as { pdppGrants?: Array<{ entry: string }> })
+        .pdppGrants?.[0]?.entry,
+    ).toBe(b);
     const del = gateway.requests.filter((r) => r.method === "DELETE");
     expect(del).toHaveLength(1);
     expect((del[0].body as { scopes: string[] }).scopes).toEqual([a]);
@@ -1630,6 +1670,126 @@ describe("never drops a scope another surface is still settling", () => {
       status: "ending",
       endingKind: "revocation",
     });
+    // NEW-7: B is not lost: it registers again.
+    expect(store.getChainRegistration(second)!.status).toBe("pending");
+  });
+
+  it("NEW-7: the fallback drops only the refused unlisted entry, never the listed live ones", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    const stale = await approvedGrantId([
+      { name: "top_artists", fields: ["name"] },
+    ]);
+    gateway.settle();
+    const [a, b, c, d] = [first, second, third, stale].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    setPermissionId(stale, `0x${"d".repeat(64)}`); // bound under an old slot
+    // The view lists A and B (live), omits C (live, this slot) and D.
+    gateway.lie = { scopes: [a, b] };
+    gateway.refuseEntries = new Set([c]);
+    const before = posts().length;
+    await ownerRevoke(first);
+    const written = posts()
+      .slice(before)
+      .map((p) => (p.body as { scopes: string[] }).scopes);
+    expect(written).toEqual([[b, c], [b]]);
+    for (const w of written) expect(w).not.toContain(d);
+    expect(store.getChainRegistration(second)!.status).toBe("bound");
+    expect(store.getChainRegistration(third)!.status).toBe("pending");
+  });
+
+  it("NEW-2: a label over 256 streams is not sent and the owner sees the grant as not fully bindable", async () => {
+    const many = Array.from({ length: 257 }, (_, i) => `s${i}`);
+    const wide = createDesign2ChainGrants({
+      store,
+      logger,
+      ready: {
+        gatewayUrl: GATEWAY,
+        fetch: gateway.fetch as typeof fetch,
+        chain: gateway.reader,
+        retryBackoffMs: 0,
+        owner: OWNER,
+        deployment: { chainId: CHAIN_ID, contractAddress: CONTRACT },
+        signMessage: (message) => server.signMessage({ message }),
+        signGrantRegistration: (msg) =>
+          server.signTypedData({
+            domain: DOMAIN,
+            types: TYPES,
+            primaryType: "GrantRegistration",
+            message: msg,
+          }),
+        clients: [{ clientId: CLIENT, granteeAddress: GRANTEE }],
+        link: () => ({ connector: "spotify", namespace: "" }),
+        declaredStreams: () => many,
+        logScope,
+        streamScope,
+      },
+    });
+    // Issued while chain grants were off, then registered by `wide`.
+    const plain = new Hono();
+    plain.route(
+      "/pdpp/v1",
+      pdppAuthRoutes({
+        logger,
+        store,
+        tokens,
+        sessions: new AuthorizationSessionStore(),
+        issuer: "https://ps.example",
+        resolveDeclaration: (id) => (id === SOURCE_ID ? snapshot : null),
+        inventoryFor: () => ({ eligibleFor: () => [INSTANCE] }),
+        currentSubjectId: (c: Context) =>
+          c.req.header("authorization") ? OWNER : null,
+        registeredClient: (id) =>
+          id === CLIENT ? { client_id: id, redirect_uris: [REDIRECT] } : null,
+      }),
+    );
+    const res = await approve(CLIENT, undefined, { target: plain });
+    const { grant_id } = (await res.json()) as { grant_id: string };
+    expect(wide.registrar.backfill()).toBe(1);
+    await wide.registrar.register(grant_id);
+    const reg = store.getChainRegistration(grant_id)!;
+    expect(reg.status).toBe("bound");
+    expect(reg.unboundLabels).toEqual([
+      { scope: "pdpp.spotify~.~log", reason: "too_many_streams" },
+    ]);
+    expect(gateway.bindings.has("pdpp.spotify~.~log")).toBe(false);
+    expect(gateway.bindings.has("pdpp.spotify~.top_artists")).toBe(true);
+  });
+
+  it("NEW-2: the owner view reports unbound labels and bindable: false", async () => {
+    const grantId = await approvedGrantId();
+    store.noteUnboundLabels(grantId, [
+      { scope: "pdpp.spotify~.~log", reason: "too_many_streams" },
+    ]);
+    const owner = (await (
+      await app.request("/pdpp/v1/grants", {
+        headers: { authorization: `Bearer ${ownerToken()}` },
+      })
+    ).json()) as { grants: Array<{ grant_id: string; chain?: unknown }> };
+    expect(owner.grants.find((g) => g.grant_id === grantId)!.chain).toEqual({
+      status: "bound",
+      unbound_labels: [
+        { scope: "pdpp.spotify~.~log", reason: "too_many_streams" },
+      ],
+      bindable: false,
+    });
+  });
+
+  it("gateway 6ae5d92: labels are sent in one batched request with per-binding results; a conflict keeps the others", async () => {
+    gateway.bindings.set("spotify.profile", {
+      sourceId: SOURCE_ID,
+      streams: ["other"],
+    });
+    const grantId = await approvedGrantId();
+    expect(gateway.bindingRequests).toBe(1);
+    expect(gateway.bindings.get("pdpp.spotify~.top_artists")).toBeDefined();
+    expect(store.getChainRegistration(grantId)!.unboundLabels).toEqual([
+      { scope: "spotify.profile", reason: "already_bound" },
+    ]);
   });
 
   it("final F3: with no registrationOutcome, a failed slot is not settling", async () => {

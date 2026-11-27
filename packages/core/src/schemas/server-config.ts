@@ -159,7 +159,10 @@ export const DEFAULTS = {
     // client reads unless that entry is live on chain. Off by default: it
     // needs a gateway with the design-2 routes, a registered server key and a
     // grantee address for every client.
-    chainGrants: { enabled: false },
+    // `allowDisableWithRegistrations`: boot with chain grants off even
+    // though grants are still registered on chain (their entries then stay
+    // there; see docs/pdpp-identifiers-and-chain-grants.md).
+    chainGrants: { enabled: false, allowDisableWithRegistrations: false },
     // Hosts this deployment allows to resolve URL-hosted (§6) client
     // identities. Empty means no client_id is ever fetched: registration in
     // `clients` above stays the only way a client is admitted, and this
@@ -396,7 +399,10 @@ export const ServerConfigSchema = z.object({
         )
         .default(DEFAULTS.pdpp.clients),
       chainGrants: z
-        .object({ enabled: z.boolean().default(false) })
+        .object({
+          enabled: z.boolean().default(false),
+          allowDisableWithRegistrations: z.boolean().default(false),
+        })
         .default(DEFAULTS.pdpp.chainGrants),
       // Local admission policy for URL-hosted clients (AS item 50). Empty
       // (the default) admits any valid client ID metadata document served

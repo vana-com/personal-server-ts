@@ -1698,6 +1698,26 @@ async function bootstrapServer(
   // grants are registered as salted entries in the owner's PermissionsV2 slot
   // for the app, signed by this server as the owner's registered server, and
   // client reads require the entry live on chain (pdpp/chain-grants.ts).
+  // NEW-3: turning chain grants off stops every on-chain removal, so an
+  // entry still bound or ending would stay on chain (and payable at the
+  // gateway) for good. Refuse that boot unless the operator says so.
+  if (pdppAuth && !config.pdpp.chainGrants.enabled) {
+    const live = pdppAuth.store.listChainRegistrations(["bound", "ending"]);
+    if (
+      live.length > 0 &&
+      !config.pdpp.chainGrants.allowDisableWithRegistrations
+    )
+      throw new Error(
+        `pdpp.chainGrants is off but ${live.length} PDPP grant(s) are still registered on chain. ` +
+          "Turn it back on so their entries can be removed when the grants end, or end those grants first; " +
+          "set pdpp.chainGrants.allowDisableWithRegistrations to boot anyway (the entries then stay on chain).",
+      );
+    if (live.length > 0)
+      logger.warn(
+        { registrations: live.length },
+        "PDPP chain grants are off with grants still registered on chain; their entries stay there",
+      );
+  }
   let chainRegistrar:
     ReturnType<typeof createDesign2ChainGrants>["registrar"] | undefined;
   if (pdppAuth && config.pdpp.chainGrants.enabled) {

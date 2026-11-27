@@ -405,7 +405,15 @@ const SETTLING = new Set(["pending", "sent", "confirmed"]);
 
 const IN_FLIGHT = new Set(["SETTLEMENT_IN_FLIGHT", "REVOCATION_IN_FLIGHT"]);
 /** The gateway's per-request limits on PUT /v1/pdpp/scope-bindings. */
-const MAX_BINDING_STREAMS = 64;
+/**
+ * The gateway's per-label stream limit on PUT /v1/pdpp/scope-bindings (raised
+ * to 256 at the gateway). A label over it is not sent; the grant is shown to
+ * the owner as not fully bindable (`chain.bindable: false`).
+ */
+const MAX_BINDING_STREAMS = 256;
+const MAX_BINDINGS_PER_REQUEST = 100;
+/** Below the gateway's 1 MiB request cap, leaving room for the envelope. */
+const MAX_BINDINGS_BYTES = 900 * 1024;
 
 function grantExpirySeconds(grant: Grant): bigint {
   if (!grant.expires_at) return 0n;
@@ -657,28 +665,64 @@ export class PdppChainRegistrar {
   private async bindScopes(
     grantId: string,
     bindings: PdppScopeBinding[],
-  ): Promise<string[]> {
+  ): Promise<Array<{ scope: string; reason: string }>> {
     const { gateway, owner, logger } = this.options;
-    const unbound: string[] = [];
+    const unbound: Array<{ scope: string; reason: string }> = [];
+    const sendable: PdppScopeBinding[] = [];
     for (const binding of bindings) {
-      if (binding.streams.length > MAX_BINDING_STREAMS) {
-        unbound.push(binding.scope);
-        continue;
+      if (binding.streams.length > MAX_BINDING_STREAMS)
+        unbound.push({ scope: binding.scope, reason: "too_many_streams" });
+      else sendable.push(binding);
+    }
+    // Gateway 6ae5d92: ≤ 100 bindings and ≤ 1 MiB of JSON per request, and
+    // bindings are independent: the non-conflicting ones are stored even
+    // when another conflicts (409 with per-binding results).
+    const batches: PdppScopeBinding[][] = [];
+    let batch: PdppScopeBinding[] = [];
+    let bytes = 0;
+    for (const binding of sendable) {
+      const size = Buffer.byteLength(JSON.stringify(binding), "utf8");
+      if (
+        batch.length > 0 &&
+        (batch.length >= MAX_BINDINGS_PER_REQUEST ||
+          bytes + size > MAX_BINDINGS_BYTES)
+      ) {
+        batches.push(batch);
+        batch = [];
+        bytes = 0;
       }
-      const answer = await gateway.putScopeBindings(owner, [binding]);
-      if (answer.status >= 200 && answer.status < 300) continue;
-      unbound.push(binding.scope);
-      if (answer.status === 409)
-        logger.warn(
-          { grantId, scope: binding.scope },
-          "PDPP chain registration: a scope label is already bound to another stream set",
-        );
-      else if (
+      batch.push(binding);
+      bytes += size;
+    }
+    if (batch.length > 0) batches.push(batch);
+    for (const part of batches) {
+      const answer = await gateway.putScopeBindings(owner, part);
+      if (
         answer.status >= 500 ||
         answer.status === 401 ||
         answer.status === 403
       )
         throw new Error(`scope bindings: ${describe(answer)}`);
+      const results = Array.isArray(answer.body.results)
+        ? (answer.body.results as Array<{ scope?: unknown; result?: unknown }>)
+        : null;
+      if (answer.status >= 200 && answer.status < 300 && !results) continue;
+      for (const binding of part) {
+        const result = results?.find((r) => r.scope === binding.scope)?.result;
+        if (result === "bound" || result === "unchanged") continue;
+        unbound.push({
+          scope: binding.scope,
+          reason:
+            result === "conflict"
+              ? "already_bound"
+              : `refused_${answer.status}`,
+        });
+        if (result === "conflict")
+          logger.warn(
+            { grantId, scope: binding.scope },
+            "PDPP chain registration: a scope label is already bound to another stream set",
+          );
+      }
     }
     return unbound;
   }
@@ -784,6 +828,7 @@ export class PdppChainRegistrar {
       const failedAtGateway = slot?.status === "failed";
       if (listed.includes(reg.entry) && !failedAtGateway) {
         // An earlier attempt landed and its answer was lost.
+        store.noteUnboundLabels(grantId, unbound);
         store.markChainBound({
           grantId,
           chainId: this.options.deployment.chainId,
@@ -858,10 +903,11 @@ export class PdppChainRegistrar {
               : grantVersion.toString(),
           now: this.now(),
         });
+        store.noteUnboundLabels(grantId, unbound);
         if (unbound.length > 0)
           store.noteChainError(
             grantId,
-            `bound; scope labels not bound at the gateway: ${unbound.join(", ")}`,
+            `bound; scope labels not bound at the gateway: ${unbound.map((u) => u.scope).join(", ")}`,
             this.now(),
           );
         return "bound";
@@ -995,7 +1041,7 @@ export class PdppChainRegistrar {
     // Only rows bound to THIS slot on THIS deployment: an entry bound under an
     // older slot or contract is not the gateway's to carry here (it would
     // answer 409 PDPP_ENTRY_BOUND_ELSEWHERE / 400 and the end would never land).
-    const ownBound = store
+    const ownBoundRows = store
       .listChainRegistrations(["bound"])
       .filter(
         (r) =>
@@ -1006,8 +1052,8 @@ export class PdppChainRegistrar {
           r.contractAddress?.toLowerCase() ===
             this.options.deployment.contractAddress.toLowerCase() &&
           !listedVerified.includes(r.entry),
-      )
-      .map((r) => r.entry);
+      );
+    const ownBound = ownBoundRows.map((r) => r.entry);
     let current = slot;
     let answer: GatewayAnswer | undefined;
     let revocation = false;
@@ -1052,15 +1098,42 @@ export class PdppChainRegistrar {
         scopes,
         expiresAt: expiresAt.toString(),
       };
+      // Carried entries go with their documents, so the gateway can accept
+      // them even when its view lost them.
+      const attachments = carryUnlisted
+        ? ownBoundRows.flatMap((r) => {
+            const g = store.getGrant(r.grantId);
+            return g
+              ? [
+                  {
+                    entry: r.entry,
+                    grant: store.clientGrantView(g),
+                    salt: r.salt,
+                  },
+                ]
+              : [];
+          })
+        : [];
       answer = revocation
         ? await gateway.revokeSlot(slotId, body, signature)
-        : await gateway.registerSlot({ ...body, granteeId }, signature);
+        : await gateway.registerSlot(
+            {
+              ...body,
+              granteeId,
+              ...(attachments.length > 0 && { pdppGrants: attachments }),
+            },
+            signature,
+          );
       const refusedCarry =
         carryUnlisted && answer.status >= 400 && answer.status < 500;
       if (!refusedCarry) break;
+      // NEW-7: drop only the carried (unlisted) entries, never the listed
+      // live ones, and register those grants again so they are not lost.
+      for (const r of ownBoundRows)
+        store.markChainPending(r.grantId, this.now());
       this.options.logger.warn(
-        { grantId, status: answer.status },
-        "PDPP chain: gateway refused own entries it does not list; ending without them",
+        { grantId, status: answer.status, requeued: ownBoundRows.length },
+        "PDPP chain: gateway refused own entries it does not list; ending without them and registering them again",
       );
       // The refused signature may have spent its version: read it again.
       current = (await gateway.getSlot(slotId)) ?? current;
@@ -1114,7 +1187,7 @@ export function design2ChainEnforcement(options: {
   });
   return {
     async authorize({ clientId, pdppGrantId }) {
-      let reg = options.store.getChainRegistration(pdppGrantId);
+      const reg = options.store.getChainRegistration(pdppGrantId);
       if (!reg) return deny("No chain binding for this grant");
       const grantee = options.registrar.granteeAddressFor(clientId);
       if (
@@ -1123,17 +1196,17 @@ export function design2ChainEnforcement(options: {
       )
         return deny("Client is not the bound grantee for this grant");
       if (reg.status === "pending") {
-        try {
-          await options.registrar.retry(pdppGrantId);
-        } catch (err) {
-          options.logger.warn(
-            { pdppGrantId, err: (err as Error).message },
-            "PDPP chain gate: registration retry failed",
+        // NEW-8: never make a read wait behind the gateway. Answer "retry
+        // later" now and try the registration in the background.
+        void options.registrar
+          .retry(pdppGrantId)
+          .catch((err: unknown) =>
+            options.logger.warn(
+              { pdppGrantId, err: (err as Error).message },
+              "PDPP chain gate: registration retry failed",
+            ),
           );
-        }
-        reg = options.store.getChainRegistration(pdppGrantId)!;
-        if (reg.status === "pending")
-          return deny("Grant is not yet registered on chain", true);
+        return deny("Grant is not yet registered on chain", true);
       }
       if (reg.status !== "bound")
         return deny("Grant's chain entry has been removed");

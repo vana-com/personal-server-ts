@@ -548,6 +548,17 @@ function chainOwnerView(
 ): { chain: Record<string, unknown> } | undefined {
   const reg = store.getChainRegistration(stored.grant.grant_id);
   if (!reg) return { chain: { status: "unregistered" } };
+  // NEW-2: labels the gateway did not bind. `bindable: false` when a label
+  // was over the gateway's stream limit: paid reads of it cannot resolve.
+  const labels =
+    reg.unboundLabels.length > 0
+      ? {
+          unbound_labels: reg.unboundLabels,
+          bindable: !reg.unboundLabels.some(
+            (l) => l.reason === "too_many_streams",
+          ),
+        }
+      : {};
   if (reg.status === "pending" && reg.deferredSince)
     return {
       chain: {
@@ -555,9 +566,10 @@ function chainOwnerView(
         registration_outcome: reg.deferredOutcome,
         since: reg.deferredSince,
         past_bound: reg.lastError?.startsWith("deferred past bound") ?? false,
+        ...labels,
       },
     };
-  return { chain: { status: reg.status } };
+  return { chain: { status: reg.status, ...labels } };
 }
 
 /** The slice of `PdppChainRegistrar` (pdpp/chain-grants.ts) the AS uses. */

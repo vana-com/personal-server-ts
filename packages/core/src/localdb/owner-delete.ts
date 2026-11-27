@@ -29,8 +29,14 @@ export type OwnerRecordDeleteResult =
   | { readonly kind: "not_found" }
   | {
       readonly kind: "refused";
-      /** A reason a client can read; no record data. */
+      /** A reason the owner can read, with the remedy; no record data. */
       readonly reason: string;
+      /**
+       * Machine-readable: `namespaced_connection`, `no_verified_artifact`,
+       * `registry_unreachable`, `delete_not_applied`, or the run intake's
+       * own error code.
+       */
+      readonly code: string;
       readonly retryable: boolean;
     };
 
@@ -78,7 +84,9 @@ export function createOwnerRecordDelete(
     if (target.namespace !== "")
       return {
         kind: "refused",
-        reason: "This connection cannot be written by a run on this server",
+        code: "namespaced_connection",
+        reason:
+          "This connection cannot be written by a run on this server, so the record cannot be deleted here. Delete it on the device that collects this connection, or disconnect the connection to remove all its records.",
         retryable: false,
       };
     // Either stream semantics: spec-core §4, `append_only`: "Explicit
@@ -95,8 +103,9 @@ export function createOwnerRecordDelete(
     if (!artifactDigest)
       return {
         kind: "refused",
+        code: "no_verified_artifact",
         reason:
-          "This server holds no verified connector artifact for this connection",
+          "This server holds no verified connector artifact for this connection, so it cannot write the delete. Update the server (or re-install the connector) so it holds the connector version this connection uses, then delete again.",
         retryable: false,
       };
     const runId = deps.newRunId();
@@ -114,8 +123,9 @@ export function createOwnerRecordDelete(
           await deps.intake.abort(runId, "cancelled").catch(() => undefined);
         return {
           kind: "refused",
+          code: "registry_unreachable",
           reason:
-            "The account registry could not be reached; the delete was not made",
+            "The account registry could not be reached; the delete was not made. Try again later.",
           retryable: true,
         };
       }
@@ -147,7 +157,11 @@ export function createOwnerRecordDelete(
       if (error instanceof RunIntakeError)
         return {
           kind: "refused",
-          reason: error.code,
+          code: error.code,
+          reason:
+            error.status === 503
+              ? `The delete could not be written now (${error.code}). Try again later.`
+              : `The delete was refused (${error.code}).`,
           retryable: error.status === 503,
         };
       throw error;
@@ -161,7 +175,9 @@ export function createOwnerRecordDelete(
     if (remains)
       return {
         kind: "refused",
-        reason: "The delete run did not remove the record",
+        code: "delete_not_applied",
+        reason:
+          "The delete run did not remove the record. Try again; if it persists, disconnect the connection to remove its records.",
         retryable: false,
       };
     return { kind: "deleted", runId };

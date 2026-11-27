@@ -533,6 +533,8 @@ function sendError(c: Context, err: PdppError, reqId: string) {
     headers["WWW-Authenticate"] =
       `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
   }
+  // A refusal's machine-readable reason, outside the closed §8 error body.
+  if (err.reason) headers["PDPP-Refusal-Reason"] = err.reason;
   return c.json(err.toJSON(reqId), err.status as never, headers);
 }
 
@@ -1495,7 +1497,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         if (!deps.switchedDelete)
           throw new PdppError(
             "update_required",
-            "This server cannot write a delete run for a stream-sync account",
+            "This server cannot write a delete run for a stream-sync account. Update the Personal Server app, then delete again.",
+            { reason: "delete_port_missing" },
           );
         const stream = c.req.param("stream");
         const recordKey = c.req.param("id");
@@ -1519,6 +1522,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             throw new PdppError(
               result.retryable ? "STREAM_READ_UNAVAILABLE" : "conflict",
               result.reason,
+              { reason: result.code },
             );
           return c.body(null, 204, {
             "Request-Id": reqId,

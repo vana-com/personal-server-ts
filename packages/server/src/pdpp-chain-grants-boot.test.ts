@@ -229,7 +229,10 @@ const CLIENT_ID = "music_recommendations";
 const GRANTEE = "0x2222222222222222222222222222222222222222";
 const BUILDER_ID = `0x${"b".repeat(64)}` as `0x${string}`;
 
-function pdppConfig(declarationPaths: string[]) {
+function pdppConfig(
+  declarationPaths: string[],
+  chainGrants: Record<string, boolean> = { enabled: true },
+) {
   return ServerConfigSchema.parse({
     tunnel: { enabled: false },
     pdpp: {
@@ -246,13 +249,13 @@ function pdppConfig(declarationPaths: string[]) {
           granteeAddress: GRANTEE,
         },
       ],
-      chainGrants: { enabled: true },
+      chainGrants,
     },
   });
 }
 
-async function boot() {
-  return createServer(pdppConfig([await writeDeclaration()]), {
+async function boot(chainGrants?: Record<string, boolean>) {
+  return createServer(pdppConfig([await writeDeclaration()], chainGrants), {
     serverDir: tempDir,
     dataDir: join(tempDir, "data"),
     outboundFetch: gateway.fetch as typeof fetch,
@@ -438,5 +441,21 @@ describe("design 2 through createServer (review F6)", () => {
     // The grant end reached the gateway as a V2 revocation.
     await new Promise((r) => setTimeout(r, 50));
     expect(gateway.revoked).toBe(true);
+  });
+});
+
+describe("turning chain grants off after use (NEW-3)", () => {
+  it("refuses to boot while a grant is registered on chain, unless overridden", async () => {
+    ctx = await boot();
+    await obtainGrantBoundToken(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(gateway.scopes.some((s) => s.startsWith("pdpp:sha256:"))).toBe(true);
+    await ctx.cleanup();
+    ctx = undefined;
+    await expect(boot({ enabled: false })).rejects.toThrow(
+      /still registered on chain/,
+    );
+    ctx = await boot({ enabled: false, allowDisableWithRegistrations: true });
+    expect(ctx.app).toBeDefined();
   });
 });

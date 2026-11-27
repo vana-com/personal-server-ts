@@ -107,18 +107,38 @@ record and blob reads require that entry to be live on chain.
   passed there). A failed or reverted removal is signed
   again. Reconciliation runs at boot, every minute, and after each write to
   `/pdpp/v1`; every gateway call times out after 10 s.
-- **Scope labels.** The PS binds, one label per request, each stream-sync
-  per-stream row (`pdpp.<c>~<ns>.<stream>` → that stream), the connection
-  log row (`pdpp.<c>~<ns>.~log` → every declared stream of the source) and
-  each legacy readable scope it projects (→ every stream the projection
-  reads). Gateway bindings are immutable. When a source's declaration later
-  adds a stream, the log label keeps its first, smaller stream set (the
-  gateway answers 409 and the PS records it): a paid read of the log is then
+- **Scope labels.** The PS binds each stream-sync per-stream row
+  (`pdpp.<c>~<ns>.<stream>` → that stream), the connection log row
+  (`pdpp.<c>~<ns>.~log` → every declared stream of the source) and each
+  legacy readable scope it projects (→ every stream the projection reads).
+  It sends them in batches of at most 100 labels and under 1 MiB, and reads
+  the gateway's per-label result (`bound`, `unchanged`, `conflict`); a
+  conflict does not stop the other labels. Gateway bindings are immutable.
+  When a source's declaration later adds a stream, the log label keeps its
+  first, smaller stream set (`conflict`): a paid read of the log is then
   checked against the old set, so a grant covering only the old streams can
-  pay for a log that also carries the new stream's operations. The other
-  labels are bound regardless. This PS publishes no design-2 meaningless
-  labels; a paid read under a label the PS never bound gets the gateway's
+  pay for a log that also carries the new stream's operations. A label over
+  256 streams (the gateway's limit) is not sent. Labels not bound are shown
+  on GET /pdpp/v1/grants as `chain.unbound_labels`, with
+  `chain.bindable: false` when one was over the limit: paid reads under that
+  label cannot resolve. This PS publishes no design-2 meaningless labels; a
+  paid read under a label the PS never bound gets the gateway's
   `SCOPE_UNBOUND`, except the unbound stream-sync physical scopes the
   gateway accepts under a slot that also holds a legacy scope.
-- **Turning the setting off** stops all on-chain registration and removal.
-  Entries already on chain stay there.
+- **A grant end keeps the PS's other grants.** A removal carries the PS's
+  own live entries for that slot, also ones the gateway's view omits (with
+  their documents); never an entry bound under another slot or contract.
+  If the gateway refuses such an entry, the end is sent again without the
+  entries it did not list, and those grants are registered again, so no live
+  grant is lost.
+- **Reads never wait for the gateway.** A read of a grant whose
+  registration is pending answers "retry later" at once; the registration
+  is retried in the background.
+- **Turning the setting off after use.** With the setting off, the PS stops
+  all on-chain registration and removal, so entries already on chain stay
+  there and a paid read at the gateway can still resolve them after their
+  grants end. A server with any grant still `bound` or `ending` on chain
+  refuses to boot with the setting off. Operators should keep it on, or end
+  those grants first (and let reconciliation finish); setting
+  `pdpp.chainGrants.allowDisableWithRegistrations: true` boots anyway and
+  leaves those entries on chain.

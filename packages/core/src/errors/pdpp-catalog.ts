@@ -134,11 +134,17 @@ export class PdppError extends Error {
   public readonly code: PdppErrorCode;
   public readonly type: PdppErrorType;
   public readonly param?: string;
+  /**
+   * A machine-readable refusal reason, when the code alone is too broad.
+   * Not part of the §8 error body (RS item 6 keeps that body closed); routes
+   * send it as the `PDPP-Refusal-Reason` response header.
+   */
+  public readonly reason?: string;
 
   constructor(
     code: PdppErrorCode,
     message: string,
-    options?: { param?: string },
+    options?: { param?: string; reason?: string },
   ) {
     super(message);
     this.name = "PdppError";
@@ -146,6 +152,7 @@ export class PdppError extends Error {
     this.status = STATUS_BY_CODE[code];
     this.type = TYPE_BY_CODE[code];
     this.param = options?.param;
+    this.reason = options?.reason;
   }
 
   toJSON(requestId: string): PdppErrorBody {
