@@ -194,6 +194,9 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   -- how the entry leaves the slot: 'removal' (removal-only upsert keeping the
   -- other entries) or 'revocation' (V2 revocation: the slot holds nothing else)
   ending_kind TEXT CHECK (ending_kind IN ('removal','revocation')),
+  -- when the PS began deferring its write for this slot because another
+  -- surface's registration is still settling there (bounded)
+  deferred_since TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -282,6 +285,7 @@ export interface ChainRegistration {
   registeredVersion: string | null;
   endedVersion: string | null;
   endingKind: "removal" | "revocation" | null;
+  deferredSince: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
@@ -301,6 +305,7 @@ interface ChainRegistrationRow {
   registered_version: string | null;
   ended_version: string | null;
   ending_kind: "removal" | "revocation" | null;
+  deferred_since: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -321,6 +326,7 @@ function chainRegistrationFromRow(row: ChainRegistrationRow): ChainRegistration 
     registeredVersion: row.registered_version,
     endedVersion: row.ended_version,
     endingKind: row.ending_kind,
+    deferredSince: row.deferred_since,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -421,6 +427,16 @@ export function openPdppAuthStore(
   ) {
     db.exec(
       "ALTER TABLE pdpp_access_tokens ADD COLUMN owner_instance_ids_json TEXT",
+    );
+  }
+
+  // Additive: a registrations table created before `deferred_since`.
+  const registrationColumns = db
+    .prepare("PRAGMA table_info(pdpp_chain_registrations)")
+    .all() as { name: string }[];
+  if (!registrationColumns.some((column) => column.name === "deferred_since")) {
+    db.exec(
+      "ALTER TABLE pdpp_chain_registrations ADD COLUMN deferred_since TEXT",
     );
   }
 
@@ -1079,6 +1095,28 @@ export class PdppAuthStore {
       )
       .run(now.toISOString(), grantId);
     return result.changes > 0;
+  }
+
+  /**
+   * Record (once) when the PS began deferring its slot write, or clear it
+   * (`since` null). Returns the deferral start in force.
+   */
+  noteChainDeferral(grantId: string, since: Date | null): string | null {
+    if (since === null) {
+      this.db
+        .prepare(
+          "UPDATE pdpp_chain_registrations SET deferred_since = NULL WHERE grant_id = ?",
+        )
+        .run(grantId);
+      return null;
+    }
+    this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations SET deferred_since = ?
+         WHERE grant_id = ? AND deferred_since IS NULL`,
+      )
+      .run(since.toISOString(), grantId);
+    return this.getChainRegistration(grantId)?.deferredSince ?? null;
   }
 
   /** Why the last gateway attempt failed; never the salt or document. */

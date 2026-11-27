@@ -48,6 +48,17 @@ record and blob reads require that entry to be live on chain.
   lists is dropped, never signed. The slot id is derived from the contract's
   domain separator, the owner and the app's builder id, and a gateway answer
   for another id is refused.
+- **Scopes another surface is still settling.** When the gateway lists
+  scopes for the slot that are neither this PS's entries nor on the
+  finalized chain, and the slot's latest registration is still `pending`,
+  `sent` or `confirmed`, the PS does not write: it retries on the reconcile
+  timer until that registration is finalized (its scopes are then kept) or
+  has failed or reverted (they are then not kept). Meanwhile a new grant
+  answers "retry later", and an ended grant's entry stays in the slot (the
+  PS itself refuses the grant at once; paid reads at the gateway under that
+  entry continue until the removal is sent). The deferral is bounded at
+  24 hours; after that the PS signs its own entries plus finalized-chain
+  scopes, which drops a registration that has not settled in a day.
 - **Slot expiry.** When the slot holds a scope that is not one of this PS's
   PDPP entries (a legacy scope), the signed expiry is the earliest of the
   gateway's and the finalized chain's expiry. A PDPP grant that would last

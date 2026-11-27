@@ -145,6 +145,13 @@ class FakeGateway {
       revocationKind: s.revocationKind,
       revocationFinalizedAt: s.revocationFinalizedAt,
       revocationOutcome: s.revocationOutcome,
+      // gateway b16e9d7 registrationOutcomeOf, from the status this fake keeps
+      registrationOutcome:
+        s.status === "failed"
+          ? "reverted"
+          : s.status === "finalized"
+            ? "finalized"
+            : "pending",
       paymentStatus: s.paymentStatus,
     };
   }
@@ -516,6 +523,7 @@ beforeEach(() => {
       chain: gateway.reader,
       retryBackoffMs: 0,
       timeoutMs: 200,
+      maxDeferralMs: 1_000,
       owner: OWNER,
       deployment: { chainId: CHAIN_ID, contractAddress: CONTRACT },
       signMessage: (message) => server.signMessage({ message }),
@@ -1198,5 +1206,95 @@ describe("review round 2: finality, retries, labels, backfill", () => {
         reg.salt,
       ),
     );
+  });
+});
+
+describe("never drops a scope another surface is still settling", () => {
+  /** Another surface (e.g. MCP) registered `instagram.posts`; not final yet. */
+  function foreignSettling(extra: string[] = []) {
+    const prior = gateway.slot;
+    gateway.slot = {
+      id: SLOT_ID,
+      scopes: [...(prior?.scopes ?? []), ...extra, "instagram.posts"],
+      grantVersion: String(gateway.current() + 1n),
+      latest: gateway.current() + 1n,
+      expiresAtSeconds: "0",
+      revokedAt: null,
+      revocationKind: null,
+      revocationFinalizedAt: null,
+      revocationOutcome: null,
+      status: "pending",
+      paymentStatus: "pending",
+      removalOnly: false,
+    };
+  }
+  const posts = () =>
+    gateway.requests.filter(
+      (r) => r.method === "POST" && r.path === "/v1/grants",
+    );
+
+  it("defers registration while the foreign registration settles, then keeps its scope", async () => {
+    foreignSettling();
+    const grantId = await approvedGrantId();
+    expect(posts()).toHaveLength(0);
+    const reg = store.getChainRegistration(grantId)!;
+    expect(reg.status).toBe("pending");
+    expect(reg.lastError).toMatch(/^deferred: another registration for this slot is pending/);
+    expect(reg.deferredSince).not.toBeNull();
+    // What the PDPP grant sees meanwhile: retry later.
+    expect(await read(grantId)).toMatchObject({ ok: false, retryable: true });
+
+    gateway.settle(); // the foreign registration finalizes
+    await chain.registrar.reconcile();
+    expect(posts()).toHaveLength(1);
+    expect((posts()[0].body as { scopes: string[] }).scopes).toEqual([
+      "instagram.posts",
+      reg.entry,
+    ]);
+    expect(store.getChainRegistration(grantId)).toMatchObject({
+      status: "bound",
+      deferredSince: null,
+    });
+  });
+
+  it("does not keep a foreign scope whose registration reverted", async () => {
+    foreignSettling();
+    const grantId = await approvedGrantId();
+    expect(posts()).toHaveLength(0);
+    gateway.settle({ fail: true }); // the foreign registration reverts
+    await chain.registrar.reconcile();
+    expect((posts()[0].body as { scopes: string[] }).scopes).toEqual([
+      store.getChainRegistration(grantId)!.entry,
+    ]);
+  });
+
+  it("bounds the deferral: after maxDeferralMs it signs own + finalized-chain scopes", async () => {
+    foreignSettling();
+    const grantId = await approvedGrantId();
+    expect(posts()).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 1_100));
+    await chain.registrar.reconcile();
+    expect((posts()[0].body as { scopes: string[] }).scopes).toEqual([
+      store.getChainRegistration(grantId)!.entry,
+    ]);
+  });
+
+  it("defers removing an ended grant's entry while a foreign registration settles", async () => {
+    const grantId = await approvedGrantId();
+    gateway.settle();
+    const entry = store.getChainRegistration(grantId)!.entry;
+    foreignSettling();
+    await ownerRevoke(grantId);
+    expect(gateway.requests.some((r) => r.method === "DELETE")).toBe(false);
+    expect(posts()).toHaveLength(1); // only the original registration
+    expect(store.getChainRegistration(grantId)).toMatchObject({
+      status: "ending",
+    });
+    gateway.settle();
+    await chain.registrar.reconcile();
+    // Removal-only upsert that keeps the now-final foreign scope.
+    const removal = posts().at(-1)!.body as { scopes: string[] };
+    expect(removal.scopes).toEqual(["instagram.posts"]);
+    expect(removal.scopes).not.toContain(entry);
   });
 });

@@ -75,6 +75,12 @@ export interface GatewaySlot {
   revocationKind: string | null;
   revocationFinalizedAt: string | null;
   revocationOutcome: string | null;
+  /**
+   * Outcome of the slot's LATEST registration or upsert (gateway b16e9d7):
+   * 'pending' | 'sent' | 'confirmed' | 'finalized' | 'reverted' | 'failed' |
+   * 'not_sent'. Absent on older gateways.
+   */
+  registrationOutcome?: string | null;
 }
 
 /** One element of `GET /v1/pdpp/chain-binding` `data.bindings`. */
@@ -384,7 +390,15 @@ export interface PdppChainRegistrarOptions {
   now?: () => Date;
   /** After a failed gateway attempt, wait this long before the next. */
   retryBackoffMs?: number;
+  /**
+   * How long the PS defers its write for a slot while another surface's
+   * registration there is still settling (default 24 h). See `deferral`.
+   */
+  maxDeferralMs?: number;
 }
+
+/** Registration outcomes that are still in progress at the gateway. */
+const SETTLING = new Set(["pending", "sent", "confirmed"]);
 
 const IN_FLIGHT = new Set(["SETTLEMENT_IN_FLIGHT", "REVOCATION_IN_FLIGHT"]);
 /** The gateway's per-request limits on PUT /v1/pdpp/scope-bindings. */
@@ -622,6 +636,51 @@ export class PdppChainRegistrar {
     return unbound;
   }
 
+  /**
+   * The PS must never drop a scope another surface (Account, MCP, another
+   * device) is still settling. When the gateway lists scopes for the slot
+   * that are neither this PS's own entries nor on the finalized chain, and
+   * the slot's latest registration is still in progress, the PS defers its
+   * write and retries on the reconcile timer, until that registration is
+   * finalized (its scopes are then on the finalized chain and are kept) or
+   * has failed or reverted (they are then not kept: they never took effect).
+   *
+   * Bounded: after `maxDeferralMs` (24 h) of continuous deferral the PS
+   * stops waiting and signs its own entries plus finalized-chain scopes. A
+   * registration still in progress after a day (typically one whose fee was
+   * never paid) is then dropped by this write; the deferral reason and its
+   * start are kept on the row. Returns the reason to defer, or null.
+   */
+  private deferral(
+    reg: ChainRegistration,
+    slot: GatewaySlot | null,
+    own: Map<string, Grant>,
+    onChain: Set<string>,
+  ): string | null {
+    const { store } = this.options;
+    const unsettled = (slot?.scopes ?? []).filter(
+      (s) => s !== reg.entry && !own.has(s) && !onChain.has(s),
+    );
+    const settling =
+      !!slot &&
+      slot.revokedAt === null &&
+      SETTLING.has(String(slot.registrationOutcome ?? ""));
+    if (!settling || unsettled.length === 0) {
+      if (reg.deferredSince) store.noteChainDeferral(reg.grantId, null);
+      return null;
+    }
+    const since = store.noteChainDeferral(reg.grantId, this.now());
+    const waited = this.now().getTime() - Date.parse(since ?? "");
+    if (waited > (this.options.maxDeferralMs ?? 24 * 60 * 60 * 1000)) {
+      this.options.logger.warn(
+        { grantId: reg.grantId, unsettled: unsettled.length },
+        "PDPP chain registration: another registration did not settle within the deferral bound; signing without it",
+      );
+      return null;
+    }
+    return `deferred: another registration for this slot is ${slot!.registrationOutcome} (${unsettled.length} scope(s) not yet final)`;
+  }
+
   private async registerNow(
     grantId: string,
     force: boolean,
@@ -674,6 +733,11 @@ export class PdppChainRegistrar {
       // a scope only the gateway claims is dropped (never added).
       const own = this.ownEntries(reg.granteeAddress, grantId);
       const onChain = new Set(permission?.scopes ?? []);
+      const deferred = this.deferral(reg, slot, own, onChain);
+      if (deferred) {
+        store.noteChainError(grantId, deferred, this.now());
+        return "pending";
+      }
       const kept = listed.filter(
         (s) => s !== reg.entry && (own.has(s) || onChain.has(s)),
       );
@@ -822,6 +886,11 @@ export class PdppChainRegistrar {
 
     const own = this.ownEntries(reg.granteeAddress, grantId);
     const onChain = new Set(read.permission?.scopes ?? []);
+    const deferred = this.deferral(reg, slot, own, onChain);
+    if (deferred) {
+      store.noteChainError(grantId, deferred, this.now());
+      return;
+    }
     const verified = (s: string) => own.has(s) || onChain.has(s);
     const remaining = slot.scopes.filter((e) => e !== reg.entry && verified(e));
     const revocation = remaining.length === 0 || slot.revokedAt !== null;
@@ -1027,6 +1096,8 @@ export function createDesign2ChainGrants(input: {
         retryBackoffMs?: number;
         /** Per gateway request (default 10 s). */
         timeoutMs?: number;
+        /** See `PdppChainRegistrarOptions.maxDeferralMs` (default 24 h). */
+        maxDeferralMs?: number;
         owner: `0x${string}`;
         deployment: { chainId: number; contractAddress: `0x${string}` };
         signMessage(message: string): Promise<`0x${string}`>;
@@ -1129,6 +1200,9 @@ export function createDesign2ChainGrants(input: {
     logger: input.logger,
     ...(ready.retryBackoffMs !== undefined && {
       retryBackoffMs: ready.retryBackoffMs,
+    }),
+    ...(ready.maxDeferralMs !== undefined && {
+      maxDeferralMs: ready.maxDeferralMs,
     }),
   });
   return {
