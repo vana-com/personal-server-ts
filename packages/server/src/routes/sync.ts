@@ -102,6 +102,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     const sync = await local();
     requireStreamMode();
     await sync.cycle();
+    requireStreamMode();
     return c.json({ status: "started", message: "Sync triggered" }, 202);
   });
   app.get("/status", async (c, next) => {
@@ -179,7 +180,11 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
           try {
             stop();
           } catch (err) {
-            deps.logger.warn({ err }, "sync event feed release failed");
+            try {
+              deps.logger.warn({ err }, "sync event feed release failed");
+            } catch {
+              // A broken logger must not prevent the remaining releases.
+            }
           }
         }
       }

@@ -428,6 +428,34 @@ describe("GET /v1/sync/events", () => {
     await vi.waitFor(() => expect(status.listeners.size).toBe(0));
   });
 
+  it("releases both subscriptions even when release and warning throw", async () => {
+    const status = fakeStatus({ syncing: false, lastSync: null });
+    const stopStatus = vi.fn(() => {
+      throw new Error("release failed");
+    });
+    const stopViews = vi.fn();
+    vi.spyOn(status.manager, "subscribeStatus").mockReturnValue(stopStatus);
+    const logger = pino({ level: "silent" });
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {
+      throw new Error("warning failed");
+    });
+    const app = syncRoutes({
+      ...auth,
+      logger,
+      syncManager: status.manager,
+      viewChanges: { subscribe: () => stopViews },
+    });
+    const feed = frames(await app.request("/events", { headers }));
+    expect((await feed.next()).event).toBe("ready");
+
+    await feed.close();
+    await vi.waitFor(() => {
+      expect(stopStatus).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(stopViews).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("releases both subscriptions when the client leaves before reading anything", async () => {
     const { views, listeners } = fakeViews();
     const status = fakeStatus({ syncing: false, lastSync: null });
