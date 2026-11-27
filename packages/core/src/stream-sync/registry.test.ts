@@ -137,6 +137,29 @@ it.each([
   },
 );
 
+it("rejects a repeated continuation without fetching a third page", async () => {
+  const cursors: (string | null)[] = [];
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch: (async (url: string) => {
+      cursors.push(new URL(url).searchParams.get("cursor"));
+      if (cursors.length > 2)
+        throw new Error("fixture received an unexpected third fetch");
+      return new Response(
+        JSON.stringify({
+          data: { dataPoints: [row(streamScope("acme", "", "items"), 1)] },
+          pagination: { hasMore: true, nextCursor: "c1" },
+        }),
+      );
+    }) as typeof fetch,
+  });
+  await expect(registry.listStreamRows("acme")).rejects.toThrow(
+    "registry listing repeated a cursor",
+  );
+  expect(cursors).toEqual([null, "c1"]);
+});
+
 /** One listing response with the given `pagination` marker. */
 function registryWithMarker(pagination: unknown) {
   return createGatewayStreamSyncRegistry({

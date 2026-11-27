@@ -329,6 +329,7 @@ export function createGatewayStreamSyncRegistry(
   /** Page through every owner row. */
   async function fetchOwnerRows(signal?: AbortSignal): Promise<OwnerRow[]> {
     const out: OwnerRow[] = [];
+    const seenCursors = new Set<string>();
     let cursor: string | null = null;
     do {
       const params = new URLSearchParams({
@@ -370,6 +371,10 @@ export function createGatewayStreamSyncRegistry(
         typeof page.nextCursor === "string" &&
         page.nextCursor !== ""
       ) {
+        if (seenCursors.has(page.nextCursor)) {
+          throw new Error("registry listing repeated a cursor");
+        }
+        seenCursors.add(page.nextCursor);
         cursor = page.nextCursor;
       } else {
         throw new Error(

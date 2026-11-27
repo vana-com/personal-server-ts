@@ -272,6 +272,7 @@ async function openSwitchedLite(
     createMemoryPsLitePersistence(),
   );
   const db = openBetterSqlite3(":memory:");
+  const closeOriginal = db.close.bind(db);
   const closeDb = vi.spyOn(db, "close");
   const lite = await createPsLiteSyncManager({
     config: ServerConfigSchema.parse({ sync: { enabled: true } }),
@@ -289,7 +290,7 @@ async function openSwitchedLite(
       listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
     },
   });
-  return { lite, closeDb };
+  return { lite, closeDb, closeOriginal };
 }
 
 it("close waits for a retirement step the registration check started", async () => {
@@ -365,6 +366,7 @@ it("closes exactly once when a lazy open fails after creating its handle", async
   const gate = new Promise<void>((_, reject) => {
     rejectInitialization = reject;
   });
+  void gate.catch(() => undefined);
   retirementFixture.beforeCrypto = () => {
     entered();
     return gate;
@@ -372,14 +374,16 @@ it("closes exactly once when a lazy open fails after creating its handle", async
   retirementFixture.waitAtOpen = async () => {
     resumeReached();
   };
+  let opening: ReturnType<typeof lite.getLocalSync> | undefined;
+  let closing: Promise<PromiseSettledResult<void>[]> | undefined;
   try {
     await lite.syncManager.trigger();
     mode = "switched";
-    const opening = lite.getLocalSync();
-    const opener = expect(opening).rejects.toBe(failure);
+    opening = lite.getLocalSync();
+    void opening.catch(() => undefined);
     await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
 
-    const closing = Promise.allSettled([
+    closing = Promise.allSettled([
       lite.closeStreamSync(),
       lite.closeStreamSync(),
     ]);
@@ -389,16 +393,46 @@ it("closes exactly once when a lazy open fails after creating its handle", async
       { status: "fulfilled", value: undefined },
       { status: "fulfilled", value: undefined },
     ]);
-    await opener;
+    await expect(opening).rejects.toBe(failure);
     expect(closeDb).toHaveBeenCalledOnce();
     expect(resumeReached).not.toHaveBeenCalled();
   } finally {
+    rejectInitialization(failure);
+    await Promise.allSettled([opening, closing]);
     retirementFixture.beforeCrypto = undefined;
     retirementFixture.waitAtOpen = undefined;
     await lite.syncManager.stop();
     if (closeDb.mock.calls.length === 0 && entered.mock.calls.length > 0) {
       await closeDb();
     }
+  }
+});
+
+it("reports the same driver close error to concurrent callers", async () => {
+  const { lite, closeDb, closeOriginal } = await openSwitchedLite(async () => ({
+    id: "registered",
+  }));
+  const failure = new Error("synthetic close failure");
+  let closes: Promise<PromiseSettledResult<void>[]> | undefined;
+  try {
+    await lite.getLocalSync();
+    closeDb.mockImplementationOnce(async () => {
+      await closeOriginal();
+      throw failure;
+    });
+    closes = Promise.allSettled([
+      lite.closeStreamSync(),
+      lite.closeStreamSync(),
+    ]);
+    const results = await closes;
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") expect(result.reason).toBe(failure);
+    }
+    expect(closeDb).toHaveBeenCalledOnce();
+  } finally {
+    await (closes ?? Promise.allSettled([lite.closeStreamSync()]));
+    await lite.syncManager.stop();
   }
 });
 
