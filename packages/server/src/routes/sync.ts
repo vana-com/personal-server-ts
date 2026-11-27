@@ -99,41 +99,45 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   const guardFileStream = (response: Response): Response => {
     if (!response.body) return response;
     const source = response.body.getReader();
-    const guarded = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        if (!isStreamMode()) {
+    // Do not pull ahead of downstream demand.
+    const guarded = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          if (!isStreamMode()) {
+            await source.cancel().catch(() => undefined);
+            controller.error(
+              new ProtocolError(
+                503,
+                "ACCOUNT_MODE_UNKNOWN",
+                "The account storage mode is not switched",
+              ),
+            );
+            return;
+          }
+          const { value, done } = await source.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          if (!isStreamMode()) {
+            await source.cancel().catch(() => undefined);
+            controller.error(
+              new ProtocolError(
+                503,
+                "ACCOUNT_MODE_UNKNOWN",
+                "The account storage mode is not switched",
+              ),
+            );
+            return;
+          }
+          if (value) controller.enqueue(value);
+        },
+        async cancel() {
           await source.cancel().catch(() => undefined);
-          controller.error(
-            new ProtocolError(
-              503,
-              "ACCOUNT_MODE_UNKNOWN",
-              "The account storage mode is not switched",
-            ),
-          );
-          return;
-        }
-        const { value, done } = await source.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        if (!isStreamMode()) {
-          await source.cancel().catch(() => undefined);
-          controller.error(
-            new ProtocolError(
-              503,
-              "ACCOUNT_MODE_UNKNOWN",
-              "The account storage mode is not switched",
-            ),
-          );
-          return;
-        }
-        if (value) controller.enqueue(value);
+        },
       },
-      async cancel() {
-        await source.cancel().catch(() => undefined);
-      },
-    });
+      { highWaterMark: 0 },
+    );
     return new Response(guarded, {
       status: response.status,
       statusText: response.statusText,

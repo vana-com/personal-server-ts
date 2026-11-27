@@ -224,6 +224,46 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
     expect(t.readFile).not.toHaveBeenCalled();
   });
 
+  it("reads a file source only in response to demand from the consumer", async () => {
+    const t = setup({ holdFile: true });
+    const nextTurn = () =>
+      new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const pull = vi.fn();
+    const cancel = vi.fn();
+    const source = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          pull();
+          controller.enqueue(new Uint8Array([1]));
+        },
+        cancel,
+      },
+      { highWaterMark: 0 },
+    );
+    t.readFile.mockResolvedValueOnce(new Response(source));
+    t.releaseFile();
+
+    const res = await t.app.request("/file/fixture", {
+      method: "POST",
+      headers,
+    });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    try {
+      await nextTurn();
+      expect(pull).not.toHaveBeenCalled();
+      expect(await reader.read()).toEqual({
+        value: new Uint8Array([1]),
+        done: false,
+      });
+      await nextTurn();
+      expect(pull).toHaveBeenCalledTimes(1);
+    } finally {
+      await reader.cancel();
+    }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("does not read listing status when the mode moved during local acquisition", async () => {
     const t = setup({ holdLocal: true });
     const pending = t.app.request("/status", { headers });
