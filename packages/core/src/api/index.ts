@@ -1920,8 +1920,6 @@ function listingVisibility(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
-  /** The owner's own listing (no grant): it also names orphaned files. */
-  listOrphanedFiles = false,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   const deletion = deps.scopeDeletions
     ? async (scope: string, entry: ReadDeletionEntry) =>
@@ -1937,19 +1935,8 @@ function listingVisibility(
   if (!view) return deletion;
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
-    // A stored file whose connection was deleted is still stored, though no
-    // read serves it. The owner's listing names it, so a host that checks for
-    // remaining data sees it until the file's own delete finishes. A grant's
-    // listing does not.
-    const orphanedFile =
-      listOrphanedFiles &&
-      listing.kind === "refused" &&
-      listing.refusal !== undefined &&
-      "reason" in listing.refusal &&
-      listing.refusal.reason === "no_connection";
-    if (listing.kind === "refused" && !orphanedFile) return false;
-    const canonicalOwned =
-      !orphanedFile && deletionHistoryOf(listing) === "canonical";
+    if (listing.kind === "refused") return false;
+    const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
     return (
@@ -2892,7 +2879,7 @@ export async function handlePersonalServerDataRequest(
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: listingVisibility(deps, deletionDeadlineAtMs, !listAuth),
+        isVisible: listingVisibility(deps, deletionDeadlineAtMs),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
