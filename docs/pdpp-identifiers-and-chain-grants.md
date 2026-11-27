@@ -125,17 +125,23 @@ record and blob reads require that entry to be live on chain.
   paid read under a label the PS never bound gets the gateway's
   `SCOPE_UNBOUND`, except the unbound stream-sync physical scopes the
   gateway accepts under a slot that also holds a legacy scope.
-- **An entry dropped elsewhere stays dropped (fail closed).** The PS never
-  re-adds one of its own entries that the gateway no longer lists and the
-  finalized chain no longer lists for that slot: another signer (for
-  example the owner dropping one grant through Vana Account) removed it, and
-  the PS cannot tell that from a stale overwrite. That grant's registration
-  becomes `dropped_elsewhere`: client reads are refused like a revoked
-  grant, GET /pdpp/v1/grants shows `chain.status: "dropped_elsewhere"`, and
-  nothing registers it again; the owner can approve the app again. Own
-  entries the finalized chain still lists are kept in the PS's writes (with
-  their documents) even when the gateway's view omits them. If the gateway
-  refuses such a carried entry (`PDPP_ENTRY_BOUND_ELSEWHERE` or
+- **An entry dropped elsewhere stays dropped (fail closed).** For each
+  grant the PS records the highest slot `grantVersion` at which it saw the
+  grant's entry listed, at the gateway or on the finalized chain. When the
+  slot (the gateway's latest view, or the finalized chain) omits the entry
+  at a version above that, another signer removed it on purpose (for
+  example the owner dropping one grant through Vana Account), even if that
+  removal is still settling and the finalized chain still lists the entry.
+  The PS then never puts it back: the registration becomes
+  `dropped_elsewhere` and the grant itself ends at once (ending reason
+  `dropped_elsewhere`, no disposition change), so client reads are refused
+  whatever the chain-grants setting, GET /pdpp/v1/grants shows
+  `chain.status: "dropped_elsewhere"`, and nothing registers it again; the
+  owner can approve the app again. If another signer later lists that entry
+  again, the PS's next write leaves it out, which removes it. An omission
+  at the same or a lower version is a stale or lagging view and is
+  ignored: the PS carries the entry (with its document) in its writes. If
+  the gateway refuses such a carried entry (`PDPP_ENTRY_BOUND_ELSEWHERE` or
   `PDPP_GRANT_DOCUMENT_REQUIRED`), the PS drops it the same way and sends the
   write without it; this path only ever drops entries. A stale-version 409
   is not a refusal of the entry: the PS reads the slot again and retries the

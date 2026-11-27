@@ -206,6 +206,9 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   -- PS did not remove it (another signer dropped it): terminal, never
   -- re-registered automatically; status is then 'ended'
   dropped_elsewhere_at TEXT,
+  -- highest slot grantVersion at which the PS saw this entry listed (gateway
+  -- or finalized chain); an omission counts only above it (W2)
+  seen_version TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -301,6 +304,8 @@ export interface ChainRegistration {
   unboundLabels: Array<{ scope: string; reason: string }>;
   /** The entry left the slot through another signer; see the column. */
   droppedElsewhereAt: string | null;
+  /** Highest slot version at which the entry was seen listed. */
+  seenVersion: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
@@ -324,6 +329,7 @@ interface ChainRegistrationRow {
   deferred_outcome: string | null;
   unbound_labels: string | null;
   dropped_elsewhere_at: string | null;
+  seen_version: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -355,6 +361,7 @@ function chainRegistrationFromRow(
         }>)
       : [],
     droppedElsewhereAt: row.dropped_elsewhere_at,
+    seenVersion: row.seen_version,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -517,7 +524,9 @@ export type GrantEndingReason =
   | "client_erasure"
   | "erasure_request"
   | "security"
-  | "history_restore";
+  | "history_restore"
+  /** Design 2: another signer dropped the grant's entry from its slot. */
+  | "dropped_elsewhere";
 
 /** Token digests the anchor keeps per erased grant (newest first, then sorted). */
 export const MAX_ANCHORED_TOKEN_DIGESTS = 64;
@@ -1017,6 +1026,7 @@ export class PdppAuthStore {
         `UPDATE pdpp_chain_registrations
          SET status = 'bound', chain_id = ?, contract_address = ?,
              permission_id = ?, grantee_id = ?, registered_version = ?,
+             seen_version = ?,
              last_error = NULL, updated_at = ?
          WHERE grant_id = ? AND status = 'pending'`,
       )
@@ -1025,6 +1035,7 @@ export class PdppAuthStore {
         input.contractAddress,
         input.permissionId,
         input.granteeId,
+        input.registeredVersion,
         input.registeredVersion,
         (input.now ?? new Date()).toISOString(),
         input.grantId,
@@ -1193,6 +1204,39 @@ export class PdppAuthStore {
       )
       .run(now.toISOString(), now.toISOString(), grantId);
     return result.changes > 0;
+  }
+
+  /** Raise the highest version at which the entry was seen listed. */
+  noteChainSeen(grantId: string, version: string): void {
+    const reg = this.getChainRegistration(grantId);
+    if (!reg || !/^\d+$/.test(version)) return;
+    const prior = reg.seenVersion ?? reg.registeredVersion;
+    if (
+      prior !== null &&
+      /^\d+$/.test(prior) &&
+      BigInt(prior) >= BigInt(version)
+    )
+      return;
+    this.db
+      .prepare(
+        "UPDATE pdpp_chain_registrations SET seen_version = ? WHERE grant_id = ?",
+      )
+      .run(version, grantId);
+  }
+
+  /**
+   * Another signer dropped the entry (W3): mark the registration
+   * `dropped_elsewhere` and end the local grant in the same transaction, with
+   * ending reason `dropped_elsewhere` and no disposition change, so no
+   * setting can make it readable again.
+   */
+  dropChainEntryElsewhere(grantId: string, now: Date = new Date()): boolean {
+    return this.commit(() => {
+      const marked = this.markChainDroppedElsewhere(grantId, now);
+      if (marked && this.getGrant(grantId))
+        this.endGrantInTx(grantId, now, { reason: "dropped_elsewhere" });
+      return marked;
+    }, now);
   }
 
   /** Record which scope labels the gateway did not bind, and why. */

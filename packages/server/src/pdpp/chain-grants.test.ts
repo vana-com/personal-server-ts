@@ -1496,7 +1496,7 @@ describe("never drops a scope another surface is still settling", () => {
     for (const signed of after) expect(signed).not.toContain(a);
   });
 
-  it("N4: one reconcile at a time; a call while one runs joins it", () => {
+  it("N4: one reconcile waits at a time; a call before it starts joins it", () => {
     const one = chain.registrar.reconcile();
     const two = chain.registrar.reconcile();
     expect(two).toBe(one);
@@ -1902,5 +1902,99 @@ describe("never drops a scope another surface is still settling", () => {
       status: "ending",
       endingKind: "removal",
     });
+  });
+
+  /** A second signer writes the slot with `scopes` at the next version. */
+  function secondSigner(scopes: string[], settle: boolean) {
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = scopes;
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.slot!.status = "pending";
+    if (settle) gateway.settle();
+  }
+
+  it("W2: a stale view that omits an entry at the same or a lower version does not drop it", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const [a, b] = [first, second].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    const seen = store.getChainRegistration(second)!.seenVersion!;
+    gateway.lie = { scopes: [a], grantVersion: seen };
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "bound",
+      droppedElsewhereAt: null,
+    });
+    await ownerRevoke(first);
+    // The stale omission is carried back, with its document.
+    const removal = posts().at(-1)!.body as {
+      scopes: string[];
+      pdppGrants?: Array<{ entry: string }>;
+    };
+    expect(removal.scopes).toEqual([b]);
+    expect(removal.pdppGrants?.map((g) => g.entry)).toEqual([b]);
+  });
+
+  it("W2: an omission above the seen version drops the entry and ends the grant (W3)", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    secondSigner([a], false); // still settling: the finalized chain lists B
+    await chain.registrar.reconcile();
+    expect(
+      store.getChainRegistration(second)!.droppedElsewhereAt,
+    ).not.toBeNull();
+    const stored = store.getGrant(second)!;
+    expect(store.grantStatus(stored)).toBe("revoked");
+    expect(store.lifecycle.getEnding(second)?.reason).toBe("dropped_elsewhere");
+  });
+
+  it("W1: on a grant end, an own entry omitted at a higher version is not carried, even while the chain lists it", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    gateway.settle();
+    const [a, b, c] = [first, second, third].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    secondSigner([a, c], false); // Account drops B; not final yet
+    expect(gateway.chain!.scopes).toContain(b);
+    const before = posts().length;
+    await ownerRevoke(first);
+    const written = posts()
+      .slice(before)
+      .map((p) => (p.body as { scopes: string[] }).scopes);
+    expect(written[0]).toEqual([c]);
+    expect(
+      store.getChainRegistration(second)!.droppedElsewhereAt,
+    ).not.toBeNull();
+    expect(await read(second)).toMatchObject({ ok: false, retryable: false });
+  });
+
+  it("W4: a dropped entry another signer re-lists is removed by the next write", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const [a, b] = [first, second].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    secondSigner([a], true);
+    await chain.registrar.reconcile();
+    expect(
+      store.getChainRegistration(second)!.droppedElsewhereAt,
+    ).not.toBeNull();
+    secondSigner([a, b], true); // B listed again elsewhere
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
+    expect(signed).toEqual([a, store.getChainRegistration(third)!.entry]);
+    expect(signed).not.toContain(b);
   });
 });

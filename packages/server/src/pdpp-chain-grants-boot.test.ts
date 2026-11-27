@@ -510,3 +510,29 @@ describe("turning chain grants off after use (NEW-3, L2)", () => {
     expect(served.status).toBe(200);
   });
 });
+
+describe("W3: a grant whose entry was dropped elsewhere ends locally", () => {
+  it("stays unreadable after a reboot with chain grants off and the override on", async () => {
+    ctx = await boot();
+    const { accessToken } = await obtainGrantBoundToken(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+    gateway.settle();
+    const read = () =>
+      ctx!.app.request("/v1/streams/top_artists/records", {
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+    expect((await read()).status).toBe(200);
+    // Another signer drops the entry at a higher version; it finalizes.
+    gateway.scopes = [];
+    gateway.version += 1n;
+    gateway.settle();
+    // Any write to /pdpp/v1 reconciles.
+    await ownerToken(ctx);
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await read()).status).toBe(401);
+    await ctx.cleanup();
+    ctx = undefined;
+    ctx = await boot({ enabled: false, allowDisableWithRegistrations: true });
+    expect((await read()).status).toBe(401);
+  });
+});

@@ -574,9 +574,12 @@ export class PdppChainRegistrar {
    * at the gateway is registered again.
    */
   reconcile(): Promise<void> {
-    // One reconcile at a time: a call while one is queued or running joins it.
+    // At most one reconcile waits in the queue: a call while one is queued
+    // (not started) joins it. A call while one RUNS queues the next one, so
+    // a write made meanwhile is always reconciled after it.
     if (this.reconciling) return this.reconciling;
     const run = this.serial(async () => {
+      this.reconciling = undefined;
       const { store } = this.options;
       const now = this.now();
       for (const reg of store.listChainRegistrations(["pending", "bound"]))
@@ -591,10 +594,8 @@ export class PdppChainRegistrar {
       for (const reg of store.listChainRegistrations(["ending"]))
         await this.guarded(reg.grantId, () => this.endNow(reg.grantId, false));
     });
-    this.reconciling = run.finally(() => {
-      this.reconciling = undefined;
-    });
-    return this.reconciling;
+    this.reconciling = run;
+    return run;
   }
 
   private async guarded<T>(
@@ -647,6 +648,71 @@ export class PdppChainRegistrar {
       if (stored) out.set(reg.entry, stored.grant);
     }
     return out;
+  }
+
+  /** The highest slot version at which a registration's entry was listed. */
+  private static seenOf(r: ChainRegistration): bigint {
+    const v = r.seenVersion ?? r.registeredVersion;
+    return v !== null && /^\d+$/.test(v) ? BigInt(v) : 0n;
+  }
+
+  /** Record every own entry of the slot that this gateway or chain read lists. */
+  private observe(
+    slotId: string,
+    slot: GatewaySlot | null,
+    permission: ChainPermission | null,
+  ): void {
+    const { store } = this.options;
+    for (const r of store.listChainRegistrations(["bound", "ending"])) {
+      if (r.permissionId?.toLowerCase() !== slotId.toLowerCase()) continue;
+      if (slot && slot.scopes.includes(r.entry))
+        store.noteChainSeen(r.grantId, slot.grantVersion);
+      if (permission && permission.scopes.includes(r.entry))
+        store.noteChainSeen(r.grantId, permission.grantVersion.toString());
+    }
+  }
+
+  /**
+   * W2: the slot (the gateway's latest, or the finalized chain) omits the
+   * entry at a version above the highest one it was seen listed at: an
+   * intentional removal by another signer, not a stale view.
+   */
+  private intentionallyOmitted(
+    r: ChainRegistration,
+    slot: GatewaySlot | null,
+    permission: ChainPermission | null,
+  ): boolean {
+    const seen = PdppChainRegistrar.seenOf(r);
+    const gatewayOmits =
+      !!slot &&
+      slot.status !== "failed" &&
+      !slot.scopes.includes(r.entry) &&
+      /^\d+$/.test(slot.grantVersion) &&
+      BigInt(slot.grantVersion) > seen;
+    const chainOmits =
+      !!permission &&
+      !permission.scopes.includes(r.entry) &&
+      permission.grantVersion > seen;
+    return gatewayOmits || chainOmits;
+  }
+
+  /** Own bound rows of this slot on this deployment (not `except`). */
+  private ownBoundOf(
+    slotId: string,
+    granteeAddress: string,
+    except: string,
+  ): ChainRegistration[] {
+    return this.options.store
+      .listChainRegistrations(["bound"])
+      .filter(
+        (r) =>
+          r.grantId !== except &&
+          r.granteeAddress.toLowerCase() === granteeAddress.toLowerCase() &&
+          r.permissionId?.toLowerCase() === slotId.toLowerCase() &&
+          r.chainId === this.options.deployment.chainId &&
+          r.contractAddress?.toLowerCase() ===
+            this.options.deployment.contractAddress.toLowerCase(),
+      );
   }
 
   /**
@@ -819,7 +885,7 @@ export class PdppChainRegistrar {
     );
     const slotId = await this.slotIdFor(builder.id);
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const slot = await gateway.getSlot(slotId);
       if (slot && slot.id.toLowerCase() !== slotId.toLowerCase()) {
         store.noteChainError(
@@ -855,11 +921,27 @@ export class PdppChainRegistrar {
         store.noteChainError(grantId, deferred, this.now());
         return "pending";
       }
+      // W1/W2 for a registration too: own bound entries the gateway view
+      // omits are carried back (with documents) when the omission is stale,
+      // and dropped (`dropped_elsewhere`, grant ended) when it is above the
+      // version they were seen at.
+      this.observe(slotId, slot, permission);
+      const carry: ChainRegistration[] = [];
+      for (const row of this.ownBoundOf(slotId, reg.granteeAddress, grantId)) {
+        if (listed.includes(row.entry)) continue;
+        const r = store.getChainRegistration(row.grantId) ?? row;
+        if (this.intentionallyOmitted(r, slot, permission))
+          store.dropChainEntryElsewhere(r.grantId, this.now());
+        else carry.push(r);
+      }
       const ended = this.endedEntries();
-      const kept = listed.filter(
-        (s) =>
-          s !== reg.entry && !ended.has(s) && (own.has(s) || onChain.has(s)),
-      );
+      const kept = [
+        ...listed.filter(
+          (s) =>
+            s !== reg.entry && !ended.has(s) && (own.has(s) || onChain.has(s)),
+        ),
+        ...carry.map((r) => r.entry).filter((e) => !ended.has(e)),
+      ];
       const foreign = kept.filter((s) => !own.has(s));
       // F1: never extend a scope this grant does not cover. With a foreign
       // scope in the slot, the slot keeps the earliest of its gateway and
@@ -892,7 +974,21 @@ export class PdppChainRegistrar {
           scopes,
           grantVersion: grantVersion.toString(),
           expiresAt: expiresAt.toString(),
-          pdppGrants: [{ entry: reg.entry, grant: document, salt: reg.salt }],
+          pdppGrants: [
+            { entry: reg.entry, grant: document, salt: reg.salt },
+            ...carry.flatMap((r) => {
+              const g = store.getGrant(r.grantId);
+              return g
+                ? [
+                    {
+                      entry: r.entry,
+                      grant: store.clientGrantView(g),
+                      salt: r.salt,
+                    },
+                  ]
+                : [];
+            }),
+          ],
         },
         signature,
       );
@@ -918,8 +1014,18 @@ export class PdppChainRegistrar {
           );
         return "bound";
       }
+      // L1: a refusal of a carried entry drops it (never re-added) and the
+      // registration is retried without it.
+      if (
+        carry.length > 0 &&
+        CARRY_REFUSALS.has(String(answer.body.code ?? ""))
+      ) {
+        for (const r of carry)
+          store.dropChainEntryElsewhere(r.grantId, this.now());
+        continue;
+      }
       // 409: another write moved the slot; read it again and sign above it.
-      if (answer.status === 409 && attempt === 0) continue;
+      if (answer.status === 409 && attempt < 2) continue;
       store.noteChainError(
         grantId,
         IN_FLIGHT.has(String(answer.body.code))
@@ -950,15 +1056,15 @@ export class PdppChainRegistrar {
       store.markChainPending(reg.grantId, this.now());
       return;
     }
-    // M1: the gateway no longer lists the entry and the finalized chain does
-    // not either: another signer dropped it. Never re-registered.
-    if (!slot.scopes.includes(reg.entry)) {
-      const { permission } = await chain.readFinalized(
-        reg.permissionId as `0x${string}`,
-      );
-      if (!permission?.scopes.includes(reg.entry))
-        store.markChainDroppedElsewhere(reg.grantId, this.now());
-    }
+    // W2: drop only on an omission above the highest version at which the
+    // entry was seen listed; a single stale or lagging read never drops it.
+    const { permission } = await chain.readFinalized(
+      reg.permissionId as `0x${string}`,
+    );
+    this.observe(reg.permissionId as `0x${string}`, slot, permission);
+    const fresh = store.getChainRegistration(reg.grantId) ?? reg;
+    if (this.intentionallyOmitted(fresh, slot, permission))
+      store.dropChainEntryElsewhere(reg.grantId, this.now());
   }
 
   /** True when the finalized chain no longer lets the entry authorize. */
@@ -1071,16 +1177,22 @@ export class PdppChainRegistrar {
             this.options.deployment.contractAddress.toLowerCase() &&
           !listedVerified.includes(r.entry),
       );
-    // M1 (decided, fail closed): an own entry the gateway does not list and
-    // the FINALIZED chain no longer lists was dropped by another signer (for
-    // example the owner dropping one grant through Account). It is never put
-    // back: its registration becomes `dropped_elsewhere` (reads refused, no
-    // automatic re-registration; the owner can approve again). Only own
-    // entries the finalized chain still lists are carried, as before.
-    for (const r of ownBoundRows)
-      if (!onChain.has(r.entry))
-        store.markChainDroppedElsewhere(r.grantId, this.now());
-    let carryRows = ownBoundRows.filter((r) => onChain.has(r.entry));
+    // M1/W1/W2 (decided, fail closed): an own entry the slot omits at a
+    // version ABOVE the highest one at which the PS saw it listed was removed
+    // by another signer (for example the owner dropping one grant through
+    // Account), even while that removal is still settling and the finalized
+    // chain still lists it. It is never carried back: its registration
+    // becomes `dropped_elsewhere` and its grant ends at once (W3). An
+    // omission at the same or a lower version is a stale view: the entry is
+    // carried, with its document.
+    this.observe(slotId, slot, read.permission);
+    const carryRows: ChainRegistration[] = [];
+    for (const row of ownBoundRows) {
+      const r = store.getChainRegistration(row.grantId) ?? row;
+      if (this.intentionallyOmitted(r, slot, read.permission))
+        store.dropChainEntryElsewhere(r.grantId, this.now());
+      else carryRows.push(r);
+    }
     let current = slot;
     let answer: GatewayAnswer | undefined;
     let revocation = false;
@@ -1156,12 +1268,12 @@ export class PdppChainRegistrar {
       if (carryRows.length > 0 && CARRY_REFUSALS.has(code)) {
         // L1: only a carry-specific refusal drops the carried entries.
         for (const r of carryRows)
-          store.markChainDroppedElsewhere(r.grantId, this.now());
+          store.dropChainEntryElsewhere(r.grantId, this.now());
         this.options.logger.warn(
           { grantId, code, dropped: carryRows.length },
           "PDPP chain: gateway refused own entries it does not list; ending without them (they are not re-added)",
         );
-        carryRows = [];
+        carryRows.length = 0;
       } else if (answer.status !== 409) {
         break;
       }
