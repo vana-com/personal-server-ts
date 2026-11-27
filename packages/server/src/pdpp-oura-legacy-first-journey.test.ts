@@ -884,7 +884,7 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
       expect(await readAll()).toEqual(ALL(FILE));
     });
 
-    it("refuses to delete a scope whose oura-browser rows exist, though the file is what reads serve", async () => {
+    it("deletes a scope whose oura-browser rows exist, though the file is what reads serve, by erasing the connection", async () => {
       await writeLegacy(DAYS, T_LEGACY);
       await writePdpp(DAYS, T_PDPP);
       expect(await readAll()).toEqual(ALL(FILE));
@@ -892,10 +892,9 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
         method: "DELETE",
         headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
       });
-      expect(del.status).toBe(409);
-      expect(await del.json()).toMatchObject({
-        error: "CANONICAL_DELETE_UNSUPPORTED",
-      });
+      expect(del.status).toBe(200);
+      // Neither the file nor the erased connection's rows serve it again.
+      expect((await ownerRead("oura.sleep")).status).not.toBe(200);
     });
   });
 });
@@ -941,11 +940,6 @@ describe("an owner who disconnects or reconnects oura-browser while the legacy f
   it("lets the owner delete the legacy scope once the connection that held rows is gone", async () => {
     await writeLegacy(DAYS, T_LEGACY);
     const token = await writePdpp(DAYS, T_PDPP);
-    const blocked = await ctx!.app.request("/v1/data/oura.sleep", {
-      method: "DELETE",
-      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
-    });
-    expect(blocked.status).toBe(409);
     await disconnect(token);
     const deleted = await ctx!.app.request("/v1/data/oura.sleep", {
       method: "DELETE",
