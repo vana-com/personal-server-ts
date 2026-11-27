@@ -42,17 +42,16 @@ import {
   deleteScope,
   type DeleteScopeDeps,
 } from "../../core/src/sync/workers/delete.js";
-import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts-core/api";
+import type * as CoreApi from "@opendatalabs/personal-server-ts-core/api";
+
+type PersonalServerDataApiDeps = CoreApi.PersonalServerDataApiDeps;
 
 // Keep the route, write seal, record store and deletion worker real. Only the
 // gateway/blob transport is synthetic, for these two DELETE journeys.
 let durableDeleteFixture:
   Pick<DeleteScopeDeps, "deleteData" | "dataPointFeed"> | undefined;
 vi.mock("@opendatalabs/personal-server-ts-core/api", async (importOriginal) => {
-  const api =
-    await importOriginal<
-      typeof import("@opendatalabs/personal-server-ts-core/api")
-    >();
+  const api = await importOriginal<typeof CoreApi>();
   return {
     ...api,
     handlePersonalServerDataRequest: (
