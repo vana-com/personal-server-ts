@@ -470,6 +470,29 @@ describe("memory-oracle error paths", () => {
     });
   }, 30_000);
 
+  it("keeps a nonzero workload exit code and its diagnostic", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(
+        module,
+        'export function abortWork() { process.stderr.write("fixture cannot measure"); process.exitCode = 7; return null; }',
+      );
+      await expect(run({ module, exportName: "abortWork" })).rejects.toThrow(
+        /memory-oracle child for abortWork exited 7: fixture cannot measure/,
+      );
+    });
+  }, 30_000);
+
+  it("rejects a workload result that cannot be written as JSON", async () => {
+    await withWorkloadDir(async (root) => {
+      const module = join(root, "workload.mjs");
+      writeFileSync(module, "export function count() { return 1n; }");
+      await expect(run({ module, exportName: "count" })).rejects.toThrow(
+        /memory-oracle child for count exited 1: .*BigInt/s,
+      );
+    });
+  }, 30_000);
+
   it("keeps ordinary workload stdout out of the returned measurement", async () => {
     await withWorkloadDir(async (root) => {
       const module = join(root, "workload.mjs");
