@@ -148,6 +148,17 @@ record and blob reads require that entry to be live on chain.
     the finalized chain again: a confirmation ends the grant as above; a
     chain that still lists the entry at a version at least the gateway's
     restores it, with no lasting effect.
+  - **New grants wait for an unconfirmed sibling.** While any of the PS's
+    own grants in a slot is `pending_confirmation`, a new registration for
+    that slot waits (its reads answer "retry later"), so it never signs a
+    list that silently leaves that grant out; it proceeds once the chain
+    confirms or contradicts the hint. A grant end does not wait: it is sent
+    at once and leaves the unconfirmed grant out (if the chain later
+    contradicts the hint, that grant must be registered again by approving
+    it again).
+  - A grant bound after a lost answer from before the PS recorded its signed
+    versions has no `seen_version` (`unknown`): it is not checked for
+    removals until the finalized chain lists it.
   - **Never into a dead slot.** The PS carries its own entries only into a
     slot that is live at the gateway and live on the finalized chain, and
     only entries the finalized chain lists. A new approval for an app whose

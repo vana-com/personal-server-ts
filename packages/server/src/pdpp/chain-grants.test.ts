@@ -2019,18 +2019,25 @@ describe("never drops a scope another surface is still settling", () => {
     gateway.slot!.latest = gateway.current() + 1n;
     await chain.registrar.reconcile();
     expect(await read(first)).toMatchObject({ ok: false });
-    // A new approval for the same app, before the revocation is final.
+    // A new approval for the same app, before the revocation is final: it
+    // waits (Condition 1) while A awaits chain confirmation.
+    const before = posts().length;
     const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
-    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
-    expect(signed).toEqual([store.getChainRegistration(second)!.entry]);
-    expect(signed).not.toContain(a);
+    expect(posts().length).toBe(before);
+    expect(await read(second)).toMatchObject({ ok: false, retryable: true });
+    // The revocation finalizes: A ends, and the new grant signs only itself.
     gateway.settle();
     await chain.registrar.reconcile();
-    expect(gateway.chain!.scopes).not.toContain(a);
+    await chain.registrar.reconcile();
     expect(await read(first)).toMatchObject({ ok: false, retryable: false });
     expect(
       store.getChainRegistration(first)!.droppedElsewhereAt,
     ).not.toBeNull();
+    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
+    expect(signed).toEqual([store.getChainRegistration(second)!.entry]);
+    expect(signed).not.toContain(a);
+    gateway.settle();
+    expect(gateway.chain!.scopes).not.toContain(a);
     expect(await read(second)).toEqual({ ok: true });
   });
 
@@ -2111,5 +2118,104 @@ describe("never drops a scope another surface is still settling", () => {
     await chain.registrar.reconcile();
     expect(store.getChainRegistration(second)!.suspectSince).toBeNull();
     expect(await read(second)).toEqual({ ok: true });
+  });
+
+  it("Condition 1: a new registration waits while an own sibling awaits chain confirmation", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const [a, b] = [first, second].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    // Account drops B at a higher version; not final yet: B is suspect.
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.slot!.status = "pending";
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)!.suspectSince).not.toBeNull();
+    const before = posts().length;
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    expect(posts().length).toBe(before);
+    expect(store.getChainRegistration(third)).toMatchObject({
+      status: "pending",
+      deferredOutcome: "own_grant_unconfirmed",
+    });
+    expect(await read(third)).toMatchObject({ ok: false, retryable: true });
+    // The chain confirms B's removal: B ends, the new grant registers.
+    gateway.settle();
+    await chain.registrar.reconcile();
+    await chain.registrar.reconcile();
+    expect(
+      store.getChainRegistration(second)!.droppedElsewhereAt,
+    ).not.toBeNull();
+    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
+    expect(signed).toEqual([a, store.getChainRegistration(third)!.entry]);
+    expect(signed).not.toContain(b);
+    expect(store.getChainRegistration(third)).toMatchObject({
+      status: "bound",
+      deferredSince: null,
+    });
+  });
+
+  it("Condition 1: a grant end does not wait for a suspect sibling (it is left out)", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    gateway.settle();
+    const [a, c] = [first, third].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a, c];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.slot!.status = "pending";
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)!.suspectSince).not.toBeNull();
+    const before = posts().length;
+    await ownerRevoke(first);
+    expect(posts().length).toBe(before + 1);
+    expect((posts().at(-1)!.body as { scopes: string[] }).scopes).toEqual([c]);
+  });
+
+  it("Q2: a lost-answer bind of a row with no recorded signed version skips the omission check until the chain lists it", async () => {
+    const first = await approvedGrantId();
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    // A row signed before signed versions were recorded: pending, no seen.
+    gateway.dropNextRegistrationAnswer = true;
+    const res = await approve(CLIENT, [{ name: "profile", fields: ["*"] }]);
+    const { grant_id: second } = (await res.json()) as { grant_id: string };
+    await drain();
+    const db = new Database(join(dir, "auth.db"));
+    db.prepare(
+      "UPDATE pdpp_chain_registrations SET seen_version = NULL, status = 'pending' WHERE grant_id = ?",
+    ).run(second);
+    db.close();
+    await chain.registrar.register(second);
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "bound",
+      seenVersion: "unknown",
+    });
+    // The finalized chain (older, without B) does not drop it.
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "bound",
+      droppedElsewhereAt: null,
+      suspectSince: null,
+    });
+    // Once the chain lists B, seen_version comes from the chain.
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(store.getChainRegistration(second)!.seenVersion).toBe(
+      String(gateway.chain!.version),
+    );
+    expect(gateway.chain!.scopes).toContain(a);
   });
 });

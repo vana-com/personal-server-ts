@@ -651,7 +651,11 @@ export class PdppChainRegistrar {
   }
 
   /** The highest slot version at which a registration's entry was listed. */
-  private static seenOf(r: ChainRegistration): bigint {
+  private static seenOf(r: ChainRegistration): bigint | null {
+    // Q2: "unknown" (a lost-answer bind of a row signed before the PS
+    // recorded its signed versions) skips the omission check until the
+    // finalized chain lists the entry.
+    if (r.seenVersion === "unknown") return null;
     const v = r.seenVersion ?? r.registeredVersion;
     return v !== null && /^\d+$/.test(v) ? BigInt(v) : 0n;
   }
@@ -698,6 +702,7 @@ export class PdppChainRegistrar {
     read: { permission: ChainPermission | null; blockTimestamp: bigint },
   ): "drop" | "suspect" | "ok" {
     const seen = PdppChainRegistrar.seenOf(r);
+    if (seen === null) return "ok";
     const p = read.permission;
     if (
       p &&
@@ -929,7 +934,9 @@ export class PdppChainRegistrar {
           slot.status !== "failed"
         : SETTLING.has(slot.registrationOutcome));
     if (!settling || unsettled.length === 0) {
-      if (reg.deferredSince) store.noteChainDeferral(reg.grantId, null);
+      // A wait on an own unconfirmed sibling is cleared by its own check.
+      if (reg.deferredSince && reg.deferredOutcome !== "own_grant_unconfirmed")
+        store.noteChainDeferral(reg.grantId, null);
       return null;
     }
     const outcome = slot!.registrationOutcome ?? "unknown";
@@ -1004,7 +1011,7 @@ export class PdppChainRegistrar {
           granteeId: builder.id,
           registeredVersion: slot!.grantVersion,
           // P3: the version this PS last signed, not the gateway's answer.
-          seenVersion: reg.seenVersion ?? "0",
+          seenVersion: reg.seenVersion ?? "unknown",
           now: this.now(),
         });
         return "bound";
@@ -1029,6 +1036,26 @@ export class PdppChainRegistrar {
         slot,
         read,
       );
+      // Condition 1 (decided): a new registration waits while any own
+      // sibling entry of this slot awaits chain confirmation, so it never
+      // signs a list that silently leaves that sibling out. Grant ends do
+      // not wait.
+      const suspectSibling = this.ownBoundOf(
+        slotId,
+        reg.granteeAddress,
+        grantId,
+      ).some((r) => store.getChainRegistration(r.grantId)?.suspectSince);
+      if (!suspectSibling && reg.deferredOutcome === "own_grant_unconfirmed")
+        store.noteChainDeferral(grantId, null);
+      if (suspectSibling) {
+        store.noteChainDeferral(grantId, this.now(), "own_grant_unconfirmed");
+        store.noteChainError(
+          grantId,
+          "deferred: another grant to this app awaits chain confirmation",
+          this.now(),
+        );
+        return "pending";
+      }
       const okEntries = new Set(okOwn.map((r) => r.entry));
       const carry = okOwn.filter(
         (r) =>
