@@ -1,11 +1,15 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
 import { userPsId } from "@opendatalabs/vana-sdk/protocol/identity";
-import { openMcpDurableState } from "./durable-state.js";
+import {
+  McpStateRequiredError,
+  McpStateRequirement,
+  openMcpDurableState,
+} from "./durable-state.js";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const CLOSED = "MCP state is closed";
@@ -491,5 +495,70 @@ describe("MCP durable state close", () => {
     } finally {
       await reopened.close();
     }
+  });
+});
+describe("MCP durable state open errors", () => {
+  it("refuses to boot when the required state file is missing and creates nothing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-open-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+
+    await expect(
+      openMcpDurableState({
+        path,
+        key: randomBytes(32),
+        requirement: McpStateRequirement.Required,
+      }),
+    ).rejects.toThrow(McpStateRequiredError);
+
+    // The lost volume must not be papered over with a fresh empty file.
+    expect(await readdir(directory)).toEqual([]);
+  });
+
+  it("does not treat a corrupt state file as a first boot", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-open-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    await writeFile(path, "not json{{{");
+    const before = await readFile(path);
+
+    await expect(
+      openMcpDurableState({ path, key: randomBytes(32) }),
+    ).rejects.toThrow();
+
+    // The corrupt file is left untouched for forensics / restore.
+    expect((await readFile(path)).equals(before)).toBe(true);
+  });
+
+  it("rejects a state file opened with the wrong key and leaves it readable with the right key", async () => {
+    const s = await seeded();
+    await s.state.close();
+
+    await expect(
+      openMcpDurableState({ path: s.path, key: randomBytes(32) }),
+    ).rejects.toThrow(/authenticate/i);
+
+    const reopened = await openMcpDurableState({ path: s.path, key: s.key });
+    try {
+      expect((await reopened.connections.getById(s.id))?.status).toBe(
+        "approved",
+      );
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("rejects a state envelope with an unsupported version", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-state-open-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    await writeFile(
+      path,
+      JSON.stringify({ v: 2, iv: "", tag: "", ciphertext: "" }),
+    );
+
+    await expect(
+      openMcpDurableState({ path, key: randomBytes(32) }),
+    ).rejects.toThrow("Unsupported MCP state version");
   });
 });
