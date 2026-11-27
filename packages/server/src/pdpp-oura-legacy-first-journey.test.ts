@@ -885,9 +885,10 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
     });
 
     // An unswitched account has no connector delete, so the per-scope
-    // delete takes the file and resets the oura-browser connection whose
-    // rows would otherwise appear once the file is gone.
-    it("deletes a scope whose oura-browser rows exist: the file goes and the rows are reset", async () => {
+    // delete is the source's delete: it takes this file, resets the
+    // oura-browser connection whose rows would otherwise appear, and deletes
+    // the files of the scopes that connection also served.
+    it("deletes a scope whose oura-browser rows exist: the source's files go and the rows are reset", async () => {
       await writeLegacy(DAYS, T_LEGACY);
       await writePdpp(DAYS, T_PDPP);
       expect(await readAll()).toEqual(ALL(FILE));
@@ -896,22 +897,31 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
         headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
       });
       expect(del.status).toBe(200);
-      // The deleted scope serves neither copy; the sibling scopes still serve
-      // their files, so the reset erased nothing they show.
-      expect(await readAll()).toEqual({
-        "oura.sleep": "503 no_connection",
-        "oura.readiness": FILE,
-        "oura.activity": FILE,
-      });
+      const body = (await del.json()) as {
+        scope: string;
+        alsoDeleted: { scope: string }[];
+      };
+      expect(body.scope).toBe("oura.sleep");
+      expect(body.alsoDeleted.map((d) => d.scope)).toEqual([
+        "oura.activity",
+        "oura.readiness",
+      ]);
+      // One request leaves nothing of the source served.
+      expect(await readAll()).toEqual(ALL("503 no_connection"));
+      for (const scope of SCOPES) {
+        expect(ctx!.indexManager.findLatestByScope(scope)).toBeUndefined();
+      }
+      // Desktop's loop then deletes the other scopes: nothing is left to do.
       for (const scope of ["oura.readiness", "oura.activity"] as const) {
-        const del2 = await ctx!.app.request(`/v1/data/${scope}`, {
+        const again = await ctx!.app.request(`/v1/data/${scope}`, {
           method: "DELETE",
           headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
         });
-        expect(del2.status).toBe(200);
+        expect(again.status).toBe(200);
+        expect(
+          ((await again.json()) as { alsoDeleted: unknown[] }).alsoDeleted,
+        ).toEqual([]);
       }
-      // Desktop deletes a source's scopes together: nothing is served.
-      expect(await readAll()).toEqual(ALL("503 no_connection"));
     });
   });
 });

@@ -1771,6 +1771,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
   // serve the scope, so neither copy stays readable.
   it("deletes a canonical scope on an unswitched account: legacy file and connection rows, then collects again", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
+    await legacyWrite("oura.readiness", { days: [day("r1", "2026-09-01")] });
     await legacyWrite("notes.manual", { text: "kept" });
     await collectActivity();
     expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
@@ -1781,16 +1782,32 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
     expect(deletion.status).toBe(200);
-    expect(await deletion.json()).toMatchObject({
+    const receipt = (await deletion.json()) as {
+      scope: string;
+      steps: { local: { status: string } };
+      alsoDeleted: { scope: string }[];
+    };
+    expect(receipt).toMatchObject({
       scope: "oura.activity",
       steps: { local: { status: "ok" } },
     });
+    // The source's other file goes too (sleep has none); notes.manual is
+    // another source and stays.
+    expect(receipt.alsoDeleted.map((d) => d.scope)).toEqual(["oura.readiness"]);
+    expect(
+      ctx!.indexManager.findLatestByScope("oura.readiness"),
+    ).toBeUndefined();
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
     expect(
       ctx!.indexManager.findLatestByScope("oura.activity"),
     ).toBeUndefined();
     expect(connectionRows(accountOne)).toBe(0);
+    // The reset connection holds no rows: the scope answers 503
+    // no_connection (the state of a connection with no data), never the
+    // erased rows or the deleted file.
     const latest = await ownerGet("/v1/data/oura.activity");
-    expect(latest.status).not.toBe(200);
+    expect(latest.status).toBe(503);
+    expect(JSON.parse(latest.text)).toMatchObject({ reason: "no_connection" });
     expect(latest.text).not.toContain("a1");
     const listing = JSON.parse((await ownerGet("/v1/data")).text) as {
       scopes: { scope: string }[];

@@ -4128,6 +4128,8 @@ export async function handlePersonalServerDataRequest(
               serving: deps.legacyScopeView.connectionsServing.bind(
                 deps.legacyScopeView,
               ),
+              siblings: (scope: string) =>
+                deps.legacyScopeView?.siblingScopes?.(scope) ?? [],
             }
           : null;
       if (owned && !resetServing) {
@@ -4153,14 +4155,52 @@ export async function handlePersonalServerDataRequest(
       // retryable 503. An On cannot land between the decision and the delete.
       const seal = deps.storage.legacyWriteSeal;
       if (!seal) return accountModeUnknownResponse();
-      let result: DeleteScopeResult;
-      try {
-        result = deps.syncManager?.deleteScope
-          ? await deps.syncManager.deleteScope(
-              parsed.scope,
-              seal.commit.bind(seal),
-            )
-          : await seal.commit((hold) =>
+      // The connection reset runs inside the same hold as the file delete,
+      // so the unswitched decision covers both: a switch to stream sync
+      // cannot land between them (a reset on a switched account would reach
+      // every device through the replica). It runs only after a delete whose
+      // gateway step did not fail ("nothing was deleted" stays true), and it
+      // reads the serving connections then, so rows that arrived during the
+      // delete go too. Every serving connection is tried; the first failure
+      // is rethrown (500, the file already gone) and the retry, which still
+      // finds the scope owned, resets what still holds rows.
+      const commit: LegacyWriteSeal["commit"] = resetServing
+        ? (write) =>
+            seal.commit(async (hold) => {
+              const out = await write(hold);
+              const deleted = out as unknown as DeleteScopeResult;
+              if (deleted.steps.gateway.status !== "failed") {
+                const serving = resetServing.serving(parsed.scope);
+                let failure: unknown = null;
+                for (const instance of serving) {
+                  try {
+                    resetServing.reset(instance);
+                  } catch (err) {
+                    failure ??= err;
+                  }
+                }
+                if (serving.length > 0) {
+                  deps.logger?.info?.(
+                    {
+                      scope: parsed.scope,
+                      resetConnections: serving.length,
+                      failed: failure !== null,
+                    },
+                    "Reset the connections serving a deleted canonical scope",
+                  );
+                }
+                if (failure !== null) throw failure;
+              }
+              return out;
+            })
+        : seal.commit.bind(seal);
+      const deleteDurably = (
+        scope: string,
+        within: LegacyWriteSeal["commit"],
+      ): Promise<DeleteScopeResult> =>
+        deps.syncManager?.deleteScope
+          ? deps.syncManager.deleteScope(scope, within)
+          : within((hold) =>
               deleteScopeLocally(
                 {
                   storage: deps.storage,
@@ -4168,10 +4208,33 @@ export async function handlePersonalServerDataRequest(
                   deleteData: null,
                   logger: apiLoggerAsLogger(deps.logger),
                 },
-                parsed.scope,
+                scope,
                 { hold },
               ),
             );
+      let result: DeleteScopeResult;
+      // The source's other scopes, deleted after a reset (see below).
+      const alsoDeleted: DeleteScopeResult[] = [];
+      try {
+        result = await deleteDurably(parsed.scope, commit);
+        // The reset erased the connection, so it erased every scope the
+        // connection serves, not only this one. The owner's delete is of the
+        // source: its other scopes' files are deleted durably too, in this
+        // request, so no client that stops after one scope (or judges "done"
+        // from the inventory, where they no longer show) leaves them behind
+        // on the gateway. Each is its own delete, outside the first hold (the
+        // sync manager's queue does not nest); a retry deletes what is left.
+        if (resetServing && result.steps.gateway.status !== "failed") {
+          for (const sibling of resetServing.siblings(parsed.scope)) {
+            if (deps.storage.countVersions(sibling) === 0) continue;
+            const deleted = await deleteDurably(
+              sibling,
+              seal.commit.bind(seal),
+            );
+            alsoDeleted.push(deleted);
+            if (deleted.steps.gateway.status === "failed") break;
+          }
+        }
       } catch (err) {
         if (err instanceof LegacyWriteRefusedError) {
           return err.verdict === "switched"
@@ -4190,59 +4253,62 @@ export async function handlePersonalServerDataRequest(
           result,
         });
       }
-
-      // After the file: a failed tombstone above leaves both copies, so
-      // "nothing was deleted" stays true. Read the serving connections now,
-      // so one that started holding rows during the file delete goes too.
-      // A reset that throws answers 500 with the file already gone; the scope
-      // stays owned, so the retry lands here and resets what still holds rows.
-      if (resetServing) {
-        const serving = resetServing.serving(parsed.scope);
-        for (const instance of serving) resetServing.reset(instance);
-        deps.logger?.info?.(
-          { scope: parsed.scope, resetConnections: serving.length },
-          "Reset the connections serving a deleted canonical scope",
-        );
+      const unfinished = alsoDeleted.find(
+        (deleted) => deleted.steps.gateway.status === "failed",
+      );
+      if (unfinished) {
+        // This scope is gone; a sibling's tombstone failed, so the source is
+        // not. The retry finds this scope owned and deletes what is left.
+        throw new DeleteTombstoneFailedError({
+          scope: unfinished.scope,
+          result: unfinished,
+        });
       }
 
       // Audit entry, best-effort: the deletion above is irreversible and
       // already done, so a failed log write must not turn it into an error
       // response that invites a misleading retry. The failure is logged.
-      try {
-        await deps.accessLogWriter.write({
-          logId: deps.createLogId?.() ?? crypto.randomUUID(),
-          grantId: "owner",
-          builder: deps.serverOwner ?? "owner",
-          action: "delete",
-          scope: parsed.scope,
-          timestamp: (deps.now ?? (() => new Date()))().toISOString(),
-          ipAddress:
-            request.headers.get("x-forwarded-for") ??
-            request.headers.get("x-real-ip") ??
-            "unknown",
-          userAgent: request.headers.get("user-agent") ?? "unknown",
-        });
-      } catch (err) {
-        deps.logger?.warn?.(
+      for (const deleted of [result, ...alsoDeleted]) {
+        try {
+          await deps.accessLogWriter.write({
+            logId: deps.createLogId?.() ?? crypto.randomUUID(),
+            grantId: "owner",
+            builder: deps.serverOwner ?? "owner",
+            action: "delete",
+            scope: deleted.scope,
+            timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+            ipAddress:
+              request.headers.get("x-forwarded-for") ??
+              request.headers.get("x-real-ip") ??
+              "unknown",
+            userAgent: request.headers.get("user-agent") ?? "unknown",
+          });
+        } catch (err) {
+          deps.logger?.warn?.(
+            {
+              scope: deleted.scope,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "Delete access-log entry failed; scope already deleted",
+          );
+        }
+        deps.logger?.info?.(
           {
-            scope: parsed.scope,
-            error: err instanceof Error ? err.message : String(err),
+            scope: deleted.scope,
+            durable: deleted.durable,
+            gateway: deleted.steps.gateway.status,
+            storage: deleted.steps.storage.status,
+            local: deleted.steps.local.status,
+            deletedCount: deleted.steps.local.deletedCount,
           },
-          "Delete access-log entry failed; scope already deleted",
+          "Scope deleted",
         );
       }
-      deps.logger?.info?.(
-        {
-          scope: parsed.scope,
-          durable: result.durable,
-          gateway: result.steps.gateway.status,
-          storage: result.steps.storage.status,
-          local: result.steps.local.status,
-          deletedCount: result.steps.local.deletedCount,
-        },
-        "Scope deleted",
-      );
-      return jsonResponse(result, { status: 200 });
+      // `alsoDeleted` names the source's other scopes this delete took (a
+      // reset of the connection serving them). Present only on that path.
+      return jsonResponse(resetServing ? { ...result, alsoDeleted } : result, {
+        status: 200,
+      });
     }
 
     return methodNotAllowed();

@@ -322,6 +322,11 @@ export interface LegacyScopeViewPort {
    * Optional: a view without it keeps the per-scope delete refused.
    */
   connectionsServing?(scope: string): string[];
+  /**
+   * The other scopes bound with this one in a connector's bindings: what a
+   * reset of the connection serving this scope also erases. Sorted.
+   */
+  siblingScopes?(scope: string): string[];
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -1390,6 +1395,16 @@ export function createLegacyScopeView(
           )
           .map((connection) => connection.instance);
       });
+    },
+    siblingScopes(scope) {
+      const siblings = new Set<string>();
+      for (const profile of BINDING_PROFILES) {
+        if (!profile.get(scope)) continue;
+        for (const other of profile.keys()) {
+          if (other !== scope) siblings.add(other);
+        }
+      }
+      return [...siblings].sort();
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),

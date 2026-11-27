@@ -2659,15 +2659,16 @@ describe("DELETE /v1/data/:scope", () => {
   /** A view that owns `instagram.profile` and names one serving connection. */
   function owningView(
     withServing = true,
+    serving: string[] = ["instagram:owner"],
+    siblings: string[] = [],
   ): NonNullable<DataRouteDeps["legacyScopeView"]> {
     return {
       readLatest: vi.fn(),
       listingFor: vi.fn(),
       listCanonicalScopes: vi.fn(() => []),
       ownsScope: vi.fn(() => true),
-      ...(withServing
-        ? { connectionsServing: vi.fn(() => ["instagram:owner"]) }
-        : {}),
+      ...(withServing ? { connectionsServing: vi.fn(() => serving) } : {}),
+      siblingScopes: vi.fn(() => siblings),
       verdictFor: vi.fn(() => []),
       resetTakeover: vi.fn(),
       isReset: vi.fn(() => false),
@@ -2710,6 +2711,151 @@ describe("DELETE /v1/data/:scope", () => {
 
     expect(res.status).toBe(502);
     expect(resetConnection).not.toHaveBeenCalled();
+  });
+
+  it("deletes the source's other scopes and names them in alsoDeleted", async () => {
+    const resetConnection = vi.fn();
+    const app = createApp({
+      legacyScopeView: owningView(
+        true,
+        ["instagram:owner"],
+        ["instagram.posts", "instagram.likes"],
+      ),
+      resetConnection,
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+    await ingestData("instagram.posts", { version: 1 }, app);
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { alsoDeleted: { scope: string }[] };
+    // instagram.likes has no copy here, so there is nothing to delete.
+    expect(body.alsoDeleted.map((d) => d.scope)).toEqual(["instagram.posts"]);
+    expect(indexManager.countByScope("instagram.posts")).toBe(0);
+  });
+
+  it("answers 502 naming the sibling whose gateway tombstone failed", async () => {
+    const ok = (scope: string) => ({
+      scope,
+      dataPointId: "0xdp",
+      durable: true,
+      steps: {
+        gateway: { status: "ok" as const },
+        storage: { status: "ok" as const },
+        local: { status: "ok" as const, deletedCount: 1 },
+      },
+      pendingBlobDeletion: false,
+    });
+    const failed = (scope: string) => ({
+      ...ok(scope),
+      durable: false,
+      steps: {
+        gateway: { status: "failed" as const, error: "Gateway error: 503" },
+        storage: { status: "skipped" as const, reason: "gateway-failed" },
+        local: { status: "skipped" as const, reason: "gateway-failed" },
+      },
+    });
+    const resetConnection = vi.fn();
+    const deleteScope = vi.fn(
+      async (
+        scope: string,
+        within?: (write: (hold: unknown) => unknown) => unknown,
+      ) => {
+        const result = scope === "instagram.posts" ? failed(scope) : ok(scope);
+        return within ? within(async () => result) : result;
+      },
+    );
+    const writer = createApp();
+    await ingestData("instagram.posts", { version: 1 }, writer);
+    const app = createApp({
+      legacyScopeView: owningView(
+        true,
+        ["instagram:owner"],
+        ["instagram.posts"],
+      ),
+      resetConnection,
+      syncManager: { deleteScope } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(502);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("DELETE_TOMBSTONE_FAILED");
+    expect(json.error.details.result.scope).toBe("instagram.posts");
+    expect(resetConnection).toHaveBeenCalledWith("instagram:owner");
+  });
+
+  it("tries every serving connection when a reset fails, then answers 500", async () => {
+    const resetConnection = vi.fn((instance: string) => {
+      if (instance === "instagram:a") throw new Error("SQLITE_BUSY");
+    });
+    const app = createApp({
+      legacyScopeView: owningView(true, ["instagram:a", "instagram:b"]),
+      resetConnection,
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(500);
+    expect(resetConnection.mock.calls.map(([id]) => id)).toEqual([
+      "instagram:a",
+      "instagram:b",
+    ]);
+  });
+
+  it("resets inside the delete's hold, so a switch cannot land between them", async () => {
+    const open = fixedLegacyWriteSeal("unswitched");
+    let held = false;
+    const seal: NonNullable<DataRouteDeps["legacyWriteSeal"]> = {
+      ...open,
+      commit: (write) =>
+        open.commit(async (hold) => {
+          held = true;
+          try {
+            return await write(hold);
+          } finally {
+            held = false;
+          }
+        }),
+    };
+    const insideHold: boolean[] = [];
+    const resetConnection = vi.fn(() => {
+      insideHold.push(held);
+    });
+    const app = createApp({
+      legacyWriteSeal: seal,
+      legacyScopeView: owningView(),
+      resetConnection,
+    });
+    await ingestData("instagram.profile", { version: 1 }, app);
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(insideHold).toEqual([true]);
+  });
+
+  it("resets nothing when the account switched before the delete took the hold", async () => {
+    const resetConnection = vi.fn();
+    const writer = createApp();
+    await ingestData("instagram.profile", { version: 1 }, writer);
+    // The handler read "unswitched"; the seal, deciding under its lock, sees
+    // the switch that landed in between.
+    const app = createApp({
+      legacyWriteSeal: fixedLegacyWriteSeal("switched"),
+      legacyScopeView: owningView(),
+      resetConnection,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error.errorCode).toBe("USE_CONNECTOR_DELETE");
+    expect(resetConnection).not.toHaveBeenCalled();
+    expect(indexManager.countByScope("instagram.profile")).toBe(1);
   });
 
   it.each([

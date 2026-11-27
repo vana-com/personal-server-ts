@@ -405,6 +405,19 @@ describe("own-write log (replication enabled)", () => {
     ).not.toThrow();
   });
 
+  it("resetConnection refuses an unknown id and creates no row", () => {
+    expect(() => store.resetConnection("account-unknown")).toThrow(
+      "connection_not_found",
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get("account-unknown"),
+    ).toEqual({ n: 0 });
+  });
+
   it("resetConnection leaves a deleted connection deleted", () => {
     store.deleteConnection("account-a");
     const deleted = store.getInstanceBinding("account-a");

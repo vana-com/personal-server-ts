@@ -1435,10 +1435,17 @@ export function createSqliteRecordStore(
    * the id registered: unlike `deleteConnection`, the next collection writes
    * to the same connection (at the new `binding_generation`). A deleted
    * connection is returned unchanged. The replica records `connection-reset`.
+   * Only a registered connection resets: an unknown or unbound id throws and
+   * creates no row (the replica baseline refuses an unbound connection).
    */
   function resetConnection(instance: string): PdppInstanceBinding {
     return connectionMutation(instance, () => {
-      const current = ensureBinding(db, instance);
+      const current = db
+        .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+        .get(instance) as BindingRowDb | undefined;
+      if (!current || current.source_id === null || current.method === null) {
+        throw new PdppBindingError("connection_not_found");
+      }
       if (current.deleted_at !== null) return getInstanceBinding(instance);
       eraseInstanceData(instance);
       const resetClock = (nextWriteSeq.get() as { value: number }).value;
