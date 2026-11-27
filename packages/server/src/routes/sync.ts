@@ -90,8 +90,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
       );
   };
   const isStreamMode = () =>
-    !deps.accountStorageMode ||
-    deps.accountStorageMode.read() === "switched";
+    !deps.accountStorageMode || deps.accountStorageMode.read() === "switched";
   // Once the Response is returned the handler cannot stop its body, so the
   // body is wrapped: every pull re-checks the mode, and on mode loss the
   // unread remainder is cancelled instead of streaming to completion.
