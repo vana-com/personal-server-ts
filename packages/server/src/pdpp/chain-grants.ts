@@ -400,6 +400,12 @@ export interface PdppChainRegistrarOptions {
   accessTokenTtlSeconds?: number;
 }
 
+/** Gateway refusals that are about a carried entry, not the version. */
+const CARRY_REFUSALS = new Set([
+  "PDPP_ENTRY_BOUND_ELSEWHERE",
+  "PDPP_GRANT_DOCUMENT_REQUIRED",
+]);
+
 /** Registration outcomes that are still in progress at the gateway. */
 const SETTLING = new Set(["pending", "sent", "confirmed"]);
 
@@ -935,12 +941,24 @@ export class PdppChainRegistrar {
     const { store, gateway, chain } = this.options;
     if (!reg.permissionId) return;
     const slot = await gateway.getSlot(reg.permissionId);
-    if (slot?.status !== "failed") return;
-    const { permission } = await chain.readFinalized(
-      reg.permissionId as `0x${string}`,
-    );
-    if (permission?.scopes.includes(reg.entry)) return;
-    store.markChainPending(reg.grantId, this.now());
+    if (!slot) return;
+    if (slot.status === "failed") {
+      const { permission } = await chain.readFinalized(
+        reg.permissionId as `0x${string}`,
+      );
+      if (permission?.scopes.includes(reg.entry)) return;
+      store.markChainPending(reg.grantId, this.now());
+      return;
+    }
+    // M1: the gateway no longer lists the entry and the finalized chain does
+    // not either: another signer dropped it. Never re-registered.
+    if (!slot.scopes.includes(reg.entry)) {
+      const { permission } = await chain.readFinalized(
+        reg.permissionId as `0x${string}`,
+      );
+      if (!permission?.scopes.includes(reg.entry))
+        store.markChainDroppedElsewhere(reg.grantId, this.now());
+    }
   }
 
   /** True when the finalized chain no longer lets the entry authorize. */
@@ -1053,18 +1071,27 @@ export class PdppChainRegistrar {
             this.options.deployment.contractAddress.toLowerCase() &&
           !listedVerified.includes(r.entry),
       );
-    const ownBound = ownBoundRows.map((r) => r.entry);
+    // M1 (decided, fail closed): an own entry the gateway does not list and
+    // the FINALIZED chain no longer lists was dropped by another signer (for
+    // example the owner dropping one grant through Account). It is never put
+    // back: its registration becomes `dropped_elsewhere` (reads refused, no
+    // automatic re-registration; the owner can approve again). Only own
+    // entries the finalized chain still lists are carried, as before.
+    for (const r of ownBoundRows)
+      if (!onChain.has(r.entry))
+        store.markChainDroppedElsewhere(r.grantId, this.now());
+    let carryRows = ownBoundRows.filter((r) => onChain.has(r.entry));
     let current = slot;
     let answer: GatewayAnswer | undefined;
     let revocation = false;
     let grantVersion = 0n;
-    // Attempt 1 carries own bound entries the gateway's view omits; if the
-    // gateway refuses that (4xx), attempt 2 re-sends the end without them,
-    // falling back to a V2 revocation when nothing remains.
-    for (const carryUnlisted of ownBound.length > 0 ? [true, false] : [false]) {
-      const remaining = carryUnlisted
-        ? [...listedVerified, ...ownBound]
-        : listedVerified;
+    // Up to three writes: a stale-version 409 re-reads the slot and retries
+    // the same write; a carry-specific refusal (the gateway will not take a
+    // carried entry) drops the carried entries and retries without them,
+    // falling back to a V2 revocation when nothing remains. Entries are only
+    // ever dropped here, never re-added.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const remaining = [...listedVerified, ...carryRows.map((r) => r.entry)];
       revocation = remaining.length === 0 || current.revokedAt !== null;
       // A V2 revocation lists a non-empty subset of the gateway's scopes and
       // a past expiry; a removal-only upsert keeps the earliest known expiry,
@@ -1100,8 +1127,9 @@ export class PdppChainRegistrar {
       };
       // Carried entries go with their documents, so the gateway can accept
       // them even when its view lost them.
-      const attachments = carryUnlisted
-        ? ownBoundRows.flatMap((r) => {
+      const attachments = revocation
+        ? []
+        : carryRows.flatMap((r) => {
             const g = store.getGrant(r.grantId);
             return g
               ? [
@@ -1112,8 +1140,7 @@ export class PdppChainRegistrar {
                   },
                 ]
               : [];
-          })
-        : [];
+          });
       answer = revocation
         ? await gateway.revokeSlot(slotId, body, signature)
         : await gateway.registerSlot(
@@ -1124,18 +1151,21 @@ export class PdppChainRegistrar {
             },
             signature,
           );
-      const refusedCarry =
-        carryUnlisted && answer.status >= 400 && answer.status < 500;
-      if (!refusedCarry) break;
-      // NEW-7: drop only the carried (unlisted) entries, never the listed
-      // live ones, and register those grants again so they are not lost.
-      for (const r of ownBoundRows)
-        store.markChainPending(r.grantId, this.now());
-      this.options.logger.warn(
-        { grantId, status: answer.status, requeued: ownBoundRows.length },
-        "PDPP chain: gateway refused own entries it does not list; ending without them and registering them again",
-      );
-      // The refused signature may have spent its version: read it again.
+      if (answer.status >= 200 && answer.status < 300) break;
+      const code = String(answer.body.code ?? "");
+      if (carryRows.length > 0 && CARRY_REFUSALS.has(code)) {
+        // L1: only a carry-specific refusal drops the carried entries.
+        for (const r of carryRows)
+          store.markChainDroppedElsewhere(r.grantId, this.now());
+        this.options.logger.warn(
+          { grantId, code, dropped: carryRows.length },
+          "PDPP chain: gateway refused own entries it does not list; ending without them (they are not re-added)",
+        );
+        carryRows = [];
+      } else if (answer.status !== 409) {
+        break;
+      }
+      // A stale version or a dropped carry: read the slot again and retry.
       current = (await gateway.getSlot(slotId)) ?? current;
     }
     if (answer && answer.status >= 200 && answer.status < 300) {
@@ -1315,6 +1345,8 @@ export function streamSyncScopeBindings(input: {
 export function createDesign2ChainGrants(input: {
   store: PdppAuthStore;
   logger: Logger;
+  /** Why chain grants are unavailable, for the fail-closed pair (`ready: null`). */
+  unavailableReason?: string;
   ready: {
     gatewayUrl: string;
     fetch?: typeof fetch;
@@ -1352,16 +1384,21 @@ export function createDesign2ChainGrants(input: {
   registrar: Pick<
     PdppChainRegistrar,
     "prepare" | "register" | "reconcile" | "backfill" | "start" | "stop"
-  >;
+  > & { unavailableReason?: string };
   gate: PdppChainEnforcementPort;
 } {
   const { ready } = input;
   if (!ready) {
+    const reason =
+      input.unavailableReason ??
+      "Chain grants are not available on this server";
     input.logger.warn(
-      "pdpp.chainGrants is on but this boot cannot register grants (owner key or records missing): PDPP approvals are refused and client reads denied",
+      { reason },
+      "PDPP chain grants unavailable on this boot: PDPP approvals are refused and client reads denied",
     );
     return {
       registrar: {
+        unavailableReason: reason,
         prepare: () => null,
         register: async () => null,
         reconcile: async () => undefined,
@@ -1373,7 +1410,7 @@ export function createDesign2ChainGrants(input: {
         authorize: async () => ({
           ok: false,
           retryable: false,
-          reason: "Chain grants are not available on this server",
+          reason,
         }),
       },
     };

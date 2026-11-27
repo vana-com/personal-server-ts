@@ -559,6 +559,14 @@ function chainOwnerView(
           ),
         }
       : {};
+  if (reg.droppedElsewhereAt)
+    return {
+      chain: {
+        status: "dropped_elsewhere",
+        since: reg.droppedElsewhereAt,
+        ...labels,
+      },
+    };
   if (reg.status === "pending" && reg.deferredSince)
     return {
       chain: {
@@ -574,6 +582,8 @@ function chainOwnerView(
 
 /** The slice of `PdppChainRegistrar` (pdpp/chain-grants.ts) the AS uses. */
 export interface PdppChainRegistrarPort {
+  /** Set when chain grants are unavailable: approvals are refused with it. */
+  unavailableReason?: string;
   prepare(
     grant: Grant,
   ): { granteeAddress: string; salt: string; entry: string } | null;
@@ -1534,7 +1544,8 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         c,
         403,
         "access_denied",
-        "this app has no Vana grantee identity, so its grant cannot be registered on chain",
+        deps.chainRegistrar?.unavailableReason ??
+          "this app has no Vana grantee identity, so its grant cannot be registered on chain",
       );
     }
 

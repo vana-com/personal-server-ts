@@ -125,12 +125,21 @@ record and blob reads require that entry to be live on chain.
   paid read under a label the PS never bound gets the gateway's
   `SCOPE_UNBOUND`, except the unbound stream-sync physical scopes the
   gateway accepts under a slot that also holds a legacy scope.
-- **A grant end keeps the PS's other grants.** A removal carries the PS's
-  own live entries for that slot, also ones the gateway's view omits (with
-  their documents); never an entry bound under another slot or contract.
-  If the gateway refuses such an entry, the end is sent again without the
-  entries it did not list, and those grants are registered again, so no live
-  grant is lost.
+- **An entry dropped elsewhere stays dropped (fail closed).** The PS never
+  re-adds one of its own entries that the gateway no longer lists and the
+  finalized chain no longer lists for that slot: another signer (for
+  example the owner dropping one grant through Vana Account) removed it, and
+  the PS cannot tell that from a stale overwrite. That grant's registration
+  becomes `dropped_elsewhere`: client reads are refused like a revoked
+  grant, GET /pdpp/v1/grants shows `chain.status: "dropped_elsewhere"`, and
+  nothing registers it again; the owner can approve the app again. Own
+  entries the finalized chain still lists are kept in the PS's writes (with
+  their documents) even when the gateway's view omits them. If the gateway
+  refuses such a carried entry (`PDPP_ENTRY_BOUND_ELSEWHERE` or
+  `PDPP_GRANT_DOCUMENT_REQUIRED`), the PS drops it the same way and sends the
+  write without it; this path only ever drops entries. A stale-version 409
+  is not a refusal of the entry: the PS reads the slot again and retries the
+  same write. An entry bound under another slot or contract is never sent.
 - **Reads never wait for the gateway.** A read of a grant whose
   registration is pending answers "retry later" at once; the registration
   is retried in the background.
@@ -138,7 +147,9 @@ record and blob reads require that entry to be live on chain.
   all on-chain registration and removal, so entries already on chain stay
   there and a paid read at the gateway can still resolve them after their
   grants end. A server with any grant still `bound` or `ending` on chain
-  refuses to boot with the setting off. Operators should keep it on, or end
-  those grants first (and let reconciliation finish); setting
-  `pdpp.chainGrants.allowDisableWithRegistrations: true` boots anyway and
-  leaves those entries on chain.
+  therefore runs PDPP chain grants fail closed when booted with the setting
+  off: the server starts, but PDPP approvals are refused and PDPP client
+  reads are denied, with an error that names the remedy. Operators should
+  keep the setting on, or end those grants first (and let reconciliation
+  finish). Setting `pdpp.chainGrants.allowDisableWithRegistrations: true`
+  serves PDPP without chain grants and leaves those entries on chain.

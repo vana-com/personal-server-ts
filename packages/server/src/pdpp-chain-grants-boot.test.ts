@@ -444,18 +444,69 @@ describe("design 2 through createServer (review F6)", () => {
   });
 });
 
-describe("turning chain grants off after use (NEW-3)", () => {
-  it("refuses to boot while a grant is registered on chain, unless overridden", async () => {
+describe("turning chain grants off after use (NEW-3, L2)", () => {
+  it("keeps the server up but refuses PDPP approvals and client reads, unless overridden", async () => {
     ctx = await boot();
-    await obtainGrantBoundToken(ctx);
+    const { accessToken } = await obtainGrantBoundToken(ctx);
     await new Promise((r) => setTimeout(r, 50));
     expect(gateway.scopes.some((s) => s.startsWith("pdpp:sha256:"))).toBe(true);
     await ctx.cleanup();
     ctx = undefined;
-    await expect(boot({ enabled: false })).rejects.toThrow(
-      /still registered on chain/,
+
+    // Chain grants off with a grant still on chain: the server boots.
+    ctx = await boot({ enabled: false });
+    const read = await ctx.app.request("/v1/streams/top_artists/records", {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    expect(read.status).toBe(401);
+    expect(
+      ((await read.json()) as { error: { message: string } }).error.message,
+    ).toMatch(/still registered on chain/);
+    const owner = await ownerToken(ctx);
+    const ownerAuth = { authorization: `Bearer ${owner}` };
+    const authorized = await ctx.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: { ...ownerAuth, "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT,
+        code_challenge: CHALLENGE,
+        code_challenge_method: "S256",
+        authorization_details: [
+          {
+            type: "https://pdpp.dev/data-access",
+            source: { id: SOURCE_ID },
+            purpose_code: "https://pdpp.dev/purpose/personalization",
+            access_mode: "continuous",
+            streams: [{ name: "top_artists", fields: ["name"] }],
+          },
+        ],
+      }),
+    });
+    const { session_id } = (await authorized.json()) as { session_id: string };
+    const reviewed = (await (
+      await ctx.app.request(`/pdpp/v1/authorize/${session_id}/review`, {
+        headers: ownerAuth,
+      })
+    ).json()) as { review: { review_digest: string } };
+    const approved = await ctx.app.request(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      {
+        method: "POST",
+        headers: { ...ownerAuth, "content-type": "application/json" },
+        body: JSON.stringify({ review_digest: reviewed.review.review_digest }),
+      },
     );
+    expect(approved.status).toBe(403);
+    expect(await approved.text()).toMatch(/still registered on chain/);
+    await ctx.cleanup();
+    ctx = undefined;
+
+    // With the override, PDPP serves without chain grants.
     ctx = await boot({ enabled: false, allowDisableWithRegistrations: true });
-    expect(ctx.app).toBeDefined();
+    const served = await ctx.app.request("/v1/streams/top_artists/records", {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    expect(served.status).toBe(200);
   });
 });

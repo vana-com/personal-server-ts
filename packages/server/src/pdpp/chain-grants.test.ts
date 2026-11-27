@@ -133,6 +133,8 @@ class FakeGateway {
   /** Refuse (409 bound elsewhere) any upsert listing one of these. */
   refuseEntries = new Set<string>();
   bindingRequests = 0;
+  /** Another writer moves the slot version just before the next POST. */
+  bumpBeforeNextPost = false;
   /** Hang every request (no answer) when set (F4 timeouts). */
   hang = false;
   requests: Array<{ method: string; path: string; body?: unknown }> = [];
@@ -374,6 +376,10 @@ class FakeGateway {
     }
 
     if (method === "POST" && url.pathname === "/v1/grants") {
+      if (this.bumpBeforeNextPost && this.slot) {
+        this.bumpBeforeNextPost = false;
+        this.slot.latest = this.current() + 1n;
+      }
       const signer = await this.signer(auth, {
         grantorAddress: body.grantorAddress,
         granteeId: body.granteeId,
@@ -1482,14 +1488,12 @@ describe("never drops a scope another surface is still settling", () => {
     const after = posts()
       .slice(before)
       .map((p) => (p.body as { scopes: string[] }).scopes);
-    // The third grant registers without A; if the lie also makes the PS
-    // treat A's removal as lost (R1), the re-signed removal keeps the PS's
-    // own bound entries and never A.
+    // The third grant registers without A, and no later write re-adds A.
+    // (The lie also hides the third entry, which the finalized chain does
+    // not hold yet; under M1 the PS treats it as dropped and never puts it
+    // back: fail closed.)
     expect(after[0]).toContain(store.getChainRegistration(third)!.entry);
-    for (const signed of after) {
-      expect(signed).not.toContain(a);
-      expect(signed).toContain(store.getChainRegistration(third)!.entry);
-    }
+    for (const signed of after) expect(signed).not.toContain(a);
   });
 
   it("N4: one reconcile at a time; a call while one runs joins it", () => {
@@ -1670,8 +1674,11 @@ describe("never drops a scope another surface is still settling", () => {
       status: "ending",
       endingKind: "revocation",
     });
-    // NEW-7: B is not lost: it registers again.
-    expect(store.getChainRegistration(second)!.status).toBe("pending");
+    // M1/L1: a carry-specific refusal only drops B; it is never re-added.
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "ended",
+      droppedElsewhereAt: expect.any(String),
+    });
   });
 
   it("NEW-7: the fallback drops only the refused unlisted entry, never the listed live ones", async () => {
@@ -1699,7 +1706,11 @@ describe("never drops a scope another surface is still settling", () => {
     expect(written).toEqual([[b, c], [b]]);
     for (const w of written) expect(w).not.toContain(d);
     expect(store.getChainRegistration(second)!.status).toBe("bound");
-    expect(store.getChainRegistration(third)!.status).toBe("pending");
+    // The refused carried entry is dropped, never re-queued (M1).
+    expect(store.getChainRegistration(third)).toMatchObject({
+      status: "ended",
+      droppedElsewhereAt: expect.any(String),
+    });
   });
 
   it("NEW-2: a label over 256 streams is not sent and the owner sees the grant as not fully bindable", async () => {
@@ -1802,5 +1813,94 @@ describe("never drops a scope another surface is still settling", () => {
       store.getChainRegistration(grantId)!.entry,
     ]);
     expect(store.getChainRegistration(grantId)!.deferredSince).toBeNull();
+  });
+
+  it("M1: an own entry another signer dropped is never put back, and stays dropped after another grant ends", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    gateway.settle();
+    const [a, b, c] = [first, second, third].map(
+      (g) => store.getChainRegistration(g)!.entry,
+    );
+    // Account drops B (POST without B) and it finalizes.
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a, c];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.settle();
+    const before = posts().length;
+    await ownerRevoke(first);
+    const written = posts()
+      .slice(before)
+      .map((p) => (p.body as { scopes: string[] }).scopes);
+    expect(written).toEqual([[c]]);
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "ended",
+      droppedElsewhereAt: expect.any(String),
+    });
+    // Reads refused; the owner sees it; no automatic re-registration.
+    expect(await read(second)).toMatchObject({ ok: false, retryable: false });
+    gateway.settle();
+    await chain.registrar.reconcile();
+    await chain.registrar.reconcile();
+    for (const p of posts().slice(before))
+      expect((p.body as { scopes: string[] }).scopes).not.toContain(b);
+    const owner = (await (
+      await app.request("/pdpp/v1/grants", {
+        headers: { authorization: `Bearer ${ownerToken()}` },
+      })
+    ).json()) as {
+      grants: Array<{ grant_id: string; chain?: { status: string } }>;
+    };
+    expect(owner.grants.find((g) => g.grant_id === second)!.chain!.status).toBe(
+      "dropped_elsewhere",
+    );
+  });
+
+  it("M1: reconcile marks a bound entry dropped when neither the gateway nor the finalized chain lists it", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect(
+      store.getChainRegistration(second)!.droppedElsewhereAt,
+    ).not.toBeNull();
+    expect(store.getChainRegistration(first)!.status).toBe("bound");
+  });
+
+  it("L1: a stale-version 409 re-reads and retries the same write; nothing is dropped or re-queued", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const b = store.getChainRegistration(second)!.entry;
+    gateway.bumpBeforeNextPost = true;
+    const before = posts().length;
+    await ownerRevoke(first);
+    const written = posts().slice(before);
+    expect(written).toHaveLength(2);
+    expect((written[1].body as { scopes: string[] }).scopes).toEqual([b]);
+    expect(
+      BigInt((written[1].body as { grantVersion: string }).grantVersion),
+    ).toBeGreaterThan(
+      BigInt((written[0].body as { grantVersion: string }).grantVersion),
+    );
+    expect(store.getChainRegistration(second)).toMatchObject({
+      status: "bound",
+      droppedElsewhereAt: null,
+      lastError: null,
+    });
+    expect(store.getChainRegistration(first)).toMatchObject({
+      status: "ending",
+      endingKind: "removal",
+    });
   });
 });

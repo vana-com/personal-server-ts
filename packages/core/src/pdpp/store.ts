@@ -202,6 +202,10 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   deferred_outcome TEXT,
   -- JSON [{scope, reason}] of scope labels the gateway did not bind
   unbound_labels TEXT,
+  -- set when the finalized chain no longer lists this grant's entry and the
+  -- PS did not remove it (another signer dropped it): terminal, never
+  -- re-registered automatically; status is then 'ended'
+  dropped_elsewhere_at TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -295,6 +299,8 @@ export interface ChainRegistration {
   deferredOutcome: string | null;
   /** Scope labels not bound at the gateway, with why. */
   unboundLabels: Array<{ scope: string; reason: string }>;
+  /** The entry left the slot through another signer; see the column. */
+  droppedElsewhereAt: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
@@ -317,6 +323,7 @@ interface ChainRegistrationRow {
   deferred_since: string | null;
   deferred_outcome: string | null;
   unbound_labels: string | null;
+  dropped_elsewhere_at: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -347,6 +354,7 @@ function chainRegistrationFromRow(
           reason: string;
         }>)
       : [],
+    droppedElsewhereAt: row.dropped_elsewhere_at,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1168,6 +1176,23 @@ export class PdppAuthStore {
       )
       .run(since.toISOString(), outcome ?? null, grantId);
     return this.getChainRegistration(grantId)?.deferredSince ?? null;
+  }
+
+  /**
+   * The entry is no longer in the slot on the finalized chain and this PS did
+   * not remove it: another signer dropped it. Terminal (status 'ended'); the
+   * grant is unreadable and is never re-registered automatically.
+   */
+  markChainDroppedElsewhere(grantId: string, now: Date = new Date()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET status = 'ended', dropped_elsewhere_at = ?, updated_at = ?,
+             last_error = 'entry dropped from the slot by another signer; approve the grant again to restore it'
+         WHERE grant_id = ? AND status IN ('pending','bound')`,
+      )
+      .run(now.toISOString(), now.toISOString(), grantId);
+    return result.changes > 0;
   }
 
   /** Record which scope labels the gateway did not bind, and why. */

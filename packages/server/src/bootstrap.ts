@@ -1713,21 +1713,27 @@ async function bootstrapServer(
   // grants are registered as salted entries in the owner's PermissionsV2 slot
   // for the app, signed by this server as the owner's registered server, and
   // client reads require the entry live on chain (pdpp/chain-grants.ts).
-  // NEW-3: turning chain grants off stops every on-chain removal, so an
+  // NEW-3 (L2): turning chain grants off stops every on-chain removal, so an
   // entry still bound or ending would stay on chain (and payable at the
-  // gateway) for good. Refuse that boot unless the operator says so.
+  // gateway) for good. The server still boots, but PDPP chain grants run in
+  // their fail-closed mode (approvals refused, client reads denied, with the
+  // reason below) unless the operator sets the override.
+  let chainOffWithRegistrations: string | undefined;
   if (pdppAuth && !config.pdpp.chainGrants.enabled) {
     const live = pdppAuth.store.listChainRegistrations(["bound", "ending"]);
     if (
       live.length > 0 &&
       !config.pdpp.chainGrants.allowDisableWithRegistrations
-    )
-      throw new Error(
+    ) {
+      chainOffWithRegistrations =
         `pdpp.chainGrants is off but ${live.length} PDPP grant(s) are still registered on chain. ` +
-          "Turn it back on so their entries can be removed when the grants end, or end those grants first; " +
-          "set pdpp.chainGrants.allowDisableWithRegistrations to boot anyway (the entries then stay on chain).",
+        "Turn it back on so their entries can be removed when the grants end, or end those grants first; " +
+        "set pdpp.chainGrants.allowDisableWithRegistrations to serve PDPP without chain grants (the entries then stay on chain).";
+      logger.error(
+        { registrations: live.length },
+        "PDPP chain grants are off with grants still on chain: PDPP approvals and client reads are refused",
       );
-    if (live.length > 0)
+    } else if (live.length > 0)
       logger.warn(
         { registrations: live.length },
         "PDPP chain grants are off with grants still registered on chain; their entries stay there",
@@ -1735,6 +1741,16 @@ async function bootstrapServer(
   }
   let chainRegistrar:
     ReturnType<typeof createDesign2ChainGrants>["registrar"] | undefined;
+  if (pdppAuth && chainOffWithRegistrations) {
+    const chain = createDesign2ChainGrants({
+      store: pdppAuth.store,
+      logger,
+      ready: null,
+      unavailableReason: chainOffWithRegistrations,
+    });
+    pdppAuth.chainRegistrar = chain.registrar;
+    if (pdppRecords) pdppRecords.chainEnforcement = chain.gate;
+  }
   if (pdppAuth && config.pdpp.chainGrants.enabled) {
     const chain = createDesign2ChainGrants({
       store: pdppAuth.store,
