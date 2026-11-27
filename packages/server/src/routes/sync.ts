@@ -153,6 +153,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     const sync = await local();
     requireStreamMode();
     await sync.cycle();
+    requireStreamMode();
     return c.json({ status: "started", message: "Sync triggered" }, 202);
   });
   app.get("/status", async (c, next) => {
@@ -182,13 +183,28 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   // what it missed while it was away without a read.
   app.get("/events", async (c) => {
     await auth.authorizeOwner(c.req.raw);
+    // Same rule as `requireStreamMode`: a host with no mode source serves the
+    // feed; one with a source serves it only while switched.
+    requireStreamMode();
+    const openingMode = deps.accountStorageMode?.read();
     return streamSSE(c, async (stream) => {
+      let endFeed!: () => void;
+      const left = new Promise<void>((resolve) => {
+        endFeed = resolve;
+      });
+      stream.onAbort(endFeed);
       // One writer per connection folds what arrives while a frame is being
       // written, so a reader that stops reading holds bounded memory.
-      const feed = createFeedWriter((event, data) =>
-        stream.writeSSE({ event, data: JSON.stringify(data) }),
-      );
-      const left = new Promise<void>((resolve) => stream.onAbort(resolve));
+      // Validate at dequeue, not at enqueue: a slow reader may still have
+      // frames pending when the account leaves switched mode.
+      const feed = createFeedWriter(async (event, data): Promise<void> => {
+        if (deps.accountStorageMode?.read() !== openingMode) {
+          feed.close();
+          endFeed();
+          return;
+        }
+        await stream.writeSSE({ event, data: JSON.stringify(data) });
+      });
       // A subscription joins this list when it is acquired, so whatever
       // happens next releases exactly what was acquired.
       const release: Array<() => void> = [];
@@ -215,7 +231,11 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
           try {
             stop();
           } catch (err) {
-            deps.logger.warn({ err }, "sync event feed release failed");
+            try {
+              deps.logger.warn({ err }, "sync event feed release failed");
+            } catch {
+              // A broken logger must not prevent the remaining releases.
+            }
           }
         }
       }
@@ -226,18 +246,21 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     await auth.authorizeOwner(c.req.raw);
     requireStreamMode();
     const file = await deps.localFile?.(c.req.param("id"));
+    requireStreamMode();
     if (!file)
       return c.json({ error: { errorCode: "STREAM_DATA_NOT_FOUND" } }, 404);
-    const result = await (await local()).syncConnection(file.connectionId);
+    const sync = await local();
+    requireStreamMode();
+    const result = await sync.syncConnection(file.connectionId);
+    requireStreamMode();
     if (result?.error)
       return c.json({ error: { errorCode: "STREAM_READ_UNAVAILABLE" } }, 503);
-    requireStreamMode();
     const response = await file.read();
     try {
       requireStreamMode();
-    } catch (err) {
+    } catch (error) {
       void response.body?.cancel().catch(() => undefined);
-      throw err;
+      throw error;
     }
     return guardFileStream(response);
   });

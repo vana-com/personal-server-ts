@@ -4,7 +4,7 @@ import { expect, it } from "vitest";
 import type { SqlDriver, SqlStatement } from "./driver.js";
 import { commitStaged } from "./log-batch.js";
 
-function harness(fail: { main?: Error; cleanup?: Error }) {
+function harness(fail: { main?: Error; cleanup?: Error; warn?: Error }) {
   const warned: Record<string, unknown>[] = [];
   const cleaned: string[] = [];
   const db: SqlDriver = {
@@ -24,7 +24,10 @@ function harness(fail: { main?: Error; cleanup?: Error }) {
   };
   const logger = {
     info: () => {},
-    warn: (obj: Record<string, unknown>) => void warned.push(obj),
+    warn: (obj: Record<string, unknown>) => {
+      if (fail.warn) throw fail.warn;
+      warned.push(obj);
+    },
   };
   return { deps: { db, logger }, warned, cleaned };
 }
@@ -59,4 +62,22 @@ it("cleans up and surfaces the error when assembling the statements throws", asy
   ];
   await expect(commitStaged(deps, throwing)).rejects.toThrow("after failed");
   expect(cleaned).toEqual(["op-1"]);
+});
+
+it("resolves when the cleanup rejects and the warning itself throws", async () => {
+  const { deps } = harness({
+    cleanup: new Error("cleanup failed"),
+    warn: new Error("warn failed"),
+  });
+  await expect(commitStaged(deps, staged)).resolves.toBeUndefined();
+});
+
+it("rejects with the commit's own error, by identity, when the warning throws", async () => {
+  const commitError = new Error("A");
+  const { deps } = harness({
+    main: commitError,
+    cleanup: new Error("B"),
+    warn: new Error("C"),
+  });
+  await expect(commitStaged(deps, staged)).rejects.toBe(commitError);
 });

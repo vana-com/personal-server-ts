@@ -655,10 +655,15 @@ export async function commitStaged(
         })),
       );
     } catch (error) {
-      deps.logger.warn(
-        { error: String(error) },
-        "stream sync: the temp rows of a commit were not cleaned up",
-      );
+      // Reporting is best effort too: a throwing logger must not escape.
+      try {
+        deps.logger.warn(
+          { error: String(error) },
+          "stream sync: the temp rows of a commit were not cleaned up",
+        );
+      } catch {
+        // Nothing left to report to.
+      }
     }
   }
 }
