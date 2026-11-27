@@ -687,18 +687,24 @@ export class PdppChainRegistrar {
     onChain: Set<string>,
   ): string | null {
     const { store } = this.options;
+    const ended = this.endedEntries(reg.grantId);
     const unsettled = (slot?.scopes ?? []).filter(
-      (s) => s !== reg.entry && !own.has(s) && !onChain.has(s),
+      (s) =>
+        s !== reg.entry && !own.has(s) && !ended.has(s) && !onChain.has(s),
     );
+    // R2: a gateway older than 129b16e sends no `registrationOutcome`; a
+    // listed scope the finalized chain lacks is then treated as settling.
     const settling =
       !!slot &&
       slot.revokedAt === null &&
-      SETTLING.has(String(slot.registrationOutcome ?? ""));
+      (slot.registrationOutcome === undefined ||
+        slot.registrationOutcome === null ||
+        SETTLING.has(slot.registrationOutcome));
     if (!settling || unsettled.length === 0) {
       if (reg.deferredSince) store.noteChainDeferral(reg.grantId, null);
       return null;
     }
-    const outcome = String(slot!.registrationOutcome);
+    const outcome = slot!.registrationOutcome ?? "unknown";
     const since = store.noteChainDeferral(reg.grantId, this.now(), outcome);
     const waited = this.now().getTime() - Date.parse(since ?? "");
     if (waited > (this.options.maxDeferralMs ?? 24 * 60 * 60 * 1000)) {
@@ -911,11 +917,15 @@ export class PdppChainRegistrar {
     // N1: a second writer (e.g. Account signing from a stale read) put the
     // entry back on the finalized chain at a version above the end this PS
     // sent: that end is lost and is signed again.
+    // R1: the same when the GATEWAY slot lists it again above that version
+    // (a second writer's upsert that may never settle on chain).
     const reAdded =
       reg.endedVersion !== null &&
-      read.permission !== null &&
-      read.permission.scopes.includes(reg.entry) &&
-      read.permission.grantVersion > BigInt(reg.endedVersion);
+      ((read.permission !== null &&
+        read.permission.scopes.includes(reg.entry) &&
+        read.permission.grantVersion > BigInt(reg.endedVersion)) ||
+        (slot.scopes.includes(reg.entry) &&
+          BigInt(slot.grantVersion) > BigInt(reg.endedVersion)));
     const failed =
       reAdded ||
       slot.status === "failed" ||
@@ -945,7 +955,21 @@ export class PdppChainRegistrar {
     const overtaken = slot.scopes.filter(
       (s) => s !== reg.entry && !verified(s),
     );
-    const remaining = slot.scopes.filter((e) => e !== reg.entry && verified(e));
+    // The PS's own bound entries are always kept, also when the gateway's
+    // view does not list them (their documents are stored there already).
+    const listedVerified = slot.scopes.filter(
+      (e) => e !== reg.entry && verified(e),
+    );
+    const ownBound = store
+      .listChainRegistrations(["bound"])
+      .filter(
+        (r) =>
+          r.grantId !== grantId &&
+          r.granteeAddress.toLowerCase() === reg.granteeAddress.toLowerCase() &&
+          !listedVerified.includes(r.entry),
+      )
+      .map((r) => r.entry);
+    const remaining = [...listedVerified, ...ownBound];
     const revocation = remaining.length === 0 || slot.revokedAt !== null;
     // A V2 revocation lists a non-empty subset of the gateway's scopes and a
     // past expiry; a removal-only upsert keeps the earliest known expiry, so

@@ -117,6 +117,8 @@ class FakeGateway {
   /** Fields the gateway's GET /v1/grants/:id lies about (F2). */
   lie: Partial<ReturnType<FakeGateway["view"]>> | null = null;
   chainDown = false;
+  /** Play a gateway older than 129b16e (no registrationOutcome). */
+  omitOutcome = false;
   /** Hang every request (no answer) when set (F4 timeouts). */
   hang = false;
   requests: Array<{ method: string; path: string; body?: unknown }> = [];
@@ -146,7 +148,10 @@ class FakeGateway {
       revocationFinalizedAt: s.revocationFinalizedAt,
       revocationOutcome: s.revocationOutcome,
       // gateway b16e9d7 registrationOutcomeOf, from the status this fake keeps
-      registrationOutcome:
+      // (omitted to play a gateway older than 129b16e)
+      registrationOutcome: this.omitOutcome
+        ? undefined
+        :
         s.status === "failed"
           ? "reverted"
           : s.status === "finalized"
@@ -1383,12 +1388,21 @@ describe("never drops a scope another surface is still settling", () => {
     gateway.settle();
     await ownerRevoke(first); // removal sent, not final
     gateway.lie = { scopes: [a, ...gateway.slot!.scopes] };
+    const before = posts().length;
     const third = await approvedGrantId([
       { name: "top_artists", fields: ["id"] },
     ]);
-    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
-    expect(signed).toContain(store.getChainRegistration(third)!.entry);
-    expect(signed).not.toContain(a);
+    const after = posts()
+      .slice(before)
+      .map((p) => (p.body as { scopes: string[] }).scopes);
+    // The third grant registers without A; if the lie also makes the PS
+    // treat A's removal as lost (R1), the re-signed removal keeps the PS's
+    // own bound entries and never A.
+    expect(after[0]).toContain(store.getChainRegistration(third)!.entry);
+    for (const signed of after) {
+      expect(signed).not.toContain(a);
+      expect(signed).toContain(store.getChainRegistration(third)!.entry);
+    }
   });
 
   it("N4: one reconcile at a time; a call while one runs joins it", () => {
@@ -1451,5 +1465,56 @@ describe("never drops a scope another surface is still settling", () => {
         new Date(issuedAt.getTime() + 2 * 60 * 60 * 1000),
       ),
     ).toBe(false);
+  });
+
+  it("R1: re-signs a removal when the gateway slot lists the ended entry again above ended_version, even unsettled", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    const b = store.getChainRegistration(second)!.entry;
+    await ownerRevoke(first);
+    const sent = store.getChainRegistration(first)!.endedVersion!;
+    // A second writer's upsert re-lists A at the gateway and never settles.
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a, b];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.slot!.status = "pending";
+    await chain.registrar.reconcile();
+    const again = store.getChainRegistration(first)!;
+    expect(BigInt(again.endedVersion!)).toBeGreaterThan(BigInt(sent));
+    expect((posts().at(-1)!.body as { scopes: string[] }).scopes).toEqual([b]);
+  });
+
+  it("R2: with a gateway that sends no registrationOutcome, a listed scope not on the finalized chain defers a new registration", async () => {
+    gateway.omitOutcome = true;
+    foreignSettling();
+    const grantId = await approvedGrantId();
+    expect(posts()).toHaveLength(0);
+    expect(store.getChainRegistration(grantId)).toMatchObject({
+      status: "pending",
+      deferredOutcome: "unknown",
+    });
+    gateway.settle();
+    await chain.registrar.reconcile();
+    expect((posts()[0].body as { scopes: string[] }).scopes).toEqual([
+      "instagram.posts",
+      store.getChainRegistration(grantId)!.entry,
+    ]);
+  });
+
+  it("R2: removals still never wait with such a gateway", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    gateway.omitOutcome = true;
+    foreignSettling();
+    const before = posts().length;
+    await ownerRevoke(first);
+    expect(posts()).toHaveLength(before + 1);
+    expect((posts().at(-1)!.body as { scopes: string[] }).scopes).toEqual([
+      store.getChainRegistration(second)!.entry,
+    ]);
   });
 });
