@@ -367,7 +367,7 @@ function validateStreamRequest(
     if (stream.fields === undefined && stream.view === undefined)
       return fail(
         "invalid_request",
-        "each stream request requires fields or view (use fields: [\"*\"] for every permitted field)",
+        'each stream request requires fields or view (use fields: ["*"] for every permitted field)',
       );
     if (
       stream.fields !== undefined &&
@@ -591,14 +591,13 @@ export function validateSelectionRequest(
   // Each recognized type is resolved under its own revision.
   // Anything else is rejected rather than processed as the nearest PDPP type:
   // a type URI the AS does not implement carries rules it does not apply.
-  const revision =
-    usesLockedRules(request.type)
-      ? "candidate"
-      : request.type === PDPP_DATA_ACCESS_TYPE_V02
-        ? "0.2"
-        : request.type === PDPP_DATA_ACCESS_TYPE
-          ? "0.1"
-          : null;
+  const revision = usesLockedRules(request.type)
+    ? "candidate"
+    : request.type === PDPP_DATA_ACCESS_TYPE_V02
+      ? "0.2"
+      : request.type === PDPP_DATA_ACCESS_TYPE
+        ? "0.1"
+        : null;
   if (revision === null) {
     return fail(
       "invalid_request",

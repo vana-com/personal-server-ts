@@ -99,8 +99,7 @@ function grantShape(
         .min(1)
         .refine(
           (streams) =>
-            new Set(streams.map((entry) => entry.name)).size ===
-            streams.length,
+            new Set(streams.map((entry) => entry.name)).size === streams.length,
         ),
       expires_at: date.optional(),
     })

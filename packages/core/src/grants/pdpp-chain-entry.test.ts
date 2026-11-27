@@ -23,7 +23,10 @@ const grant = {
     client_id: "https://app.example/client.json",
     client_display: { name: 'Café ☕ \u0007 "q"' },
   },
-  source: { kind: "connector", id: "https://registry.pdpp.dev/connectors/oura" },
+  source: {
+    kind: "connector",
+    id: "https://registry.pdpp.dev/connectors/oura",
+  },
   source_declaration: { version: "v1" },
   purpose_code: "https://pdpp.dev/purpose/personalization",
   access_mode: "continuous",

@@ -496,7 +496,11 @@ describe("createPdppImporter", () => {
           .status,
       ).toBe("imported");
       const refused = await importer.importEnvelope(
-        envelope({ op: "delete", semantics: "append_only", collectedAt: "2026-09-18T10:00:00.000Z" }),
+        envelope({
+          op: "delete",
+          semantics: "append_only",
+          collectedAt: "2026-09-18T10:00:00.000Z",
+        }),
       );
       expect(refused).toMatchObject({
         status: "rejected",

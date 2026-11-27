@@ -241,7 +241,10 @@ describe("v0.1 results are unchanged", () => {
       streams: Array<{ required_fields?: string[] }>;
     };
     expect(delivered.version).toBe("0.1.0");
-    expect(delivered.retention).toEqual({ max_duration: "P30D", on_expiry: "delete" });
+    expect(delivered.retention).toEqual({
+      max_duration: "P30D",
+      on_expiry: "delete",
+    });
     expect(delivered.streams[0]?.required_fields).toEqual([]);
     expect(entry).not.toHaveProperty("streams");
   });

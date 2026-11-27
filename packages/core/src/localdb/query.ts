@@ -596,7 +596,11 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
           // set would shift under the page offset (spec-core §4: 410).
           const uncertain = await db.query<{ seq: number }>(
             "SELECT seq FROM record_changes WHERE connection_id=? AND stream=? AND seq>? LIMIT 1",
-            [target.id, stream, removals && !projected ? horizon : (since ?? horizon)],
+            [
+              target.id,
+              stream,
+              removals && !projected ? horizon : (since ?? horizon),
+            ],
           );
           if (uncertain.length) throw new CursorExpiredError();
         }
@@ -650,7 +654,9 @@ export function createGrantHistory(db: SqlReader, link: ConnectionLink) {
     // A `changes_since` session uses `(instance_id, key)` in the direction
     // `order` selects (spec-core §8 "Stable sort"; RS item 21).
     const listing = options.purpose === "listing";
-    const sort: ListSort = listing ? (options.sort ?? { by: "key" }) : { by: "key" };
+    const sort: ListSort = listing
+      ? (options.sort ?? { by: "key" })
+      : { by: "key" };
     const order = options.order ?? "asc";
     const ranked =
       order === "desc" || sort.by === "field" || (removals && !listing);

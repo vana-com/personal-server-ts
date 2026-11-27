@@ -54,7 +54,11 @@ function fixture(
             fields: ["text"],
             required_fields: [],
           }
-        : { name: "messages", instance_ids: ["issuer-handle"], fields: ["text"] },
+        : {
+            name: "messages",
+            instance_ids: ["issuer-handle"],
+            fields: ["text"],
+          },
     ],
   };
   if (options.pairwise)

@@ -1,4 +1,11 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +15,8 @@ import { cursorSealKeyFor } from "./records-bootstrap.js";
 describe("cursorSealKeyFor", () => {
   const dirs: string[] = [];
   afterEach(() => {
-    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    for (const dir of dirs.splice(0))
+      rmSync(dir, { recursive: true, force: true });
   });
   function setup() {
     const dir = mkdtempSync(join(tmpdir(), "pdpp-seal-key-"));
@@ -23,7 +31,9 @@ describe("cursorSealKeyFor", () => {
     const first = cursorSealKeyFor(db, logger);
     expect(first.byteLength).toBe(32);
     expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(Buffer.from(cursorSealKeyFor(db, logger))).toEqual(Buffer.from(first));
+    expect(Buffer.from(cursorSealKeyFor(db, logger))).toEqual(
+      Buffer.from(first),
+    );
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
@@ -34,7 +44,9 @@ describe("cursorSealKeyFor", () => {
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(readFileSync(file)).toEqual(Buffer.from(replaced));
     expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(Buffer.from(cursorSealKeyFor(db, logger))).toEqual(Buffer.from(replaced));
+    expect(Buffer.from(cursorSealKeyFor(db, logger))).toEqual(
+      Buffer.from(replaced),
+    );
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
 

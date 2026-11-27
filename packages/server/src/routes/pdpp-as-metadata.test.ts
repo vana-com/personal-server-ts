@@ -183,9 +183,7 @@ describe("PDPP AS metadata: RFC 8414 discovery location", () => {
         "/pdpp/v1/.well-known/oauth-authorization-server",
       );
       expect(res.status).toBe(200);
-      expect((await res.json()).issuer).toBe(
-        "https://ps.example.com/pdpp/v1",
-      );
+      expect((await res.json()).issuer).toBe("https://ps.example.com/pdpp/v1");
     } finally {
       cleanup();
     }
@@ -242,9 +240,7 @@ describe("PDPP AS metadata: issuer round-trips through RFC 8414", () => {
       const body = await res.json();
       // RFC 8414 §3.3: the issuer in the document equals the one used.
       expect(body.issuer).toBe(first.issuer);
-      expect(body.authorization_endpoint).toBe(
-        `${first.issuer}/authorize`,
-      );
+      expect(body.authorization_endpoint).toBe(`${first.issuer}/authorize`);
     } finally {
       cleanup();
     }
@@ -252,10 +248,7 @@ describe("PDPP AS metadata: issuer round-trips through RFC 8414", () => {
 
   it("does not double the path when the configured origin already names the issuer", async () => {
     const app = new Hono();
-    app.get(
-      "/m",
-      pdppAsMetadataHandler("https://ps.example.com/pdpp/v1/"),
-    );
+    app.get("/m", pdppAsMetadataHandler("https://ps.example.com/pdpp/v1/"));
     const body = await (await app.request("/m")).json();
     expect(body.issuer).toBe("https://ps.example.com/pdpp/v1");
     expect(body.token_endpoint).toBe("https://ps.example.com/pdpp/v1/token");

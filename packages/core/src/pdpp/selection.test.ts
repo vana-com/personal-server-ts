@@ -420,7 +420,13 @@ describe("locked v0.1.0 minimum field ceiling (spec-core L1248, L1258)", () => {
         source: { id: snap.source_id },
         purpose_code: "https://pdpp.dev/purpose/personalization",
         access_mode: "single_use",
-        streams: [{ name: "top_artists", fields: ["name"], minimum: { fields: minimumFields } }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["name"],
+            minimum: { fields: minimumFields },
+          },
+        ],
       },
       snap,
     );
@@ -435,4 +441,3 @@ describe("locked v0.1.0 minimum field ceiling (spec-core L1248, L1258)", () => {
     if (!result.ok) expect(result.failure.code).toBe("invalid_minimum");
   });
 });
-

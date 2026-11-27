@@ -37,9 +37,7 @@ export function resolveReadScope(
    * "Effective projection"; §9 RS item 32).
    */
   declarationOrLookup:
-    | StreamDeclaration
-    | undefined
-    | (() => StreamDeclaration | undefined),
+    StreamDeclaration | undefined | (() => StreamDeclaration | undefined),
   requestedFields?: string[],
 ): ResolvedReadScope {
   if (!context.active) {
@@ -112,7 +110,9 @@ export function resolveReadScope(
   // above; the declaration is looked up only after this check (RS 31, 32).
   if (requestedFields && requestedFields.length > 0) {
     const ungranted = [
-      ...new Set(requestedFields.filter((f) => !streamGrant.fields.includes(f))),
+      ...new Set(
+        requestedFields.filter((f) => !streamGrant.fields.includes(f)),
+      ),
     ];
     if (ungranted.length > 0) {
       throw new PdppError(

@@ -89,13 +89,17 @@ function jsonError(
   // Every 401 carries the challenge, not just the missing-token branch: a
   // client holding a STALE token is exactly who needs the pointer back to the
   // metadata document in order to re-authorize.
-  const headers: Record<string, string> = versionedHeaders(c, {
-    "Request-Id": reqId,
-    ...(err.status === 401 && {
-      "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
-    }),
-    ...extraHeaders,
-  }, PDPP_VERSION);
+  const headers: Record<string, string> = versionedHeaders(
+    c,
+    {
+      "Request-Id": reqId,
+      ...(err.status === 401 && {
+        "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
+      }),
+      ...extraHeaders,
+    },
+    PDPP_VERSION,
+  );
   if (err instanceof PdppAuthorizationUnavailableError) {
     headers["Retry-After"] = String(err.retryAfterSeconds);
   }

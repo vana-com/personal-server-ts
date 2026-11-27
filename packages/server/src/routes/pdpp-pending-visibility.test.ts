@@ -571,7 +571,10 @@ it("uses local journal values for conflicted owners and hides the whole connecti
           token,
           "/streams/messages/records?changes_since=beginning&limit=1",
         ),
-        session: await read(token, "/streams/messages/records?changes_since=beginning"),
+        session: await read(
+          token,
+          "/streams/messages/records?changes_since=beginning",
+        ),
         list: await read(token, "/streams/messages/records?limit=1&order=asc"),
       })),
     );
@@ -603,8 +606,12 @@ it("uses local journal values for conflicted owners and hides the whole connecti
     })();
     for (const old of oldFeeds) {
       expect(
-        (await read(old.token, "/streams/messages/records?changes_since=beginning")).body
-          .data,
+        (
+          await read(
+            old.token,
+            "/streams/messages/records?changes_since=beginning",
+          )
+        ).body.data,
       ).toEqual([]);
       expect(
         (

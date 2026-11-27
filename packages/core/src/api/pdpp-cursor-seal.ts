@@ -54,7 +54,9 @@ export interface CursorSeal {
  */
 export function createCursorSeal(key?: Uint8Array): CursorSeal {
   const subtle = globalThis.crypto.subtle;
-  const raw = key ? new Uint8Array(key) : globalThis.crypto.getRandomValues(new Uint8Array(32));
+  const raw = key
+    ? new Uint8Array(key)
+    : globalThis.crypto.getRandomValues(new Uint8Array(32));
   if (raw.byteLength !== 32) {
     throw new Error("Cursor seal key must be 32 bytes");
   }
@@ -81,7 +83,9 @@ export function createCursorSeal(key?: Uint8Array): CursorSeal {
         await subtle.encrypt(
           { name: "AES-GCM", iv, additionalData: encoder.encode(kind) },
           await secret,
-          encoder.encode(JSON.stringify({ c: await digest(context), t: inner })),
+          encoder.encode(
+            JSON.stringify({ c: await digest(context), t: inner }),
+          ),
         ),
       );
       const out = new Uint8Array(iv.byteLength + body.byteLength);

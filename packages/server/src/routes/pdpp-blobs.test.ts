@@ -1278,7 +1278,12 @@ describe.each(backends)(
 describe("pdpp blobs: PDPP-Version (spec-core §8, RS item 11)", () => {
   function ownerBlobApp() {
     const store = backends[0]!.createStore();
-    store.putBlobMeta({ blobId: "blob_1", mimeType: "image/jpeg", sizeBytes: 10, sha256: "abc" });
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
     store.ingestBatch(
       [
         {
@@ -1295,7 +1300,12 @@ describe("pdpp blobs: PDPP-Version (spec-core §8, RS item 11)", () => {
     return pdppBlobsRoutes({
       store,
       auth: createFixtureAuthorizationService({
-        "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1", instanceIds: ["inst_1"] },
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
       }),
       declarations,
       instancesForSubject: () => ["inst_1"],
@@ -1313,7 +1323,10 @@ describe("pdpp blobs: PDPP-Version (spec-core §8, RS item 11)", () => {
 
   it("refuses an unsupported version without disclosing the blob or echoing a version", async () => {
     const res = await ownerBlobApp().request("/blob_1?instance_id=inst_1", {
-      headers: { Authorization: "Bearer owner-tok", "PDPP-Version": "2026-04-06" },
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "PDPP-Version": "2026-04-06",
+      },
     });
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -1337,82 +1350,117 @@ describe("pdpp blobs: PDPP-Version (spec-core §8, RS item 11)", () => {
  * reference in the selected instance counts, and the field holding the
  * reference is found by its blob_ref shape, not by the name `blob_ref`.
  */
-describe.each(backends)("pdpp blobs route: instance and field rules ($name store)", ({ createStore }) => {
-  function appWith(fields: string[], instances = ["inst_1", "inst_2"]) {
-    const store = createStore();
-    store.putBlobMeta({
-      blobId: "blob_photo",
-      mimeType: "image/png",
-      sizeBytes: 3,
-      sha256: "abc",
-    });
-    store.ingestBatch(
-      [
-        {
-          instance: "inst_1",
-          stream: "media",
-          key: "m1",
-          data: { id: "m1", blob_ref: { blob_id: "blob_photo", mime_type: "image/png" } },
-          emitted_at: "2026-04-01T00:00:00.000Z",
-        },
-      ],
-      () => "append_only",
-      () => ["id"],
-    );
-    return pdppBlobsRoutes({
-      store,
-      auth: createFixtureAuthorizationService({
-        client: {
-          active: true,
-          tokenKind: "client",
-          subjectId: "sub_1",
-          clientId: "client_1",
-          grant: clientGrant({ instance_ids: instances, fields, required_fields: ["id"] } as never),
-        },
-        owner: { active: true, tokenKind: "owner", subjectId: "sub_1", instanceIds: ["inst_1", "inst_2"] },
-      }),
-      declarations,
-      instancesForSubject: () => ["inst_1", "inst_2"],
-      readBlobBytes: async () => new Uint8Array(3),
-    });
-  }
-  const get = (app: ReturnType<typeof appWith>, path: string, token = "client") =>
-    app.request(path, { headers: { Authorization: `Bearer ${token}` } });
-
-  it("rejects a blob fetch without instance_id with 400 invalid_request (client and owner)", async () => {
-    const app = appWith(["id", "blob_ref"]);
-    for (const token of ["client", "owner"]) {
-      const res = await get(app, "/blob_photo", token);
-      expect(res.status).toBe(400);
-      expect((await res.json()).error).toMatchObject({ code: "invalid_request", param: "instance_id" });
+describe.each(backends)(
+  "pdpp blobs route: instance and field rules ($name store)",
+  ({ createStore }) => {
+    function appWith(fields: string[], instances = ["inst_1", "inst_2"]) {
+      const store = createStore();
+      store.putBlobMeta({
+        blobId: "blob_photo",
+        mimeType: "image/png",
+        sizeBytes: 3,
+        sha256: "abc",
+      });
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "m1",
+            data: {
+              id: "m1",
+              blob_ref: { blob_id: "blob_photo", mime_type: "image/png" },
+            },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      return pdppBlobsRoutes({
+        store,
+        auth: createFixtureAuthorizationService({
+          client: {
+            active: true,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            clientId: "client_1",
+            grant: clientGrant({
+              instance_ids: instances,
+              fields,
+              required_fields: ["id"],
+            } as never),
+          },
+          owner: {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1", "inst_2"],
+          },
+        }),
+        declarations,
+        instancesForSubject: () => ["inst_1", "inst_2"],
+        readBlobBytes: async () => new Uint8Array(3),
+      });
     }
-  });
+    const get = (
+      app: ReturnType<typeof appWith>,
+      path: string,
+      token = "client",
+    ) => app.request(path, { headers: { Authorization: `Bearer ${token}` } });
 
-  it("rejects an unknown query parameter with 400", async () => {
-    const res = await get(appWith(["id", "blob_ref"]), "/blob_photo?instance_id=inst_1&x=1");
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatchObject({ code: "invalid_request", param: "x" });
-  });
+    it("rejects a blob fetch without instance_id with 400 invalid_request (client and owner)", async () => {
+      const app = appWith(["id", "blob_ref"]);
+      for (const token of ["client", "owner"]) {
+        const res = await get(app, "/blob_photo", token);
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatchObject({
+          code: "invalid_request",
+          param: "instance_id",
+        });
+      }
+    });
 
-  it("serves a blob whose referencing field is granted", async () => {
-    const res = await get(appWith(["id", "blob_ref"]), "/blob_photo?instance_id=inst_1");
-    expect(res.status).toBe(200);
-    expect(res.headers.get("Content-Type")).toBe("image/png");
-  });
+    it("rejects an unknown query parameter with 400", async () => {
+      const res = await get(
+        appWith(["id", "blob_ref"]),
+        "/blob_photo?instance_id=inst_1&x=1",
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatchObject({
+        code: "invalid_request",
+        param: "x",
+      });
+    });
 
-  it("refuses when the referencing field is outside the grant's projection", async () => {
-    const res = await get(appWith(["id", "photo"]), "/blob_photo?instance_id=inst_1");
-    expect(res.status).toBe(404);
-    expect((await res.json()).error.code).toBe("blob_not_found");
-  });
+    it("serves a blob whose referencing field is granted", async () => {
+      const res = await get(
+        appWith(["id", "blob_ref"]),
+        "/blob_photo?instance_id=inst_1",
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Type")).toBe("image/png");
+    });
 
-  it("refuses a reference outside the selected instance (client and owner)", async () => {
-    const app = appWith(["id", "blob_ref"]);
-    for (const token of ["client", "owner"]) {
-      const res = await get(app, "/blob_photo?instance_id=inst_2", token);
+    it("refuses when the referencing field is outside the grant's projection", async () => {
+      const res = await get(
+        appWith(["id", "photo"]),
+        "/blob_photo?instance_id=inst_1",
+      );
       expect(res.status).toBe(404);
       expect((await res.json()).error.code).toBe("blob_not_found");
-    }
-    expect((await get(app, "/blob_photo?instance_id=inst_1", "owner")).status).toBe(200);
-  });
-});
+    });
+
+    it("refuses a reference outside the selected instance (client and owner)", async () => {
+      const app = appWith(["id", "blob_ref"]);
+      for (const token of ["client", "owner"]) {
+        const res = await get(app, "/blob_photo?instance_id=inst_2", token);
+        expect(res.status).toBe(404);
+        expect((await res.json()).error.code).toBe("blob_not_found");
+      }
+      expect(
+        (await get(app, "/blob_photo?instance_id=inst_1", "owner")).status,
+      ).toBe(200);
+    });
+  },
+);

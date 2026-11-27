@@ -203,10 +203,12 @@ async function redeem(code: string, clientId = CLIENT) {
   });
 }
 
-
 type TokenBody = {
   access_token: string;
-  authorization_details: Array<{ type: string; grant: { subject: { id: string }; grant_id: string } }>;
+  authorization_details: Array<{
+    type: string;
+    grant: { subject: { id: string }; grant_id: string };
+  }>;
 };
 
 async function grantFor(clientId: string) {
@@ -214,7 +216,10 @@ async function grantFor(clientId: string) {
   const res = await redeem(code, clientId);
   expect(res.status).toBe(200);
   const json = (await res.json()) as TokenBody;
-  return { token: json.access_token, grant: json.authorization_details[0].grant };
+  return {
+    token: json.access_token,
+    grant: json.authorization_details[0].grant,
+  };
 }
 
 describe("AS item 29 — pairwise subject identifiers", () => {
@@ -274,7 +279,9 @@ describe("AS item 29 — pairwise subject identifiers", () => {
   it("stores the grant under the internal subject, so owner views still list it", async () => {
     const a = await grantFor(CLIENT);
     const b = await grantFor(CLIENT_B);
-    const stored = store.listGrantsForSubject(OWNER).map((g) => g.grant.grant_id);
+    const stored = store
+      .listGrantsForSubject(OWNER)
+      .map((g) => g.grant.grant_id);
     expect(stored).toEqual(
       expect.arrayContaining([a.grant.grant_id, b.grant.grant_id]),
     );
@@ -291,7 +298,9 @@ describe("AS item 29 — pairwise subject identifiers", () => {
     const a = await grantFor(CLIENT);
     const db = new Database(join(dir, "auth.db"), { readonly: true });
     const row = db
-      .prepare("SELECT consent_evidence_json FROM pdpp_grants WHERE grant_id = ?")
+      .prepare(
+        "SELECT consent_evidence_json FROM pdpp_grants WHERE grant_id = ?",
+      )
       .get(a.grant.grant_id) as { consent_evidence_json: string };
     db.close();
     expect(JSON.parse(row.consent_evidence_json).subject_identifier).toEqual({
@@ -305,12 +314,16 @@ describe("AS item 29 — pairwise subject identifiers", () => {
     await grantFor(CLIENT);
     const db = new Database(join(dir, "auth.db"), { readonly: true });
     const kinds = (
-      db.prepare("SELECT kind FROM pdpp_history_log ORDER BY seq").all() as Array<{
+      db
+        .prepare("SELECT kind FROM pdpp_history_log ORDER BY seq")
+        .all() as Array<{
         kind: string;
       }>
     ).map((r) => r.kind);
     db.close();
-    expect(kinds.indexOf("pairwise_subject_assigned")).toBeGreaterThanOrEqual(0);
+    expect(kinds.indexOf("pairwise_subject_assigned")).toBeGreaterThanOrEqual(
+      0,
+    );
     expect(kinds.indexOf("pairwise_subject_assigned")).toBeLessThan(
       kinds.indexOf("grant_issued"),
     );

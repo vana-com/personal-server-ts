@@ -39,9 +39,15 @@ import {
   type PdppAuthStore,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { computePdppGrantEntry } from "@opendatalabs/personal-server-ts-core/grants";
-import { logScope, streamScope } from "@opendatalabs/personal-server-ts-stream-sync";
+import {
+  logScope,
+  streamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
 import { pdppAuthRoutes } from "../routes/pdpp-auth.js";
-import { createDesign2ChainGrants, streamSyncScopeBindings } from "./chain-grants.js";
+import {
+  createDesign2ChainGrants,
+  streamSyncScopeBindings,
+} from "./chain-grants.js";
 
 const logger = pino({ level: "silent" });
 const SERVER_KEY =
@@ -105,9 +111,11 @@ interface Slot {
 class FakeGateway {
   slot: Slot | null = null;
   /** What PermissionsV2 holds; changes only on settle(). */
-  chain: { scopes: string[]; expiresAt: bigint; version: bigint } | null =
-    null;
-  documents = new Map<string, { grant: Grant; salt: string; streams: string[] }>();
+  chain: { scopes: string[]; expiresAt: bigint; version: bigint } | null = null;
+  documents = new Map<
+    string,
+    { grant: Grant; salt: string; streams: string[] }
+  >();
   bindings = new Map<string, { sourceId: string; streams: string[] }>();
   down = false;
   /** Process the next POST /v1/grants, then lose its answer. */
@@ -151,8 +159,7 @@ class FakeGateway {
       // (omitted to play a gateway older than 129b16e)
       registrationOutcome: this.omitOutcome
         ? undefined
-        :
-        s.status === "failed"
+        : s.status === "failed"
           ? "reverted"
           : s.status === "finalized"
             ? "finalized"
@@ -290,7 +297,9 @@ class FakeGateway {
     const auth = new Headers(init?.headers).get("authorization");
 
     if (method === "GET" && url.pathname === `/v1/builders/${GRANTEE}`)
-      return Response.json({ data: { id: BUILDER_ID, granteeAddress: GRANTEE } });
+      return Response.json({
+        data: { id: BUILDER_ID, granteeAddress: GRANTEE },
+      });
     if (method === "GET" && url.pathname.startsWith("/v1/builders/"))
       return new Response(null, { status: 404 });
 
@@ -305,7 +314,8 @@ class FakeGateway {
     if (method === "GET" && url.pathname.startsWith("/v1/grants/")) {
       if (this.slotLookupsAllowed !== null && this.slotLookupsAllowed-- <= 0)
         return new Response(null, { status: 500 });
-      if (this.lie) return Response.json({ data: { ...this.view(), ...this.lie } });
+      if (this.lie)
+        return Response.json({ data: { ...this.view(), ...this.lie } });
       return this.slot && url.pathname.endsWith(this.slot.id)
         ? Response.json({ data: this.view() })
         : new Response(null, { status: 404 });
@@ -324,7 +334,10 @@ class FakeGateway {
           return Response.json({ error: "binding differs" }, { status: 409 });
       }
       for (const b of body.bindings)
-        this.bindings.set(b.scope, { sourceId: b.sourceId, streams: b.streams });
+        this.bindings.set(b.scope, {
+          sourceId: b.sourceId,
+          streams: b.streams,
+        });
       return Response.json({ data: { stored: body.bindings.length } });
     }
 
@@ -413,7 +426,10 @@ class FakeGateway {
       });
       if (signer.toLowerCase() !== server.address.toLowerCase())
         return Response.json({ error: "bad signer" }, { status: 401 });
-      if (BigInt(body.expiresAt) === 0n || Number(body.expiresAt) * 1000 > Date.now())
+      if (
+        BigInt(body.expiresAt) === 0n ||
+        Number(body.expiresAt) * 1000 > Date.now()
+      )
         return Response.json(
           { code: "REVOCATION_EXPIRY_NOT_PAST" },
           { status: 400 },
@@ -427,7 +443,10 @@ class FakeGateway {
           { status: 400 },
         );
       if (s.revokedAt && s.revocationKind === "v2_upsert")
-        return Response.json({ error: "Grant already revoked" }, { status: 409 });
+        return Response.json(
+          { error: "Grant already revoked" },
+          { status: 409 },
+        );
       const stale = this.checkVersion(BigInt(body.grantVersion));
       if (stale) return stale;
       s.latest = BigInt(body.grantVersion);
@@ -732,9 +751,7 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
 
   it("keeps earlier entries when a second grant joins the slot, signing exactly one version above", async () => {
     const first = await approvedGrantId();
-    const second = await approvedGrantId([
-      { name: "profile", fields: ["*"] },
-    ]);
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
     const a = store.getChainRegistration(first)!;
     const b = store.getChainRegistration(second)!;
     expect(gateway.slot!.scopes).toEqual([a.entry, b.entry]);
@@ -765,9 +782,13 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
   }
 
   function lastRegistration() {
-    return gateway.requests.filter(
-      (r) => r.method === "POST" && r.path === "/v1/grants",
-    ).at(-1)!.body as { scopes: string[]; expiresAt: string; grantVersion: string };
+    return gateway.requests
+      .filter((r) => r.method === "POST" && r.path === "/v1/grants")
+      .at(-1)!.body as {
+      scopes: string[];
+      expiresAt: string;
+      grantVersion: string;
+    };
   }
 
   it("signs above the gateway's highest answered version, keeping a legacy scope the chain holds", async () => {
@@ -798,7 +819,13 @@ describe("design 2 issuance: every grant gets a chain registration", () => {
   it("F2: never signs a scope only the gateway claims (lying gateway)", async () => {
     legacySlot("0");
     // The gateway's view adds scopes the finalized chain does not hold.
-    gateway.lie = { scopes: ["instagram.posts", "linkedin.profile", "pdpp:sha256:" + "e".repeat(64)] };
+    gateway.lie = {
+      scopes: [
+        "instagram.posts",
+        "linkedin.profile",
+        "pdpp:sha256:" + "e".repeat(64),
+      ],
+    };
     const grantId = await approvedGrantId();
     const signed = lastRegistration().scopes;
     expect(signed).toEqual([
@@ -900,9 +927,7 @@ describe("design 2 reads are chain-enforced (Vana-6.1)", () => {
 describe("design 2 grant end and revocation on chain (Vana-6.2)", () => {
   it("drops one entry with a removal-only upsert and keeps the other grant readable", async () => {
     const first = await approvedGrantId();
-    const second = await approvedGrantId([
-      { name: "profile", fields: ["*"] },
-    ]);
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
     gateway.settle();
     await ownerRevoke(first);
     const a = store.getChainRegistration(first)!;
@@ -932,9 +957,9 @@ describe("design 2 grant end and revocation on chain (Vana-6.2)", () => {
       grantVersion: "2",
       scopes: [store.getChainRegistration(grantId)!.entry],
     });
-    expect(Number((del.body as { expiresAt: string }).expiresAt) * 1000).toBeLessThan(
-      Date.now(),
-    );
+    expect(
+      Number((del.body as { expiresAt: string }).expiresAt) * 1000,
+    ).toBeLessThan(Date.now());
     expect(store.getChainRegistration(grantId)).toMatchObject({
       status: "ending",
       endingKind: "revocation",
@@ -955,7 +980,9 @@ describe("design 2 grant end and revocation on chain (Vana-6.2)", () => {
     expect(gateway.slot!.revocationKind).toBe("v2_reverted");
     await chain.registrar.reconcile();
     const deletes = gateway.requests.filter((r) => r.method === "DELETE");
-    expect(deletes.map((d) => (d.body as { grantVersion: string }).grantVersion)).toEqual(["2", "3"]);
+    expect(
+      deletes.map((d) => (d.body as { grantVersion: string }).grantVersion),
+    ).toEqual(["2", "3"]);
     gateway.settle();
     await chain.registrar.reconcile();
     expect(store.getChainRegistration(grantId)!.status).toBe("ended");
@@ -1139,7 +1166,9 @@ describe("review round 2: finality, retries, labels, backfill", () => {
     const started = Date.now();
     await chain.registrar.reconcile();
     expect(Date.now() - started).toBeLessThan(5_000);
-    expect(store.getChainRegistration(grantId)!.lastError).toMatch(/time|abort/i);
+    expect(store.getChainRegistration(grantId)!.lastError).toMatch(
+      /time|abort/i,
+    );
     gateway.hang = false;
     await chain.registrar.reconcile();
     expect(store.getChainRegistration(grantId)!.status).toBe("bound");
@@ -1244,7 +1273,9 @@ describe("never drops a scope another surface is still settling", () => {
     expect(posts()).toHaveLength(0);
     const reg = store.getChainRegistration(grantId)!;
     expect(reg.status).toBe("pending");
-    expect(reg.lastError).toMatch(/^deferred: another registration for this slot is pending/);
+    expect(reg.lastError).toMatch(
+      /^deferred: another registration for this slot is pending/,
+    );
     expect(reg.deferredSince).not.toBeNull();
     // What the PDPP grant sees meanwhile: retry later.
     expect(await read(grantId)).toMatchObject({ ok: false, retryable: true });
@@ -1423,13 +1454,18 @@ describe("never drops a scope another surface is still settling", () => {
       source_declaration: { version: "v1" },
       purpose_code: "https://pdpp.dev/purpose/personalization",
       access_mode: "continuous",
-      streams: [{ name: "top_artists", instance_ids: [INSTANCE], fields: ["id"] }],
+      streams: [
+        { name: "top_artists", instance_ids: [INSTANCE], fields: ["id"] },
+      ],
     } as unknown as Grant;
     store.insertGrant({ grant, subjectId: OWNER, reviewDigest: "r" });
     expect(chain.registrar.backfill()).toBe(1);
     expect(store.getChainRegistration("grt_v02")).toMatchObject({
       status: "pending",
-      entry: computePdppGrantEntry(grant, store.getChainRegistration("grt_v02")!.salt),
+      entry: computePdppGrantEntry(
+        grant,
+        store.getChainRegistration("grt_v02")!.salt,
+      ),
     });
   });
 
@@ -1444,7 +1480,9 @@ describe("never drops a scope another surface is still settling", () => {
       source_declaration: { version: "v1" },
       purpose_code: "p",
       access_mode: "single_use",
-      streams: [{ name: "top_artists", instance_ids: [INSTANCE], fields: ["id"] }],
+      streams: [
+        { name: "top_artists", instance_ids: [INSTANCE], fields: ["id"] },
+      ],
     } as unknown as Grant;
     store.insertGrant({ grant, subjectId: OWNER, reviewDigest: "r" });
     const issuedAt = new Date();

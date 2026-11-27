@@ -139,8 +139,12 @@ for (const backend of ["memory", "sqlite"])
             ).toBe(id === "visible" ? 200 : 404);
           for (const method of ["GET", "HEAD"])
             expect(
-              (await blobs.request(`/${blob.blobId}?instance_id=i`, { method, headers }))
-                .status,
+              (
+                await blobs.request(`/${blob.blobId}?instance_id=i`, {
+                  method,
+                  headers,
+                })
+              ).status,
             ).toBe(404);
           // Making one referencing record eligible admits the same content, proving
           // the negative case was the temporal gate rather than missing blob bytes.
@@ -162,7 +166,8 @@ for (const backend of ["memory", "sqlite"])
             () => ["id"],
           );
           expect(
-            (await blobs.request(`/${blob.blobId}?instance_id=i`, { headers })).status,
+            (await blobs.request(`/${blob.blobId}?instance_id=i`, { headers }))
+              .status,
           ).toBe(200);
           if (version.endsWith("candidate")) {
             expect(checkpoint).toBeTruthy();

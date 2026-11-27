@@ -588,24 +588,27 @@ describe("resolveDataListGrantScopes", () => {
  */
 describe("verifyDataReadPolicy under a design-2 slot (N2)", () => {
   const entry = `pdpp:sha256:${"a".repeat(64)}`;
-  it.each(["spotify.profile", "pdpp.spotify~.top_artists", "pdpp.spotify.top_artists"])(
-    "refuses %s when the slot lists only PDPP entries",
-    async (scope) => {
-      const grant = makeGrant({ scopes: [entry] });
-      await expect(
-        verifyDataReadPolicy(
-          {
-            signer: BUILDER_ADDRESS,
-            grantId: grant.id,
-            requestedScope: scope,
-            serverOwner: "0xOwner",
+  it.each([
+    "spotify.profile",
+    "pdpp.spotify~.top_artists",
+    "pdpp.spotify.top_artists",
+  ])("refuses %s when the slot lists only PDPP entries", async (scope) => {
+    const grant = makeGrant({ scopes: [entry] });
+    await expect(
+      verifyDataReadPolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: grant.id,
+          requestedScope: scope,
+          serverOwner: "0xOwner",
+        },
+        {
+          authSessionVerifier: {
+            getBuilder: vi.fn().mockResolvedValue(builder),
           },
-          {
-            authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
-            grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
-          },
-        ),
-      ).rejects.toBeInstanceOf(ScopeMismatchError);
-    },
-  );
+          grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+        },
+      ),
+    ).rejects.toBeInstanceOf(ScopeMismatchError);
+  });
 });

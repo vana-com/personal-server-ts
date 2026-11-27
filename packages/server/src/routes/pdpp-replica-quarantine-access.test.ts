@@ -304,14 +304,18 @@ async function fixture() {
     expect((await read("/streams/messages/records/a-control")).status).toBe(
       404,
     );
-    const response = await read(`/blobs/${encodeURIComponent(controlId)}?instance_id=conn`);
+    const response = await read(
+      `/blobs/${encodeURIComponent(controlId)}?instance_id=conn`,
+    );
     expect(response.status).toBe(404);
   }
   async function controlWorks() {
     expect((await json("/streams/messages/records/a-control")).data.text).toBe(
       controlText,
     );
-    const response = await read(`/blobs/${encodeURIComponent(controlId)}?instance_id=conn`);
+    const response = await read(
+      `/blobs/${encodeURIComponent(controlId)}?instance_id=conn`,
+    );
     expect(response.status).toBe(200);
     expect(Buffer.from(await response.arrayBuffer())).toEqual(controlBytes);
   }
@@ -323,7 +327,9 @@ async function fixture() {
   expect(
     (await json("/streams/messages/records/z-quarantined")).data.text,
   ).toBe(secret);
-  const binary = await read(`/blobs/${encodeURIComponent(blobId)}?instance_id=conn`);
+  const binary = await read(
+    `/blobs/${encodeURIComponent(blobId)}?instance_id=conn`,
+  );
   expect(binary.status).toBe(200);
   expect(Buffer.from(await binary.arrayBuffer())).toEqual(blobBytes);
   await controlWorks();
@@ -335,7 +341,9 @@ async function fixture() {
   );
   expect(changes.data.map((r: { id: string }) => r.id)).toEqual(["a-control"]);
   expect(changes.next_cursor).toBeTypeOf("string");
-  const allChanges = await json("/streams/messages/records?changes_since=beginning");
+  const allChanges = await json(
+    "/streams/messages/records?changes_since=beginning",
+  );
   expect(allChanges.next_changes_since).toBeTypeOf("string");
   for (const token of [
     list.next_cursor,
@@ -347,10 +355,9 @@ async function fixture() {
     expect(token).toMatch(/^(pc|cs)_/);
   // The same first page read at the store, below the HTTP seal: its own
   // cursor must expire after quarantine too (store-level check).
-  const storeList = activeReceiver.readStore({ reader: "grant" }).listRecords(
-    "messages",
-    { instanceIds: ["conn"], limit: 1, order: "asc" },
-  );
+  const storeList = activeReceiver
+    .readStore({ reader: "grant" })
+    .listRecords("messages", { instanceIds: ["conn"], limit: 1, order: "asc" });
   expect(storeList.nextCursor).toBeTypeOf("string");
   // Every quarantine raises the connection's integrity epoch, so a saved
   // cursor expires instead of continuing over a shifted, filtered page set
@@ -412,7 +419,10 @@ async function fixture() {
       { method: "HEAD" },
       { headers: { range: "bytes=0-7" } },
     ]) {
-      const response = await read(`/blobs/${encodeURIComponent(blobId)}?instance_id=conn`, init);
+      const response = await read(
+        `/blobs/${encodeURIComponent(blobId)}?instance_id=conn`,
+        init,
+      );
       const bytes = Buffer.from(await response.arrayBuffer());
       expect.soft(response.status, "quarantined blob GET/HEAD/range").toBe(404);
       expect

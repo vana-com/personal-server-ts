@@ -426,7 +426,9 @@ it("requires verified claimed blob bytes before exposing an imported record", as
   });
   expect(response.status).toBe(200);
   expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
-  expect((await blobs.request(`/${blob.blobId}?instance_id=conn_a`)).status).toBe(401);
+  expect(
+    (await blobs.request(`/${blob.blobId}?instance_id=conn_a`)).status,
+  ).toBe(401);
 
   expect(
     target.store.replication.readTailPage({ limit: 100 }).operations,

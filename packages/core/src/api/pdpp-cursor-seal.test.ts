@@ -34,9 +34,9 @@ describe("cursor seal", () => {
     expect(
       new TextDecoder().decode(decodeBase64Url(first.slice(3))),
     ).not.toContain("same-position");
-    await expect(createCursorSeal(key).open("page", ["c"], first)).resolves.toBe(
-      "same-position",
-    );
+    await expect(
+      createCursorSeal(key).open("page", ["c"], first),
+    ).resolves.toBe("same-position");
     await expect(
       createCursorSeal(new Uint8Array(32).fill(2)).open("page", ["c"], first),
     ).rejects.toMatchObject({ code: "invalid_cursor" });

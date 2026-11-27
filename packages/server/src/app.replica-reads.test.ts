@@ -325,7 +325,10 @@ describe("createApp with an enabled replica receiver", () => {
     expect(streams.body.data).toEqual([
       expect.objectContaining({ name: stream, record_count: 1 }),
     ]);
-    const blob = await h.get("owner", `/v1/blobs/${h.blobId}?instance_id=${instance}`);
+    const blob = await h.get(
+      "owner",
+      `/v1/blobs/${h.blobId}?instance_id=${instance}`,
+    );
     expect(blob).toEqual({ status: 200, body: "activity attachment" });
 
     expect(
@@ -336,10 +339,17 @@ describe("createApp with an enabled replica receiver", () => {
     ).toEqual([]);
     expect((await h.get("app", "/v1/streams")).body.data).toEqual([]);
     expect(
-      (await h.get("app", `/v1/streams/${stream}/records?changes_since=beginning`)).body
-        .data,
+      (
+        await h.get(
+          "app",
+          `/v1/streams/${stream}/records?changes_since=beginning`,
+        )
+      ).body.data,
     ).toEqual([]);
-    expect((await h.get("app", `/v1/blobs/${h.blobId}?instance_id=${instance}`)).status).toBe(404);
+    expect(
+      (await h.get("app", `/v1/blobs/${h.blobId}?instance_id=${instance}`))
+        .status,
+    ).toBe(404);
 
     // `empty` is the binding precondition the store enforces, not
     // visible existence: a pending-only connection holds no canonical row.
@@ -363,7 +373,10 @@ describe("createApp with an enabled replica receiver", () => {
     expect(
       (await h.get("app", `/v1/streams/${stream}/records/a1`)).status,
     ).toBe(200);
-    expect((await h.get("app", `/v1/blobs/${h.blobId}?instance_id=${instance}`)).status).toBe(200);
+    expect(
+      (await h.get("app", `/v1/blobs/${h.blobId}?instance_id=${instance}`))
+        .status,
+    ).toBe(200);
 
     h.db
       .prepare(
@@ -379,14 +392,27 @@ describe("createApp with an enabled replica receiver", () => {
         (await h.get(token, `/v1/streams/${stream}/records`)).body.data,
       ).toEqual([]);
       expect((await h.get(token, "/v1/streams")).body.data).toEqual([]);
-      expect((await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`)).status).toBe(404);
-      expect((await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`, "HEAD")).status).toBe(
-        404,
-      );
+      expect(
+        (await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`))
+          .status,
+      ).toBe(404);
+      expect(
+        (
+          await h.get(
+            token,
+            `/v1/blobs/${h.blobId}?instance_id=${instance}`,
+            "HEAD",
+          )
+        ).status,
+      ).toBe(404);
     }
     expect(
-      (await h.get("app", `/v1/streams/${stream}/records?changes_since=beginning`)).body
-        .data,
+      (
+        await h.get(
+          "app",
+          `/v1/streams/${stream}/records?changes_since=beginning`,
+        )
+      ).body.data,
     ).toEqual([]);
   });
 
@@ -470,7 +496,9 @@ describe("createApp with an enabled replica receiver", () => {
         expect(
           (await h.get(token, `/v1/streams/${stream}/records/a1`)).status,
         ).toBe(200);
-        expect(await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`)).toEqual({
+        expect(
+          await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`),
+        ).toEqual({
           status: 200,
           body: "activity attachment",
         });
@@ -493,17 +521,28 @@ describe("createApp with an enabled replica receiver", () => {
           `${token} streams`,
         ).toEqual([]);
         expect(
-          (await h.get(token, `/v1/streams/${stream}/records?changes_since=beginning`))
-            .body.data,
+          (
+            await h.get(
+              token,
+              `/v1/streams/${stream}/records?changes_since=beginning`,
+            )
+          ).body.data,
           `${token} changes_since`,
         ).toEqual([]);
         // Metadata (HEAD), references and confirmed bytes (GET).
         expect(
-          (await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`, "HEAD")).status,
+          (
+            await h.get(
+              token,
+              `/v1/blobs/${h.blobId}?instance_id=${instance}`,
+              "HEAD",
+            )
+          ).status,
           `${token} blob HEAD`,
         ).toBe(404);
         expect(
-          (await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`)).status,
+          (await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`))
+            .status,
           `${token} blob GET`,
         ).toBe(404);
       }
@@ -626,7 +665,10 @@ describe("createApp with an enabled replica receiver", () => {
         (await h.get("owner", `/v1/streams/${stream}/records/pending-key`))
           .status,
       ).toBe(200);
-      expect((await h.get("owner", `/v1/blobs/${h.blobId}?instance_id=${instance}`)).status).toBe(200);
+      expect(
+        (await h.get("owner", `/v1/blobs/${h.blobId}?instance_id=${instance}`))
+          .status,
+      ).toBe(200);
 
       // The key has no canonical row, so no withdrawal marks it for the view.
       h.receiver.quarantineImported({
@@ -646,7 +688,10 @@ describe("createApp with an enabled replica receiver", () => {
           (await h.get(token, `/v1/streams/${stream}/records`)).body.data,
         ).toEqual([]);
         expect((await h.get(token, "/v1/streams")).body.data).toEqual([]);
-        expect((await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`)).status).toBe(404);
+        expect(
+          (await h.get(token, `/v1/blobs/${h.blobId}?instance_id=${instance}`))
+            .status,
+        ).toBe(404);
       }
     },
   );
@@ -743,9 +788,15 @@ describe("createApp switched reads without the host connection-link capability",
         );
       }
     }
-    expect((await h.get("owner", `/v1/blobs/${h.blobId}?instance_id=${instance}`, "HEAD")).status).toBe(
-      503,
-    );
+    expect(
+      (
+        await h.get(
+          "owner",
+          `/v1/blobs/${h.blobId}?instance_id=${instance}`,
+          "HEAD",
+        )
+      ).status,
+    ).toBe(503);
     // Per-stream metadata is the declaration alone: it reads no records, so
     // it stays available and exposes no row.
     for (const token of ["owner", "app"]) {

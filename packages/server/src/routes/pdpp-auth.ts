@@ -580,12 +580,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     app.use("*", async (c, next) => {
       await next();
       if (c.req.method !== "POST") return;
-      void registrar.reconcile().catch((err: unknown) =>
-        deps.logger.warn(
-          { err: (err as Error).message },
-          "PDPP chain reconcile failed; it is retried on the next write",
-        ),
-      );
+      void registrar
+        .reconcile()
+        .catch((err: unknown) =>
+          deps.logger.warn(
+            { err: (err as Error).message },
+            "PDPP chain reconcile failed; it is retried on the next write",
+          ),
+        );
     });
   }
   const lifecycle =
@@ -1556,12 +1558,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     // the read gate denies with a retry and retries it (fail closed).
     if (deps.chainRegistrar && chainRegistration) {
       const grantId = issued.grant.grant_id;
-      void deps.chainRegistrar.register(grantId).catch((err: unknown) =>
-        deps.logger.warn(
-          { grant_id: grantId, err: (err as Error).message },
-          "PDPP chain registration deferred; the read gate retries it",
-        ),
-      );
+      void deps.chainRegistrar
+        .register(grantId)
+        .catch((err: unknown) =>
+          deps.logger.warn(
+            { grant_id: grantId, err: (err as Error).message },
+            "PDPP chain registration deferred; the read gate retries it",
+          ),
+        );
     }
 
     const redirect = new URL(session!.redirect_uri);

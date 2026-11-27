@@ -2,7 +2,6 @@ import { Hono } from "hono";
 import Database from "better-sqlite3";
 import {
   createRecordQuery,
-  listCursor,
   openLocalDb,
   type SqlDriver,
   type SqlValue,
@@ -192,9 +191,12 @@ describe("PS-2 D.8 local record routes", () => {
       // An owner change session reads the frozen two-horizon history, not
       // the raw change sequence (spec-core §4; RS items 7, 20, 21). Without
       // a history port it is unavailable rather than served out of order.
-      const changed = await app.request(path + "?changes_since=beginning&limit=2", {
-        headers,
-      });
+      const changed = await app.request(
+        path + "?changes_since=beginning&limit=2",
+        {
+          headers,
+        },
+      );
       expect(changed.status).toBe(503);
       expect((await changed.json()).error.code).toBe(
         "STREAM_HISTORY_UNAVAILABLE",
@@ -265,9 +267,12 @@ describe("PS-2 D.8 local record routes", () => {
         headers: clientHeaders,
       });
       expect(Object.keys((await clientSingle.json()).data)).toEqual(["id"]);
-      const clientChanges = await app.request(path + "?changes_since=beginning", {
-        headers: clientHeaders,
-      });
+      const clientChanges = await app.request(
+        path + "?changes_since=beginning",
+        {
+          headers: clientHeaders,
+        },
+      );
       expect(clientChanges.status).toBe(503);
 
       // Identical keys in distinct connections survive a one-row page boundary.
@@ -584,7 +589,9 @@ describe("pdpp records routes: authentication", () => {
     });
     expect(res.status).toBe(401);
     // RS item 19: every inactive token carries the Bearer invalid_token challenge.
-    expect(res.headers.get("WWW-Authenticate")).toMatch(/^Bearer error="invalid_token"/);
+    expect(res.headers.get("WWW-Authenticate")).toMatch(
+      /^Bearer error="invalid_token"/,
+    );
     const body = await res.json();
     expect(body.error.code).toBe("grant_revoked");
     expect(body.error.type).toBe("authentication_error");
@@ -605,9 +612,13 @@ describe("pdpp records routes: pre-lock grant state (AS item 21)", () => {
       headers: { Authorization: "Bearer legacy-tok" },
     });
     expect(res.status).toBe(401);
-    expect(res.headers.get("WWW-Authenticate")).toMatch(/^Bearer error="invalid_token"/);
+    expect(res.headers.get("WWW-Authenticate")).toMatch(
+      /^Bearer error="invalid_token"/,
+    );
     const body = await res.json();
-    expect(body.error.code).toBe("authorization_state.unsupported_legacy_shape");
+    expect(body.error.code).toBe(
+      "authorization_state.unsupported_legacy_shape",
+    );
   });
 });
 
@@ -953,9 +964,12 @@ describe("pdpp records routes: field projection", () => {
       { store },
     );
 
-    const res = await app.request("/streams/playlists/records?changes_since=beginning", {
-      headers: { Authorization: "Bearer client-tok" },
-    });
+    const res = await app.request(
+      "/streams/playlists/records?changes_since=beginning",
+      {
+        headers: { Authorization: "Bearer client-tok" },
+      },
+    );
     expect(res.status).toBe(200);
     const body = await res.json();
     const keys = body.data.map((r: { id: string }) => r.id);
@@ -1304,19 +1318,30 @@ describe("pdpp records routes: locked v0.1.0 PDPP-Version rules (spec-core §8)"
 });
 
 describe("pdpp records routes: negotiation holds at any mount prefix", () => {
-  it.each(["/v1", "/pdpp/v1"])("refuses 2026-04-06 when mounted at %s", async (prefix) => {
-    const { app } = buildApp({
-      "owner-tok": { active: true, tokenKind: "owner", subjectId: "sub_1", instanceIds: ["inst_1"] },
-    });
-    const root = new Hono();
-    root.route(prefix, app);
-    const res = await root.request(`${prefix}/streams`, {
-      headers: { Authorization: "Bearer owner-tok", "PDPP-Version": "2026-04-06" },
-    });
-    expect(res.status).toBe(400);
-    expect((await res.json()).error.code).toBe("unsupported_version");
-    expect(res.headers.get("PDPP-Version")).toBeNull();
-  });
+  it.each(["/v1", "/pdpp/v1"])(
+    "refuses 2026-04-06 when mounted at %s",
+    async (prefix) => {
+      const { app } = buildApp({
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      });
+      const root = new Hono();
+      root.route(prefix, app);
+      const res = await root.request(`${prefix}/streams`, {
+        headers: {
+          Authorization: "Bearer owner-tok",
+          "PDPP-Version": "2026-04-06",
+        },
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error.code).toBe("unsupported_version");
+      expect(res.headers.get("PDPP-Version")).toBeNull();
+    },
+  );
 });
 
 describe("pdpp records routes: pagination limit clamping", () => {

@@ -64,6 +64,8 @@ describe("storage mode refusals preserve HTTP errors", () => {
         throw new PdppError("ACCOUNT_MODE_UNKNOWN", "Waiting for the account");
       },
     });
-    expect((await app.request("/fixture?instance_id=i", { headers })).status).toBe(503);
+    expect(
+      (await app.request("/fixture?instance_id=i", { headers })).status,
+    ).toBe(503);
   });
 });

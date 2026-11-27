@@ -33,7 +33,10 @@ import {
 import { fixedOwnedAccountStorageMode as explicitLegacyStorageMode } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppAuthRoutes } from "./pdpp-auth.js";
-import { pdppRecordsRoutes, type PdppChainEnforcementPort } from "./pdpp-records.js";
+import {
+  pdppRecordsRoutes,
+  type PdppChainEnforcementPort,
+} from "./pdpp-records.js";
 import { pdppBlobsRoutes } from "./pdpp-blobs.js";
 
 const logger = pino({ level: "silent" });
@@ -205,7 +208,10 @@ async function grantFor(clientId: string, instanceIds?: string[]) {
     { headers },
   );
   const reviewBody = (await reviewed.json()) as {
-    review?: { review_digest: string; data: { streams: Array<{ instance_ids: string[] }> } };
+    review?: {
+      review_digest: string;
+      data: { streams: Array<{ instance_ids: string[] }> };
+    };
   };
   const approved = await app.request(
     `/pdpp/v1/authorize/${session_id}/approve`,
@@ -389,9 +395,9 @@ describe("AS item 29: pairwise instance handles", () => {
     ).json()) as { data: { blob_ref: { fetch_url: string } } };
     const url = new URL(rec.data.blob_ref.fetch_url);
     expect(url.searchParams.get("instance_id")).toBe(a.handle);
-    expect(
-      (await get(`/v1/blobs/blob_1${url.search}`, a.token!)).status,
-    ).toBe(200);
+    expect((await get(`/v1/blobs/blob_1${url.search}`, a.token!)).status).toBe(
+      200,
+    );
     for (const other of [b.handle!, INSTANCE]) {
       const res = await get(
         `/v1/blobs/blob_1?instance_id=${encodeURIComponent(other)}`,
@@ -451,12 +457,16 @@ describe("AS item 29: pairwise instance handles", () => {
     const Database = (await import("better-sqlite3")).default;
     const db = new Database(join(dir, "auth.db"), { readonly: true });
     const kinds = (
-      db.prepare("SELECT kind FROM pdpp_history_log ORDER BY seq").all() as Array<{
+      db
+        .prepare("SELECT kind FROM pdpp_history_log ORDER BY seq")
+        .all() as Array<{
         kind: string;
       }>
     ).map((r) => r.kind);
     db.close();
-    expect(kinds.indexOf("pairwise_instance_assigned")).toBeGreaterThanOrEqual(0);
+    expect(kinds.indexOf("pairwise_instance_assigned")).toBeGreaterThanOrEqual(
+      0,
+    );
     expect(kinds.indexOf("pairwise_instance_assigned")).toBeLessThan(
       kinds.indexOf("grant_issued"),
     );
@@ -472,12 +482,12 @@ describe("design 2 chain gate on /v1/blobs (Vana-6.1)", () => {
     chainDecision = { ok: false, retryable: false, reason: "entry removed" };
     const denied = await get(path, a.token!);
     expect(denied.status).toBe(401);
-    expect(((await denied.json()) as { error: { code: string } }).error.code).toBe(
-      "grant_revoked",
-    );
     expect(
-      (await get("/v1/streams/media/records", a.token!)).status,
-    ).toBe(denied.status);
+      ((await denied.json()) as { error: { code: string } }).error.code,
+    ).toBe("grant_revoked");
+    expect((await get("/v1/streams/media/records", a.token!)).status).toBe(
+      denied.status,
+    );
 
     chainDecision = { ok: false, retryable: true, reason: "gateway down" };
     const retry = await get(path, a.token!);

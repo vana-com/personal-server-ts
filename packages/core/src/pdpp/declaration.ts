@@ -510,7 +510,9 @@ function readDeclaredFieldDisplay(
     const { label, meaning } = raw as { label?: unknown; meaning?: unknown };
     const labelMap = asLanguageMap(label);
     const meaningMap = asLanguageMap(meaning);
-    const labelText = labelMap ? defaultVersion(labelMap, defaultLanguage) : label;
+    const labelText = labelMap
+      ? defaultVersion(labelMap, defaultLanguage)
+      : label;
     const meaningText = meaningMap
       ? defaultVersion(meaningMap, defaultLanguage)
       : meaning;

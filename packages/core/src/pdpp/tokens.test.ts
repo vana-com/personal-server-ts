@@ -533,7 +533,10 @@ describe("§10 — tokens are not stored in plaintext", () => {
 
 describe("§9 AS item 21 — persisted pre-lock state is rejected on every path", () => {
   /** Rewrite a stored grant in place, as a pre-lock build would have left it. */
-  function rewriteGrant(grantId: string, mutate: (g: Record<string, unknown>) => void) {
+  function rewriteGrant(
+    grantId: string,
+    mutate: (g: Record<string, unknown>) => void,
+  ) {
     const Database = createRequire(import.meta.url)("better-sqlite3");
     const db = new Database(join(dir, "auth.db"));
     const row = db
@@ -548,7 +551,8 @@ describe("§9 AS item 21 — persisted pre-lock state is rejected on every path"
     db.close();
   }
   const stripFloor = (g: Record<string, unknown>) => {
-    for (const s of g.streams as Array<Record<string, unknown>>) delete s.required_fields;
+    for (const s of g.streams as Array<Record<string, unknown>>)
+      delete s.required_fields;
   };
 
   it("refuses refresh, resolution and introspection for a live grant left in pre-lock shape", () => {
@@ -561,8 +565,12 @@ describe("§9 AS item 21 — persisted pre-lock state is rejected on every path"
     const context = tokens.resolveToken(issued.issued.access_token);
     expect(context.active).toBe(false);
     expect(context.inactiveReason).toBe("unsupported_legacy_shape");
-    expect(tokens.introspect(issued.issued.access_token)).toEqual({ active: false });
-    const refreshed = tokens.refresh({ refreshToken: issued.issued.refresh_token });
+    expect(tokens.introspect(issued.issued.access_token)).toEqual({
+      active: false,
+    });
+    const refreshed = tokens.refresh({
+      refreshToken: issued.issued.refresh_token,
+    });
     expect(refreshed.ok).toBe(false);
     if (!refreshed.ok) expect(refreshed.failure.code).toBe("invalid_grant");
   });
@@ -582,16 +590,27 @@ describe("§9 AS item 21 — persisted pre-lock state is rejected on every path"
   it("treats mixed-shape streams as pre-lock and empty floors as locked", () => {
     const mixed = seedGrant("continuous", {
       streams: [
-        { name: "a", instance_ids: ["i1"], fields: ["id"], required_fields: ["id"] },
+        {
+          name: "a",
+          instance_ids: ["i1"],
+          fields: ["id"],
+          required_fields: ["id"],
+        },
         { name: "b", instance_ids: ["i2"], fields: ["id"] } as never,
       ],
     });
     const m = redeem(mixed.code);
     expect(m.ok).toBe(false);
     const emptyFloor = seedGrant("continuous", {
-      streams: [{ name: "a", instance_ids: ["i1"], fields: ["id"], required_fields: [] }],
+      streams: [
+        {
+          name: "a",
+          instance_ids: ["i1"],
+          fields: ["id"],
+          required_fields: [],
+        },
+      ],
     });
     expect(redeem(emptyFloor.code).ok).toBe(true);
   });
 });
-

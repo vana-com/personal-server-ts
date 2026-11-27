@@ -479,17 +479,12 @@ export async function listPdppRecords(
     requested.source,
   );
   const requestedFields = owner
-    ? ownerViewFields(
+    ? (ownerViewFields(
         typeof declaration === "function" ? declaration() : declaration,
         requested.view,
-      ) ?? requested.fields
+      ) ?? requested.fields)
     : requested.fields;
-  const scope = resolveReadScope(
-    context,
-    stream,
-    declaration,
-    requestedFields,
-  );
+  const scope = resolveReadScope(context, stream, declaration, requestedFields);
   const instanceIds = owner ? ownerInstanceIds : scope.instanceIds;
   if (!owner) ports.requireRegisteredConnections?.(instanceIds);
   if (owner && instanceIds.length === 0) {
@@ -670,7 +665,9 @@ export function ownerViewFields(
       param: "view",
     });
   }
-  return [...new Set([...found.fields, ...(declaration?.requiredFields ?? [])])];
+  return [
+    ...new Set([...found.fields, ...(declaration?.requiredFields ?? [])]),
+  ];
 }
 
 let fallbackSeal: CursorSeal | undefined;
@@ -712,9 +709,7 @@ function readDeclaration(
   source: string | undefined,
 ): {
   declaration:
-    | StreamDeclaration
-    | undefined
-    | (() => StreamDeclaration | undefined);
+    StreamDeclaration | undefined | (() => StreamDeclaration | undefined);
   ownerInstanceIds: string[];
 } {
   if (context.tokenKind !== "owner") {

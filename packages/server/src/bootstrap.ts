@@ -1699,8 +1699,7 @@ async function bootstrapServer(
   // for the app, signed by this server as the owner's registered server, and
   // client reads require the entry live on chain (pdpp/chain-grants.ts).
   let chainRegistrar:
-    | ReturnType<typeof createDesign2ChainGrants>["registrar"]
-    | undefined;
+    ReturnType<typeof createDesign2ChainGrants>["registrar"] | undefined;
   if (pdppAuth && config.pdpp.chainGrants.enabled) {
     const chain = createDesign2ChainGrants({
       store: pdppAuth.store,

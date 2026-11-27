@@ -61,7 +61,6 @@ const DECLARATION = JSON.stringify({
   ],
 });
 
-
 const DOMAIN = {
   name: "Vana Data Portability",
   version: "1",
@@ -109,7 +108,9 @@ class BootGateway {
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     if (method === "GET" && url.pathname === `/v1/builders/${GRANTEE}`)
-      return Response.json({ data: { id: BUILDER_ID, granteeAddress: GRANTEE } });
+      return Response.json({
+        data: { id: BUILDER_ID, granteeAddress: GRANTEE },
+      });
     if (method === "PUT" && url.pathname === "/v1/pdpp/scope-bindings")
       return Response.json({ data: {} });
     if (method === "GET" && url.pathname === `/v1/grants/${this.slotId}`)
@@ -133,11 +134,18 @@ class BootGateway {
           });
     if (method === "POST" && url.pathname === "/v1/grants") {
       if (BigInt(body.grantVersion) !== this.version + 1n)
-        return Response.json({ currentGrantVersion: this.version.toString() }, { status: 409 });
+        return Response.json(
+          { currentGrantVersion: this.version.toString() },
+          { status: 409 },
+        );
       this.version = BigInt(body.grantVersion);
       this.scopes = body.scopes;
       return Response.json(
-        { success: true, grantId: this.slotId, grantVersion: body.grantVersion },
+        {
+          success: true,
+          grantId: this.slotId,
+          grantVersion: body.grantVersion,
+        },
         { status: 201 },
       );
     }
@@ -159,7 +167,11 @@ class BootGateway {
               entry,
               pdppGrantId: url.searchParams.get("grantId"),
               pdppExpired: false,
-              gateway: { entryListed: true, slotRevoked: this.revoked, slotExpired: false },
+              gateway: {
+                entryListed: true,
+                slotRevoked: this.revoked,
+                slotExpired: false,
+              },
               onChain: {
                 entryPresent: !!this.chainScopes?.includes(entry),
                 slotActive: !!this.chainScopes,
@@ -228,7 +240,11 @@ function pdppConfig(declarationPaths: string[]) {
         declaration_path,
       })),
       clients: [
-        { clientId: CLIENT_ID, redirectUris: [REDIRECT], granteeAddress: GRANTEE },
+        {
+          clientId: CLIENT_ID,
+          redirectUris: [REDIRECT],
+          granteeAddress: GRANTEE,
+        },
       ],
       chainGrants: { enabled: true },
     },
@@ -357,7 +373,6 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-
 describe("design 2 through createServer (review F6)", () => {
   it("records and blob reads: retry before settle, served after, revoked after the owner revokes", async () => {
     ctx = await boot();
@@ -379,7 +394,9 @@ describe("design 2 through createServer (review F6)", () => {
             body: new URLSearchParams({ token: accessToken }).toString(),
           })
         ).json()) as {
-          authorization_details?: { grant: { streams: { instance_ids: string[] }[] } }[];
+          authorization_details?: {
+            grant: { streams: { instance_ids: string[] }[] };
+          }[];
         }
       ).authorization_details?.[0]?.grant.streams[0].instance_ids[0];
       return ctx!.app.request(
@@ -400,9 +417,9 @@ describe("design 2 through createServer (review F6)", () => {
     expect((await records()).status).toBe(200);
     const pastGate = await blob();
     expect(pastGate.status).toBe(404);
-    expect(((await pastGate.json()) as { error: { code: string } }).error.code).toBe(
-      "blob_not_found",
-    );
+    expect(
+      ((await pastGate.json()) as { error: { code: string } }).error.code,
+    ).toBe("blob_not_found");
 
     const revoked = await ctx.app.request("/pdpp/v1/revoke", {
       method: "POST",
@@ -410,10 +427,14 @@ describe("design 2 through createServer (review F6)", () => {
         authorization: `Bearer ${await ownerToken(ctx)}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId, disposition: "keep" }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revoked.status).toBeLessThan(300);
-    for (const res of [await records(), await blob()]) expect(res.status).toBe(401);
+    for (const res of [await records(), await blob()])
+      expect(res.status).toBe(401);
     // The grant end reached the gateway as a V2 revocation.
     await new Promise((r) => setTimeout(r, 50));
     expect(gateway.revoked).toBe(true);

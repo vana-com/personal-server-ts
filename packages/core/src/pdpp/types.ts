@@ -636,7 +636,10 @@ export function grantUsesLockedRules(
  */
 export function isSupportedPersistedGrant(
   grant:
-    | { version: string; streams?: ReadonlyArray<{ required_fields?: unknown }> }
+    | {
+        version: string;
+        streams?: ReadonlyArray<{ required_fields?: unknown }>;
+      }
     | undefined,
 ): boolean {
   if (!grant) return false;

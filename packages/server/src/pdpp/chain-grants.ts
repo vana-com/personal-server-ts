@@ -475,7 +475,9 @@ export class PdppChainRegistrar {
 
   /** Register a pending grant now (no backoff). Resolves to its state. */
   register(grantId: string): Promise<ChainRegistration["status"] | null> {
-    return this.serial(() => this.guarded(grantId, () => this.registerNow(grantId, true)));
+    return this.serial(() =>
+      this.guarded(grantId, () => this.registerNow(grantId, true)),
+    );
   }
 
   /** Register a pending grant unless a failed attempt is backing off. */
@@ -569,7 +571,9 @@ export class PdppChainRegistrar {
       for (const reg of store.listChainRegistrations(["bound"]))
         await this.guarded(reg.grantId, () => this.recheckBound(reg));
       for (const reg of store.listChainRegistrations(["pending"]))
-        await this.guarded(reg.grantId, () => this.registerNow(reg.grantId, false));
+        await this.guarded(reg.grantId, () =>
+          this.registerNow(reg.grantId, false),
+        );
       for (const reg of store.listChainRegistrations(["ending"]))
         await this.guarded(reg.grantId, () => this.endNow(reg.grantId, false));
     });
@@ -579,7 +583,10 @@ export class PdppChainRegistrar {
     return this.reconciling;
   }
 
-  private async guarded<T>(grantId: string, fn: () => Promise<T>): Promise<T | null> {
+  private async guarded<T>(
+    grantId: string,
+    fn: () => Promise<T>,
+  ): Promise<T | null> {
     try {
       return await fn();
     } catch (err) {
@@ -612,7 +619,10 @@ export class PdppChainRegistrar {
   }
 
   /** Entries of this PS's own live grants for this grantee (not ending). */
-  private ownEntries(granteeAddress: string, except?: string): Map<string, Grant> {
+  private ownEntries(
+    granteeAddress: string,
+    except?: string,
+  ): Map<string, Grant> {
     const { store } = this.options;
     const out = new Map<string, Grant>();
     for (const reg of store.listChainRegistrations(["pending", "bound"])) {
@@ -644,7 +654,10 @@ export class PdppChainRegistrar {
    * stream set (409, bindings are immutable) cannot drop the others. A label
    * over the gateway's stream limit is not sent. Returns the labels not bound.
    */
-  private async bindScopes(grantId: string, bindings: PdppScopeBinding[]): Promise<string[]> {
+  private async bindScopes(
+    grantId: string,
+    bindings: PdppScopeBinding[],
+  ): Promise<string[]> {
     const { gateway, owner, logger } = this.options;
     const unbound: string[] = [];
     for (const binding of bindings) {
@@ -660,7 +673,11 @@ export class PdppChainRegistrar {
           { grantId, scope: binding.scope },
           "PDPP chain registration: a scope label is already bound to another stream set",
         );
-      else if (answer.status >= 500 || answer.status === 401 || answer.status === 403)
+      else if (
+        answer.status >= 500 ||
+        answer.status === 401 ||
+        answer.status === 403
+      )
         throw new Error(`scope bindings: ${describe(answer)}`);
     }
     return unbound;
@@ -689,8 +706,7 @@ export class PdppChainRegistrar {
     const { store } = this.options;
     const ended = this.endedEntries(reg.grantId);
     const unsettled = (slot?.scopes ?? []).filter(
-      (s) =>
-        s !== reg.entry && !own.has(s) && !ended.has(s) && !onChain.has(s),
+      (s) => s !== reg.entry && !own.has(s) && !ended.has(s) && !onChain.has(s),
     );
     // R2: a gateway older than 129b16e sends no `registrationOutcome`; a
     // listed scope the finalized chain lacks is then treated as settling.
@@ -738,7 +754,11 @@ export class PdppChainRegistrar {
 
     const builder = await gateway.getBuilder(reg.granteeAddress);
     if (!builder) {
-      store.noteChainError(grantId, "grantee is not a registered builder", this.now());
+      store.noteChainError(
+        grantId,
+        "grantee is not a registered builder",
+        this.now(),
+      );
       return "pending";
     }
     const unbound = await this.bindScopes(
@@ -750,7 +770,11 @@ export class PdppChainRegistrar {
     for (let attempt = 0; attempt < 2; attempt++) {
       const slot = await gateway.getSlot(slotId);
       if (slot && slot.id.toLowerCase() !== slotId.toLowerCase()) {
-        store.noteChainError(grantId, "gateway answered for another slot id", this.now());
+        store.noteChainError(
+          grantId,
+          "gateway answered for another slot id",
+          this.now(),
+        );
         return "pending";
       }
       const { permission } = await chain.readFinalized(slotId);
@@ -781,9 +805,7 @@ export class PdppChainRegistrar {
       const ended = this.endedEntries();
       const kept = listed.filter(
         (s) =>
-          s !== reg.entry &&
-          !ended.has(s) &&
-          (own.has(s) || onChain.has(s)),
+          s !== reg.entry && !ended.has(s) && (own.has(s) || onChain.has(s)),
       );
       const foreign = kept.filter((s) => !own.has(s));
       // F1: never extend a scope this grant does not cover. With a foreign
@@ -802,8 +824,7 @@ export class PdppChainRegistrar {
               .map(grantExpirySeconds)
               .reduce((a, b) => laterExpiry(a, b));
       const scopes = [...kept, reg.entry];
-      const grantVersion =
-        (slot ? BigInt(slot.currentGrantVersion) : 0n) + 1n;
+      const grantVersion = (slot ? BigInt(slot.currentGrantVersion) : 0n) + 1n;
       const signature = await this.options.signGrantRegistration({
         grantorAddress: owner,
         granteeId: builder.id as `0x${string}`,
@@ -896,7 +917,11 @@ export class PdppChainRegistrar {
       const builder = await gateway.getBuilder(reg.granteeAddress);
       if (!builder) {
         // No builder: no slot can hold the entry, unless the chain says so.
-        store.noteChainError(grantId, "grantee is not a registered builder", this.now());
+        store.noteChainError(
+          grantId,
+          "grantee is not a registered builder",
+          this.now(),
+        );
         return;
       }
       granteeId = builder.id;
@@ -911,7 +936,11 @@ export class PdppChainRegistrar {
 
     const slot = await gateway.getSlot(slotId);
     if (!slot) {
-      store.noteChainError(grantId, "entry on chain but the gateway knows no slot", this.now());
+      store.noteChainError(
+        grantId,
+        "entry on chain but the gateway knows no slot",
+        this.now(),
+      );
       return;
     }
     // N1: a second writer (e.g. Account signing from a stale read) put the
@@ -974,11 +1003,13 @@ export class PdppChainRegistrar {
     // A V2 revocation lists a non-empty subset of the gateway's scopes and a
     // past expiry; a removal-only upsert keeps the earliest known expiry, so
     // nothing it keeps outlives its terms (F1).
-    const scopes = revocation
-      ? slot.scopes.filter(verified)
-      : remaining;
+    const scopes = revocation ? slot.scopes.filter(verified) : remaining;
     if (scopes.length === 0) {
-      store.noteChainError(grantId, "no verified scope to sign a revocation over", this.now());
+      store.noteChainError(
+        grantId,
+        "no verified scope to sign a revocation over",
+        this.now(),
+      );
       return;
     }
     const expiresAt = revocation
@@ -1055,7 +1086,10 @@ export function design2ChainEnforcement(options: {
       let reg = options.store.getChainRegistration(pdppGrantId);
       if (!reg) return deny("No chain binding for this grant");
       const grantee = options.registrar.granteeAddressFor(clientId);
-      if (!grantee || grantee.toLowerCase() !== reg.granteeAddress.toLowerCase())
+      if (
+        !grantee ||
+        grantee.toLowerCase() !== reg.granteeAddress.toLowerCase()
+      )
         return deny("Client is not the bound grantee for this grant");
       if (reg.status === "pending") {
         try {
@@ -1147,7 +1181,11 @@ export function streamSyncScopeBindings(input: {
         linked.namespace,
         stream.name,
       );
-      out.set(perStream, { scope: perStream, sourceId, streams: [stream.name] });
+      out.set(perStream, {
+        scope: perStream,
+        sourceId,
+        streams: [stream.name],
+      });
       const log = input.logScope(linked.connector, linked.namespace);
       if (!out.has(log)) {
         const all = input.declaredStreams(sourceId);
@@ -1162,7 +1200,6 @@ export function streamSyncScopeBindings(input: {
   return [...out.values()];
 }
 
-
 // ─── Host wiring ──────────────────────────────────────────────────────────
 
 /**
@@ -1174,41 +1211,39 @@ export function streamSyncScopeBindings(input: {
 export function createDesign2ChainGrants(input: {
   store: PdppAuthStore;
   logger: Logger;
-  ready:
-    | {
-        gatewayUrl: string;
-        fetch?: typeof fetch;
-        /** Defaults to the deployment's public RPC (`createPermissionsV2Reader`). */
-        chain?: PermissionsV2Reader;
-        /** See `PdppChainRegistrarOptions.retryBackoffMs` (default 30 s). */
-        retryBackoffMs?: number;
-        /** Per gateway request (default 10 s). */
-        timeoutMs?: number;
-        /** See `PdppChainRegistrarOptions.maxDeferralMs` (default 24 h). */
-        maxDeferralMs?: number;
-        owner: `0x${string}`;
-        deployment: { chainId: number; contractAddress: `0x${string}` };
-        signMessage(message: string): Promise<`0x${string}`>;
-        signGrantRegistration(
-          msg: GrantRegistrationToSign,
-        ): Promise<`0x${string}`>;
-        clients: ReadonlyArray<{ clientId: string; granteeAddress?: string }>;
-        link?: (
-          instance: string,
-          stream: string,
-        ) => { connector: string; namespace: string } | null;
-        declaredStreams(sourceId: string): string[];
-        /**
-         * Legacy readable scopes this PS projects from a source's PDPP
-         * streams (`LEGACY_SCOPE_BINDINGS`): each is bound to every stream
-         * its projection reads, so a paid read of it needs one grant that
-         * covers all of them (gateway pay rule).
-         */
-        legacyScopes?: (sourceId: string) => Array<{ scope: string; streams: string[] }>;
-        logScope(connector: string, ns: string): string;
-        streamScope(connector: string, ns: string, stream: string): string;
-      }
-    | null;
+  ready: {
+    gatewayUrl: string;
+    fetch?: typeof fetch;
+    /** Defaults to the deployment's public RPC (`createPermissionsV2Reader`). */
+    chain?: PermissionsV2Reader;
+    /** See `PdppChainRegistrarOptions.retryBackoffMs` (default 30 s). */
+    retryBackoffMs?: number;
+    /** Per gateway request (default 10 s). */
+    timeoutMs?: number;
+    /** See `PdppChainRegistrarOptions.maxDeferralMs` (default 24 h). */
+    maxDeferralMs?: number;
+    owner: `0x${string}`;
+    deployment: { chainId: number; contractAddress: `0x${string}` };
+    signMessage(message: string): Promise<`0x${string}`>;
+    signGrantRegistration(msg: GrantRegistrationToSign): Promise<`0x${string}`>;
+    clients: ReadonlyArray<{ clientId: string; granteeAddress?: string }>;
+    link?: (
+      instance: string,
+      stream: string,
+    ) => { connector: string; namespace: string } | null;
+    declaredStreams(sourceId: string): string[];
+    /**
+     * Legacy readable scopes this PS projects from a source's PDPP
+     * streams (`LEGACY_SCOPE_BINDINGS`): each is bound to every stream
+     * its projection reads, so a paid read of it needs one grant that
+     * covers all of them (gateway pay rule).
+     */
+    legacyScopes?: (
+      sourceId: string,
+    ) => Array<{ scope: string; streams: string[] }>;
+    logScope(connector: string, ns: string): string;
+    streamScope(connector: string, ns: string, stream: string): string;
+  } | null;
 }): {
   registrar: Pick<
     PdppChainRegistrar,

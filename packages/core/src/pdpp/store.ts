@@ -24,6 +24,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
+import { encodeBase64Url } from "../encoding/base64url.js";
 import {
   HistoryRecorder,
   PendingActionJournal,
@@ -316,7 +317,9 @@ interface ChainRegistrationRow {
   updated_at: string;
 }
 
-function chainRegistrationFromRow(row: ChainRegistrationRow): ChainRegistration {
+function chainRegistrationFromRow(
+  row: ChainRegistrationRow,
+): ChainRegistration {
   return {
     grantId: row.grant_id,
     clientId: row.client_id,
@@ -684,7 +687,7 @@ export class PdppAuthStore {
     return this.commit(() => {
       const raced = this.findPairwiseSubjectId(subjectId, clientId);
       if (raced) return raced;
-      const pairwiseId = `pws_${randomBytes(32).toString("base64url")}`;
+      const pairwiseId = `pws_${encodeBase64Url(randomBytes(32))}`;
       const at = now.toISOString();
       this.db
         .prepare(
@@ -733,7 +736,7 @@ export class PdppAuthStore {
               subjectId,
               clientId,
               instance,
-              `pwi_${randomBytes(32).toString("base64url")}`,
+              `pwi_${encodeBase64Url(randomBytes(32))}`,
               at,
             );
           assigned++;
@@ -790,7 +793,9 @@ export class PdppAuthStore {
    * issued with pairwise handles; undefined for a grant issued before them
    * (its document is immutable and keeps the ids it was issued with).
    */
-  clientInstanceHandles(stored: StoredGrant): Record<string, string> | undefined {
+  clientInstanceHandles(
+    stored: StoredGrant,
+  ): Record<string, string> | undefined {
     const evidence = this.getConsentEvidence(stored.grant.grant_id);
     if (evidence?.instance_handles !== "pairwise") return undefined;
     const out: Record<string, string> = {};
@@ -936,7 +941,9 @@ export class PdppAuthStore {
   /** The retained consent evidence of a grant, parsed; null when none. */
   getConsentEvidence(grantId: string): Record<string, unknown> | null {
     const row = this.db
-      .prepare("SELECT consent_evidence_json FROM pdpp_grants WHERE grant_id = ?")
+      .prepare(
+        "SELECT consent_evidence_json FROM pdpp_grants WHERE grant_id = ?",
+      )
       .get(grantId) as { consent_evidence_json: string | null } | undefined;
     if (!row?.consent_evidence_json) return null;
     try {
@@ -1424,7 +1431,7 @@ export class PdppAuthStore {
     // endGrantInTx already settled an advance election at the ending.
     instruction = this.lifecycle.getInstruction(input.grantId)!;
     const stored = this.getGrant(input.grantId)!;
-    const ending = this.endingOf(stored, input.now);
+    const _ending = this.endingOf(stored, input.now);
     if (input.receiptReportedAt) {
       this.lifecycle.recordReceipt(
         instruction.instructionId,

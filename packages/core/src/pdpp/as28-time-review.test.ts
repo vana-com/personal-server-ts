@@ -202,9 +202,9 @@ describe("AS item 28 — time-bounded review payload", () => {
   it("omits meaning when the declaration states none, leaving the surface's own words", () => {
     const r = review(snapshotOf(declaration({ fieldsDisplay: {} })), ["en"]);
     expect(r.data.streams[0].time_constraint?.meaning).toBeUndefined();
-    expect(
-      r.display_values?.some((v) => v.id.includes("display.fields")),
-    ).toBe(false);
+    expect(r.display_values?.some((v) => v.id.includes("display.fields"))).toBe(
+      false,
+    );
   });
 
   it("defaults consent_time_content_may_exceed to false when undeclared", () => {

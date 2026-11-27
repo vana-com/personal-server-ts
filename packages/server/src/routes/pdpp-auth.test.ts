@@ -927,7 +927,10 @@ describe("existing_grants — the review lists this client's active grants", () 
 
   it("does not list a persisted pre-lock grant as an existing grant (AS item 21)", async () => {
     // This seed has no required_fields: the shape a pre-lock build stored.
-    seedGrant({ grantId: "grant_prelock_1", clientId: "music_recommendations" });
+    seedGrant({
+      grantId: "grant_prelock_1",
+      clientId: "music_recommendations",
+    });
     const ownerToken = scopedOwnerToken();
     const created = await post("/pdpp/v1/authorize", selectionBody());
     const { session_id } = (await created.json()) as { session_id: string };
@@ -940,9 +943,9 @@ describe("existing_grants — the review lists this client's active grants", () 
       review: { existing_grants?: Array<{ grant_id: string }> };
     };
     // An empty list is omitted from the review model.
-    expect((body.review.existing_grants ?? []).map((g) => g.grant_id)).not.toContain(
-      "grant_prelock_1",
-    );
+    expect(
+      (body.review.existing_grants ?? []).map((g) => g.grant_id),
+    ).not.toContain("grant_prelock_1");
   });
 
   it("keeps approval behavior unchanged when existing grants are present", async () => {
@@ -1730,7 +1733,11 @@ describe("GET /grants — the owner's own grants, with status", () => {
   }
 
   it("lists a persisted pre-lock grant as requires_fresh_consent (AS item 21)", async () => {
-    seedGrant({ grantId: "grant_prelock", clientId: "music_recommendations", preLock: true });
+    seedGrant({
+      grantId: "grant_prelock",
+      clientId: "music_recommendations",
+      preLock: true,
+    });
     const response = await listGrants(scopedOwnerToken());
     expect(response.status).toBe(200);
     const { grants } = (await response.json()) as { grants: Listed[] };

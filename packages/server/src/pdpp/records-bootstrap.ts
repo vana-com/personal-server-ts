@@ -64,7 +64,10 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { CanonicalLegacyReadStore } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
-import { pdppIssuerIdentifier, type PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
+import {
+  pdppIssuerIdentifier,
+  type PdppAuthRouteDeps,
+} from "../routes/pdpp-auth.js";
 import type { PdppChainEnforcementPort } from "../routes/pdpp-records.js";
 import {
   createSqliteRecordStore,

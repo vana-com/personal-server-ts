@@ -705,7 +705,11 @@ it("owner change sessions follow the two-horizon rules on a switched account (RS
       [id, "selected", key, key, stamp],
     );
   const remove = (key: string) =>
-    run(db, "DELETE FROM records WHERE connection_id=? AND stream='selected' AND record_key=?", [id, key]);
+    run(
+      db,
+      "DELETE FROM records WHERE connection_id=? AND stream='selected' AND record_key=?",
+      [id, key],
+    );
   await put("gone", 1);
   await put("kept", 1);
   const read = createGrantHistory(db, () => ({
@@ -783,7 +787,11 @@ it("an owner change session with a fields projection fails closed (410) when a r
   const projectedStart = await session(undefined, ["a"]);
   const wholeStart = await session();
   // A removal alone: still a tombstone with a projection.
-  await run(db, "DELETE FROM records WHERE connection_id=? AND record_key='allowed'", [id]);
+  await run(
+    db,
+    "DELETE FROM records WHERE connection_id=? AND record_key='allowed'",
+    [id],
+  );
   const removedOnly = await session(projectedStart.nextChangesSince, ["a"]);
   expect(removedOnly.data.map((r) => [r.recordKey, r.deleted])).toEqual([
     ["allowed", true],
@@ -796,9 +804,9 @@ it("an owner change session with a fields projection fails closed (410) when a r
     "UPDATE records SET body='{\"a\":1,\"b\":2}', body_sha256='h2', stamp_o=2 WHERE connection_id=? AND record_key='kept'",
     [id],
   );
-  await expect(
-    session(projectedStart.nextChangesSince, ["a"]),
-  ).rejects.toThrow(/expired/i);
+  await expect(session(projectedStart.nextChangesSince, ["a"])).rejects.toThrow(
+    /expired/i,
+  );
   const whole = await session(wholeStart.nextChangesSince);
   expect(whole.data.map((r) => [r.recordKey, r.deleted])).toEqual([
     ["allowed", true],

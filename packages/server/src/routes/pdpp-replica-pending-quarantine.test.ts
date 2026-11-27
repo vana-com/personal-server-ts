@@ -172,7 +172,8 @@ it.each(["key", "connection"] as const)(
           ...init,
           headers: { authorization: `Bearer ${token}`, ...init.headers },
         });
-      const targetPath = "/streams/messages/records/quarantined-id?instance_id=conn";
+      const targetPath =
+        "/streams/messages/records/quarantined-id?instance_id=conn";
       const blobPath = `/blobs/${encodeURIComponent(blobId)}?instance_id=conn`;
       for (const token of [issuer.credential, consent.token]) {
         const response = await read(token, targetPath);
@@ -217,7 +218,8 @@ it.each(["key", "connection"] as const)(
         id: "unrelated-pending",
         envelope: envelope("unrelated-pending", [pending]),
       });
-      const pendingPath = "/streams/messages/records/pending-control?instance_id=conn-other";
+      const pendingPath =
+        "/streams/messages/records/pending-control?instance_id=conn-other";
       const pendingOwner = await read(issuer.credential, pendingPath);
       expect(pendingOwner.status).toBe(200);
       expect(await pendingOwner.json()).toMatchObject({

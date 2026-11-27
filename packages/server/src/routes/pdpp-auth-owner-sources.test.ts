@@ -43,7 +43,12 @@ function declaration(id: string, name?: string): DeclarationSnapshot {
     digest: "d".repeat(64),
     ...(name && { display: { name } }),
     streams: [
-      { name: "s", fields: ["id"], required_fields: ["id"], primary_key: ["id"] },
+      {
+        name: "s",
+        fields: ["id"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+      },
     ],
   };
 }
@@ -73,7 +78,12 @@ function grant(
     purpose_code: "https://pdpp.dev/purpose/personalization",
     access_mode: "continuous",
     streams: [
-      { name: "s", instance_ids: ["i"], fields: ["id"], required_fields: ["id"] },
+      {
+        name: "s",
+        instance_ids: ["i"],
+        fields: ["id"],
+        required_fields: ["id"],
+      },
     ],
   } as Grant;
 }
@@ -112,7 +122,9 @@ beforeEach(() => {
     subjectId: SUBJECT,
     reviewDigest: "r",
     consentEvidence: {
-      displayed: { client: { client_id: "plain_app", display_name: "plain_app" } },
+      displayed: {
+        client: { client_id: "plain_app", display_name: "plain_app" },
+      },
     },
   });
   store.insertGrant({
@@ -159,8 +171,10 @@ describe("GET /pdpp/v1/owner/sources", () => {
   });
 
   it("does not accept a PDPP owner token in place of the wallet proof", async () => {
-    const token = tokens.issueOwnerToken({ subjectId: SUBJECT, sourceId: SPOTIFY })
-      .access_token;
+    const token = tokens.issueOwnerToken({
+      subjectId: SUBJECT,
+      sourceId: SPOTIFY,
+    }).access_token;
     const res = await app.request("/pdpp/v1/owner/sources", {
       headers: { authorization: `Bearer ${token}` },
     });

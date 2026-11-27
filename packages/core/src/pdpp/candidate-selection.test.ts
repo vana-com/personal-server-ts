@@ -333,7 +333,10 @@ it("candidate validates a named-stream minimum and refuses a wildcard one", () =
   // locked v0.1.0: minimum is a v0.1.0 stream parameter (spec-core L1189).
   const request = (name: string) =>
     validateSelectionRequest(
-      { ...base, streams: [{ name, fields: ["*"], minimum: { fields: ["id"] } }] },
+      {
+        ...base,
+        streams: [{ name, fields: ["*"], minimum: { fields: ["id"] } }],
+      },
       snapshot,
     );
   expect(request("required").ok).toBe(true);

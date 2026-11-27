@@ -1,4 +1,3 @@
-import { grantUsesLockedRules } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { OwnerRecordDeleteResult } from "@opendatalabs/personal-server-ts-core/localdb";
 import {
   listPdppRecords,

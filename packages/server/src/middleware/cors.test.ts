@@ -126,16 +126,19 @@ describe("CORS: PDPP-Version (spec-core §8 API versioning)", () => {
         "Access-Control-Request-Headers": "Authorization, PDPP-Version",
       },
     });
-    expect(lowerList(res.headers.get("Access-Control-Allow-Headers"))).toContain("pdpp-version");
+    expect(
+      lowerList(res.headers.get("Access-Control-Allow-Headers")),
+    ).toContain("pdpp-version");
   });
 
   it("exposes PDPP-Version so a browser client can verify the selected contract", async () => {
     const res = await createApp().request("/v1/streams", {
       headers: { Origin: "https://app.example.com" },
     });
-    expect(lowerList(res.headers.get("Access-Control-Expose-Headers"))).toContain("pdpp-version");
+    expect(
+      lowerList(res.headers.get("Access-Control-Expose-Headers")),
+    ).toContain("pdpp-version");
     expect(CORS_ALLOW_HEADERS).toContain("PDPP-Version");
     expect(CORS_EXPOSE_HEADERS).toContain("PDPP-Version");
   });
 });
-

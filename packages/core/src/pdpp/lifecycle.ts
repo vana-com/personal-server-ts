@@ -1351,7 +1351,7 @@ export class GrantLifecycleService {
   erasureView(
     stored: StoredGrant,
     instruction: ErasureInstructionRecord,
-    now: Date,
+    _now: Date,
   ): ErasureOwnerView {
     const retained = this.store.lifecycle.listRetained(
       instruction.instructionId,

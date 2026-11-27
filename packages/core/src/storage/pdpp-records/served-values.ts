@@ -82,7 +82,8 @@ function redactValue(value: unknown): unknown {
   let out: Record<string, unknown> | undefined;
   for (const [key, member] of Object.entries(value)) {
     const next = redactValue(member);
-    if (next !== member) (out ??= { ...(value as Record<string, unknown>) })[key] = next;
+    if (next !== member)
+      (out ??= { ...(value as Record<string, unknown>) })[key] = next;
   }
   return out ?? value;
 }
