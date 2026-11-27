@@ -533,6 +533,33 @@ function resolvedClientName(
   return retained && retained.length > 0 ? retained : undefined;
 }
 
+/**
+ * Design 2, owner view: where the grant's chain registration stands, so a
+ * consent surface (Account /apps) can say why a grant is not readable yet.
+ * `waiting_on_other_grant`: the PS is holding the registration because
+ * another registration for the same app (from Account, MCP or another
+ * device) is still settling in the slot, with that registration's gateway
+ * `registrationOutcome`; `past_bound` once it has waited longer than the PS's
+ * bound (24 h). Never carries the salt, the entry or the document.
+ */
+function chainOwnerView(
+  store: PdppAuthStore,
+  stored: StoredGrant,
+): { chain: Record<string, unknown> } | undefined {
+  const reg = store.getChainRegistration(stored.grant.grant_id);
+  if (!reg) return { chain: { status: "unregistered" } };
+  if (reg.status === "pending" && reg.deferredSince)
+    return {
+      chain: {
+        status: "waiting_on_other_grant",
+        registration_outcome: reg.deferredOutcome,
+        since: reg.deferredSince,
+        past_bound: reg.lastError?.startsWith("deferred past bound") ?? false,
+      },
+    };
+  return { chain: { status: reg.status } };
+}
+
 /** The slice of `PdppChainRegistrar` (pdpp/chain-grants.ts) the AS uses. */
 export interface PdppChainRegistrarPort {
   prepare(
@@ -2029,6 +2056,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         // AS items 42, 43, 46: read state, ending reason, disposition stage
         // and erasure stages. Additive; `status` above is unchanged.
         lifecycle: lifecycle.ownerView(stored, at),
+        ...(deps.chainRegistrar && chainOwnerView(deps.store, stored)),
       }));
 
     const pending = lifecycle.pendingOwnerActions(caller.subjectId);

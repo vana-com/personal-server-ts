@@ -37,6 +37,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/grants";
 import {
   grantUsesLockedRules,
+  isV02Grant,
   type ChainRegistration,
   type Grant,
   type PdppAuthStore,
@@ -391,10 +392,12 @@ export interface PdppChainRegistrarOptions {
   /** After a failed gateway attempt, wait this long before the next. */
   retryBackoffMs?: number;
   /**
-   * How long the PS defers its write for a slot while another surface's
-   * registration there is still settling (default 24 h). See `deferral`.
+   * After this long deferring a new registration behind another surface's
+   * settling one (default 24 h), the owner view reports it. See `deferral`.
    */
   maxDeferralMs?: number;
+  /** The token service's access-token TTL (default 1 h); see `grantEnded`. */
+  accessTokenTtlSeconds?: number;
 }
 
 /** Registration outcomes that are still in progress at the gateway. */
@@ -436,6 +439,7 @@ export class PdppChainRegistrar {
   /** One gateway conversation at a time: every write moves one slot version. */
   private queue: Promise<unknown> = Promise.resolve();
   private timer: ReturnType<typeof setInterval> | undefined;
+  private reconciling: Promise<void> | undefined;
 
   constructor(private readonly options: PdppChainRegistrarOptions) {}
 
@@ -493,7 +497,9 @@ export class PdppChainRegistrar {
     const now = this.now();
     let created = 0;
     for (const stored of store.listAllGrants()) {
-      if (!grantUsesLockedRules(stored.grant)) continue;
+      // Locked-rule and v0.2 grants are both served under the chain gate.
+      if (!grantUsesLockedRules(stored.grant) && !isV02Grant(stored.grant))
+        continue;
       if (store.grantStatus(stored, now) !== "active") continue;
       if (store.getChainRegistration(stored.grant.grant_id)) continue;
       const prepared = this.prepare(store.clientGrantView(stored));
@@ -537,7 +543,11 @@ export class PdppChainRegistrar {
     return (
       stored.grant.access_mode === "single_use" &&
       stored.consumedAt !== null &&
-      !store.hasLiveClientToken(grantId, now)
+      !store.hasLiveClientToken(
+        grantId,
+        now,
+        this.options.accessTokenTtlSeconds,
+      )
     );
   }
 
@@ -548,7 +558,9 @@ export class PdppChainRegistrar {
    * at the gateway is registered again.
    */
   reconcile(): Promise<void> {
-    return this.serial(async () => {
+    // One reconcile at a time: a call while one is queued or running joins it.
+    if (this.reconciling) return this.reconciling;
+    const run = this.serial(async () => {
       const { store } = this.options;
       const now = this.now();
       for (const reg of store.listChainRegistrations(["pending", "bound"]))
@@ -561,6 +573,10 @@ export class PdppChainRegistrar {
       for (const reg of store.listChainRegistrations(["ending"]))
         await this.guarded(reg.grantId, () => this.endNow(reg.grantId, false));
     });
+    this.reconciling = run.finally(() => {
+      this.reconciling = undefined;
+    });
+    return this.reconciling;
   }
 
   private async guarded<T>(grantId: string, fn: () => Promise<T>): Promise<T | null> {
@@ -610,6 +626,20 @@ export class PdppChainRegistrar {
   }
 
   /**
+   * Entries of this PS's grants that ended (`ending` or `ended`): never
+   * signed again, whatever the gateway or even the finalized chain lists
+   * while their removal is in flight (review N4).
+   */
+  private endedEntries(except?: string): Set<string> {
+    return new Set(
+      this.options.store
+        .listChainRegistrations(["ending", "ended"])
+        .filter((r) => r.grantId !== except)
+        .map((r) => r.entry),
+    );
+  }
+
+  /**
    * One PUT per label, so a label the gateway already holds with another
    * stream set (409, bindings are immutable) cannot drop the others. A label
    * over the gateway's stream limit is not sent. Returns the labels not bound.
@@ -637,19 +667,18 @@ export class PdppChainRegistrar {
   }
 
   /**
-   * The PS must never drop a scope another surface (Account, MCP, another
-   * device) is still settling. When the gateway lists scopes for the slot
+   * New registrations only (a grant end never waits). The PS must never drop
+   * a scope another surface (Account, MCP, another device) is still settling. When the gateway lists scopes for the slot
    * that are neither this PS's own entries nor on the finalized chain, and
    * the slot's latest registration is still in progress, the PS defers its
    * write and retries on the reconcile timer, until that registration is
    * finalized (its scopes are then on the finalized chain and are kept) or
    * has failed or reverted (they are then not kept: they never took effect).
    *
-   * Bounded: after `maxDeferralMs` (24 h) of continuous deferral the PS
-   * stops waiting and signs its own entries plus finalized-chain scopes. A
-   * registration still in progress after a day (typically one whose fee was
-   * never paid) is then dropped by this write; the deferral reason and its
-   * start are kept on the row. Returns the reason to defer, or null.
+   * Bounded visibility, not a bounded wait (decided): after `maxDeferralMs`
+   * (24 h) the PS still does not sign over the other scope. It logs once and
+   * the owner sees `waiting_on_other_grant` with that registration's outcome
+   * on GET /pdpp/v1/grants. Returns the reason to defer, or null.
    */
   private deferral(
     reg: ChainRegistration,
@@ -669,16 +698,21 @@ export class PdppChainRegistrar {
       if (reg.deferredSince) store.noteChainDeferral(reg.grantId, null);
       return null;
     }
-    const since = store.noteChainDeferral(reg.grantId, this.now());
+    const outcome = String(slot!.registrationOutcome);
+    const since = store.noteChainDeferral(reg.grantId, this.now(), outcome);
     const waited = this.now().getTime() - Date.parse(since ?? "");
     if (waited > (this.options.maxDeferralMs ?? 24 * 60 * 60 * 1000)) {
-      this.options.logger.warn(
-        { grantId: reg.grantId, unsettled: unsettled.length },
-        "PDPP chain registration: another registration did not settle within the deferral bound; signing without it",
-      );
-      return null;
+      // Decided: never sign over another surface's settling scope, even after
+      // the bound. The grant stays pending (reads: retry later) and the owner
+      // sees `waiting_on_other_grant` on GET /pdpp/v1/grants. Warn once.
+      if (!reg.lastError?.startsWith("deferred past bound"))
+        this.options.logger.warn(
+          { grantId: reg.grantId, unsettled: unsettled.length, outcome },
+          "PDPP chain registration: another registration for this app has not settled within the bound; still waiting",
+        );
+      return `deferred past bound: another registration for this slot is ${outcome} (${unsettled.length} scope(s) not yet final)`;
     }
-    return `deferred: another registration for this slot is ${slot!.registrationOutcome} (${unsettled.length} scope(s) not yet final)`;
+    return `deferred: another registration for this slot is ${outcome} (${unsettled.length} scope(s) not yet final)`;
   }
 
   private async registerNow(
@@ -738,8 +772,12 @@ export class PdppChainRegistrar {
         store.noteChainError(grantId, deferred, this.now());
         return "pending";
       }
+      const ended = this.endedEntries();
       const kept = listed.filter(
-        (s) => s !== reg.entry && (own.has(s) || onChain.has(s)),
+        (s) =>
+          s !== reg.entry &&
+          !ended.has(s) &&
+          (own.has(s) || onChain.has(s)),
       );
       const foreign = kept.filter((s) => !own.has(s));
       // F1: never extend a scope this grant does not cover. With a foreign
@@ -870,7 +908,16 @@ export class PdppChainRegistrar {
       store.noteChainError(grantId, "entry on chain but the gateway knows no slot", this.now());
       return;
     }
+    // N1: a second writer (e.g. Account signing from a stale read) put the
+    // entry back on the finalized chain at a version above the end this PS
+    // sent: that end is lost and is signed again.
+    const reAdded =
+      reg.endedVersion !== null &&
+      read.permission !== null &&
+      read.permission.scopes.includes(reg.entry) &&
+      read.permission.grantVersion > BigInt(reg.endedVersion);
     const failed =
+      reAdded ||
       slot.status === "failed" ||
       slot.revocationKind === "v2_reverted" ||
       slot.revocationOutcome === "superseded";
@@ -884,14 +931,20 @@ export class PdppChainRegistrar {
         (slot.revokedAt !== null && slot.revocationKind === "v2_upsert"));
     if (inFlight) return;
 
+    // An ended grant never waits (decided): the owner's revocation outranks
+    // another surface's registration still settling in this slot. The PS
+    // signs at once over its own live entries plus finalized-chain scopes,
+    // which overtakes that registration: the other grant must be signed
+    // again by its surface. The PS's own pending registrations for this
+    // slot are re-queued so they register on top of this write.
     const own = this.ownEntries(reg.granteeAddress, grantId);
     const onChain = new Set(read.permission?.scopes ?? []);
-    const deferred = this.deferral(reg, slot, own, onChain);
-    if (deferred) {
-      store.noteChainError(grantId, deferred, this.now());
-      return;
-    }
-    const verified = (s: string) => own.has(s) || onChain.has(s);
+    const ended = this.endedEntries(grantId);
+    const verified = (s: string) =>
+      !ended.has(s) && (own.has(s) || onChain.has(s));
+    const overtaken = slot.scopes.filter(
+      (s) => s !== reg.entry && !verified(s),
+    );
     const remaining = slot.scopes.filter((e) => e !== reg.entry && verified(e));
     const revocation = remaining.length === 0 || slot.revokedAt !== null;
     // A V2 revocation lists a non-empty subset of the gateway's scopes and a
@@ -934,6 +987,17 @@ export class PdppChainRegistrar {
         revocation ? "revocation" : "removal",
         this.now(),
       );
+      if (overtaken.length > 0)
+        this.options.logger.warn(
+          { grantId, overtaken: overtaken.length },
+          "PDPP chain: grant end overtook a registration still settling in this slot; that grant must be signed again",
+        );
+      for (const pending of store.listChainRegistrations(["pending"]))
+        if (
+          pending.granteeAddress.toLowerCase() ===
+          reg.granteeAddress.toLowerCase()
+        )
+          store.requeueChainRegistration(pending.grantId);
       return;
     }
     store.noteChainError(grantId, `end: ${describe(answer)}`, this.now());

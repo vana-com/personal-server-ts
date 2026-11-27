@@ -29,6 +29,16 @@ introduced keep the identifiers they were issued with:
   that address.
 - Instance handles are the stored connection ids, shared by every client.
 
+Where such grants can exist: the locked v0.1.0 rules are new in this
+branch (introduced by b8731ffa, not in `origin/main` at 431dc501), so no
+locked-rule grant was issued by a released build; old locked-rule grants
+exist only in development or test data. `origin/main` can issue pre-lock
+v0.1 and v0.2 grants, but only on a deployment that turned on the opt-in
+`pdpp.enabled` (default off), and those carry the wallet address as
+`subject.id`. Pre-lock v0.1 grants are refused by this build (AS item 21);
+v0.2 grants issued there keep the address. Which production deployments, if
+any, enabled PDPP was not checked from this repository.
+
 A client that holds an old grant and a new one sees two different
 `subject.id` values and two different handles for the same instance. No new
 grant is issued with the wallet address or with stored instance ids. Owners
@@ -48,17 +58,34 @@ record and blob reads require that entry to be live on chain.
   lists is dropped, never signed. The slot id is derived from the contract's
   domain separator, the owner and the app's builder id, and a gateway answer
   for another id is refused.
-- **Scopes another surface is still settling.** When the gateway lists
-  scopes for the slot that are neither this PS's entries nor on the
-  finalized chain, and the slot's latest registration is still `pending`,
-  `sent` or `confirmed`, the PS does not write: it retries on the reconcile
-  timer until that registration is finalized (its scopes are then kept) or
-  has failed or reverted (they are then not kept). Meanwhile a new grant
-  answers "retry later", and an ended grant's entry stays in the slot (the
-  PS itself refuses the grant at once; paid reads at the gateway under that
-  entry continue until the removal is sent). The deferral is bounded at
-  24 hours; after that the PS signs its own entries plus finalized-chain
-  scopes, which drops a registration that has not settled in a day.
+- **New registrations wait for another surface's settling scope.** When
+  the gateway lists scopes for the slot that are neither this PS's entries
+  nor on the finalized chain, and the slot's latest registration is still
+  `pending`, `sent` or `confirmed`, the PS does not register a new grant: it
+  retries on the reconcile timer until that registration is finalized (its
+  scopes are then kept) or has failed or reverted (they are then not kept).
+  Meanwhile the new grant answers "retry later". It never signs over that
+  scope, also after 24 hours: from then on GET /pdpp/v1/grants shows the
+  grant's `chain` as `waiting_on_other_grant` with the other registration's
+  `registration_outcome` and `past_bound: true`, so the owner's app can say
+  "waiting for another grant to this app to settle".
+- **A grant end never waits.** An owner's revocation outranks another
+  surface's settling registration. On grant end the PS signs at once, at
+  `currentGrantVersion + 1`, over its own remaining live entries plus
+  finalized-chain scopes. A registration from another surface still
+  settling in that slot is overtaken, and that other grant must be signed
+  again by its surface. The PS's own pending registrations for the app are
+  re-queued. If another writer later puts the ended entry back on the
+  finalized chain at a higher version, the PS signs the removal again, and
+  it never re-signs an entry of an ended grant, whatever the gateway lists.
+- **What a gateway paid read releases.** The gateway authorizes payment
+  only. The bytes are released by this PS: legacy and stream-sync scopes by
+  `/v1/data/:scope` (and the MCP and job read paths), which require the slot
+  to list the requested scope itself or a wildcard covering it, so a PDPP
+  fingerprint never releases anything there; PDPP data by the record and
+  blob routes, under the client token, which enforce the grant's fields,
+  time bounds, resources and instance. A label binding therefore lets a
+  PDPP grant pay at the gateway, never read more than the grant allows.
 - **Slot expiry.** When the slot holds a scope that is not one of this PS's
   PDPP entries (a legacy scope), the signed expiry is the earliest of the
   gateway's and the finalized chain's expiry. A PDPP grant that would last
@@ -68,7 +95,7 @@ record and blob reads require that entry to be live on chain.
 - **Window after approval, and after turning the setting on.** A grant is
   readable only once its registration is final on chain. Until then reads
   answer 500 with `Retry-After` ("retry"), not `grant_revoked`. At boot with
-  the setting on, every active locked-rule grant without a registration is
+  the setting on, every active locked-rule or v0.2 grant without a registration is
   queued (a client without `granteeAddress` is skipped and its grants stay
   unreadable). The window lasts until the gateway's `/v1/settle` lands the
   slot, which can also wait for the registration fee.

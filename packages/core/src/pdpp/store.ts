@@ -197,6 +197,8 @@ CREATE TABLE IF NOT EXISTS pdpp_chain_registrations (
   -- when the PS began deferring its write for this slot because another
   -- surface's registration is still settling there (bounded)
   deferred_since TEXT,
+  -- the slot's latest registrationOutcome the deferral is waiting on
+  deferred_outcome TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -286,6 +288,8 @@ export interface ChainRegistration {
   endedVersion: string | null;
   endingKind: "removal" | "revocation" | null;
   deferredSince: string | null;
+  /** The other registration's `registrationOutcome` while deferred. */
+  deferredOutcome: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
@@ -306,6 +310,7 @@ interface ChainRegistrationRow {
   ended_version: string | null;
   ending_kind: "removal" | "revocation" | null;
   deferred_since: string | null;
+  deferred_outcome: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -327,6 +332,7 @@ function chainRegistrationFromRow(row: ChainRegistrationRow): ChainRegistration 
     endedVersion: row.ended_version,
     endingKind: row.ending_kind,
     deferredSince: row.deferred_since,
+    deferredOutcome: row.deferred_outcome,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -434,10 +440,10 @@ export function openPdppAuthStore(
   const registrationColumns = db
     .prepare("PRAGMA table_info(pdpp_chain_registrations)")
     .all() as { name: string }[];
-  if (!registrationColumns.some((column) => column.name === "deferred_since")) {
-    db.exec(
-      "ALTER TABLE pdpp_chain_registrations ADD COLUMN deferred_since TEXT",
-    );
+  for (const column of ["deferred_since", "deferred_outcome"]) {
+    if (!registrationColumns.some((existing) => existing.name === column)) {
+      db.exec(`ALTER TABLE pdpp_chain_registrations ADD COLUMN ${column} TEXT`);
+    }
   }
 
   const meta = db
@@ -1041,15 +1047,32 @@ export class PdppAuthStore {
   }
 
   /** Whether a client access token of this grant is still usable. */
-  hasLiveClientToken(grantId: string, now: Date = new Date()): boolean {
-    const row = this.db
+  /**
+   * Whether a client access token of this grant is still usable: not
+   * revoked, its family (if any) not revoked, and not expired. A token stored
+   * with no expiry counts as expiring `maxTtlSeconds` after issuance (the
+   * token service always sets one; a missing one must not keep a consumed
+   * single-use grant alive for ever).
+   */
+  hasLiveClientToken(
+    grantId: string,
+    now: Date = new Date(),
+    maxTtlSeconds = 60 * 60,
+  ): boolean {
+    const rows = this.db
       .prepare(
-        `SELECT 1 FROM pdpp_access_tokens
-         WHERE grant_id = ? AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`,
+        `SELECT t.expires_at, t.issued_at FROM pdpp_access_tokens t
+         LEFT JOIN pdpp_refresh_families f ON f.family_id = t.family_id
+         WHERE t.grant_id = ? AND t.token_kind = 'client'
+           AND t.revoked_at IS NULL AND f.revoked_at IS NULL`,
       )
-      .get(grantId, now.toISOString());
-    return row !== undefined;
+      .all(grantId) as Array<{ expires_at: string | null; issued_at: string }>;
+    const at = now.getTime();
+    return rows.some((r) =>
+      r.expires_at !== null
+        ? Date.parse(r.expires_at) > at
+        : Date.parse(r.issued_at) + maxTtlSeconds * 1000 > at,
+    );
   }
 
   /** The grant ended: its entry must leave the slot. Never goes backwards. */
@@ -1101,22 +1124,42 @@ export class PdppAuthStore {
    * Record (once) when the PS began deferring its slot write, or clear it
    * (`since` null). Returns the deferral start in force.
    */
-  noteChainDeferral(grantId: string, since: Date | null): string | null {
+  noteChainDeferral(
+    grantId: string,
+    since: Date | null,
+    outcome?: string,
+  ): string | null {
     if (since === null) {
       this.db
         .prepare(
-          "UPDATE pdpp_chain_registrations SET deferred_since = NULL WHERE grant_id = ?",
+          `UPDATE pdpp_chain_registrations
+           SET deferred_since = NULL, deferred_outcome = NULL WHERE grant_id = ?`,
         )
         .run(grantId);
       return null;
     }
     this.db
       .prepare(
-        `UPDATE pdpp_chain_registrations SET deferred_since = ?
-         WHERE grant_id = ? AND deferred_since IS NULL`,
+        `UPDATE pdpp_chain_registrations
+         SET deferred_since = COALESCE(deferred_since, ?), deferred_outcome = ?
+         WHERE grant_id = ?`,
       )
-      .run(since.toISOString(), grantId);
+      .run(since.toISOString(), outcome ?? null, grantId);
     return this.getChainRegistration(grantId)?.deferredSince ?? null;
+  }
+
+  /**
+   * Make a pending registration eligible at the next reconcile: clear its
+   * backoff and any deferral.
+   */
+  requeueChainRegistration(grantId: string): void {
+    this.db
+      .prepare(
+        `UPDATE pdpp_chain_registrations
+         SET last_error = NULL, deferred_since = NULL, deferred_outcome = NULL
+         WHERE grant_id = ? AND status = 'pending'`,
+      )
+      .run(grantId);
   }
 
   /** Why the last gateway attempt failed; never the salt or document. */

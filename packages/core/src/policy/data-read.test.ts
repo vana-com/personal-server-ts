@@ -3,6 +3,7 @@ import type {
   Builder,
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/browser";
+import { ScopeMismatchError } from "../errors/catalog.js";
 import {
   resolveDataListGrantScopes,
   verifyDataReadPolicy,
@@ -574,4 +575,37 @@ describe("resolveDataListGrantScopes", () => {
       resolveDataListGrantScopes(input, portsWith([])),
     ).resolves.toEqual([]);
   });
+});
+
+/**
+ * Review N2 (design 2): a gateway-paid read authorizes payment only. The
+ * bytes of a legacy or stream-sync scope are released by this PS's
+ * `/v1/data/:scope` (and MCP / job) read path, which requires the chain
+ * slot to list the requested scope itself (or a wildcard covering it). A
+ * PDPP fingerprint entry never covers a scope name, so a slot holding only
+ * PDPP entries releases nothing on this path; PDPP data is served only by
+ * the PDPP record and blob routes, under the client token's grant.
+ */
+describe("verifyDataReadPolicy under a design-2 slot (N2)", () => {
+  const entry = `pdpp:sha256:${"a".repeat(64)}`;
+  it.each(["spotify.profile", "pdpp.spotify~.top_artists", "pdpp.spotify.top_artists"])(
+    "refuses %s when the slot lists only PDPP entries",
+    async (scope) => {
+      const grant = makeGrant({ scopes: [entry] });
+      await expect(
+        verifyDataReadPolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: grant.id,
+            requestedScope: scope,
+            serverOwner: "0xOwner",
+          },
+          {
+            authSessionVerifier: { getBuilder: vi.fn().mockResolvedValue(builder) },
+            grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+          },
+        ),
+      ).rejects.toBeInstanceOf(ScopeMismatchError);
+    },
+  );
 });

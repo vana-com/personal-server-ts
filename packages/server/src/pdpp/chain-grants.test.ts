@@ -1268,33 +1268,188 @@ describe("never drops a scope another surface is still settling", () => {
     ]);
   });
 
-  it("bounds the deferral: after maxDeferralMs it signs own + finalized-chain scopes", async () => {
+  it("past the bound it still never signs over the settling scope, and tells the owner", async () => {
     foreignSettling();
     const grantId = await approvedGrantId();
     expect(posts()).toHaveLength(0);
     await new Promise((r) => setTimeout(r, 1_100));
     await chain.registrar.reconcile();
+    expect(posts()).toHaveLength(0);
+    expect(store.getChainRegistration(grantId)).toMatchObject({
+      status: "pending",
+      deferredOutcome: "pending",
+    });
+    expect(store.getChainRegistration(grantId)!.lastError).toMatch(
+      /^deferred past bound/,
+    );
+    expect(await read(grantId)).toMatchObject({ ok: false, retryable: true });
+    const owner = (await (
+      await app.request("/pdpp/v1/grants", {
+        headers: { authorization: `Bearer ${ownerToken()}` },
+      })
+    ).json()) as { grants: Array<{ grant_id: string; chain?: unknown }> };
+    expect(owner.grants.find((g) => g.grant_id === grantId)!.chain).toEqual({
+      status: "waiting_on_other_grant",
+      registration_outcome: "pending",
+      since: store.getChainRegistration(grantId)!.deferredSince,
+      past_bound: true,
+    });
+    // Once the other registration finalizes, the PS registers over both.
+    gateway.settle();
+    await chain.registrar.reconcile();
     expect((posts()[0].body as { scopes: string[] }).scopes).toEqual([
+      "instagram.posts",
       store.getChainRegistration(grantId)!.entry,
     ]);
   });
 
-  it("defers removing an ended grant's entry while a foreign registration settles", async () => {
-    const grantId = await approvedGrantId();
+  it("never defers a grant end: the removal goes out at once and overtakes the settling foreign registration", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
     gateway.settle();
-    const entry = store.getChainRegistration(grantId)!.entry;
+    const a = store.getChainRegistration(first)!.entry;
+    const b = store.getChainRegistration(second)!.entry;
     foreignSettling();
-    await ownerRevoke(grantId);
-    expect(gateway.requests.some((r) => r.method === "DELETE")).toBe(false);
-    expect(posts()).toHaveLength(1); // only the original registration
-    expect(store.getChainRegistration(grantId)).toMatchObject({
+    const before = posts().length;
+    await ownerRevoke(first);
+    // Sent at once, at currentGrantVersion + 1: own live entry + finalized
+    // chain scopes; the foreign scope still settling is not kept.
+    const removal = posts().at(-1)!.body as {
+      scopes: string[];
+      grantVersion: string;
+    };
+    expect(posts()).toHaveLength(before + 1);
+    expect(removal.scopes).toEqual([b]);
+    expect(removal.scopes).not.toContain(a);
+    expect(removal.scopes).not.toContain("instagram.posts");
+    expect(gateway.signedVersions.at(-1)).toBe(BigInt(removal.grantVersion));
+    expect(store.getChainRegistration(first)).toMatchObject({
       status: "ending",
+      endingKind: "removal",
     });
+  });
+
+  it("never defers a revocation either, and re-queues the PS's own pending registration", async () => {
+    const first = await approvedGrantId();
+    gateway.settle();
+    foreignSettling();
+    // A second grant for the app is deferred behind the foreign registration.
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    expect(store.getChainRegistration(second)!.lastError).toMatch(/^deferred/);
+    await ownerRevoke(first);
+    const del = gateway.requests.filter((r) => r.method === "DELETE");
+    expect(del).toHaveLength(1);
+    // The revocation lists only verified scopes (here the ended entry).
+    expect((del[0].body as { scopes: string[] }).scopes).toEqual([
+      store.getChainRegistration(first)!.entry,
+    ]);
+    // The own pending registration was re-queued (backoff and deferral
+    // cleared) and registers at the next reconcile.
+    expect(store.getChainRegistration(second)!.lastError).toBeNull();
+    expect(store.getChainRegistration(second)!.deferredSince).toBeNull();
+  });
+
+  it("N1: re-signs a removal when a second writer puts the ended entry back", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    const b = store.getChainRegistration(second)!.entry;
+    await ownerRevoke(first);
+    const sent = store.getChainRegistration(first)!.endedVersion!;
+    // Account, from a stale read, signs the slot with A again, above it.
+    const v = gateway.current() + 1n;
+    gateway.slot!.scopes = [a, b];
+    gateway.slot!.grantVersion = String(v);
+    gateway.slot!.latest = v;
+    gateway.slot!.status = "pending";
+    gateway.settle();
+    expect(gateway.chain!.scopes).toContain(a);
+    await chain.registrar.reconcile();
+    const again = store.getChainRegistration(first)!;
+    expect(again.status).toBe("ending");
+    expect(BigInt(again.endedVersion!)).toBeGreaterThan(BigInt(sent));
+    expect((posts().at(-1)!.body as { scopes: string[] }).scopes).toEqual([b]);
     gateway.settle();
     await chain.registrar.reconcile();
-    // Removal-only upsert that keeps the now-final foreign scope.
-    const removal = posts().at(-1)!.body as { scopes: string[] };
-    expect(removal.scopes).toEqual(["instagram.posts"]);
-    expect(removal.scopes).not.toContain(entry);
+    expect(store.getChainRegistration(first)!.status).toBe("ended");
+  });
+
+  it("N4: never re-signs an ended entry a gateway re-lists while its removal is in flight", async () => {
+    const first = await approvedGrantId();
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    await ownerRevoke(first); // removal sent, not final
+    gateway.lie = { scopes: [a, ...gateway.slot!.scopes] };
+    const third = await approvedGrantId([
+      { name: "top_artists", fields: ["id"] },
+    ]);
+    const signed = (posts().at(-1)!.body as { scopes: string[] }).scopes;
+    expect(signed).toContain(store.getChainRegistration(third)!.entry);
+    expect(signed).not.toContain(a);
+  });
+
+  it("N4: one reconcile at a time; a call while one runs joins it", () => {
+    const one = chain.registrar.reconcile();
+    const two = chain.registrar.reconcile();
+    expect(two).toBe(one);
+    return one;
+  });
+
+  it("N4: backfills a v0.2 grant issued while chain grants were off", () => {
+    const grant = {
+      version: "0.2.0",
+      grant_id: "grt_v02",
+      issued_at: new Date().toISOString(),
+      subject: { id: OWNER },
+      client: { client_id: CLIENT },
+      source: { kind: "connector", id: SOURCE_ID },
+      source_declaration: { version: "v1" },
+      purpose_code: "https://pdpp.dev/purpose/personalization",
+      access_mode: "continuous",
+      streams: [{ name: "top_artists", instance_ids: [INSTANCE], fields: ["id"] }],
+    } as unknown as Grant;
+    store.insertGrant({ grant, subjectId: OWNER, reviewDigest: "r" });
+    expect(chain.registrar.backfill()).toBe(1);
+    expect(store.getChainRegistration("grt_v02")).toMatchObject({
+      status: "pending",
+      entry: computePdppGrantEntry(grant, store.getChainRegistration("grt_v02")!.salt),
+    });
+  });
+
+  it("N4: a stored token with no expiry stops counting as usable after the access TTL", () => {
+    const grant = {
+      version: "0.2.0",
+      grant_id: "grt_t",
+      issued_at: new Date().toISOString(),
+      subject: { id: OWNER },
+      client: { client_id: CLIENT },
+      source: { kind: "connector", id: SOURCE_ID },
+      source_declaration: { version: "v1" },
+      purpose_code: "p",
+      access_mode: "single_use",
+      streams: [{ name: "top_artists", instance_ids: [INSTANCE], fields: ["id"] }],
+    } as unknown as Grant;
+    store.insertGrant({ grant, subjectId: OWNER, reviewDigest: "r" });
+    const issuedAt = new Date();
+    store.issueAccessToken({
+      token: "tok_noexp",
+      grantId: "grt_t",
+      subjectId: OWNER,
+      clientId: CLIENT,
+      tokenKind: "client",
+      expiresAt: null,
+      consumeSingleUse: true,
+      now: issuedAt,
+    });
+    expect(store.hasLiveClientToken("grt_t", issuedAt)).toBe(true);
+    expect(
+      store.hasLiveClientToken(
+        "grt_t",
+        new Date(issuedAt.getTime() + 2 * 60 * 60 * 1000),
+      ),
+    ).toBe(false);
   });
 });
