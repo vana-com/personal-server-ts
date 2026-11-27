@@ -665,6 +665,7 @@ export async function createPsLiteSyncManager(
       );
     };
     let opening: Promise<LocalSync | null> | undefined;
+    let closing: Promise<void> | undefined;
     async function openDatabase(): Promise<LocalSync | null> {
       if (!options.localDb) return null;
       // Every write the sync engine makes goes through the driver this
@@ -961,11 +962,14 @@ export async function createPsLiteSyncManager(
       serverOwner,
       dataPointFeed,
       scopeDeletions,
-      closeStreamSync: async () => {
-        closed = true;
-        await opening;
-        await Promise.allSettled([...retirementTasks]);
-        await closeDatabase();
+      closeStreamSync: () => {
+        closing ??= (async () => {
+          closed = true;
+          if (opening) await Promise.allSettled([opening]);
+          await Promise.allSettled([...retirementTasks]);
+          await closeDatabase();
+        })();
+        return closing;
       },
       streamSyncIntake,
       streamSyncSeed,
