@@ -439,6 +439,54 @@ describe("stream-sync read status route", () => {
     },
   );
 
+  it.each(["lazy runtime", "listing"] as const)(
+    "maps a raw %s rejection to 503 STREAM_READ_UNAVAILABLE",
+    async (stage) => {
+      const listingStatus = vi.fn(async () => {
+        throw new Error("listing database unavailable");
+      });
+      const localSync = vi.fn(async () => {
+        if (stage === "lazy runtime")
+          throw new Error("local sync factory unavailable");
+        return { listing: { status: listingStatus } } as unknown as LocalSync;
+      });
+      const fallbackStatus = vi.fn(() => ({
+        listed: true,
+        connections: [],
+        issues: [],
+      }));
+      const route = streamSyncReadStatusRoutes({
+        serverOrigin: "http://127.0.0.1",
+        serverOwner: OWNER,
+        gateway: {} as GatewayClient,
+        accessToken: TOKEN,
+        accountStorageMode: { owner: OWNER, read: () => "switched" },
+        localSync,
+        streamSyncRead: {
+          resolve: vi.fn(),
+          status: fallbackStatus,
+        } as unknown as StreamSyncReadPort,
+      });
+      route.onError((error, c) =>
+        error instanceof ProtocolError
+          ? c.json(error.toJSON(), error.code as 503)
+          : c.json({ error: String(error) }, 500),
+      );
+      const response = await route.request("/", {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(response.status).toBe(503);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        error: { errorCode: "STREAM_READ_UNAVAILABLE" },
+      });
+      expect(body).not.toHaveProperty("streams");
+      expect(localSync).toHaveBeenCalledTimes(1);
+      expect(listingStatus).toHaveBeenCalledTimes(stage === "listing" ? 1 : 0);
+      expect(fallbackStatus).not.toHaveBeenCalled();
+    },
+  );
+
   it("answers 404 when stream sync reading is off", async () => {
     const response = await app(undefined)();
     expect(response.status).toBe(404);

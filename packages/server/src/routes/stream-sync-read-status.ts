@@ -84,16 +84,38 @@ export function streamSyncReadStatusRoutes(
         "STREAM_READ_UNAVAILABLE",
         "Stream sync is unavailable",
       );
-    const local =
-      deps.localSync && mode !== "unswitched"
-        ? typeof deps.localSync === "function"
-          ? await deps.localSync()
-          : deps.localSync
-        : undefined;
+    let local: LocalSync | undefined;
+    if (deps.localSync && mode !== "unswitched") {
+      try {
+        local =
+          typeof deps.localSync === "function"
+            ? await deps.localSync()
+            : deps.localSync;
+      } catch {
+        throw new ProtocolError(
+          503,
+          "STREAM_READ_UNAVAILABLE",
+          "Stream sync is unavailable",
+        );
+      }
+    }
     const audit = ["1", "true"].includes(c.req.query("audit") ?? "");
-    const status = local
-      ? await local.listing.status(audit ? { audit: true } : undefined)
-      : deps.streamSyncRead?.status?.();
+    let status;
+    if (local) {
+      try {
+        status = await local.listing.status(
+          audit ? { audit: true } : undefined,
+        );
+      } catch {
+        throw new ProtocolError(
+          503,
+          "STREAM_READ_UNAVAILABLE",
+          "Stream sync is unavailable",
+        );
+      }
+    } else {
+      status = deps.streamSyncRead?.status?.();
+    }
     // The count was in flight while the mode could move: an answer chosen
     // under the old mode is not published under the new one.
     if (deps.accountStorageMode?.read() !== mode)
