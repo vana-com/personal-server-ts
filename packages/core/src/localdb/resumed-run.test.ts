@@ -296,6 +296,72 @@ describe("a run resumed from a cursor read before it began", () => {
     return { here, elsewhere };
   }
 
+  it("a failed end of a run whose stream was deleted mid-run takes the fence's reset: no checkpoint, the stream incomplete and flagged for a full read", async () => {
+    const registry = createMemoryStreamSyncRegistry();
+    const blobs = createMemoryStreamSyncBlobs();
+    const here = await open({ registry, blobs, streams: ["items"] });
+    const elsewhere = await open({ registry, blobs, streams: ["items"] });
+    try {
+      await seeded(here);
+      await elsewhere.sync.cycle();
+      // A run of the same lifetime is collecting when the delete lands.
+      await here.sync.intake.begin("run-2", { ...connect, connect: false });
+      await elsewhere.sync.deleter.requestConnectionDelete("fixture");
+      await elsewhere.sync.cycle();
+      await here.sync.cycle();
+      expect(
+        await here.db.query("SELECT control_state FROM connections"),
+      ).toEqual([{ control_state: "deleted" }]);
+      const ended = await here.sync.intake.end("run-2", {
+        finish: "completed",
+        streams: { items: { ...observed(false), sourceAnswered: false } },
+        checkpoints: {},
+        lastBatch: -1,
+      });
+      expect(ended.outcome).toBe("failed");
+      expect(await storedCheckpoint(here)).toBeNull();
+      expect(await itemsState(here)).toEqual([{ complete: 0, needs_full: 1 }]);
+    } finally {
+      await here.sync.close();
+      await elsewhere.sync.close();
+    }
+  });
+
+  it("an end that finds a delete intent pending is fenced as control_deleted, though the connection is still active", async () => {
+    const here = await open({ streams: ["items"] });
+    try {
+      await seeded(here);
+      await here.sync.intake.begin("run-2", { ...connect, connect: false });
+      await here.sync.intake.batch("run-2", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "two" } }],
+      });
+      await here.db.batch([
+        {
+          sql: "INSERT INTO delete_intents(connector, delete_id, intent) VALUES ('fixture', 'd1', '{}')",
+          params: [],
+        },
+      ]);
+      expect(
+        await here.db.query("SELECT control_state FROM connections"),
+      ).toEqual([{ control_state: "active" }]);
+      await here.sync.intake.end("run-2", {
+        finish: "completed",
+        streams: { items: observed(true) },
+        checkpoints: { items: { cursor: "c" } },
+        lastBatch: 0,
+      });
+      expect(
+        await here.db.query(
+          "SELECT decision, reason FROM run_streams WHERE run_id = 'run-2'",
+        ),
+      ).toEqual([{ decision: "discarded", reason: "control_deleted" }]);
+      expect(await storedCheckpoint(here)).toBeNull();
+    } finally {
+      await here.sync.close();
+    }
+  });
+
   it("saves no cursor when the connection was deleted after the cursor was read: the reconnect is a new lifetime without the rows before the cursor", async () => {
     const { here, elsewhere } = await deletedMeanwhile();
     try {
@@ -472,6 +538,67 @@ describe("a run resumed from a cursor read before it began", () => {
     } finally {
       await here.sync.close();
       await elsewhere.sync.close();
+    }
+  });
+
+  it("does not merge or save a checkpoint when a delete intent lands just before the END transaction", async () => {
+    const here = await open({ streams: ["items"] });
+    try {
+      await seeded(here);
+      await here.sync.intake.begin("raced-end", { ...connect, connect: false });
+      await here.sync.intake.batch("raced-end", {
+        batch: 0,
+        records: [{ stream: "items", data: { id: "late" } }],
+      });
+      const originalBatch = here.db.batch.bind(here.db);
+      let inserted = false;
+      const intercepted = vi
+        .spyOn(here.db, "batch")
+        .mockImplementation(async (statements) => {
+          if (
+            !inserted &&
+            statements.some(({ sql }) =>
+              sql.includes("end_response=?,raw_end=?"),
+            )
+          ) {
+            inserted = true;
+            await originalBatch([
+              {
+                sql: "INSERT INTO delete_intents(connector,delete_id,intent) VALUES (?,?,?)",
+                params: [
+                  "fixture",
+                  "synthetic-delete",
+                  JSON.stringify({ pins: [] }),
+                ],
+              },
+            ]);
+          }
+          return originalBatch(statements);
+        });
+      try {
+        const ended = await here.sync.intake.end("raced-end", {
+          finish: "completed",
+          streams: { items: observed(true) },
+          checkpoints: { items: { cursor: "do-not-save" } },
+          lastBatch: 0,
+        });
+        expect(inserted).toBe(true);
+        expect(ended.result).toBe("discarded");
+        expect(await itemKeys(here)).toEqual(["one"]);
+        expect((await storedCheckpoint(here))?.items).not.toEqual({
+          cursor: "do-not-save",
+        });
+        expect(
+          await here.db.query(
+            "SELECT reason FROM run_streams WHERE run_id = ?",
+            ["raced-end"],
+          ),
+        ).toEqual([{ reason: "control_deleted" }]);
+      } finally {
+        intercepted.mockRestore();
+      }
+    } finally {
+      await here.sync.close();
     }
   });
 });

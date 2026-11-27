@@ -137,6 +137,64 @@ const auth = {
 };
 
 describe("GET /v1/sync/events", () => {
+  it("returns ACCOUNT_MODE_UNKNOWN without subscribing when the mode is unknown", async () => {
+    const { views, listeners } = fakeViews();
+    const status = fakeStatus({ syncing: false });
+    const app = syncRoutes({
+      ...auth,
+      accountStorageMode: { read: () => "unknown" } as never,
+      syncManager: status.manager,
+      viewChanges: views,
+    });
+    app.onError((err, c) =>
+      err instanceof ProtocolError
+        ? c.json(err.toJSON(), err.code as 503)
+        : c.json({}, 500),
+    );
+    const response = await app.request("/events", { headers });
+    if (response.status === 200) await response.body?.cancel();
+    expect(response.status).toBe(503);
+    expect(response.headers.get("content-type")).not.toContain(
+      "text/event-stream",
+    );
+    expect(await response.json()).toMatchObject({
+      error: { errorCode: "ACCOUNT_MODE_UNKNOWN" },
+    });
+    expect(listeners()).toBe(0);
+    expect(status.listeners.size).toBe(0);
+  });
+
+  it("ends without writing another frame when the account leaves switched mode", async () => {
+    let mode = "switched";
+    const { views, emit, listeners } = fakeViews();
+    const status = fakeStatus({ syncing: false });
+    const app = syncRoutes({
+      ...auth,
+      accountStorageMode: { read: () => mode } as never,
+      syncManager: status.manager,
+      viewChanges: views,
+    });
+    const response = await app.request("/events", { headers });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    try {
+      let opening = "";
+      while (!opening.includes("event: status")) {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error("stream ended before opening status");
+        opening += decoder.decode(chunk.value, { stream: true });
+      }
+      expect(opening).toContain("event: ready");
+      mode = "unswitched";
+      emit(["fixture-connection"]);
+      expect(await reader.read()).toEqual({ done: true, value: undefined });
+      expect(listeners()).toBe(0);
+      expect(status.listeners.size).toBe(0);
+    } finally {
+      await reader.cancel();
+    }
+  });
   it("delivers an applied change to a connected client with no timer", async () => {
     const registry =
       createMemoryStreamSyncRegistry() as MemoryStreamSyncRegistry;
@@ -368,6 +426,34 @@ describe("GET /v1/sync/events", () => {
     expect((await feed.next()).event).toBe("ready");
     await feed.close();
     await vi.waitFor(() => expect(status.listeners.size).toBe(0));
+  });
+
+  it("releases both subscriptions even when release and warning throw", async () => {
+    const status = fakeStatus({ syncing: false, lastSync: null });
+    const stopStatus = vi.fn(() => {
+      throw new Error("release failed");
+    });
+    const stopViews = vi.fn();
+    vi.spyOn(status.manager, "subscribeStatus").mockReturnValue(stopStatus);
+    const logger = pino({ level: "silent" });
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {
+      throw new Error("warning failed");
+    });
+    const app = syncRoutes({
+      ...auth,
+      logger,
+      syncManager: status.manager,
+      viewChanges: { subscribe: () => stopViews },
+    });
+    const feed = frames(await app.request("/events", { headers }));
+    expect((await feed.next()).event).toBe("ready");
+
+    await feed.close();
+    await vi.waitFor(() => {
+      expect(stopStatus).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(stopViews).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("releases both subscriptions when the client leaves before reading anything", async () => {

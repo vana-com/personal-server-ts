@@ -59,7 +59,7 @@ it("does not mark hydration complete while a later registry page is held or fail
     await arrived;
     expect((await sync.listing.status()).accountHydrated).toBe(false);
     release();
-    await expect(applying).rejects.toThrow("gives no cursor");
+    await expect(applying).rejects.toThrow("no valid pagination marker");
     expect((await sync.listing.status()).accountHydrated).toBe(false);
     fail = false;
     await sync.apply();

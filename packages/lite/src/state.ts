@@ -608,13 +608,13 @@ export async function loadOrCreatePsLiteConfig(
   const parsed = ServerConfigSchema.parse(existing);
   const stored = withCurrentInferenceModel(parsed);
   if (stored !== parsed) await store.set(CONFIG_KEY, stored);
-  // The gateway block (url, chainId, contracts) and the payment toggle are
-  // environment/deployment config, not instance state — when the caller's
-  // defaults move them (a contract redeploy, or flipping x402 payment via
-  // env), the stored snapshot must follow, or EIP-712 signing keeps using the
-  // stale verifyingContract / payment stays at its old value. Instance state
-  // (server.origin, sync cursor, etc.) stays persisted.
-  if (!(defaults?.gateway || defaults?.payment)) return stored;
+  // The gateway block (url, chainId, contracts), payment toggle, and storage
+  // backend choice are environment/account-authoritative config, not sticky
+  // instance state — when the caller's defaults move them, the stored snapshot
+  // must follow. Instance state (server.origin, sync cursor, etc.) stays
+  // persisted.
+  if (!(defaults?.gateway || defaults?.payment || defaults?.storage))
+    return stored;
   const reconciled = ServerConfigSchema.parse({
     ...stored,
     ...(defaults.gateway
@@ -632,10 +632,23 @@ export async function loadOrCreatePsLiteConfig(
     ...(defaults.payment
       ? { payment: { ...stored.payment, ...defaults.payment } }
       : {}),
+    ...(defaults.storage
+      ? {
+          storage: {
+            ...stored.storage,
+            ...defaults.storage,
+            config: {
+              ...stored.storage.config,
+              ...defaults.storage.config,
+            },
+          },
+        }
+      : {}),
   });
   if (
     JSON.stringify(reconciled.gateway) !== JSON.stringify(stored.gateway) ||
-    JSON.stringify(reconciled.payment) !== JSON.stringify(stored.payment)
+    JSON.stringify(reconciled.payment) !== JSON.stringify(stored.payment) ||
+    JSON.stringify(reconciled.storage) !== JSON.stringify(stored.storage)
   ) {
     await store.set(CONFIG_KEY, reconciled);
   }

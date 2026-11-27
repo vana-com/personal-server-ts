@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  REPLICA_DEFAULT_LIMITS,
   REPLICA_LIVE_COPY_FACTOR,
   REPLICA_MAX_BLOB_BYTES,
   REPLICA_MAX_FRAGMENTS,
   REPLICA_MAX_TOTAL_BYTES,
   ReplicaByteBudget,
+  type ReplicaResourceLimits,
   admit,
+  replicaResourceLimits,
 } from "./limits.js";
 
 const identity = {
@@ -133,5 +136,34 @@ describe("replication admission limits", () => {
     expect(afterRelease).not.toHaveProperty("kind");
     if (typeof afterRelease === "function") afterRelease();
     expect(budget.reserved).toBe(0);
+  });
+
+  it("replicaResourceLimits rejects malformed host overrides", () => {
+    const malformed: Partial<ReplicaResourceLimits>[] = [
+      { maxFragments: Number.NaN },
+      { maxFragments: Number.POSITIVE_INFINITY },
+      { maxFragments: undefined },
+      { maxFragments: -1 },
+      { maxFragments: 10.5 },
+      { maxTotalBytes: Number.NaN },
+    ];
+    for (const overrides of malformed) {
+      expect(() => replicaResourceLimits(overrides)).toThrow(RangeError);
+    }
+  });
+
+  it("replicaResourceLimits applies a valid finite override and admit enforces it", () => {
+    const limits = replicaResourceLimits({ maxFragments: 1 });
+    expect(limits.maxFragments).toBe(1);
+    expect(limits.maxTotalBytes).toBe(REPLICA_DEFAULT_LIMITS.maxTotalBytes);
+    const budget = new ReplicaByteBudget(Number.MAX_SAFE_INTEGER);
+    expect(
+      admit(
+        { totalBytes: 1, fragments: [{ bytes: 1 }, { bytes: 1 }] },
+        budget,
+        identity,
+        limits,
+      ),
+    ).toMatchObject({ kind: "resource_unsupported", limit: "fragment_count" });
   });
 });

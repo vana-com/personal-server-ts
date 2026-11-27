@@ -85,7 +85,7 @@ export function streamSyncReadStatusRoutes(
         "Stream sync is unavailable",
       );
     const local =
-      deps.localSync && deps.accountStorageMode?.read() !== "unswitched"
+      deps.localSync && mode !== "unswitched"
         ? typeof deps.localSync === "function"
           ? await deps.localSync()
           : deps.localSync
@@ -94,6 +94,14 @@ export function streamSyncReadStatusRoutes(
     const status = local
       ? await local.listing.status(audit ? { audit: true } : undefined)
       : deps.streamSyncRead?.status?.();
+    // The count was in flight while the mode could move: an answer chosen
+    // under the old mode is not published under the new one.
+    if (deps.accountStorageMode?.read() !== mode)
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "The account storage mode changed while the count was read",
+      );
     if (!status) {
       // An expected state while a diagnostic polls: answered here, not thrown,
       // so the global error handler does not log a warning per request.

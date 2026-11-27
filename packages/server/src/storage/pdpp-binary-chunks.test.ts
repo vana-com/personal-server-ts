@@ -3,6 +3,8 @@ import { expect, it } from "vitest";
 import {
   BINARY_CHUNK_BYTES,
   BINARY_CHUNKS_MIGRATION,
+  copyBinaryToCanonical,
+  readBinary,
   readBinaryChunks,
   readBinaryWindow,
   type BinaryCursor,
@@ -141,4 +143,110 @@ it("readBinaryWindow reads rows of any length in parts by cursor", () => {
   expect(() =>
     readBinaryWindow(db, "canonical", "p", { position: 0, offset: 0 }, 1),
   ).toThrow("legacy binary windows unsupported");
+});
+/**
+ * readBinary after a manifest must not report a chunk-read failure as
+ * absence: a corrupt, partial or excess chunk set throws, while a blob
+ * with no manifest at all still reads as undefined.
+ */
+function chunkedDatabase(
+  size: number,
+  chunks: { position: number; bytes: Buffer }[],
+) {
+  const db = new Database(":memory:");
+  db.exec(BINARY_CHUNKS_MIGRATION);
+  db.prepare("INSERT INTO pdpp_binary_manifests VALUES (?,?,?)").run(
+    "canonical",
+    "blob",
+    size,
+  );
+  for (const chunk of chunks)
+    db.prepare("INSERT INTO pdpp_binary_chunks VALUES (?,?,?,?)").run(
+      "canonical",
+      "blob",
+      chunk.position,
+      chunk.bytes,
+    );
+  return db;
+}
+
+/** The error readBinary throws, or undefined when it returns instead. */
+function readError(db: Database.Database, id: string): unknown {
+  try {
+    readBinary(db, "canonical", id);
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+function readFailure(error: unknown) {
+  expect(error).toBeInstanceOf(Error);
+  return error as Error & { code?: unknown; cause?: unknown };
+}
+
+it("readBinary throws with a code and cause when the manifest's chunks are missing", () => {
+  const db = chunkedDatabase(10, []);
+  const failure = readFailure(readError(db, "blob"));
+  db.close();
+  expect(failure.message).toContain("corrupt binary chunks");
+  expect(failure.code).toBe("binary_read_failed");
+  expect(failure.cause).toBeInstanceOf(Error);
+  expect((failure.cause as Error).message).toBe("corrupt binary chunks");
+});
+
+it("readBinary throws when a chunk is missing mid-blob", () => {
+  const db = chunkedDatabase(10, [{ position: 0, bytes: Buffer.alloc(5, 1) }]);
+  const failure = readFailure(readError(db, "blob"));
+  db.close();
+  expect(failure.message).toContain("corrupt binary chunks");
+  expect(failure.code).toBe("binary_read_failed");
+  expect((failure.cause as Error).message).toBe("corrupt binary chunks");
+});
+
+it("readBinary throws when extra chunks follow the manifest size", () => {
+  const db = chunkedDatabase(5, [
+    { position: 0, bytes: Buffer.alloc(5, 2) },
+    { position: 1, bytes: Buffer.alloc(5, 3) },
+  ]);
+  const failure = readFailure(readError(db, "blob"));
+  db.close();
+  expect(failure.message).toContain("excess binary chunks");
+  expect(failure.code).toBe("binary_read_failed");
+  expect((failure.cause as Error).message).toBe("excess binary chunks");
+});
+
+it("readBinary still returns undefined when no manifest exists", () => {
+  const db = new Database(":memory:");
+  db.exec(BINARY_CHUNKS_MIGRATION);
+  db.exec(
+    "CREATE TABLE pdpp_blob_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL)",
+  );
+  expect(readBinary(db, "canonical", "blob")).toBeUndefined();
+  expect(readBinary(db, "payload", "blob")).toBeUndefined();
+  db.close();
+});
+
+it("readBinary returns the bytes for a complete manifest", () => {
+  const bytes = Buffer.alloc(10, 9);
+  const db = chunkedDatabase(10, [{ position: 0, bytes }]);
+  const read = readBinary(db, "canonical", "blob");
+  db.close();
+  expect(read).toEqual(new Uint8Array(bytes));
+});
+
+it("copyBinaryToCanonical reports a corrupt read as a read failure, not missing bytes", () => {
+  const db = chunkedDatabase(10, []);
+  const error = (() => {
+    try {
+      copyBinaryToCanonical(db, "canonical", "blob");
+      return undefined;
+    } catch (caught) {
+      return caught;
+    }
+  })();
+  db.close();
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).not.toContain("missing binary bytes");
+  expect((error as { code?: unknown }).code).toBe("binary_read_failed");
 });

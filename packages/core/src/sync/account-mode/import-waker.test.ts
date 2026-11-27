@@ -71,6 +71,26 @@ describe("the import waker", () => {
     expect(signals).toHaveLength(2);
   });
 
+  it("does not launch when the mode leaves streams before the run starts", async () => {
+    const { importer, signals } = recorder();
+    let reads = 0;
+    const authority = {
+      ready: Promise.resolve(),
+      // First read (in wake): switched. Any later read: no answer.
+      read: () =>
+        ++reads === 1
+          ? ({ kind: "streams" } as const)
+          : ({
+              kind: "refuse",
+              code: "ACCOUNT_MODE_UNKNOWN",
+              status: 503,
+            } as const),
+    };
+    const waker = createImportWaker({ authority, owner: OWNER, importer });
+    await waker.wake();
+    expect(signals).toHaveLength(0);
+  });
+
   it("logs a failed run, and the next wake tries again", async () => {
     const warnings: string[] = [];
     let calls = 0;
@@ -86,6 +106,25 @@ describe("the import waker", () => {
     });
     await expect(waker.wake()).resolves.toBeUndefined();
     expect(warnings).toHaveLength(1);
+    await waker.wake();
+    expect(calls).toBe(2);
+  });
+
+  it("a throwing warning sink does not reject wake(), and the next wake tries again", async () => {
+    let calls = 0;
+    const { importer } = recorder(async () => {
+      calls += 1;
+      throw new Error("disk full");
+    });
+    const waker = createImportWaker({
+      authority: await authorityWith("on"),
+      owner: OWNER,
+      importer,
+      onWarning: () => {
+        throw new Error("sink boom");
+      },
+    });
+    await expect(waker.wake()).resolves.toBeUndefined();
     await waker.wake();
     expect(calls).toBe(2);
   });

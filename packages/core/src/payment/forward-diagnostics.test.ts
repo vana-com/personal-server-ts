@@ -11,6 +11,7 @@ import {
 import { handleX402Cycle, type X402CycleInput } from "../api/index.js";
 import { encodePaymentHeader } from "./x402.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
+import { isOwnAppRead } from "./own-app.js";
 const gatewayConfig: DataPortabilityGatewayConfig = {
   chainId: 14800,
   contracts: {
@@ -229,5 +230,86 @@ describe("log-bound payment forwarding diagnostics", () => {
     expect(JSON.stringify(logger.info.mock.calls)).not.toContain(
       "untrusted diagnostic",
     );
+  });
+});
+
+describe("own-app read fee evidence", () => {
+  const input = {
+    accountUrl: "https://account.test:8443",
+    appAddress: "0xAa",
+    dataOwner: "0xBb",
+    chainId: 14800,
+  };
+  const evidence = {
+    object: "own_app_read_eligibility",
+    appAddress: "0xaa",
+    dataOwner: "0xbb",
+    network: "moksha",
+  };
+
+  it.each([
+    [14800, "moksha", "eligible", true],
+    [1480, "mainnet", "not_eligible", false],
+  ] as const)(
+    "binds an Account answer to chain %s and normalized addresses",
+    async (chainId, network, eligibility, expected) => {
+      const fetch = vi.fn(async (_url: URL, _init: RequestInit) =>
+        Response.json({ ...evidence, network, eligibility }),
+      );
+      vi.stubGlobal("fetch", fetch);
+      try {
+        await expect(isOwnAppRead({ ...input, chainId })).resolves.toBe(
+          expected,
+        );
+        expect(fetch).toHaveBeenCalledOnce();
+        const [url, init] = fetch.mock.calls[0]!;
+        expect(url.origin).toBe("https://account.test:8443");
+        expect(url.pathname).toBe("/api/v1/apps/own-data-read-eligibility");
+        expect(Object.fromEntries(url.searchParams)).toEqual({
+          appAddress: "0xaa",
+          dataOwner: "0xbb",
+          network,
+        });
+        expect(init).toMatchObject({ redirect: "error", cache: "no-store" });
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it.each([
+    ["appAddress", "0xcc"],
+    ["dataOwner", "0xcc"],
+    ["network", "mainnet"],
+  ])(
+    "rejects an eligible response bound to a different %s",
+    async (field, value) => {
+      vi.stubGlobal("fetch", async () =>
+        Response.json({ ...evidence, eligibility: "eligible", [field]: value }),
+      );
+      try {
+        await expect(isOwnAppRead(input)).rejects.toThrow(
+          "Mismatched own-app evidence",
+        );
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("does not request evidence from a non-origin Account URL or an unsupported chain", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    try {
+      await expect(
+        isOwnAppRead({ ...input, accountUrl: "https://account.test/a" }),
+      ).rejects.toThrow("Own-app Account must be an HTTPS origin");
+      await expect(isOwnAppRead({ ...input, chainId: 1 })).rejects.toThrow(
+        "Unsupported own-app network",
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

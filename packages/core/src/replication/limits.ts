@@ -106,6 +106,10 @@ export const REPLICA_DEFAULT_LIMITS: ReplicaResourceLimits = Object.freeze({
 export function replicaResourceLimits(
   overrides: Partial<ReplicaResourceLimits> = {},
 ): ReplicaResourceLimits {
+  for (const [key, value] of Object.entries(overrides)) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+      throw new RangeError(`invalid replica resource limit: ${key}`);
+  }
   return Object.freeze({ ...REPLICA_DEFAULT_LIMITS, ...overrides });
 }
 

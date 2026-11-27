@@ -430,8 +430,20 @@ export function readBinary(
       result.set(bytes, offset);
       offset += bytes.length;
     }
-  } catch {
-    return undefined;
+  } catch (error) {
+    // A manifest was found (length is defined), so a chunk-read failure is
+    // corruption, not absence: surface it with an operator-safe code and the
+    // original error as the cause instead of reporting the blob as missing.
+    const cause = error instanceof Error ? error : new Error(String(error));
+    const failure = new Error(
+      `binary read failed: ${cause.message}`,
+    ) as Error & {
+      code: string;
+      cause: unknown;
+    };
+    failure.code = "binary_read_failed";
+    failure.cause = cause;
+    throw failure;
   }
   return result;
 }

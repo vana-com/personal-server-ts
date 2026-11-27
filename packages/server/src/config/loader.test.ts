@@ -307,6 +307,24 @@ describe("loadConfig", () => {
       },
     );
 
+    it("leaves a valid file unchanged when a cloud port override is invalid", async () => {
+      await withTempDir(async (dir) => {
+        const configPath = join(dir, "config.json");
+        const raw = '{"server":{"port":3017}}\n';
+        await writeFile(configPath, raw);
+
+        await withEnv(
+          { CLOUD_MODE: "true", SERVER_PORT: "not-a-port" },
+          async () => {
+            await expect(loadConfig({ configPath })).rejects.toMatchObject({
+              name: "ZodError",
+            });
+            expect(await readFile(configPath, "utf8")).toBe(raw);
+          },
+        );
+      });
+    });
+
     it("SERVER_ORIGIN overrides default", async () => {
       await withTempDir(async (dir) => {
         const configPath = join(dir, "config.json");
@@ -488,6 +506,20 @@ describe("config storage and path formatting", () => {
         JSON.stringify(edited, null, 2) + "\n",
       );
       expect((await loadConfig({ configPath })).logging.level).toBe("debug");
+    });
+  });
+
+  it("creates config.json under the supplied root when saving without configPath", async () => {
+    const { saveConfig } = await import("./loader.js");
+    await withTempDir(async (dir) => {
+      const config = await loadConfig({
+        configPath: join(dir, "initial.json"),
+      });
+      const rootPath = join(dir, "instance", "nested");
+      await saveConfig(config, { rootPath });
+      expect(await readFile(join(rootPath, "config.json"), "utf8")).toBe(
+        JSON.stringify(config, null, 2) + "\n",
+      );
     });
   });
 

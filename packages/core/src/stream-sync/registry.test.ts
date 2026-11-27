@@ -82,6 +82,84 @@ it("still lists control rows only", async () => {
   ).toEqual([controlScope("acme", "")]);
 });
 
+it.each([
+  ["missing rows", { data: {}, pagination: { hasMore: false } }],
+  [
+    "missing scope",
+    {
+      data: { dataPoints: [{ expectedVersion: "1" }] },
+      pagination: { hasMore: false },
+    },
+  ],
+  [
+    "blank scope",
+    {
+      data: { dataPoints: [row(" ", 1)] },
+      pagination: { hasMore: false },
+    },
+  ],
+  [
+    "non-boolean hasMore",
+    {
+      data: { dataPoints: [] },
+      pagination: { hasMore: "false", nextCursor: "unexpected-third" },
+    },
+  ],
+])(
+  "rejects the entire stream inventory when the later page has %s",
+  async (_name, later) => {
+    const cursors: (string | null)[] = [];
+    const registry = createGatewayStreamSyncRegistry({
+      gatewayUrl: "https://gateway.test",
+      ownerAddress: "0x" + "11".repeat(20),
+      fetch: (async (url: string) => {
+        const cursor = new URL(url).searchParams.get("cursor");
+        cursors.push(cursor);
+        const body =
+          cursor === null
+            ? {
+                data: {
+                  dataPoints: [row(streamScope("acme", "", "items"), 1)],
+                },
+                pagination: { hasMore: true, nextCursor: "next" },
+              }
+            : cursor === "next"
+              ? later
+              : { data: { dataPoints: [] }, pagination: { hasMore: false } };
+        return new Response(JSON.stringify(body));
+      }) as typeof fetch,
+    });
+
+    await expect(registry.listStreamRows("acme")).rejects.toThrow(
+      /registry listing/,
+    );
+    expect(cursors).toEqual([null, "next"]);
+  },
+);
+
+it("rejects a repeated continuation without fetching a third page", async () => {
+  const cursors: (string | null)[] = [];
+  const registry = createGatewayStreamSyncRegistry({
+    gatewayUrl: "https://gateway.test",
+    ownerAddress: "0x" + "11".repeat(20),
+    fetch: (async (url: string) => {
+      cursors.push(new URL(url).searchParams.get("cursor"));
+      if (cursors.length > 2)
+        throw new Error("fixture received an unexpected third fetch");
+      return new Response(
+        JSON.stringify({
+          data: { dataPoints: [row(streamScope("acme", "", "items"), 1)] },
+          pagination: { hasMore: true, nextCursor: "c1" },
+        }),
+      );
+    }) as typeof fetch,
+  });
+  await expect(registry.listStreamRows("acme")).rejects.toThrow(
+    "registry listing repeated a cursor",
+  );
+  expect(cursors).toEqual([null, "c1"]);
+});
+
 /** One listing response with the given `pagination` marker. */
 function registryWithMarker(pagination: unknown) {
   return createGatewayStreamSyncRegistry({
@@ -1022,6 +1100,18 @@ describe("an unreachable registry is told apart from a refusing one", () => {
       );
     },
   );
+  it.each([[true], [[]], ["0x2"], [" 2"], ["2.0"], [2.5], ["1e1"], [null]])(
+    "a point read of a row whose version is %j fails, never an authoritative row",
+    async (expectedVersion) => {
+      const body = {
+        data: { ...row(scope, 1), expectedVersion },
+      };
+      const read = over(async () => new Response(JSON.stringify(body))).read(
+        scope,
+      );
+      await expect(read).rejects.toThrow(/valid version/);
+    },
+  );
   it("a 4xx is not unavailability", async () => {
     for (const status of [400, 401, 403]) {
       const error = await over(refuse(status))
@@ -1352,6 +1442,16 @@ describe("waitForChange with since", () => {
       "for another since (mutation: since not matched)",
       { since: mintCursor(EPOCH_A, 2), reset: true },
     ],
+    ...[true, [], "0x2", 2.5, " 3"].map((expectedVersion) => [
+      `with a row whose version is ${JSON.stringify(expectedVersion)}`,
+      {
+        since: SINCE,
+        reset: false,
+        rows: [{ ...ROW, expectedVersion }],
+        gone: [],
+        serversChanged: false,
+      },
+    ]),
     [
       "with a row whose version is not valid (mutation: rows read loosely)",
       {
@@ -1424,6 +1524,25 @@ describe("Batch-Policy", () => {
     ]) {
       expect(parseBatchPolicy(bad)).toBeUndefined();
     }
+  });
+
+  it("rejects a required policy limit above the safe integer boundary", () => {
+    const overflow = "9007199254740992";
+    for (const header of [
+      `rows=${overflow};bytes=100;requires=3`,
+      `rows=2;bytes=${overflow};requires=3`,
+      `rows=2;bytes=100;requires=${overflow}`,
+    ]) {
+      expect(parseBatchPolicy(header)).toBeUndefined();
+    }
+  });
+
+  it("keeps required limits when only the optional lock limit is out of range", () => {
+    expect(
+      parseBatchPolicy(
+        "rows=2;bytes=9007199254740991;requires=3;lockedScopes=9007199254740992",
+      ),
+    ).toEqual({ rows: 2, bytes: Number.MAX_SAFE_INTEGER, requires: 3 });
   });
 
   it("reads known policy fields regardless of their order and separator spacing", () => {

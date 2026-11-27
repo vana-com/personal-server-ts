@@ -116,7 +116,9 @@ export function streamSyncSeedRoutes(deps: StreamSyncSeedRouteDeps): Hono {
         stream!,
         upload(),
       );
-      if (result.state === "merged") await body?.cancel();
+      // Best effort: the receipt is settled, so a failed cancel of the unread
+      // upload must not turn it into a 500.
+      if (result.state === "merged") await body?.cancel().catch(() => {});
       return c.json(result, result.state === "merged" ? 200 : 202);
     } catch (error) {
       if (error instanceof SeedUploadError) throw badRequest(error);

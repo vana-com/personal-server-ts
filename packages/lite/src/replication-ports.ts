@@ -81,7 +81,10 @@ export function replicationBootConfigProblem(
   if (!/^0x[0-9a-fA-F]{40}$/.test(config.owner)) return "invalid_owner";
   if (config.environment !== "dev" && config.environment !== "prod")
     return "invalid_environment";
-  const { fragmentBytes, step } = config.limits;
+  const limits = config.limits;
+  if (!limits || typeof limits !== "object") return "invalid_limits";
+  const { fragmentBytes, step } = limits;
+  if (!step || typeof step !== "object") return "invalid_limits";
   const positive = (value: number) => Number.isSafeInteger(value) && value > 0;
   if (
     !positive(config.chainId) ||

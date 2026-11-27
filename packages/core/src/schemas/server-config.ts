@@ -183,6 +183,13 @@ export const VanaStorageConfigSchema = z.object({
   apiUrl: z.url().default(DEFAULTS.storage.config.vana.apiUrl),
 });
 
+export const GdriveStorageConfigSchema = z.object({
+  folderId: z.string().min(1).max(256),
+  folderName: z.string().min(1).max(128).default("Vana"),
+  /** Optional Drive API base URL override for local/CI loopback E2E tests. */
+  apiBaseUrl: z.url().optional(),
+});
+
 export const ServerConfigSchema = z.object({
   server: z
     .object({
@@ -204,6 +211,7 @@ export const ServerConfigSchema = z.object({
       config: z
         .object({
           vana: VanaStorageConfigSchema.optional(),
+          gdrive: GdriveStorageConfigSchema.optional(),
         })
         .default({}),
     })

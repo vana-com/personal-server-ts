@@ -73,8 +73,9 @@ import type {
   PendingBlobDeletionStore,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import {
-  createVanaSyncStorageAdapter,
+  createSyncStorageAdapter,
   resolveVanaStorageEndpoint,
+  type StorageCredentialProvider,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import {
   createServerSigner,
@@ -196,6 +197,8 @@ export interface PsLiteSyncOptions {
   autoStartSync?: boolean;
   /** Storage authentication origin, independent of its routing endpoint. */
   storageAudience?: string;
+  /** Host-owned short-lived access-token broker for external OAuth storage backends. */
+  storageCredentials?: StorageCredentialProvider;
   /**
    * Gateway client. The default SDK client is wrapped so the upload deadline
    * closes its in-flight registry write. A client supplied here is used as
@@ -457,11 +460,13 @@ export async function createPsLiteSyncManager(
     );
   const uploadAttemptNamespace =
     options.uploadAttemptNamespace ?? options.stateStore.namespace;
-  const storageAdapter = createVanaSyncStorageAdapter({
+  const storageAdapter = createSyncStorageAdapter({
     config: options.config,
     serverOwner,
     serverAccount: syncAccount,
     audience: options.storageAudience,
+    storageCredentials: options.storageCredentials,
+    fallbackReadToVana: options.config.storage.backend === "gdrive",
   });
   const signer =
     options.ownerSyncSigner ??
@@ -507,6 +512,9 @@ export async function createPsLiteSyncManager(
             masterKey,
             ownerSigner: boundedSigner,
             storageAudience: options.storageAudience,
+            ...(options.config.storage.backend !== "vana"
+              ? { storageAdapter }
+              : {}),
           }),
           workerFactory: options.additionsWorkerFactory,
           deleteSystemScope: async (scope) => {
@@ -545,6 +553,7 @@ export async function createPsLiteSyncManager(
       chainId: options.config.gateway.chainId,
       signMessage: (message) => syncAccount.signMessage(message),
     },
+    ...(options.config.storage.backend !== "vana" ? { storageAdapter } : {}),
   });
   const pendingBlobDeletions = createPsLitePendingBlobDeletionStore(
     options.stateStore,
@@ -588,13 +597,25 @@ export async function createPsLiteSyncManager(
     if (generation === registrationGeneration)
       registrationConfirmed = confirmed;
   }
-  async function checkRegistration(): Promise<boolean> {
+  /**
+   * `confirmed` is this lookup's own answer; `generation` is its token. A
+   * caller that resumes after an await must compare the token again, as a
+   * newer check can start between this return and the caller's resumption.
+   */
+  async function checkRegistration(): Promise<{
+    confirmed: boolean;
+    generation: number;
+  }> {
     const generation = ++registrationGeneration;
     setRegistrationConfirmed(false, generation);
     const serverInfo = await gateway.getServer(options.serverAccount.address);
     const confirmed = Boolean(serverInfo?.id);
     setRegistrationConfirmed(confirmed, generation);
-    return confirmed;
+    // A lookup that a newer one superseded confirms nothing for its caller.
+    return {
+      confirmed: generation === registrationGeneration && confirmed,
+      generation,
+    };
   }
   const retirementWriteReady = () =>
     registrationConfirmed &&
@@ -633,7 +654,18 @@ export async function createPsLiteSyncManager(
   let syncManager!: ReturnType<typeof createSyncManager>;
   try {
     let closed = false;
+    // Retirement tasks started outside a sync cycle. Close settles them before
+    // it closes the database they write to.
+    const retirementTasks = new Set<Promise<unknown>>();
+    const trackRetirement = (task: Promise<unknown>) => {
+      retirementTasks.add(task);
+      void task.then(
+        () => retirementTasks.delete(task),
+        () => retirementTasks.delete(task),
+      );
+    };
     let opening: Promise<LocalSync | null> | undefined;
+    let closing: Promise<void> | undefined;
     async function openDatabase(): Promise<LocalSync | null> {
       if (!options.localDb) return null;
       // Every write the sync engine makes goes through the driver this
@@ -729,13 +761,15 @@ export async function createPsLiteSyncManager(
         // in a full sync cycle. It sends deletes at the gateway, so it needs
         // the write authority a registered runtime has: a read-only
         // registration waits for the cycle that runs once it is admitted.
-        if (retirementWriteReady())
-          void localSync.legacyRetirer.resume().catch((error: unknown) =>
-            logger.warn(
-              {
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Could not resume the legacy retirement at open",
+        if (retirementWriteReady() && !closed)
+          trackRetirement(
+            localSync.legacyRetirer.resume().catch((error: unknown) =>
+              logger.warn(
+                {
+                  error: error instanceof Error ? error.message : String(error),
+                },
+                "Could not resume the legacy retirement at open",
+              ),
             ),
           );
       }
@@ -787,8 +821,14 @@ export async function createPsLiteSyncManager(
           if (options.ownerSyncSigner)
             setRegistrationConfirmed(true, ++registrationGeneration);
           else await checkRegistration();
-          if (!closed && retirementWriteReady())
-            await sync?.legacyRetirer.resume();
+          // Only the resume is tracked: close must not wait on a gateway
+          // lookup that never answers, and a check that answers after close
+          // starts nothing.
+          if (!closed && retirementWriteReady() && sync) {
+            const resuming = sync.legacyRetirer.resume();
+            trackRetirement(resuming);
+            await resuming;
+          }
         })().catch((error: unknown) => {
           logger.warn(
             { error: String(error) },
@@ -888,7 +928,9 @@ export async function createPsLiteSyncManager(
           )
             return { ok: true };
           try {
-            if (await checkRegistration()) return { ok: true };
+            const check = await checkRegistration();
+            if (check.confirmed && check.generation === registrationGeneration)
+              return { ok: true };
             return {
               ok: false,
               reason: "unregistered",
@@ -920,10 +962,14 @@ export async function createPsLiteSyncManager(
       serverOwner,
       dataPointFeed,
       scopeDeletions,
-      closeStreamSync: async () => {
-        closed = true;
-        await opening;
-        await closeDatabase();
+      closeStreamSync: () => {
+        closing ??= (async () => {
+          closed = true;
+          if (opening) await Promise.allSettled([opening]);
+          await Promise.allSettled([...retirementTasks]);
+          await closeDatabase();
+        })();
+        return closing;
       },
       streamSyncIntake,
       streamSyncSeed,

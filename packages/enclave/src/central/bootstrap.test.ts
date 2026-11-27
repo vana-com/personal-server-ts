@@ -55,6 +55,49 @@ it("surfaces a listener close error when MCP cleanup succeeds", async () => {
   ).rejects.toBe(secondary);
 });
 
+it("waits for MCP shutdown to settle before closing the fleet listeners", async () => {
+  const calls: string[] = [];
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const closed = closeFleetListeners(
+    async () => {
+      calls.push("mcp started");
+      await pending;
+      calls.push("mcp closed");
+    },
+    async () => {
+      calls.push("listeners closed");
+    },
+  );
+  try {
+    await Promise.resolve();
+    expect(calls).toEqual(["mcp started"]);
+  } finally {
+    release();
+    await closed;
+  }
+  expect(calls).toEqual(["mcp started", "mcp closed", "listeners closed"]);
+});
+
+it("still closes the fleet listeners after a synchronous MCP cleanup throw", async () => {
+  const calls: string[] = [];
+  const failure = new Error("synchronous MCP close failure");
+  await expect(
+    closeFleetListeners(
+      () => {
+        calls.push("mcp");
+        throw failure;
+      },
+      async () => {
+        calls.push("listeners");
+      },
+    ),
+  ).rejects.toBe(failure);
+  expect(calls).toEqual(["mcp", "listeners"]);
+});
+
 it("rejects unsigned runtime configuration before reading any protected central state", async () => {
   const path = await mkdtemp(join(tmpdir(), "central-config-"));
   const dstack = createFakeDstackClient({ appId: "1".repeat(40) });

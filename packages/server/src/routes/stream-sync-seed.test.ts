@@ -210,6 +210,42 @@ describe("stream-sync seed route", () => {
     expect(await staging.staged(c)).toEqual({});
   });
 
+  it("keeps a merged 200 when cancelling the unread request body fails", async () => {
+    const c = "fixture";
+    status = { targetKnown: true, receipts: { history: "merged" } };
+    const importStaged = vi.fn(async () => {});
+    const cancelled = vi.fn();
+    const request = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(body({ ...DESCRIPTOR, records: 0 }, [])),
+        );
+      },
+      cancel() {
+        cancelled();
+        return Promise.reject(new Error("cancel failed"));
+      },
+    });
+    const merged = app({
+      writer: { seedStatus: async () => status, importStaged },
+      staging,
+    });
+    const res = await merged.request(`/v1/stream-sync/seed/${c}/history`, {
+      method: "PUT",
+      headers: {
+        "content-type": "application/x-ndjson",
+        authorization: `Bearer ${TOKEN}`,
+      },
+      body: request,
+      duplex: "half",
+    } as RequestInit);
+    expect(cancelled).toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ state: "merged" });
+    expect(importStaged).not.toHaveBeenCalled();
+    expect(await staging.staged(c)).toEqual({});
+  });
+
   it("replaces an earlier upload of the same stream", async () => {
     await put(
       routes,
@@ -230,8 +266,10 @@ describe("stream-sync seed route", () => {
       receipts: {},
       skipped: [],
     }));
-    expect(await source.streams("c")).toHaveLength(1);
-    for await (const row of source.records("c", "s")) rowsRead.push(row);
+    const listed = await source.streams("c");
+    expect(listed).toHaveLength(1);
+    for await (const row of source.records("c", "s", listed[0]!.upload))
+      rowsRead.push(row);
     expect(rowsRead).toEqual([{ id: "a" }, { id: "b" }]);
   });
 });

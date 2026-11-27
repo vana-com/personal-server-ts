@@ -774,3 +774,111 @@ it("a rebaseline still drops the tombstones the log delivered", async () => {
   );
   expect(await tombstones()).toEqual([]);
 });
+
+it("a receipt cleanup never drops an upload that replaced the one its status listed", async () => {
+  const w = await world();
+  const dir = mkdtempSync(join(process.cwd(), ".late-seed-test-"));
+  dirs.push(dir);
+  const device = await w.device("a", join(dir, "db.sqlite"));
+  await device.run("refresh", ["B"]);
+  await device.publish();
+  const real = createSeedStaging(createFsStreamSyncFiles(join(dir, "staging")));
+  let listings = 0;
+  const staging = {
+    ...real,
+    // The status lists once under the lock, then the intake lists again. A
+    // newer upload stages straight after the intake's listing, before the
+    // receipt cleanup takes the lock.
+    async staged(connector: string) {
+      const listed = await real.staged(connector);
+      if (++listings === 2)
+        await real.stage(connector, "items", upload(["N1", "N2"]));
+      return listed;
+    },
+  };
+  const intake = createSeedIntake(
+    createLocalSeed({
+      getDeps: async () => device.deps,
+      manifests: () => [manifest],
+      staging,
+    }),
+  );
+  await intake.put("fixture", "items", upload(["A", "B"]));
+  const merged = (await real.staged("fixture")).items!.upload;
+  listings = 0;
+  await intake.status("fixture");
+  const kept = (await real.staged("fixture")).items;
+  expect(kept?.upload).toBeDefined();
+  expect(kept?.upload).not.toBe(merged);
+  expect(kept?.records).toBe(2);
+});
+
+it("a stage and a drop of one stream are serialized: a stage during a drop is not removed by it", async () => {
+  const w = await world();
+  const dir = mkdtempSync(join(process.cwd(), ".late-seed-test-"));
+  dirs.push(dir);
+  const device = await w.device("a", join(dir, "db.sqlite"));
+  const files = createFsStreamSyncFiles(join(dir, "staging"));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let held!: () => void;
+  const holding = new Promise<void>((resolve) => (held = resolve));
+  let gated = false;
+  const whileDropHeld: string[] = [];
+  let dropHeld = false;
+  const onDisk = createSeedStaging({
+    ...files,
+    async write(path, bytes) {
+      if (dropHeld && path.startsWith("staged/")) whileDropHeld.push("publish");
+      await files.write(path, bytes);
+    },
+    async remove(prefix) {
+      if (!gated && prefix.startsWith("staged/")) {
+        gated = true;
+        dropHeld = true;
+        held();
+        await gate;
+        dropHeld = false;
+      }
+      return files.remove(prefix);
+    },
+  });
+  const staging = {
+    ...onDisk,
+    stage(...args: Parameters<typeof onDisk.stage>) {
+      // Reaching the storage adapter proves stage got through its lock, even
+      // if its later blob/pointer writes would be delayed by the filesystem.
+      if (dropHeld) whileDropHeld.push("stage entered");
+      return onDisk.stage(...args);
+    },
+  };
+  const seed = createLocalSeed({
+    getDeps: async () => device.deps,
+    manifests: () => [manifest],
+    staging,
+  });
+  const a = await seed.staging.stage("fixture", "items", upload(["A"]));
+  const dropping = seed.staging.drop("fixture", "items", a.upload);
+  await holding;
+  // The old pointer is still held in drop. Give the promise-based lock and
+  // getDeps handoff one event-loop turn; the admission probe does not wait on disk.
+  const staging2 = seed.staging.stage("fixture", "items", upload(["B"]));
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(whileDropHeld).toEqual([]);
+  } finally {
+    release();
+    await Promise.allSettled([dropping, staging2]);
+  }
+  await dropping;
+  const b = await staging2;
+  expect((await staging.staged("fixture")).items?.upload).toBe(b.upload);
+  const source = staging.source("install", async () => ({
+    receipts: {},
+    skipped: [],
+  }));
+  const rows = [];
+  for await (const row of source.records("fixture", "items", b.upload))
+    rows.push(row);
+  expect(rows).toEqual([{ id: "B" }]);
+});

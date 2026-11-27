@@ -6,6 +6,7 @@ import { pino } from "pino";
 import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { syncRoutes } from "./sync.js";
 
 const auth = {
@@ -79,5 +80,179 @@ describe("switched-mode GET /status", () => {
     const { app } = build(0);
     const res = await app.request("/status", { headers });
     expect(await res.json()).toMatchObject({ changeProbeMs: 0 });
+  });
+});
+
+// The mode can move across any await of a switched-mode route. A route that
+// chose the stream branch must not act or answer under a mode that left it.
+describe("switched-mode routes re-check the mode after their awaits", () => {
+  function setup(
+    opts: {
+      holdLocal?: boolean;
+      holdStatus?: boolean;
+      holdFile?: boolean;
+    } = {},
+  ) {
+    // The first read picks the route; `flip()` moves every later read.
+    let moved = false;
+    let first = true;
+    const read = () => {
+      if (first) {
+        first = false;
+        return "switched";
+      }
+      return moved ? "unswitched" : "switched";
+    };
+    const hold = <T>() => {
+      let release!: (v: T) => void;
+      const promise = new Promise<T>((resolve) => (release = resolve));
+      return { promise, release };
+    };
+    const local = hold<void>();
+    const localEntered = vi.fn();
+    const listing = hold<unknown>();
+    const fileReady = hold<void>();
+    const readFile = vi.fn(async () => new Response("fixture only"));
+    const localFile = vi.fn(async () => {
+      await fileReady.promise;
+      return { connectionId: "fixture", read: readFile };
+    });
+    const syncConnection = vi.fn(async () => undefined);
+    const localSync = {
+      cycle: vi.fn(async () => undefined),
+      syncConnection,
+      listing: {
+        status: vi.fn(() =>
+          opts.holdStatus
+            ? listing.promise
+            : Promise.resolve({ listed: 0, connections: [], issues: [] }),
+        ),
+      },
+    } as unknown as LocalSync;
+    const syncManager = {
+      requestPull: vi.fn(async () => undefined),
+      trigger: vi.fn(async () => undefined),
+      getStatus: vi.fn(() => ({ changeProbeMs: 0 })),
+    } as unknown as SyncManager;
+    const app = syncRoutes({
+      ...auth,
+      logger: pino({ level: "silent" }),
+      syncManager,
+      localSync: opts.holdLocal
+        ? async () => {
+            localEntered();
+            await local.promise;
+            return localSync;
+          }
+        : localSync,
+      accountStorageMode: { read } as never,
+      ...(opts.holdFile ? { localFile } : {}),
+    });
+    app.onError((err, c) =>
+      err instanceof ProtocolError
+        ? c.json(err.toJSON(), err.code as 503)
+        : c.json({ error: String(err) }, 500),
+    );
+    return {
+      app,
+      localEntered,
+      localSync,
+      syncManager,
+      flip: () => (moved = true),
+      releaseLocal: () => local.release(),
+      releaseFile: () => fileReady.release(),
+      localFile,
+      readFile,
+      syncConnection,
+      releaseListing: () =>
+        listing.release({ listed: 0, connections: [], issues: [] }),
+    };
+  }
+  const stopped = async (res: Response) => {
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "ACCOUNT_MODE_UNKNOWN" },
+    });
+  };
+
+  it("does not pull or cycle when the mode moved during auth", async () => {
+    for (const path of ["/trigger?when=changed", "/trigger"]) {
+      const t = setup();
+      t.flip();
+      await stopped(await t.app.request(path, { method: "POST", headers }));
+      expect(t.syncManager.requestPull).not.toHaveBeenCalled();
+      expect(t.localSync.cycle).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not cycle when the mode moved while the local runtime was acquired", async () => {
+    const t = setup({ holdLocal: true });
+    const pending = t.app.request("/trigger", { method: "POST", headers });
+    await vi.waitFor(() => expect(t.localEntered).toHaveBeenCalledTimes(1));
+    t.flip();
+    t.releaseLocal();
+    await stopped(await pending);
+    expect(t.localSync.cycle).not.toHaveBeenCalled();
+  });
+
+  it("refuses a trigger response if the mode moved during a full cycle", async () => {
+    const t = setup();
+    let releaseCycle!: () => void;
+    const cycle = new Promise<void>((resolve) => {
+      releaseCycle = resolve;
+    });
+    const entered = vi.mocked(t.localSync.cycle);
+    entered.mockImplementationOnce(async () => (await cycle) as never);
+    const pending = t.app.request("/trigger", { method: "POST", headers });
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+      t.flip();
+    } finally {
+      releaseCycle();
+    }
+    await stopped(await pending);
+  });
+
+  it("refuses a file response if its account is no longer switched", async () => {
+    const t = setup({ holdFile: true });
+    const pending = t.app.request("/file/fixture", { method: "POST", headers });
+    await vi.waitFor(() => expect(t.localFile).toHaveBeenCalledTimes(1));
+    t.flip();
+    t.releaseFile();
+    await stopped(await pending);
+    expect(t.syncConnection).not.toHaveBeenCalled();
+    expect(t.readFile).not.toHaveBeenCalled();
+  });
+
+  it("does not read listing status when the mode moved during local acquisition", async () => {
+    const t = setup({ holdLocal: true });
+    const pending = t.app.request("/status", { headers });
+    try {
+      await vi.waitFor(() => expect(t.localEntered).toHaveBeenCalledTimes(1));
+      t.flip();
+    } finally {
+      t.releaseLocal();
+    }
+    await stopped(await pending);
+    expect(t.localSync.listing.status).not.toHaveBeenCalled();
+  });
+
+  it("answers no counts when the mode moved while status was read", async () => {
+    const t = setup({ holdStatus: true });
+    const pending = t.app.request("/status", { headers });
+    await vi.waitFor(() =>
+      expect(t.localSync.listing.status).toHaveBeenCalledTimes(1),
+    );
+    t.flip();
+    t.releaseListing();
+    const res = await pending;
+    await stopped(res);
+  });
+
+  it("answers no status when the mode moved before it was read", async () => {
+    const t = setup();
+    t.flip();
+    await stopped(await t.app.request("/status", { headers }));
+    expect(t.localSync.listing.status).not.toHaveBeenCalled();
   });
 });

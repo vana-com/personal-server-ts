@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  OURA_BROWSER_HISTORY_POLICY,
   isOuraTakeoverSelection,
   ouraTakeoverSelectionSince,
 } from "./history-policy.js";
@@ -278,5 +279,24 @@ describe("Oura history selection portability", () => {
       "oura.readiness",
       "oura.activity",
     ]);
+  });
+});
+
+describe("browser checkpoint history protection", () => {
+  it("never interprets an omitted retained entity as a proven deletion", () => {
+    expect(OURA_BROWSER_HISTORY_POLICY).toEqual({
+      allowProvenDeletion: false,
+      preserveRetainedEntities: true,
+    });
+  });
+
+  it("treats an undefined optional time range as full history alongside absent ranges", () => {
+    const streams = [
+      { name: "oura.sleep", time_range: undefined },
+      { name: "oura.readiness" },
+      { name: "oura.activity" },
+    ];
+    expect(ouraTakeoverSelectionSince({ streams })).toEqual({ since: null });
+    expect(isOuraTakeoverSelection({ streams })).toBe(true);
   });
 });

@@ -1056,3 +1056,48 @@ describe("chatgpt.memories supplementary current-binding goldens", () => {
     });
   });
 });
+
+describe("instagram.posts unsafe liker ordinals", () => {
+  it("rejects liker ordinals that JSON cannot represent exactly", () => {
+    // 9007199254740993 parses to 9007199254740992, the same number as
+    // 9007199254740992, so without a safe-integer check both records sort
+    // equal and stable sort preserves delivery order instead of liker order.
+    const result = projectPdppRecordsToLegacyPayload(
+      "instagram.posts",
+      [
+        { stream: "posts", data: { id: "p1" } },
+        {
+          stream: "post_likes",
+          data: {
+            post_id: "p1",
+            liker_ordinal: 9007199254740993,
+            user_id: "u1",
+            username: "first",
+          },
+        },
+        {
+          stream: "post_likes",
+          data: {
+            post_id: "p1",
+            liker_ordinal: 9007199254740992,
+            user_id: "u2",
+            username: "second",
+          },
+        },
+      ],
+      {
+        fetchedStreams: ["posts", "post_likes"],
+        now: ORACLE_CLOCK,
+        profileKey: "meta",
+      },
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "incomplete_scope",
+        scope: "instagram.posts",
+        reason: "post_likes record lacks a valid liker ordinal",
+      },
+    });
+  });
+});

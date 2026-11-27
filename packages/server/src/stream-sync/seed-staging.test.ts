@@ -53,7 +53,8 @@ describe("seed staging", () => {
     expect(seed).toMatchObject({ records: 3, invalid: 0 });
     const source = staging.source("install", async () => NONE);
     const rows = [];
-    for await (const row of source.records("c", "s")) rows.push(row);
+    for await (const row of source.records("c", "s", seed.upload))
+      rows.push(row);
     expect(rows.map((r) => (r as { id: string }).id)).toEqual([
       "a",
       "big",
@@ -63,7 +64,7 @@ describe("seed staging", () => {
     expect(await source.streams("c")).toEqual([
       {
         stream: "s",
-        upload: expect.any(String),
+        upload: seed.upload,
         primaryKey: ["id"],
         profile: { key: "p", version: "2.0.0" },
       },
@@ -104,6 +105,34 @@ describe("seed staging", () => {
       skipped: [{ stream: "s", upload: retired }],
     }));
     expect((await source.streams("c")).map((s) => s.stream)).toEqual(["s"]);
+  });
+
+  it("never serves a later upload's rows under the upload a listing named", async () => {
+    const first = [DESCRIPTOR, '{"id":"a1"}', '{"id":"a2"}', '{"id":"a3"}'];
+    const second = [DESCRIPTOR, '{"id":"b1"}', '{"id":"b2"}', '{"id":"b3"}'];
+    await staging.stage("c", "s", pieces(first.join("\n"), 5));
+    const source = staging.source("install", async () => NONE);
+    const [listed] = await source.streams("c");
+    // A second upload stages between the listing and the read.
+    await staging.stage("c", "s", pieces(second.join("\n"), 5));
+    const read = async (upload: string) => {
+      const rows: string[] = [];
+      for await (const row of source.records("c", "s", upload))
+        rows.push((row as { id: string }).id);
+      return rows;
+    };
+    await expect(read(listed!.upload)).rejects.toMatchObject({
+      errorCode: "SEED_SUPERSEDED",
+    });
+    // The current upload reads under its own identity.
+    const [current] = await source.streams("c");
+    expect(current!.upload).not.toBe(listed!.upload);
+    expect(await read(current!.upload)).toEqual(["b1", "b2", "b3"]);
+    // An acknowledgement of the listed upload leaves the newer one staged.
+    await staging.drop("c", "s", listed!.upload);
+    expect((await staging.staged("c")).s!.upload).toBe(current!.upload);
+    await staging.drop("c", "s", current!.upload);
+    expect(await staging.staged("c")).toEqual({});
   });
 
   it("removes an upload that failed", async () => {
@@ -154,7 +183,9 @@ describe("seed staging", () => {
         async () => NONE,
       );
       const rows = [];
-      for await (const row of source.records("c", "s")) rows.push(row);
+      const [listed] = await source.streams("c");
+      for await (const row of source.records("c", "s", listed!.upload))
+        rows.push(row);
       expect(rows).toEqual([{ id: "a" }]);
     },
   );

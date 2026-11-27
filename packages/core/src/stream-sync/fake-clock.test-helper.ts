@@ -5,6 +5,11 @@
 export function fakeClock() {
   let time = 0;
   const timers: { until: number; fn: () => void }[] = [];
+  // A chain of due timers that reschedules itself (for example at zero delay)
+  // would otherwise keep advance() from returning, so drive()'s elapsed
+  // budget could never stop it. Cap the timers one advance() call fires; the
+  // rest stay queued for the next advance().
+  const MAX_TIMERS_PER_ADVANCE = 1000;
   const flush = async () => {
     for (let i = 0; i < 30; i++) await Promise.resolve();
   };
@@ -24,12 +29,14 @@ export function fakeClock() {
     flush,
     async advance(ms: number): Promise<void> {
       const target = time + ms;
+      let fired = 0;
       for (;;) {
         await flush();
         const due = timers
           .filter((t) => t.until <= target)
           .sort((a, b) => a.until - b.until)[0];
         if (!due) break;
+        if (++fired > MAX_TIMERS_PER_ADVANCE) break;
         timers.splice(timers.indexOf(due), 1);
         time = Math.max(time, due.until);
         due.fn();

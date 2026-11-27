@@ -608,3 +608,37 @@ describe("attempt ledger — paged scans", () => {
     expect((await records(store)).map((r) => r.path)).toEqual([late.path]);
   });
 });
+
+describe("shared core path defaults", () => {
+  it("keeps the portable default root and both legacy aliases consistent", async () => {
+    const {
+      DEFAULT_ROOT_PATH,
+      DEFAULT_DATA_DIR,
+      DEFAULT_CONFIG_PATH,
+      DEFAULT_SERVER_DIR,
+      DEFAULT_VANA_DIR,
+      resolveRootPath,
+    } = await import("../../config/index.js");
+    expect(DEFAULT_ROOT_PATH).toBe("~/personal-server");
+    expect(resolveRootPath()).toBe(DEFAULT_ROOT_PATH);
+    expect(DEFAULT_DATA_DIR).toBe(`${DEFAULT_ROOT_PATH}/data`);
+    expect(DEFAULT_CONFIG_PATH).toBe(`${DEFAULT_ROOT_PATH}/config.json`);
+    expect([DEFAULT_SERVER_DIR, DEFAULT_VANA_DIR]).toEqual([
+      DEFAULT_ROOT_PATH,
+      DEFAULT_ROOT_PATH,
+    ]);
+  });
+
+  it("keeps a browser-safe imported path exactly as the caller supplied it", async () => {
+    const { expandHomePath, resolveRootPath } =
+      await import("../../config/index.js");
+    for (const input of [
+      "~/Fixture Folder",
+      "relative/fixture",
+      "/fixture path/data",
+    ]) {
+      expect(expandHomePath(input)).toBe(input);
+      expect(resolveRootPath(input)).toBe(input);
+    }
+  });
+});

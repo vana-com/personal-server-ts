@@ -138,8 +138,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataPointFeedPort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
-  createVanaSyncStorageAdapter,
+  createSyncStorageAdapter,
   resolveVanaStorageEndpoint,
+  type StorageCredentialProvider,
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import { createFileUploadAttemptStore } from "./upload-attempts.js";
@@ -416,6 +417,11 @@ export interface CreateServerOptions {
    * a copy itself. Ignored unless replication runs in this boot.
    */
   rotateReplicaWriterIdentity?: boolean;
+  /**
+   * Host-owned short-lived access-token broker for external OAuth storage
+   * backends (e.g. Google Drive). Refresh tokens remain in the host boundary.
+   */
+  storageCredentials?: StorageCredentialProvider;
 }
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
@@ -1003,12 +1009,14 @@ async function bootstrapServer(
           },
           { viewChanges: { recorder: viewChanges, logger } },
         );
-        const storage = createVanaSyncStorageAdapter({
+        const storage = createSyncStorageAdapter({
           config,
           serverOwner: serverOwner!,
           serverAccount: serverAccount!,
           reads: "signed",
           fetch: outboundFetch,
+          storageCredentials: options?.storageCredentials,
+          fallbackReadToVana: config.storage.backend === "gdrive",
         });
         const deps: LocalSyncDeps = {
           db,
@@ -1238,12 +1246,14 @@ async function bootstrapServer(
       }),
       storageAdapter:
         options?.additionsWriter?.storageAdapter ??
-        createVanaSyncStorageAdapter({
+        createSyncStorageAdapter({
           config,
           serverOwner,
           serverAccount,
           reads: isEnclave ? "public" : "signed",
           fetch: outboundFetch,
+          storageCredentials: options?.storageCredentials,
+          fallbackReadToVana: config.storage.backend === "gdrive",
         }),
       masterKey: legacyMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
@@ -1260,12 +1270,14 @@ async function bootstrapServer(
   ) {
     const masterKey = legacyMasterKey(masterKeySignature);
 
-    const storageAdapter = createVanaSyncStorageAdapter({
+    const storageAdapter = createSyncStorageAdapter({
       config,
       serverOwner,
       serverAccount,
       reads: isEnclave ? "public" : "signed",
       fetch: outboundFetch,
+      storageCredentials: options?.storageCredentials,
+      fallbackReadToVana: config.storage.backend === "gdrive",
     });
 
     const cursor = createSyncCursor(syncCursorPath, {
@@ -1318,6 +1330,7 @@ async function bootstrapServer(
             chainId: config.gateway.chainId,
             signMessage: (message) => serverAccount.signMessage(message),
           },
+          ...(config.storage.backend !== "vana" ? { storageAdapter } : {}),
         });
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
@@ -1624,12 +1637,14 @@ async function bootstrapServer(
                 config,
                 owner,
                 masterKey: legacyMasterKey(masterKeySignature),
-                storage: createVanaSyncStorageAdapter({
+                storage: createSyncStorageAdapter({
                   config,
                   serverOwner,
                   serverAccount,
                   reads: "signed",
                   fetch: outboundFetch,
+                  storageCredentials: options?.storageCredentials,
+                  fallbackReadToVana: config.storage.backend === "gdrive",
                 }),
                 gateway: gatewayClient,
                 feed: dataPointFeed,

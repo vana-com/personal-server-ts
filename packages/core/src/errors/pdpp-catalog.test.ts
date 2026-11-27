@@ -50,4 +50,33 @@ describe("PdppError", () => {
     expect(first.error.request_id).toBe("first-test");
     expect(second.error.request_id).toBe("second-test");
   });
+
+  it("treats inherited object keys as unknown codes", () => {
+    for (const code of ["constructor", "toString", "__proto__"]) {
+      expect(() => new PdppError(code as never, "x")).toThrow(RangeError);
+      const overridden = new PdppError(code as never, "x", { status: 418 });
+      expect(overridden.status).toBe(418);
+      expect(overridden.type).toBe("api_error");
+    }
+    expect(new PdppError("not_found", "missing").status).toBe(404);
+  });
+
+  it("always uses the catalog status for a known code", () => {
+    const err = new PdppError("not_found", "missing", { status: 500 });
+    expect(err.status).toBe(404);
+    expect(err.type).toBe("not_found_error");
+  });
+
+  it("accepts only an integer HTTP error status for an unknown code", () => {
+    for (const status of [399, 600, 200, 503.5, Number.NaN, 0, -1]) {
+      expect(
+        () => new PdppError("future_code" as never, "x", { status }),
+      ).toThrow(RangeError);
+    }
+    for (const status of [400, 503, 599]) {
+      expect(
+        new PdppError("future_code" as never, "x", { status }).status,
+      ).toBe(status);
+    }
+  });
 });

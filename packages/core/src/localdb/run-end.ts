@@ -1,3 +1,4 @@
+import { runOwnsConnectionState } from "./run-generation-guard.js";
 import { normalizeRawEnd } from "../stream-sync/normalize-raw-end.js";
 import { readRawRecordEvidence } from "./raw-end-evidence.js";
 import { readEndReceipt } from "./run-receipts.js";
@@ -287,11 +288,10 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           declarations,
           raw ? "raw-v1" : "legacy",
         );
-        if (plan.outcome === "failed")
-          return discard("failed", plan.unconfirmed, plan.streamStatus);
         const covered = new Set(plan.covered);
-        const trips = await checkRunFence(deps, runId, "end");
-        if (trips.length > 0) {
+        const settleFence = async (
+          trips: Awaited<ReturnType<typeof checkRunFence>>,
+        ) => {
           const fenced = answer(
             raw
               ? {
@@ -313,8 +313,8 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
           );
           await db.batch([
             {
-              sql: "UPDATE connections SET checkpoint = NULL WHERE connection_id = ?",
-              params: [run.connection_id],
+              sql: `UPDATE connections SET checkpoint = NULL WHERE ${runOwnsConnectionState("connections")}`,
+              params: [runId],
             },
             {
               sql: "UPDATE run_streams SET decision = 'discarded', reason = 'fence', replace = 0, publication_state = 'superseded', publication_reason = 'fence' WHERE run_id = ?",
@@ -326,13 +326,20 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
             })),
             {
               sql: `UPDATE stream_state SET needs_full = 1, complete = 0
-              WHERE connection_id = ? AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
-              params: [run.connection_id, runId],
+              WHERE ${runOwnsConnectionState("stream_state")}
+                AND stream IN (SELECT stream FROM run_streams WHERE run_id = ?)`,
+              params: [runId, runId],
             },
             ...cleanup(fenced),
           ]);
           return fenced;
-        }
+        };
+        const trips = await checkRunFence(deps, runId, "end");
+        if (trips.length > 0) return settleFence(trips);
+        // A failed plan with no fence trip is discarded as it is. With a trip,
+        // the fenced path above has already reset what the delete left.
+        if (plan.outcome === "failed")
+          return discard("failed", plan.unconfirmed, plan.streamStatus);
         // A cursor applied during the run is the entry this run's own merges onto.
         await foldAppliedCursors(db, run.connection_id);
         const [connection] = await db.query<{
@@ -734,9 +741,39 @@ export function createRunEndStore(deps: LocalSyncDeps): RunEndStore {
                 })),
                 { sql: "DROP TABLE run_end_delete_check" },
               ];
+        const intentCheck: SqlStatement[] = [
+          {
+            sql: "CREATE TEMP TABLE run_end_intent_check(ok INTEGER CONSTRAINT run_end_delete_intent CHECK(ok=1))",
+          },
+          {
+            sql: `INSERT INTO run_end_intent_check SELECT NOT EXISTS(
+              SELECT 1 FROM delete_intents d JOIN connections c ON c.connector=d.connector
+              WHERE c.connection_id=?)`,
+            params: [run.connection_id],
+          },
+          { sql: "DROP TABLE run_end_intent_check" },
+        ];
         try {
-          await db.batch(withOrigin("local", [...deleteCheck, ...statements]));
+          await db.batch(
+            withOrigin("local", [
+              ...intentCheck,
+              ...deleteCheck,
+              ...statements,
+            ]),
+          );
         } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message.includes(
+              "CHECK constraint failed: run_end_delete_intent",
+            )
+          )
+            return settleFence(
+              streams.map(({ stream }) => ({
+                stream,
+                trip: "control_deleted",
+              })),
+            );
           if (
             skipZeroDeletes &&
             error instanceof Error &&

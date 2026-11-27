@@ -3,6 +3,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  existsSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -668,3 +669,39 @@ for (const kind of ["node", "lite"])
       expect(f.effects).toHaveLength(2); // capture and the first receipt only
     });
   });
+
+describe("retirement rows when the index delete fails after the file is retired", () => {
+  it("a repeated erase finishes the row: a missing file counts as retired", async () => {
+    const seal = openLegacyWriteSealForTests();
+    const dataDir = mkdtempSync(join(tmpdir(), "legacy-retire-rows-"));
+    const db = initializeDatabase(join(dataDir, "index.db"));
+    closing.push(() => {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    });
+    const index = createIndexManager(db);
+    const rows = createLegacyRetireRows(db, index, { dataDir }, seal);
+    const path = buildDataFilePath(dataDir, base.scope, base.collectedAt);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ scope: base.scope, data: {} }));
+    const indexedPath = relative(dataDir, path);
+    const row = await seal.commit((hold) =>
+      Promise.resolve(index.insert(hold, { ...base, path: indexedPath })),
+    );
+    const authority = () => {};
+
+    const fail = vi.spyOn(index, "deleteByPath").mockImplementationOnce(() => {
+      throw Error("index write failed");
+    });
+    await expect(rows.erase(row, authority)).rejects.toThrow(
+      "index write failed",
+    );
+    // The file is gone and the row stays, so the row is not yet absent.
+    expect(existsSync(path)).toBe(false);
+    expect(await rows.absent([row], authority)).toBe(false);
+
+    fail.mockRestore();
+    await rows.erase(row, authority);
+    expect(await rows.absent([row], authority)).toBe(true);
+  });
+});

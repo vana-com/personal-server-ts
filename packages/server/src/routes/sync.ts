@@ -76,22 +76,43 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     deps.accountStorageMode
       ? deps.accountStorageMode.read() === "unswitched"
       : !deps.localSync;
+  // The stream routes serve a switched account only. The mode can move across
+  // any await, so each route asks again after its awaits.
+  const requireStreamMode = () => {
+    if (
+      deps.accountStorageMode &&
+      deps.accountStorageMode.read() !== "switched"
+    )
+      throw new ProtocolError(
+        503,
+        "ACCOUNT_MODE_UNKNOWN",
+        "The account storage mode is not switched",
+      );
+  };
   app.post("/trigger", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
+    requireStreamMode();
     // A signal, not a sync request: through the manager, which coalesces it
     // with the cycle that is running and cycles only if the registry moved.
     if (c.req.query("when") === "changed" && deps.syncManager) {
       void deps.syncManager.requestPull().catch(() => undefined);
       return c.json({ status: "started", message: "Sync triggered" }, 202);
     }
-    await (await local()).cycle();
+    const sync = await local();
+    requireStreamMode();
+    await sync.cycle();
+    requireStreamMode();
     return c.json({ status: "started", message: "Sync triggered" }, 202);
   });
   app.get("/status", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
-    const status = await (await local()).listing.status();
+    requireStreamMode();
+    const sync = await local();
+    requireStreamMode();
+    const status = await sync.listing.status();
+    requireStreamMode();
     // The probe period is how a client learns this server answers
     // `?when=changed` with a pull and not a full cycle.
     return c.json({
@@ -111,13 +132,28 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   // what it missed while it was away without a read.
   app.get("/events", async (c) => {
     await auth.authorizeOwner(c.req.raw);
+    // Same rule as `requireStreamMode`: a host with no mode source serves the
+    // feed; one with a source serves it only while switched.
+    requireStreamMode();
+    const openingMode = deps.accountStorageMode?.read();
     return streamSSE(c, async (stream) => {
+      let endFeed!: () => void;
+      const left = new Promise<void>((resolve) => {
+        endFeed = resolve;
+      });
+      stream.onAbort(endFeed);
       // One writer per connection folds what arrives while a frame is being
       // written, so a reader that stops reading holds bounded memory.
-      const feed = createFeedWriter((event, data) =>
-        stream.writeSSE({ event, data: JSON.stringify(data) }),
-      );
-      const left = new Promise<void>((resolve) => stream.onAbort(resolve));
+      // Validate at dequeue, not at enqueue: a slow reader may still have
+      // frames pending when the account leaves switched mode.
+      const feed = createFeedWriter(async (event, data): Promise<void> => {
+        if (deps.accountStorageMode?.read() !== openingMode) {
+          feed.close();
+          endFeed();
+          return;
+        }
+        await stream.writeSSE({ event, data: JSON.stringify(data) });
+      });
       // A subscription joins this list when it is acquired, so whatever
       // happens next releases exactly what was acquired.
       const release: Array<() => void> = [];
@@ -144,7 +180,11 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
           try {
             stop();
           } catch (err) {
-            deps.logger.warn({ err }, "sync event feed release failed");
+            try {
+              deps.logger.warn({ err }, "sync event feed release failed");
+            } catch {
+              // A broken logger must not prevent the remaining releases.
+            }
           }
         }
       }
@@ -153,13 +193,25 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
   app.post("/file/:id", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
+    requireStreamMode();
     const file = await deps.localFile?.(c.req.param("id"));
+    requireStreamMode();
     if (!file)
       return c.json({ error: { errorCode: "STREAM_DATA_NOT_FOUND" } }, 404);
-    const result = await (await local()).syncConnection(file.connectionId);
+    const sync = await local();
+    requireStreamMode();
+    const result = await sync.syncConnection(file.connectionId);
+    requireStreamMode();
     if (result?.error)
       return c.json({ error: { errorCode: "STREAM_READ_UNAVAILABLE" } }, 503);
-    return file.read();
+    const response = await file.read();
+    try {
+      requireStreamMode();
+    } catch (error) {
+      void response.body?.cancel().catch(() => undefined);
+      throw error;
+    }
+    return response;
   });
 
   app.all("*", (c) =>

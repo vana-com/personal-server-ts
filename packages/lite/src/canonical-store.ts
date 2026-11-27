@@ -417,13 +417,20 @@ export function createLiteCanonicalStore(deps: {
     if (deps.enabled !== true)
       throw new Error("Lite canonical replication disabled");
   }
+  /** The owner rule of clock(), without binding an owner or writing a clock. */
+  async function assertOwner(
+    tx: LiteCanonicalTransaction,
+    context = deps.context(),
+  ): Promise<void> {
+    const owner = await get<string>(tx, "owner");
+    if (!context.owner || (owner !== undefined && owner !== context.owner))
+      throw new Error("immutable canonical owner binding");
+  }
   async function clock(
     tx: LiteCanonicalTransaction,
     context = deps.context(),
   ): Promise<Clock> {
-    const owner = await get<string>(tx, "owner");
-    if (!context.owner || (owner !== undefined && owner !== context.owner))
-      throw new Error("immutable canonical owner binding");
+    await assertOwner(tx, context);
     await put(tx, "owner", context.owner);
     const stored = await get<Clock>(tx, "clock");
     if (stored) return stored;
@@ -2191,6 +2198,7 @@ export function createLiteCanonicalStore(deps: {
       if (replicaStateVisible("pending", options.reader, deps.visibilityPolicy))
         return [];
       return persistence.transaction(async (tx) => {
+        await assertOwner(tx);
         const completions: CompletionOperation[] = [];
         for await (const entry of scan(
           tx,

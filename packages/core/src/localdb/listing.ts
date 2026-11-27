@@ -498,14 +498,37 @@ export function createLocalListing(
 
     async status(options) {
       const audit = options?.audit === true;
-      const rows = await connections();
-      // An audit reads each connection's state with its digests (see
-      // `auditedConnection`); a plain status reads every state at once.
-      const states = audit
+      // Control and heads must come from one snapshot before reporting
+      // completeness. The left join retains connections without heads.
+      const joined = audit
         ? []
-        : await reads.db.query<StreamState>(
-            `${stateSql} ORDER BY s.connection_id, s.stream`,
+        : await reads.db.query<
+            Connection & Omit<StreamState, "stream"> & { stream: string | null }
+          >(
+            `SELECT connections.connection_id, connections.connector,
+               connections.ns, connections.generation,
+               ${effectiveControl("connections")} AS control_state,
+               s.stream, s.complete, s.head_version, s.head_generation,
+               s.head_blob, s.last_delete_version,
+               (SELECT COUNT(*) FROM records r
+                WHERE r.connection_id = s.connection_id AND r.stream = s.stream)
+                AS records
+             FROM connections LEFT JOIN stream_state s
+               ON s.connection_id = connections.connection_id
+             ORDER BY connections.connector, connections.ns,
+               connections.connection_id, s.stream`,
           );
+      const rows = audit
+        ? await connections()
+        : [...new Map(joined.map((row) => [row.connection_id, row])).values()];
+      const states = new Map<string, StreamState[]>();
+      for (const row of joined) {
+        if (row.stream === null) continue;
+        const state = { ...row, stream: row.stream };
+        const connectionStates = states.get(row.connection_id);
+        if (connectionStates) connectionStates.push(state);
+        else states.set(row.connection_id, [state]);
+      }
       // A first load in progress, for the owner's diagnostics. Only when the
       // host serves them: with the flag off a stream with no complete head
       // reports as it always did.
@@ -557,8 +580,9 @@ export function createLocalListing(
           string,
           StreamSyncReadStatus["connections"][number]["streams"][string]
         > = {};
-        for (const state of audited?.states ?? states) {
-          if (state.connection_id !== row.connection_id) continue;
+        for (const state of audited?.states ??
+          states.get(row.connection_id) ??
+          []) {
           const { tombstoned, live, complete } = streamFacts(row, state);
           streams[state.stream] = {
             tombstoned,
