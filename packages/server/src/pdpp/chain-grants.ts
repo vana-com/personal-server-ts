@@ -714,8 +714,10 @@ export class PdppChainRegistrar {
       !!slot &&
       slot.revokedAt === null &&
       (slot.registrationOutcome === undefined ||
-        slot.registrationOutcome === null ||
-        SETTLING.has(slot.registrationOutcome));
+      slot.registrationOutcome === null
+        ? // F3: without an outcome, a failed slot is not settling.
+          slot.status !== "failed"
+        : SETTLING.has(slot.registrationOutcome));
     if (!settling || unsettled.length === 0) {
       if (reg.deferredSince) store.noteChainDeferral(reg.grantId, null);
       return null;
@@ -910,7 +912,8 @@ export class PdppChainRegistrar {
     const { store, gateway, owner, chain } = this.options;
     const reg = store.getChainRegistration(grantId);
     if (!reg || reg.status !== "ending") return;
-    if (!force && reg.endedVersion === null && this.backingOff(reg)) return;
+    // A failed write (first end or re-sign) backs off like any other.
+    if (!force && this.backingOff(reg)) return;
 
     let granteeId = reg.granteeId;
     if (!granteeId) {
@@ -989,53 +992,80 @@ export class PdppChainRegistrar {
     const listedVerified = slot.scopes.filter(
       (e) => e !== reg.entry && verified(e),
     );
+    // Only rows bound to THIS slot on THIS deployment: an entry bound under an
+    // older slot or contract is not the gateway's to carry here (it would
+    // answer 409 PDPP_ENTRY_BOUND_ELSEWHERE / 400 and the end would never land).
     const ownBound = store
       .listChainRegistrations(["bound"])
       .filter(
         (r) =>
           r.grantId !== grantId &&
           r.granteeAddress.toLowerCase() === reg.granteeAddress.toLowerCase() &&
+          r.permissionId?.toLowerCase() === slotId.toLowerCase() &&
+          r.chainId === this.options.deployment.chainId &&
+          r.contractAddress?.toLowerCase() ===
+            this.options.deployment.contractAddress.toLowerCase() &&
           !listedVerified.includes(r.entry),
       )
       .map((r) => r.entry);
-    const remaining = [...listedVerified, ...ownBound];
-    const revocation = remaining.length === 0 || slot.revokedAt !== null;
-    // A V2 revocation lists a non-empty subset of the gateway's scopes and a
-    // past expiry; a removal-only upsert keeps the earliest known expiry, so
-    // nothing it keeps outlives its terms (F1).
-    const scopes = revocation ? slot.scopes.filter(verified) : remaining;
-    if (scopes.length === 0) {
-      store.noteChainError(
-        grantId,
-        "no verified scope to sign a revocation over",
-        this.now(),
-      );
-      return;
-    }
-    const expiresAt = revocation
-      ? BigInt(Math.floor(this.now().getTime() / 1000) - 300)
-      : earlierExpiry(
-          BigInt(slot.expiresAtSeconds),
-          read.permission?.expiresAt ?? 0n,
+    let current = slot;
+    let answer: GatewayAnswer | undefined;
+    let revocation = false;
+    let grantVersion = 0n;
+    // Attempt 1 carries own bound entries the gateway's view omits; if the
+    // gateway refuses that (4xx), attempt 2 re-sends the end without them,
+    // falling back to a V2 revocation when nothing remains.
+    for (const carryUnlisted of ownBound.length > 0 ? [true, false] : [false]) {
+      const remaining = carryUnlisted
+        ? [...listedVerified, ...ownBound]
+        : listedVerified;
+      revocation = remaining.length === 0 || current.revokedAt !== null;
+      // A V2 revocation lists a non-empty subset of the gateway's scopes and
+      // a past expiry; a removal-only upsert keeps the earliest known expiry,
+      // so nothing it keeps outlives its terms (F1).
+      const scopes = revocation ? current.scopes.filter(verified) : remaining;
+      if (scopes.length === 0) {
+        store.noteChainError(
+          grantId,
+          "no verified scope to sign a revocation over",
+          this.now(),
         );
-    const grantVersion = BigInt(slot.currentGrantVersion) + 1n;
-    const signature = await this.options.signGrantRegistration({
-      grantorAddress: owner,
-      granteeId: granteeId as `0x${string}`,
-      scopes,
-      grantVersion,
-      expiresAt,
-    });
-    const body = {
-      grantorAddress: owner,
-      grantVersion: grantVersion.toString(),
-      scopes,
-      expiresAt: expiresAt.toString(),
-    };
-    const answer = revocation
-      ? await gateway.revokeSlot(slotId, body, signature)
-      : await gateway.registerSlot({ ...body, granteeId }, signature);
-    if (answer.status >= 200 && answer.status < 300) {
+        return;
+      }
+      const expiresAt = revocation
+        ? BigInt(Math.floor(this.now().getTime() / 1000) - 300)
+        : earlierExpiry(
+            BigInt(current.expiresAtSeconds),
+            read.permission?.expiresAt ?? 0n,
+          );
+      grantVersion = BigInt(current.currentGrantVersion) + 1n;
+      const signature = await this.options.signGrantRegistration({
+        grantorAddress: owner,
+        granteeId: granteeId as `0x${string}`,
+        scopes,
+        grantVersion,
+        expiresAt,
+      });
+      const body = {
+        grantorAddress: owner,
+        grantVersion: grantVersion.toString(),
+        scopes,
+        expiresAt: expiresAt.toString(),
+      };
+      answer = revocation
+        ? await gateway.revokeSlot(slotId, body, signature)
+        : await gateway.registerSlot({ ...body, granteeId }, signature);
+      const refusedCarry =
+        carryUnlisted && answer.status >= 400 && answer.status < 500;
+      if (!refusedCarry) break;
+      this.options.logger.warn(
+        { grantId, status: answer.status },
+        "PDPP chain: gateway refused own entries it does not list; ending without them",
+      );
+      // The refused signature may have spent its version: read it again.
+      current = (await gateway.getSlot(slotId)) ?? current;
+    }
+    if (answer && answer.status >= 200 && answer.status < 300) {
       store.noteChainEndingSent(
         grantId,
         grantVersion.toString(),
@@ -1055,7 +1085,8 @@ export class PdppChainRegistrar {
           store.requeueChainRegistration(pending.grantId);
       return;
     }
-    store.noteChainError(grantId, `end: ${describe(answer)}`, this.now());
+    if (answer)
+      store.noteChainError(grantId, `end: ${describe(answer)}`, this.now());
   }
 }
 

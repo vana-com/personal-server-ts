@@ -18,6 +18,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { Hono, type Context } from "hono";
 import pino from "pino";
 import { privateKeyToAccount } from "viem/accounts";
@@ -127,6 +128,8 @@ class FakeGateway {
   chainDown = false;
   /** Play a gateway older than 129b16e (no registrationOutcome). */
   omitOutcome = false;
+  /** Refuse an upsert listing an entry the gateway view does not list. */
+  refuseUnlisted = false;
   /** Hang every request (no answer) when set (F4 timeouts). */
   hang = false;
   requests: Array<{ method: string; path: string; body?: unknown }> = [];
@@ -351,6 +354,23 @@ class FakeGateway {
       });
       if (signer.toLowerCase() !== server.address.toLowerCase())
         return Response.json({ error: "bad signer" }, { status: 401 });
+      if (this.refuseUnlisted) {
+        const listed =
+          (this.lie?.scopes as string[] | undefined) ?? this.slot?.scopes ?? [];
+        const attached = new Set(
+          (body.pdppGrants ?? []).map((a: { entry: string }) => a.entry),
+        );
+        if (
+          (body.scopes as string[]).some(
+            (e) =>
+              e.startsWith("pdpp:") && !listed.includes(e) && !attached.has(e),
+          )
+        )
+          return Response.json(
+            { code: "PDPP_ENTRY_BOUND_ELSEWHERE" },
+            { status: 409 },
+          );
+      }
       const stale = this.checkVersion(BigInt(body.grantVersion));
       if (stale) return stale;
       for (const a of body.pdppGrants ?? []) {
@@ -1554,5 +1574,73 @@ describe("never drops a scope another surface is still settling", () => {
     expect((posts().at(-1)!.body as { scopes: string[] }).scopes).toEqual([
       store.getChainRegistration(second)!.entry,
     ]);
+  });
+
+  function setPermissionId(grantId: string, permissionId: string) {
+    const db = new Database(join(dir, "auth.db"));
+    db.prepare(
+      "UPDATE pdpp_chain_registrations SET permission_id = ? WHERE grant_id = ?",
+    ).run(permissionId, grantId);
+    db.close();
+  }
+
+  it("final F1: never carries an own entry bound under another slot into a removal", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    const b = store.getChainRegistration(second)!.entry;
+    // B is bound under an old slot; the gateway's view of THIS slot omits it.
+    setPermissionId(second, `0x${"d".repeat(64)}`);
+    gateway.lie = { scopes: [a] };
+    await ownerRevoke(first);
+    const written = gateway.requests
+      .filter(
+        (r) =>
+          r.method === "DELETE" ||
+          (r.method === "POST" && r.path === "/v1/grants"),
+      )
+      .at(-1)!;
+    expect(written.method).toBe("DELETE");
+    expect((written.body as { scopes: string[] }).scopes).toEqual([a]);
+    expect((written.body as { scopes: string[] }).scopes).not.toContain(b);
+  });
+
+  it("final F1: a refused upsert carrying unlisted own entries is re-sent without them", async () => {
+    const first = await approvedGrantId();
+    const second = await approvedGrantId([{ name: "profile", fields: ["*"] }]);
+    gateway.settle();
+    const a = store.getChainRegistration(first)!.entry;
+    const b = store.getChainRegistration(second)!.entry;
+    gateway.lie = { scopes: [a] }; // the view omits B, bound to this slot
+    gateway.refuseUnlisted = true;
+    const before = posts().length;
+    await ownerRevoke(first);
+    // Attempt 1: removal-only [B], refused 409; attempt 2: nothing remains,
+    // so a V2 revocation over the verified scopes.
+    expect(
+      posts()
+        .slice(before)
+        .map((p) => (p.body as { scopes: string[] }).scopes),
+    ).toEqual([[b]]);
+    const del = gateway.requests.filter((r) => r.method === "DELETE");
+    expect(del).toHaveLength(1);
+    expect((del[0].body as { scopes: string[] }).scopes).toEqual([a]);
+    expect(store.getChainRegistration(first)).toMatchObject({
+      status: "ending",
+      endingKind: "revocation",
+    });
+  });
+
+  it("final F3: with no registrationOutcome, a failed slot is not settling", async () => {
+    gateway.omitOutcome = true;
+    foreignSettling();
+    gateway.slot!.status = "failed";
+    const grantId = await approvedGrantId();
+    expect(posts()).toHaveLength(1);
+    expect((posts()[0].body as { scopes: string[] }).scopes).toEqual([
+      store.getChainRegistration(grantId)!.entry,
+    ]);
+    expect(store.getChainRegistration(grantId)!.deferredSince).toBeNull();
   });
 });
