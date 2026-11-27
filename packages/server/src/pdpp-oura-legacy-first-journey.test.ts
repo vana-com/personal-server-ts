@@ -884,7 +884,10 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
       expect(await readAll()).toEqual(ALL(FILE));
     });
 
-    it("refuses to delete a scope whose oura-browser rows exist, though the file is what reads serve", async () => {
+    // An unswitched account has no connector delete, so the per-scope
+    // delete takes the file and resets the oura-browser connection whose
+    // rows would otherwise appear once the file is gone.
+    it("deletes a scope whose oura-browser rows exist: the file goes and the rows are reset", async () => {
       await writeLegacy(DAYS, T_LEGACY);
       await writePdpp(DAYS, T_PDPP);
       expect(await readAll()).toEqual(ALL(FILE));
@@ -892,10 +895,23 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
         method: "DELETE",
         headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
       });
-      expect(del.status).toBe(409);
-      expect(await del.json()).toMatchObject({
-        error: "CANONICAL_DELETE_UNSUPPORTED",
+      expect(del.status).toBe(200);
+      // The deleted scope serves neither copy; the sibling scopes still serve
+      // their files, so the reset erased nothing they show.
+      expect(await readAll()).toEqual({
+        "oura.sleep": "503 no_connection",
+        "oura.readiness": FILE,
+        "oura.activity": FILE,
       });
+      for (const scope of ["oura.readiness", "oura.activity"] as const) {
+        const del2 = await ctx!.app.request(`/v1/data/${scope}`, {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+        });
+        expect(del2.status).toBe(200);
+      }
+      // Desktop deletes a source's scopes together: nothing is served.
+      expect(await readAll()).toEqual(ALL("503 no_connection"));
     });
   });
 });
@@ -941,11 +957,6 @@ describe("an owner who disconnects or reconnects oura-browser while the legacy f
   it("lets the owner delete the legacy scope once the connection that held rows is gone", async () => {
     await writeLegacy(DAYS, T_LEGACY);
     const token = await writePdpp(DAYS, T_PDPP);
-    const blocked = await ctx!.app.request("/v1/data/oura.sleep", {
-      method: "DELETE",
-      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
-    });
-    expect(blocked.status).toBe(409);
     await disconnect(token);
     const deleted = await ctx!.app.request("/v1/data/oura.sleep", {
       method: "DELETE",

@@ -111,6 +111,8 @@ export interface DataRouteDeps {
    * `PersonalServerDataApiDeps.legacyScopeView`. Absent = file reads only.
    */
   legacyScopeView?: LegacyScopeViewPort;
+  /** See `PersonalServerDataApiDeps.resetConnection`. Absent = refused as before. */
+  resetConnection?: (instance: string) => void;
   /** See `PersonalServerDataApiDeps.streamSyncRead`. Absent = reads as before. */
   streamSyncRead?: StreamSyncReadPort;
   history?: LocalHistory;
@@ -438,6 +440,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         additions: deps.additions,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
+        resetConnection: deps.resetConnection,
         streamSyncRead: deps.streamSyncRead,
         history: deps.history,
         accountStorageMode: deps.accountStorageMode,

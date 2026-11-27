@@ -2656,6 +2656,84 @@ describe("DELETE /v1/data/:scope", () => {
     expect(accessLogWriter.write).not.toHaveBeenCalled();
   });
 
+  /** A view that owns `instagram.profile` and names one serving connection. */
+  function owningView(
+    withServing = true,
+  ): NonNullable<DataRouteDeps["legacyScopeView"]> {
+    return {
+      readLatest: vi.fn(),
+      listingFor: vi.fn(),
+      listCanonicalScopes: vi.fn(() => []),
+      ownsScope: vi.fn(() => true),
+      ...(withServing
+        ? { connectionsServing: vi.fn(() => ["instagram:owner"]) }
+        : {}),
+      verdictFor: vi.fn(() => []),
+      resetTakeover: vi.fn(),
+      isReset: vi.fn(() => false),
+    } as unknown as NonNullable<DataRouteDeps["legacyScopeView"]>;
+  }
+
+  it("deletes an owned scope on an unswitched account, then resets its serving connections", async () => {
+    const resetConnection = vi.fn();
+    const app = createApp({ legacyScopeView: owningView(), resetConnection });
+    await ingestData("instagram.profile", { version: 1 }, app);
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(200);
+    expect(indexManager.countByScope("instagram.profile")).toBe(0);
+    expect(resetConnection).toHaveBeenCalledWith("instagram:owner");
+  });
+
+  it("resets no connection when the gateway tombstone fails (nothing was deleted)", async () => {
+    const resetConnection = vi.fn();
+    const app = createApp({
+      legacyScopeView: owningView(),
+      resetConnection,
+      syncManager: {
+        deleteScope: vi.fn(async (scope: string) => ({
+          scope,
+          dataPointId: "0xdp",
+          durable: false,
+          steps: {
+            gateway: { status: "failed" as const, error: "Gateway error: 503" },
+            storage: { status: "skipped" as const, reason: "gateway-failed" },
+            local: { status: "skipped" as const, reason: "gateway-failed" },
+          },
+          pendingBlobDeletion: false,
+        })),
+      } as unknown as SyncManager,
+    });
+
+    const res = await deleteWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(502);
+    expect(resetConnection).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no reset seam", { withServing: true, reset: false }],
+    ["no serving read", { withServing: false, reset: true }],
+  ])(
+    "still refuses an owned scope (409) and changes nothing with %s",
+    async (_label, { withServing, reset }) => {
+      const resetConnection = vi.fn();
+      const app = createApp({
+        legacyScopeView: owningView(withServing),
+        ...(reset ? { resetConnection } : {}),
+      });
+      await ingestData("instagram.profile", { version: 1 }, app);
+
+      const res = await deleteWithAuth(app, "instagram.profile");
+
+      expect(res.status).toBe(409);
+      expect((await res.json()).error).toBe("CANONICAL_DELETE_UNSUPPORTED");
+      expect(indexManager.countByScope("instagram.profile")).toBe(1);
+      expect(resetConnection).not.toHaveBeenCalled();
+    },
+  );
+
   it("returns 400 for invalid scope", async () => {
     const app = createApp();
 

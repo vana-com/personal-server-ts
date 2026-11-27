@@ -403,6 +403,15 @@ export interface PersonalServerDataApiDeps {
    */
   legacyScopeView?: LegacyScopeViewPort;
   /**
+   * Resets one connection on this device: erases its rows and starts its
+   * next generation, keeping the id registered so the next collection writes
+   * to it (the record store's `resetConnection`, not `deleteConnection`, which
+   * retires the id). With `legacyScopeView.connectionsServing` it lets an
+   * unswitched account delete a canonical-owned scope; absent, that delete is
+   * refused (409 CANONICAL_DELETE_UNSUPPORTED) as before.
+   */
+  resetConnection?: (instance: string) => void;
+  /**
    * Stream-sync reads. Absent = every read takes the
    * existing path, unchanged. Present: a latest read of a name a stream view
    * can serve is answered from the view (§2.10); a deleted connector's
@@ -4098,9 +4107,30 @@ export async function handlePersonalServerDataRequest(
       // A canonical-owned scope's latest body is its connection's rows. No
       // store seam deletes one legacy scope's rows (streams can be shared,
       // and the account and its generation are the unit of erasure), so a
-      // 200 here would leave the data readable. Refuse before any gateway or
-      // file change; the connection's own delete erases its rows.
-      if (deps.legacyScopeView?.ownsScope(parsed.scope)) {
+      // legacy-only 200 would leave the data readable.
+      //
+      // This account is not switched (a switched one was refused above), so
+      // it has no connector delete: that route answers NOT_SWITCHED. Here the
+      // per-scope delete is the only way to erase, so it deletes the file
+      // durably and then resets every connection serving the scope: its rows
+      // are erased whole and the id stays usable for the next collection.
+      // A connection holds sibling scopes too, so their canonical rows go as
+      // well; Desktop, Web and Mobile delete a source's scopes together, and a
+      // partial run converges on retry. Without both seams the delete is
+      // refused before any change.
+      const owned = deps.legacyScopeView?.ownsScope(parsed.scope) ?? false;
+      const resetServing =
+        owned &&
+        deps.resetConnection &&
+        deps.legacyScopeView?.connectionsServing
+          ? {
+              reset: deps.resetConnection,
+              serving: deps.legacyScopeView.connectionsServing.bind(
+                deps.legacyScopeView,
+              ),
+            }
+          : null;
+      if (owned && !resetServing) {
         return jsonResponse(
           {
             error: "CANONICAL_DELETE_UNSUPPORTED",
@@ -4159,6 +4189,20 @@ export async function handlePersonalServerDataRequest(
           scope: parsed.scope,
           result,
         });
+      }
+
+      // After the file: a failed tombstone above leaves both copies, so
+      // "nothing was deleted" stays true. Read the serving connections now,
+      // so one that started holding rows during the file delete goes too.
+      // A reset that throws answers 500 with the file already gone; the scope
+      // stays owned, so the retry lands here and resets what still holds rows.
+      if (resetServing) {
+        const serving = resetServing.serving(parsed.scope);
+        for (const instance of serving) resetServing.reset(instance);
+        deps.logger?.info?.(
+          { scope: parsed.scope, resetConnections: serving.length },
+          "Reset the connections serving a deleted canonical scope",
+        );
       }
 
       // Audit entry, best-effort: the deletion above is irreversible and

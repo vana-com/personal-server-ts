@@ -685,6 +685,7 @@ export function createSqliteRecordStore(
     label: string;
   }): PdppInstanceBinding;
   deleteConnection(instance: string): PdppInstanceBinding;
+  resetConnection(instance: string): PdppInstanceBinding;
   getInstanceBinding(instance: string): PdppInstanceBinding;
   /**
    * Run synchronous reads against one SQLite read snapshot. A write from any
@@ -1424,6 +1425,27 @@ export function createSqliteRecordStore(
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
       replica?.captureLifecycle(instance, "connection-delete");
+      replica?.notifyVisibility();
+      return getInstanceBinding(instance);
+    });
+  }
+
+  /**
+   * Erases a live connection's rows and starts its next generation, keeping
+   * the id registered: unlike `deleteConnection`, the next collection writes
+   * to the same connection (at the new `binding_generation`). A deleted
+   * connection is returned unchanged. The replica records `connection-reset`.
+   */
+  function resetConnection(instance: string): PdppInstanceBinding {
+    return connectionMutation(instance, () => {
+      const current = ensureBinding(db, instance);
+      if (current.deleted_at !== null) return getInstanceBinding(instance);
+      eraseInstanceData(instance);
+      const resetClock = (nextWriteSeq.get() as { value: number }).value;
+      db.prepare(
+        "UPDATE pdpp_instance_binding SET generation = generation + 1, reset_clock = ? WHERE instance = ?",
+      ).run(resetClock, instance);
+      replica?.captureLifecycle(instance, "connection-reset");
       replica?.notifyVisibility();
       return getInstanceBinding(instance);
     });
@@ -2286,6 +2308,7 @@ export function createSqliteRecordStore(
     listConnections,
     registerConnection,
     deleteConnection,
+    resetConnection,
     ingestBatch,
     getInstanceBinding,
     listRetainedRecordData: (instance: string, stream: string) => {

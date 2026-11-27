@@ -219,9 +219,10 @@ async function replace(
   rows: Record<string, unknown>[],
   sourceCollectedAt: string | undefined,
   instance = accountOne,
+  generation = 1,
 ) {
   const response = await ctx!.app.request(
-    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=1`,
+    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=${generation}`,
     {
       method: "POST",
       headers: {
@@ -1732,30 +1733,94 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     ]);
   });
 
-  it("refuses a local DELETE of a canonical scope and changes nothing", async () => {
+  function connectionRows(instance: string): number {
+    const db = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return (
+        db
+          .prepare("SELECT COUNT(*) AS n FROM pdpp_records WHERE instance = ?")
+          .get(instance) as { n: number }
+      ).n;
+    } finally {
+      db.close();
+    }
+  }
+
+  function binding(instance: string) {
+    const db = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return db
+        .prepare(
+          "SELECT generation, deleted_at FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get(instance);
+    } finally {
+      db.close();
+    }
+  }
+
+  // An unswitched account has no connector delete (it answers NOT_SWITCHED),
+  // so the per-scope DELETE is the only way to erase a canonical scope. It
+  // deletes the legacy file as before and erases the connection rows that
+  // serve the scope, so neither copy stays readable.
+  it("deletes a canonical scope on an unswitched account: legacy file and connection rows, then collects again", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("notes.manual", { text: "kept" });
     await collectActivity();
-    const before = ctx!.indexManager.findLatestByScope("oura.activity");
-    expect(before).toBeDefined();
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
+    expect(connectionRows(accountOne)).toBeGreaterThan(0);
 
     const deletion = await ctx!.app.request("/v1/data/oura.activity", {
       method: "DELETE",
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
-    expect(deletion.status).toBe(409);
+    expect(deletion.status).toBe(200);
     expect(await deletion.json()).toMatchObject({
-      error: "CANONICAL_DELETE_UNSUPPORTED",
       scope: "oura.activity",
+      steps: { local: { status: "ok" } },
     });
-    // Nothing was deleted, and nothing claims it was: the legacy history
-    // and the canonical latest body are both as before.
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
-      before,
-    );
+    expect(
+      ctx!.indexManager.findLatestByScope("oura.activity"),
+    ).toBeUndefined();
+    expect(connectionRows(accountOne)).toBe(0);
     const latest = await ownerGet("/v1/data/oura.activity");
-    expect(latest.status).toBe(200);
-    expect(ids(latest.text)).toEqual(["a1"]);
+    expect(latest.status).not.toBe(200);
+    expect(latest.text).not.toContain("a1");
+    const listing = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(listing.scopes.map((s) => s.scope)).not.toContain("oura.activity");
+
+    // A repeat (Desktop's retry) answers the same and changes nothing more.
+    const again = await ctx!.app.request("/v1/data/oura.activity", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(again.status).toBe(200);
+
+    // The connection was reset, not retired: same id, next generation.
+    expect(binding(accountOne)).toEqual({ generation: 2, deleted_at: null });
+
+    // The person refreshes Oura later: the same connection collects again,
+    // at the generation Desktop reads from the binding.
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a2", "2026-09-02")],
+      "2026-09-11T06:00:00Z",
+      accountOne,
+      2,
+    );
+    const recollected = await ownerGet("/v1/data/oura.activity");
+    expect(recollected.status).toBe(200);
+    expect(ids(recollected.text)).toEqual(["a2"]);
 
     // A scope the view does not own is still deleted as before.
     const manual = await ctx!.app.request("/v1/data/notes.manual", {

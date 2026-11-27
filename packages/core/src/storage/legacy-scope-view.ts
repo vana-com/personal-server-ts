@@ -316,6 +316,12 @@ export interface LegacyScopeViewPort {
    * `deletionHistoryOf`.
    */
   ownsScope(scope: string): boolean;
+  /**
+   * The live connections, of every method bound to the scope, that hold rows:
+   * what an unswitched account's per-scope delete resets beside the file.
+   * Optional: a view without it keeps the per-scope delete refused.
+   */
+  connectionsServing?(scope: string): string[];
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -1370,6 +1376,20 @@ export function createLegacyScopeView(
 
     ownsScope(scope) {
       return authority.readSnapshot(() => ownsScope(scope));
+    },
+    connectionsServing(scope) {
+      return authority.readSnapshot(() => {
+        const methods = [...scopeMethods(scope).keys()];
+        if (methods.length === 0) return [];
+        return authority
+          .listMethodConnections(methods)
+          .filter(
+            (connection) =>
+              connection.deletedAt === null &&
+              authority.hasHeldData(connection.instance, null),
+          )
+          .map((connection) => connection.instance);
+      });
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),
