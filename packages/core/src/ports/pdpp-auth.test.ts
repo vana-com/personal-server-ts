@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
+  GRANT_VERSION_V02,
+  PdppAuthorizationUnavailableError,
   findStreamGrant,
   grantIsV02,
   withinTimeConstraint,
@@ -107,5 +109,65 @@ describe("withinTimeConstraint", () => {
         since: "2026-01-01",
       }),
     ).toBe(false);
+  });
+});
+
+describe("GRANT_VERSION_V02", () => {
+  it("is the published v0.2 grant version string", () => {
+    expect(GRANT_VERSION_V02).toBe("0.2.0");
+  });
+
+  it("is the version grantIsV02 recognises", () => {
+    expect(grantIsV02({ version: GRANT_VERSION_V02 } as Grant)).toBe(true);
+  });
+
+  it("does not recognise an unknown future version as v0.2", () => {
+    expect(grantIsV02({ version: "0.3.0" } as Grant)).toBe(false);
+  });
+});
+
+describe("PdppAuthorizationUnavailableError", () => {
+  it("carries the authorization-server-unreachable message and a 5s retry hint", () => {
+    const error = new PdppAuthorizationUnavailableError();
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("PdppAuthorizationUnavailableError");
+    expect(error.message).toBe(
+      "Authorization server could not be reached or validated",
+    );
+    expect(error.retryAfterSeconds).toBe(5);
+  });
+});
+
+describe("withinTimeConstraint range edges", () => {
+  it("excludes a value before `since`", () => {
+    expect(
+      withinTimeConstraint("2025-12-31T23:59:59Z", {
+        field: "source_created_at",
+        since: "2026-01-01T00:00:00Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("excludes a value after `until`", () => {
+    expect(
+      withinTimeConstraint("2026-01-02T00:00:00Z", {
+        field: "source_created_at",
+        until: "2026-01-01T00:00:00Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("includes a value inside a bounded [since, until) window", () => {
+    expect(
+      withinTimeConstraint("2026-06-15T12:00:00Z", {
+        field: "source_created_at",
+        since: "2026-01-01T00:00:00Z",
+        until: "2027-01-01T00:00:00Z",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns true for a missing value when there is no constraint", () => {
+    expect(withinTimeConstraint(undefined, undefined)).toBe(true);
   });
 });
