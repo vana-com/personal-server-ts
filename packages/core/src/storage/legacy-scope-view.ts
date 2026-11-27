@@ -1397,19 +1397,7 @@ export function createLegacyScopeView(
           .map((connection) => connection.instance);
       });
     },
-    siblingScopes(scope) {
-      // A profile maps every bound scope of every source, so siblings are
-      // the scopes that share a connector method with this one: the scopes
-      // a reset of this scope's connection also erases, and no other
-      // source's.
-      const methods = new Set(scopeMethods(scope).keys());
-      if (methods.size === 0) return [];
-      return boundScopes().filter(
-        (other) =>
-          other !== scope &&
-          [...scopeMethods(other).keys()].some((method) => methods.has(method)),
-      );
-    },
+    siblingScopes: (scope) => siblingScopesOf(scope),
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),
     isReset: (scope) => authority.isReset(scope),
@@ -1618,6 +1606,28 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
 function requiredStreamsOf(scope: string, method: string): readonly string[] {
   const binding = legacyBindingsForProfile(method).get(scope);
   return binding ? requiredLegacyStreams(binding) : [];
+}
+
+/**
+ * The other bound scopes that share a connector method with `scope`: what a
+ * reset of the connection serving `scope` also erases. A binding profile maps
+ * every bound scope of every source, so sharing a method (not a profile) is
+ * the rule; with today's tables a method maps to one source's prefix, which
+ * `legacy-scope-view-siblings.test.ts` pins.
+ */
+export function siblingScopesOf(scope: string): string[] {
+  const methods = new Set(scopeMethods(scope).keys());
+  if (methods.size === 0) return [];
+  return boundScopes().filter(
+    (other) =>
+      other !== scope &&
+      [...scopeMethods(other).keys()].some((method) => methods.has(method)),
+  );
+}
+
+/** Every scope some binding profile maps, sorted. Exported for tests. */
+export function allBoundScopes(): string[] {
+  return boundScopes();
 }
 
 function boundScopes(): string[] {

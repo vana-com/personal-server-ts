@@ -2784,6 +2784,8 @@ describe("DELETE /v1/data/:scope", () => {
     const json = await res.json();
     expect(json.error.errorCode).toBe("DELETE_TOMBSTONE_FAILED");
     expect(json.error.details.result.scope).toBe("instagram.posts");
+    expect(json.error.details.deleted).toEqual(["instagram.profile"]);
+    expect(json.error.message).toContain("instagram.profile already deleted");
     expect(resetConnection).toHaveBeenCalledWith("instagram:owner");
   });
 

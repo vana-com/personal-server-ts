@@ -4259,10 +4259,13 @@ export async function handlePersonalServerDataRequest(
       if (unfinished) {
         // This scope is gone; a sibling's tombstone failed, so the source is
         // not. The retry finds this scope owned and deletes what is left.
-        throw new DeleteTombstoneFailedError({
-          scope: unfinished.scope,
-          result: unfinished,
-        });
+        const deleted = [result, ...alsoDeleted]
+          .filter((entry) => entry.steps.gateway.status !== "failed")
+          .map((entry) => entry.scope);
+        throw new DeleteTombstoneFailedError(
+          { scope: unfinished.scope, result: unfinished, deleted },
+          `Gateway did not acknowledge the deletion tombstone of ${unfinished.scope}; ${deleted.join(", ")} already deleted. Retry to finish.`,
+        );
       }
 
       // Audit entry, best-effort: the deletion above is irreversible and
