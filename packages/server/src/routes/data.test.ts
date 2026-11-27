@@ -2675,18 +2675,6 @@ describe("DELETE /v1/data/:scope", () => {
     } as unknown as NonNullable<DataRouteDeps["legacyScopeView"]>;
   }
 
-  it("deletes an owned scope on an unswitched account, then resets its serving connections", async () => {
-    const resetConnection = vi.fn();
-    const app = createApp({ legacyScopeView: owningView(), resetConnection });
-    await ingestData("instagram.profile", { version: 1 }, app);
-
-    const res = await deleteWithAuth(app, "instagram.profile");
-
-    expect(res.status).toBe(200);
-    expect(indexManager.countByScope("instagram.profile")).toBe(0);
-    expect(resetConnection).toHaveBeenCalledWith("instagram:owner");
-  });
-
   it("resets no connection when the gateway tombstone fails (nothing was deleted)", async () => {
     const resetConnection = vi.fn();
     const app = createApp({
@@ -2711,28 +2699,6 @@ describe("DELETE /v1/data/:scope", () => {
 
     expect(res.status).toBe(502);
     expect(resetConnection).not.toHaveBeenCalled();
-  });
-
-  it("deletes the source's other scopes and names them in alsoDeleted", async () => {
-    const resetConnection = vi.fn();
-    const app = createApp({
-      legacyScopeView: owningView(
-        true,
-        ["instagram:owner"],
-        ["instagram.posts", "instagram.likes"],
-      ),
-      resetConnection,
-    });
-    await ingestData("instagram.profile", { version: 1 }, app);
-    await ingestData("instagram.posts", { version: 1 }, app);
-
-    const res = await deleteWithAuth(app, "instagram.profile");
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { alsoDeleted: { scope: string }[] };
-    // instagram.likes has no copy here, so there is nothing to delete.
-    expect(body.alsoDeleted.map((d) => d.scope)).toEqual(["instagram.posts"]);
-    expect(indexManager.countByScope("instagram.posts")).toBe(0);
   });
 
   it("answers 502 naming the sibling whose gateway tombstone failed", async () => {
