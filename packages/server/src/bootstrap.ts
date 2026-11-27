@@ -1886,12 +1886,6 @@ async function bootstrapServer(
       logger,
       authority: createLegacyScopeAuthority(db),
       records: pdppRecords && legacyScopeRecords(pdppRecords),
-      deleteConnection:
-        pdppRecords && pdppConnections
-          ? (instance) => {
-              pdppConnections.store.deleteConnection(instance);
-            }
-          : undefined,
       // Reuse the source-scoped declarations selected by the record server.
       // Declaration schema identity participates in projection revisions and
       // takeover cache keys; staging an upgrade takes effect on the next boot.

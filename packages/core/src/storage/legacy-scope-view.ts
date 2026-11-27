@@ -316,8 +316,18 @@ export interface LegacyScopeViewPort {
    * `deletionHistoryOf`.
    */
   ownsScope(scope: string): boolean;
-  /** Erase the live owning connections, inside the caller's legacy write seal. */
-  eraseOwningConnections?(scope: string): number;
+  /**
+   * The live connections, of every method bound to the scope, that hold rows:
+   * what an unswitched account's per-scope delete resets beside the file.
+   * Optional: a view without it keeps the per-scope delete refused.
+   */
+  connectionsServing?(scope: string): string[];
+  /**
+   * The other scopes bound to a connector method this scope is bound to:
+   * what a reset of the connection serving this scope also erases. Never
+   * another source's scopes. Sorted.
+   */
+  siblingScopes?(scope: string): string[];
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -331,8 +341,6 @@ export interface CreateLegacyScopeViewInput {
    * are then refused.
    */
   records?: CanonicalLegacyReadStore;
-  /** Optional synchronous, idempotent deletion of a record-store connection. */
-  deleteConnection?(instance: string): void;
   /** Current trusted declarations; pass the same registry used by canonical ingest. */
   declarations?: ReadCanonicalLegacyScopeInput["declarations"];
   /** Methods this boot configures for a store source id. */
@@ -1375,35 +1383,21 @@ export function createLegacyScopeView(
     ownsScope(scope) {
       return authority.readSnapshot(() => ownsScope(scope));
     },
-    eraseOwningConnections: input.deleteConnection
-      ? (scope) => {
-          const instances = authority.readSnapshot(() => {
-            // Read ownership also considers tombstoned and reset connections.
-            // Those can prevent fallback on GET but have no live rows to erase.
-            if (!ownsScope(scope)) return [];
-            const methods =
-              decide(scope).kind === "file"
-                ? optedOutMethods(scope)
-                : [...scopeMethods(scope).keys()];
-            return [
-              ...new Set(
-                authority
-                  .listMethodConnections(methods)
-                  .filter(
-                    (connection) =>
-                      connection.deletedAt === null &&
-                      authority.hasHeldData(connection.instance, null),
-                  )
-                  .map((connection) => connection.instance),
-              ),
-            ];
-          });
-          // The snapshot is closed before the record-store writes begin.
-          const erase = input.deleteConnection!;
-          for (const instance of instances) erase(instance);
-          return instances.length;
-        }
-      : undefined,
+    connectionsServing(scope) {
+      return authority.readSnapshot(() => {
+        const methods = [...scopeMethods(scope).keys()];
+        if (methods.length === 0) return [];
+        return authority
+          .listMethodConnections(methods)
+          .filter(
+            (connection) =>
+              connection.deletedAt === null &&
+              authority.hasHeldData(connection.instance, null),
+          )
+          .map((connection) => connection.instance);
+      });
+    },
+    siblingScopes: (scope) => siblingScopesOf(scope),
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),
     isReset: (scope) => authority.isReset(scope),
@@ -1612,6 +1606,28 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
 function requiredStreamsOf(scope: string, method: string): readonly string[] {
   const binding = legacyBindingsForProfile(method).get(scope);
   return binding ? requiredLegacyStreams(binding) : [];
+}
+
+/**
+ * The other bound scopes that share a connector method with `scope`: what a
+ * reset of the connection serving `scope` also erases. A binding profile maps
+ * every bound scope of every source, so sharing a method (not a profile) is
+ * the rule; with today's tables a method maps to one source's prefix, which
+ * `legacy-scope-view-siblings.test.ts` pins.
+ */
+export function siblingScopesOf(scope: string): string[] {
+  const methods = new Set(scopeMethods(scope).keys());
+  if (methods.size === 0) return [];
+  return boundScopes().filter(
+    (other) =>
+      other !== scope &&
+      [...scopeMethods(other).keys()].some((method) => methods.has(method)),
+  );
+}
+
+/** Every scope some binding profile maps, sorted. Exported for tests. */
+export function allBoundScopes(): string[] {
+  return boundScopes();
 }
 
 function boundScopes(): string[] {

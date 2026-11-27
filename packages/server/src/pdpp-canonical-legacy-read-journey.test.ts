@@ -219,9 +219,10 @@ async function replace(
   rows: Record<string, unknown>[],
   sourceCollectedAt: string | undefined,
   instance = accountOne,
+  generation = 1,
 ) {
   const response = await ctx!.app.request(
-    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=1`,
+    `/v1/streams/${stream}/records/replace?method=oura&binding_generation=${generation}`,
     {
       method: "POST",
       headers: {
@@ -1720,19 +1721,6 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
       detail: "method_not_configured",
     });
     expect(read.text).not.toContain("stale-legacy");
-    const before = ctx!.indexManager.findLatestByScope("oura.activity");
-    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
-      method: "DELETE",
-      headers: new Headers([["Authorization", `Bearer ${ctx!.devToken!}`]]),
-    });
-    expect(deletion.status).toBe(409);
-    expect(await deletion.json()).toMatchObject({
-      error: "CANONICAL_DELETE_UNSUPPORTED",
-      scope: "oura.activity",
-    });
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
-      before,
-    );
     // Only the owned scope is refused; the others keep their files.
     expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
@@ -1745,34 +1733,118 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     ]);
   });
 
-  it("erases the owning connection and both requested legacy files", async () => {
+  function connectionRows(instance: string): number {
+    const db = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return (
+        db
+          .prepare("SELECT COUNT(*) AS n FROM pdpp_records WHERE instance = ?")
+          .get(instance) as { n: number }
+      ).n;
+    } finally {
+      db.close();
+    }
+  }
+
+  function binding(instance: string) {
+    const db = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      return db
+        .prepare(
+          "SELECT generation, deleted_at FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get(instance);
+    } finally {
+      db.close();
+    }
+  }
+
+  // An unswitched account has no connector delete (it answers NOT_SWITCHED),
+  // so the per-scope DELETE is the only way to erase a canonical scope. It
+  // deletes the legacy file as before and erases the connection rows that
+  // serve the scope, so neither copy stays readable.
+  it("deletes a canonical scope on an unswitched account: legacy file and connection rows, then collects again", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
-    await legacyWrite("oura.readiness", { readiness: [] });
+    await legacyWrite("oura.readiness", { days: [day("r1", "2026-09-01")] });
     await legacyWrite("notes.manual", { text: "kept" });
+    // Other bound sources: a delete of Oura must never reach them.
+    await legacyWrite("github.profile", { login: "kept" });
+    await legacyWrite("instagram.profile", { username: "kept" });
     await collectActivity();
-    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
-      "canonical",
-    );
     expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeDefined();
-    expect(ctx!.indexManager.findLatestByScope("oura.readiness")).toBeDefined();
+    expect(connectionRows(accountOne)).toBeGreaterThan(0);
 
     const deletion = await ctx!.app.request("/v1/data/oura.activity", {
       method: "DELETE",
       headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
     expect(deletion.status).toBe(200);
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toBeFalsy();
+    const receipt = (await deletion.json()) as {
+      scope: string;
+      steps: { local: { status: string } };
+      alsoDeleted: { scope: string }[];
+    };
+    expect(receipt).toMatchObject({
+      scope: "oura.activity",
+      steps: { local: { status: "ok" } },
+    });
+    // The source's other file goes too (sleep has none); notes.manual is
+    // another source and stays.
+    expect(receipt.alsoDeleted.map((d) => d.scope)).toEqual(["oura.readiness"]);
+    for (const other of ["github.profile", "instagram.profile"]) {
+      expect(ctx!.indexManager.findLatestByScope(other)).toBeDefined();
+      expect((await ownerGet(`/v1/data/${other}`)).status).toBe(200);
+    }
+    expect(
+      ctx!.indexManager.findLatestByScope("oura.readiness"),
+    ).toBeUndefined();
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
+    expect(
+      ctx!.indexManager.findLatestByScope("oura.activity"),
+    ).toBeUndefined();
+    expect(connectionRows(accountOne)).toBe(0);
+    // The reset connection holds no rows: the scope answers 503
+    // no_connection (the state of a connection with no data), never the
+    // erased rows or the deleted file.
     const latest = await ownerGet("/v1/data/oura.activity");
     expect(latest.status).toBe(503);
     expect(JSON.parse(latest.text)).toMatchObject({ reason: "no_connection" });
-    expect(latest.text).not.toContain('"id":"a1"');
+    expect(latest.text).not.toContain("a1");
+    const listing = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(listing.scopes.map((s) => s.scope)).not.toContain("oura.activity");
 
-    const sibling = await ctx!.app.request("/v1/data/oura.readiness", {
+    // A repeat (Desktop's retry) answers the same and changes nothing more.
+    const again = await ctx!.app.request("/v1/data/oura.activity", {
       method: "DELETE",
-      headers: new Headers([["Authorization", `Bearer ${ctx!.devToken!}`]]),
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
     });
-    expect(sibling.status).toBe(200);
-    expect(ctx!.indexManager.findLatestByScope("oura.readiness")).toBeFalsy();
+    expect(again.status).toBe(200);
+
+    // The connection was reset, not retired: same id, next generation.
+    expect(binding(accountOne)).toEqual({ generation: 2, deleted_at: null });
+
+    // The person refreshes Oura later: the same connection collects again,
+    // at the generation Desktop reads from the binding.
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a2", "2026-09-02")],
+      "2026-09-11T06:00:00Z",
+      accountOne,
+      2,
+    );
+    const recollected = await ownerGet("/v1/data/oura.activity");
+    expect(recollected.status).toBe(200);
+    expect(ids(recollected.text)).toEqual(["a2"]);
 
     // A scope the view does not own is still deleted as before.
     const manual = await ctx!.app.request("/v1/data/notes.manual", {
@@ -1781,28 +1853,6 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     });
     expect(manual.status).toBe(200);
     expect((await ownerGet("/v1/data/notes.manual")).status).toBe(404);
-  });
-
-  it("keeps refusing scope DELETE on a switched account", async () => {
-    await legacyWrite("oura.activity", COVERED_A1);
-    await collectActivity();
-    const before = ctx!.indexManager.findLatestByScope("oura.activity");
-    await ctx!.accountModeAuthority.submitEvidence({
-      owner: ctx!.serverOwner!,
-      state: "on",
-      generation: 1,
-    });
-    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
-      method: "DELETE",
-      headers: new Headers([["Authorization", `Bearer ${ctx!.devToken!}`]]),
-    });
-    expect(deletion.status).toBe(409);
-    expect(await deletion.json()).not.toMatchObject({
-      error: "CANONICAL_DELETE_UNSUPPORTED",
-    });
-    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
-      before,
-    );
   });
 });
 

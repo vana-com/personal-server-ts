@@ -797,6 +797,16 @@ export function createApp(deps: AppDeps): Hono {
       dataStorage: deps.dataStorage,
       legacyWriteSeal,
       legacyScopeView,
+      // An unswitched account's per-scope delete of a canonical-owned scope
+      // resets the serving connections (rows erased, id kept); without the
+      // record store it stays refused.
+      ...(deps.pdpp
+        ? {
+            resetConnection: (instance: string) => {
+              deps.pdpp!.bindingStore.resetConnection(instance);
+            },
+          }
+        : {}),
       streamSyncRead,
       history,
       // The account's storage mode (see the top of createApp).

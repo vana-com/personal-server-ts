@@ -371,6 +371,60 @@ describe("own-write log (replication enabled)", () => {
     expect(ownWrites(db)).toEqual(before);
   });
 
+  it("resetConnection erases rows and starts the next generation, keeping the id writable", () => {
+    store.ingestBatch([envelope()], semantics, primaryKey, binding);
+    const before = ownWrites(db);
+
+    const reset = store.resetConnection("account-a");
+
+    expect(reset).toMatchObject({ generation: 2, deletedAt: null });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM pdpp_records").get()).toEqual({
+      n: 0,
+    });
+    // Earlier evidence is kept (the log is append-only).
+    expect(ownWrites(db)).toEqual(before);
+    // The next collection writes to the same id at the new generation; the
+    // old generation is stale.
+    expect(
+      store.ingestBatch([envelope()], semantics, primaryKey, {
+        ...binding,
+        generation: 2,
+      }).accepted,
+    ).toBe(1);
+    expect(() =>
+      store.ingestBatch([envelope()], semantics, primaryKey, binding),
+    ).toThrow();
+    // Registering the id again (Desktop's PUT) still succeeds.
+    expect(() =>
+      store.registerConnection({
+        instance: "account-a",
+        sourceId: "https://source.invalid/declaration",
+        method: binding.method,
+        label: "Account A",
+      }),
+    ).not.toThrow();
+  });
+
+  it("resetConnection refuses an unknown id and creates no row", () => {
+    expect(() => store.resetConnection("account-unknown")).toThrow(
+      "connection_not_found",
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get("account-unknown"),
+    ).toEqual({ n: 0 });
+  });
+
+  it("resetConnection leaves a deleted connection deleted", () => {
+    store.deleteConnection("account-a");
+    const deleted = store.getInstanceBinding("account-a");
+    expect(store.resetConnection("account-a")).toEqual(deleted);
+    expect(store.getInstanceBinding("account-a")).toEqual(deleted);
+  });
+
   it.each(["sequence", "operation_id"])(
     "rejects REPLACE by %s even with recursive triggers disabled",
     (conflict) => {
