@@ -102,6 +102,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
     const sync = await local();
     requireStreamMode();
     await sync.cycle();
+    requireStreamMode();
     return c.json({ status: "started", message: "Sync triggered" }, 202);
   });
   app.get("/status", async (c, next) => {

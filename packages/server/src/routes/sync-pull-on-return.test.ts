@@ -195,6 +195,24 @@ describe("switched-mode routes re-check the mode after their awaits", () => {
     expect(t.localSync.cycle).not.toHaveBeenCalled();
   });
 
+  it("refuses a trigger response if the mode moved during a full cycle", async () => {
+    const t = setup();
+    let releaseCycle!: () => void;
+    const cycle = new Promise<void>((resolve) => {
+      releaseCycle = resolve;
+    });
+    const entered = vi.mocked(t.localSync.cycle);
+    entered.mockImplementationOnce(async () => (await cycle) as never);
+    const pending = t.app.request("/trigger", { method: "POST", headers });
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+      t.flip();
+    } finally {
+      releaseCycle();
+    }
+    await stopped(await pending);
+  });
+
   it("refuses a file response if its account is no longer switched", async () => {
     const t = setup({ holdFile: true });
     const pending = t.app.request("/file/fixture", { method: "POST", headers });
