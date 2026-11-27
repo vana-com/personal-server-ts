@@ -227,6 +227,11 @@ export interface PdppAuthRouteDeps {
    */
   chainRegistrar?: PdppChainRegistrarPort;
   /**
+   * Source ids holding this owner's connected data (`GET /owner/sources`).
+   * Sources with a grant for the owner are added from the grant store.
+   */
+  ownerDataSources?: (subjectId: string) => string[];
+  /**
    * The held-data lifecycle service (AS items 39-47). Defaults to one over
    * `store`, using the token service's clock.
    */
@@ -502,6 +507,31 @@ export function pdppAsMetadataHandler(
   };
 }
 
+/**
+ * The display name the AS resolved for a grant's client (AS item 7), or
+ * undefined when it resolved none. Final review's bound requester identity
+ * comes first (locked grants keep it in consent evidence); otherwise the
+ * retained `client.client_display.name`. The `client_id` fallback the
+ * review uses when nothing else exists is not a display name.
+ */
+function resolvedClientName(
+  store: PdppAuthStore,
+  stored: StoredGrant,
+): string | undefined {
+  const evidence = store.getConsentEvidence(stored.grant.grant_id);
+  const shown = (
+    evidence?.displayed as { client?: { display_name?: unknown } } | undefined
+  )?.client?.display_name;
+  if (
+    typeof shown === "string" &&
+    shown.length > 0 &&
+    shown !== stored.clientId
+  )
+    return shown;
+  const retained = stored.grant.client.client_display?.name;
+  return retained && retained.length > 0 ? retained : undefined;
+}
+
 /** The slice of `PdppChainRegistrar` (pdpp/chain-grants.ts) the AS uses. */
 export interface PdppChainRegistrarPort {
   prepare(
@@ -570,6 +600,10 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     for (const path of [
       "/owner/decommission/confirm",
       "/owner/lifecycle/reestablish",
+      // The owner's source list comes before any per-source owner token
+      // (Account asks for one token per source), so it takes the wallet
+      // proof /owner/token takes.
+      "/owner/sources",
     ]) {
       app.use(path, createBodyLimit(DEFAULT_MAX_SIZE));
       app.use(
@@ -642,6 +676,43 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    * `ownerSubjectId` resolves the verified signer to the PDPP subject; a
    * deployment that maps wallets to subjects differently supplies its own.
    */
+  /**
+   * The owner's sources: every source that holds this owner's connected data
+   * or a grant this owner issued, with its declaration display name. Wallet
+   * proof (the same Web3Signed owner proof `/owner/token` takes, uri
+   * `/pdpp/v1/owner/sources`), because a consent broker needs this list to
+   * know which per-source owner tokens to ask for. Grants and data of other
+   * subjects never appear: both sets are read by the proven subject.
+   */
+  app.get("/owner/sources", (c) => {
+    const verifiedSigner = (c.get("auth") as { signer?: string } | undefined)
+      ?.signer;
+    const subjectId = deps.ownerAuth
+      ? verifiedSigner
+        ? (deps.ownerSubjectId?.(c) ?? verifiedSigner)
+        : null
+      : deps.currentSubjectId(c);
+    if (!subjectId) {
+      return errorResponse(
+        c,
+        401,
+        "unauthorized",
+        "a verified owner proof is required to list the owner's sources",
+      );
+    }
+    const ids = new Set<string>(deps.ownerDataSources?.(subjectId) ?? []);
+    for (const stored of deps.store.listGrantsForSubject(subjectId))
+      ids.add(stored.grant.source.id);
+    const sources = [...ids].sort().map((sourceId) => {
+      const name = deps.resolveDeclaration(sourceId)?.display?.name;
+      return {
+        source_id: sourceId,
+        ...(name && { display_name: name }),
+      };
+    });
+    return c.json({ sources }, 200, NO_STORE);
+  });
+
   app.post("/owner/token", async (c) => {
     // With `ownerAuth` wired, the middleware above has already verified a
     // wallet signature and confirmed the signer is the server owner, so
@@ -1886,6 +1957,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       .map((stored) => ({
         grant_id: stored.grant.grant_id,
         client_id: stored.clientId,
+        // The AS-resolved display name (AS item 7 precedence), as final
+        // review showed it; omitted when the AS resolved none.
+        client: {
+          client_id: stored.clientId,
+          ...(resolvedClientName(deps.store, stored) && {
+            client_display: { name: resolvedClientName(deps.store, stored)! },
+          }),
+        },
         status: listedGrantStatus(deps.store, stored, at),
         issued_at: stored.grant.issued_at,
         ...(stored.grant.expires_at && { expires_at: stored.grant.expires_at }),

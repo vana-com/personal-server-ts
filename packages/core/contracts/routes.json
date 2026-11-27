@@ -198,6 +198,11 @@
       "methods": ["POST"]
     },
     {
+      "path": "/pdpp/v1/owner/sources",
+      "hosts": ["server"],
+      "methods": ["GET"]
+    },
+    {
       "path": "/pdpp/v1/owner/token",
       "hosts": ["server"],
       "methods": ["POST"]

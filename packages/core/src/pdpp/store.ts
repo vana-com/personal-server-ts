@@ -761,6 +761,22 @@ export class PdppAuthStore {
     });
   }
 
+  /** The retained consent evidence of a grant, parsed; null when none. */
+  getConsentEvidence(grantId: string): Record<string, unknown> | null {
+    const row = this.db
+      .prepare("SELECT consent_evidence_json FROM pdpp_grants WHERE grant_id = ?")
+      .get(grantId) as { consent_evidence_json: string | null } | undefined;
+    if (!row?.consent_evidence_json) return null;
+    try {
+      const parsed: unknown = JSON.parse(row.consent_evidence_json);
+      return parsed && typeof parsed === "object"
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
   // -- design-2 chain registrations ----------------------------------------
 
   getChainRegistration(grantId: string): ChainRegistration | null {

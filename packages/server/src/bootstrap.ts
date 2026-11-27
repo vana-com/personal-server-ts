@@ -1669,6 +1669,19 @@ async function bootstrapServer(
     },
   });
 
+  // GET /pdpp/v1/owner/sources: sources holding the owner's connected data.
+  // `instancesForSource` already answers nothing for any other subject.
+  if (pdppAuth && pdppRecords?.instancesForSource) {
+    const instancesForSource = pdppRecords.instancesForSource;
+    pdppAuth.ownerDataSources = (subject) =>
+      [
+        ...new Set([
+          ...pdppAuth.retainedDeclarations.map((d) => d.source_id),
+          ...pdppAuth.connectionMethods.keys(),
+        ]),
+      ].filter((sourceId) => instancesForSource(subject, sourceId).length > 0);
+  }
+
   // Design 2 (Vana-6.1 / 6.2): chain-enforced PDPP grants, opt-in. Issued
   // grants are registered as salted entries in the owner's PermissionsV2 slot
   // for the app, signed by this server as the owner's registered server, and
