@@ -6,6 +6,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
 import type { SyncStatus } from "@opendatalabs/personal-server-ts-core/sync";
+import type { OwnedAccountStorageMode } from "@opendatalabs/personal-server-ts-core/api";
+import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
 import { syncRoutes } from "./sync.js";
 
 const logger = pino({ level: "silent" });
@@ -268,6 +270,140 @@ describe("syncRoutes", () => {
           message: "Sync is not enabled",
         });
       });
+    });
+  });
+
+  describe("POST /file/:id stream mode guard", () => {
+    // A switched-mode app whose file body is a gated stream: chunk 1 flows
+    // at once, later chunks only after the test releases their gate, so a
+    // mode change between reads is deterministic.
+    function createStreamApp() {
+      const modeBox = { current: "switched" };
+      const accountStorageMode = {
+        read: () => modeBox.current,
+      } as unknown as OwnedAccountStorageMode;
+      const encoder = new TextEncoder();
+      const chunks = ["first-", "second-", "third-"].map((s) =>
+        encoder.encode(s),
+      );
+      let next = 0;
+      let cancelled = false;
+      const releases: Array<() => void> = [];
+      const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          const n = next++;
+          if (n < chunks.length) {
+            // Later chunks wait for the test to release their gate, so a
+            // mode change between reads is deterministic. The terminal
+            // pull closes without a gate.
+            if (n > 0)
+              await new Promise<void>((resolve) => {
+                releases[n] = resolve;
+              });
+            controller.enqueue(chunks[n]);
+          } else controller.close();
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const read = vi.fn(async () => new Response(body));
+      const syncConnection = vi.fn(async () => undefined);
+      const app = syncRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: owner.address,
+        gateway: undefined as never,
+        syncManager: createMockSyncManager(),
+        localSync: { syncConnection } as unknown as LocalSync,
+        accountStorageMode,
+        localFile: async () => ({ connectionId: "conn-1", read }),
+      });
+      const release = async (n: number) => {
+        for (let i = 0; i < 100 && !releases[n]; i++)
+          await new Promise((r) => setTimeout(r, 10));
+        releases[n]?.();
+      };
+      return {
+        app,
+        modeBox,
+        read,
+        syncConnection,
+        release,
+        isCancelled: () => cancelled,
+      };
+    }
+
+    async function postFile(app: ReturnType<typeof createStreamApp>["app"]) {
+      const auth = await buildWeb3SignedHeader({
+        wallet: owner,
+        aud: SERVER_ORIGIN,
+        method: "POST",
+        uri: "/file/file-1",
+      });
+      return app.request("/file/file-1", {
+        method: "POST",
+        headers: { authorization: auth },
+      });
+    }
+
+    it("stops the body when the account leaves switched mode mid-stream", async () => {
+      const { app, modeBox, release, isCancelled } = createStreamApp();
+      const res = await postFile(app);
+      expect(res.status).toBe(200);
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      const first = await reader.read();
+      expect(decoder.decode(first.value)).toBe("first-");
+      modeBox.current = "unswitched";
+      await release(1);
+      await expect(reader.read()).rejects.toThrow(/not switched/i);
+      expect(isCancelled()).toBe(true);
+    });
+
+    it("streams the whole body when the mode stays switched", async () => {
+      const { app, release } = createStreamApp();
+      const res = await postFile(app);
+      expect(res.status).toBe(200);
+      // Release the gated chunks as the reader asks for them.
+      void release(1);
+      void release(2);
+      expect(await res.text()).toBe("first-second-third-");
+    });
+
+    it("does not read the file when the mode is lost before the read", async () => {
+      const { app, modeBox, read, syncConnection } = createStreamApp();
+      syncConnection.mockImplementation(async () => {
+        modeBox.current = "unswitched";
+        return undefined;
+      });
+      const res = await postFile(app);
+      expect(res.status).not.toBe(200);
+      expect(read).not.toHaveBeenCalled();
+    });
+
+    it("passes a body-less response through unchanged", async () => {
+      const modeBox = { current: "switched" };
+      const app = syncRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: owner.address,
+        gateway: undefined as never,
+        syncManager: createMockSyncManager(),
+        localSync: {
+          syncConnection: vi.fn(async () => undefined),
+        } as unknown as LocalSync,
+        accountStorageMode: {
+          read: () => modeBox.current,
+        } as unknown as OwnedAccountStorageMode,
+        localFile: async () => ({
+          connectionId: "conn-1",
+          read: async () => new Response(null, { status: 200 }),
+        }),
+      });
+      const res = await postFile(app);
+      expect(res.status).toBe(200);
+      expect(res.body).toBeNull();
     });
   });
 });
