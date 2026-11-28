@@ -184,11 +184,26 @@ describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
   it("still serves a valid cursor", async () => {
     // Positive control: the narrowing above must not reject store-minted
     // stream + epoch bound cursors.
-    const { app, cursor } = mintedListCursor("desc");
+    // A store-minted cursor never leaves the RS unsealed (RS item 21), so
+    // the valid cursor is the one the route issued.
+    const { app } = fixture();
+    const first = await app.request(
+      "/v1/streams/s/records?order=desc&limit=1",
+      {
+        headers: AUTH,
+      },
+    );
+    const { next_cursor: cursor } = await first.json();
     const res = await app.request(
-      `/v1/streams/s/records?order=desc&cursor=${encodeURIComponent(cursor)}`,
+      `/v1/streams/s/records?order=desc&limit=1&cursor=${encodeURIComponent(cursor)}`,
       { headers: AUTH },
     );
     expect(res.status).toBe(200);
+    // The raw store cursor is not accepted.
+    const raw = await app.request(
+      `/v1/streams/s/records?order=desc&cursor=${encodeURIComponent(mintedListCursor("desc").cursor)}`,
+      { headers: AUTH },
+    );
+    expect(raw.status).toBe(400);
   });
 });

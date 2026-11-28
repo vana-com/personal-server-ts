@@ -64,6 +64,16 @@ for (const cidr of [
   "fc00::/7", // unique local (ULA)
   "fe80::/10", // link-local
   "ff00::/8", // multicast
+  // Transition and special-purpose ranges that can embed or reach IPv4 space
+  // (RFC 6890 registry): a NAT64 route or tunnel would otherwise let a
+  // client_id URL reach private IPv4 addresses.
+  "::/96", // IPv4-compatible (deprecated)
+  "64:ff9b::/96", // NAT64 well-known prefix
+  "64:ff9b:1::/48", // NAT64 local-use
+  "2001::/32", // Teredo
+  "2002::/16", // 6to4
+  "2001:db8::/32", // documentation
+  "fec0::/10", // site-local (deprecated)
 ]) {
   const [address, prefix] = cidr.split("/");
   blockedAddresses.addSubnet(address, Number(prefix), "ipv6");

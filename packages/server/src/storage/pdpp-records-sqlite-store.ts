@@ -17,8 +17,14 @@ import {
   listSnapshotPage,
   compareRecordIdentity,
   LIST_ORDER_COLUMNS,
+  assertListCursorSort,
+  cursorPosition,
+  fieldSortKey,
+  type ListPosition,
+  type ListSort,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { Database } from "better-sqlite3";
+import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
 import {
@@ -105,6 +111,14 @@ export class PdppBindingError extends Error {
   constructor(public readonly reason: string) {
     super(reason);
   }
+}
+
+/** The refusal of an append-only delete while replication is enabled. */
+function appendOnlyDeleteUnsupported(): PdppError {
+  return new PdppError(
+    "append_only_delete_unsupported",
+    "This server replicates its records, and replication cannot carry an append-only delete",
+  );
 }
 
 function blobIdForBytes(bytes: Uint8Array): string {
@@ -380,6 +394,19 @@ function addCompletionProofColumns(db: Database): void {
 function registerTimeKey(db: Database): void {
   db.function("pdpp_time_key", { deterministic: true }, (value: unknown) =>
     timeSortKey(String(value)),
+  );
+  // spec-core §8 "Stable sort": the sort key of a frozen `sort_field` value.
+  db.function(
+    "pdpp_field_sort_key",
+    { deterministic: true },
+    (data: unknown, field: unknown) => {
+      if (typeof data !== "string" || typeof field !== "string") return null;
+      const parsed: unknown = JSON.parse(data);
+      if (parsed === null || typeof parsed !== "object") return null;
+      return Object.hasOwn(parsed, field)
+        ? fieldSortKey((parsed as Record<string, unknown>)[field])
+        : null;
+    },
   );
 }
 
@@ -930,6 +957,17 @@ export function createSqliteRecordStore(
       if (envelopes.length > 0) {
         checkBinding(binding.method, generation, envelopes);
       }
+      // Replication cannot carry an append-only delete (merge-plan.ts and
+      // pdpp-replication-sqlite.ts refuse it), so while it is on, the whole
+      // batch is refused before any write instead of diverging the peers.
+      if (replica)
+        for (const envelope of envelopes)
+          if (
+            envelope.op === "delete" &&
+            streamSemantics(envelope.stream, envelope.instance) ===
+              "append_only"
+          )
+            throw appendOnlyDeleteUnsupported();
       envelopes.forEach((envelope, index) => {
         const semantics = streamSemantics(envelope.stream, envelope.instance);
         const primaryKey = primaryKeyFields(envelope.stream, envelope.instance);
@@ -1785,32 +1823,69 @@ export function createSqliteRecordStore(
     horizon: number,
     options: {
       order?: "asc" | "desc";
-      after?: { val: string; key: string; instance: string } | null;
+      after?: ListPosition | null;
       liveOnly?: boolean;
+      /** Absent: emitted order (spec-core §8 "Stable sort"). */
+      sort?: ListSort;
     } = {},
   ): Generator<RecordRowDb & { written_at: number }> {
     const dir = options.order === "desc" ? "DESC" : "ASC";
     const comparison = options.order === "desc" ? "<" : ">";
-    let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order
+    const sort = options.sort;
+    const params: unknown[] = [];
+    // Field order: the sort key of the frozen `sort_field` value, null when
+    // absent or invalid (sorted after every value in both directions).
+    const sortKeyColumn =
+      sort?.by === "field" ? ", pdpp_field_sort_key(c.data, ?) AS sk" : "";
+    if (sort?.by === "field") params.push(sort.field);
+    let sql = `SELECT c.*${sortKeyColumn} FROM pdpp_record_changes c ${sort === undefined ? "INDEXED BY idx_pdpp_record_changes_snapshot_key_order" : ""}
       WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ?
       AND c.version = (
         SELECT c2.version FROM pdpp_record_changes c2 INDEXED BY idx_pdpp_record_changes_snapshot_latest
         WHERE c2.instance = c.instance AND c2.stream = c.stream AND c2.record_key = c.record_key AND c2.written_at <= ?
         ORDER BY c2.written_at DESC, c2.version DESC LIMIT 1
       )`;
-    const params: unknown[] = [stream, ...instanceIds, horizon, horizon];
+    params.push(stream, ...instanceIds, horizon, horizon);
     if (options.liveOnly) sql += " AND c.deleted = 0";
     sql += unquarantined("c");
-    if (options.after) {
-      sql += ` AND (c.emitted_key, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
-      params.push(
-        timeSortKey(options.after.val),
-        options.after.key,
-        options.after.instance,
-      );
+    if (sort === undefined) {
+      if (options.after) {
+        sql += ` AND (c.emitted_key, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
+        params.push(
+          options.after.sortKey ?? "",
+          options.after.recordKey,
+          options.after.instance,
+        );
+      }
+      sql += ` ORDER BY ${LIST_ORDER_COLUMNS.map((column) => `c.${column} ${dir}`).join(", ")}`;
+      for (const row of db.prepare(sql).iterate(...params))
+        yield row as RecordRowDb & { written_at: number };
+      return;
     }
-    sql += ` ORDER BY ${LIST_ORDER_COLUMNS.map((column) => `c.${column} ${dir}`).join(", ")}`;
-    for (const row of db.prepare(sql).iterate(...params))
+    // Key and field order: `(instance_id, canonical key)` by code point
+    // (SQLite BINARY compares UTF-8 bytes, which is code-point order).
+    let outer = `SELECT * FROM (${sql}) s WHERE 1 = 1`;
+    const after = options.after;
+    if (after) {
+      const identity = `(s.instance, s.record_key) ${comparison} (?, ?)`;
+      if (sort.by === "key") {
+        outer += ` AND ${identity}`;
+        params.push(after.instance, after.recordKey);
+      } else if (after.sortKey === null) {
+        outer += ` AND s.sk IS NULL AND ${identity}`;
+        params.push(after.instance, after.recordKey);
+      } else {
+        outer += ` AND (s.sk IS NULL OR s.sk ${comparison} ? OR (s.sk = ? AND ${identity}))`;
+        params.push(
+          after.sortKey,
+          after.sortKey,
+          after.instance,
+          after.recordKey,
+        );
+      }
+    }
+    outer += ` ORDER BY ${sort.by === "field" ? `(s.sk IS NULL) ASC, s.sk ${dir}, ` : ""}s.instance ${dir}, s.record_key ${dir}`;
+    for (const row of db.prepare(outer).iterate(...params))
       yield row as RecordRowDb & { written_at: number };
   }
 
@@ -1826,13 +1901,13 @@ export function createSqliteRecordStore(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    let startAfter: { val: string; key: string; instance: string } | null =
-      null;
+    let startAfter: ListPosition | null = null;
     let horizon: number;
     if (options.cursor) {
       const payload = decodeListCursor(options.cursor);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
+      assertListCursorSort(payload, options.sort);
       horizon = parseHorizon(payload.horizon);
       replica?.assertCursorIntegrity(
         payload,
@@ -1840,11 +1915,7 @@ export function createSqliteRecordStore(
         options.fields,
       );
       assertNotResetSince(options.instanceIds, [horizon]);
-      startAfter = {
-        val: payload.sortValue ?? "",
-        key: payload.recordKey,
-        instance: payload.instance,
-      };
+      startAfter = cursorPosition(payload, options.sort);
     } else {
       horizon = readWriteClock();
     }
@@ -1855,6 +1926,7 @@ export function createSqliteRecordStore(
         order: options.order,
         after: startAfter,
         liveOnly: true,
+        sort: options.sort,
       })) {
         yield toRow(row) as PdppStoredRecord;
       }
@@ -1886,7 +1958,12 @@ export function createSqliteRecordStore(
     deletedAt: string,
     streamSemantics: StreamSemantics,
   ): boolean {
-    if (streamSemantics === "append_only") return false;
+    // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+    // permitted" (§8 "Delete a record"; RS item 1). Only re-emitted
+    // duplicates are no-ops, at ingest.
+    // While replication is on it cannot carry the delete: refuse it.
+    if (replica && streamSemantics === "append_only")
+      throw appendOnlyDeleteUnsupported();
     let result = false;
     const run = () =>
       connectionMutation(instance, () => {
@@ -1962,7 +2039,7 @@ export function createSqliteRecordStore(
     let offset = 0;
 
     if (options.cursor) {
-      const payload = decodeSyncPageCursor(options.cursor);
+      const payload = decodeSyncPageCursor(options.cursor, options.order);
       assertCursorScope(payload, stream);
       horizon = parseHorizon(payload.horizon);
       sinceHorizon =
@@ -2050,7 +2127,10 @@ export function createSqliteRecordStore(
       if (selected) changed.push(selected);
     }
 
-    changed.sort(compareRecordIdentity);
+    // spec-core §8 "Stable sort": `(instance_id, key)` in the direction
+    // `order` selects (RS item 21).
+    const direction = options.order === "desc" ? -1 : 1;
+    changed.sort((a, b) => direction * compareRecordIdentity(a, b));
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
     if (options.expireOnErasure && horizon < readWriteClock()) {
@@ -2081,6 +2161,7 @@ export function createSqliteRecordStore(
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
             orderKey: "code-point",
+            order: options.order ?? "asc",
           })
         : undefined,
       nextChangesSince: hasMore

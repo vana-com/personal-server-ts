@@ -163,6 +163,11 @@ const SNAPSHOT: DeclarationSnapshot = {
       fields: ["id", "name", "owner_email", "created_at"],
       required_fields: ["id"],
       consent_time_field: "created_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: { created_at: { type: "string", format: "date-time" } },
+      },
       primary_key: ["id"],
     },
     {
@@ -598,7 +603,7 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     const { accessToken } = await runAuthorizationJourney();
 
     const res = await harness.app.request(
-      "/v1/streams/playlists/records?changes_since=",
+      "/v1/streams/playlists/records?changes_since=beginning",
       { headers: { Authorization: `Bearer ${accessToken}` } },
     );
     expect(res.status).toBe(200);
@@ -834,7 +839,10 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         Authorization: `Bearer ${harness.ownerToken}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revokeRes.status).toBe(200);
 
@@ -843,13 +851,13 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
     expect(context.active).toBe(false);
     expect(context.inactiveReason).toBe("grant_revoked");
 
-    // And the RS denies the read with 403 grant_revoked. There is no cache to
+    // And the RS denies the read with 401 grant_revoked. There is no cache to
     // wait out here: the RS resolves through the AS on every request, so the
     // 60-second positive-cache bound is satisfied trivially.
     const after = await harness.app.request("/v1/streams/playlists/records", {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    expect(after.status).toBe(403);
+    expect(after.status).toBe(401);
     const error = await after.json();
     expect(JSON.stringify(error)).toContain("grant_revoked");
   });

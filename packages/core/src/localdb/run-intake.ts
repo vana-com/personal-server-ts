@@ -791,12 +791,10 @@ export function createRunIntakeStore(
             record.op !== "delete"
           )
             throw invalid("invalid record op");
+          // spec-core §4 "Stream semantics", `append_only`: "Explicit
+          // deletion is permitted." A delete row is accepted on either
+          // semantics; append-only duplicates stay no-ops at ingest.
           const declaration = streams.get(record.stream)!;
-          if (
-            record.op === "delete" &&
-            declaration.semantics !== "mutable_state"
-          )
-            throw invalid("delete requires a mutable_state stream");
           const primaryKey = declaration.primaryKey;
           let body: string;
           let bodySha256: string;

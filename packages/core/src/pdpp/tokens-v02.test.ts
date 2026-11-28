@@ -109,6 +109,7 @@ function v01Grant(): Grant {
         name: "transactions",
         instance_ids: ["account_example"],
         fields: ["date", "amount"],
+        required_fields: [],
       },
     ],
   };
@@ -225,7 +226,7 @@ describe("v0.2 token response carries the complete grant", () => {
 });
 
 describe("v0.1 results are unchanged", () => {
-  it("still returns the v0.1 detail projection for a v0.1 grant", () => {
+  it("redeems a locked v0.1.0 grant under the data-access type", () => {
     const result = redeem(seed(v01Grant()));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -234,11 +235,28 @@ describe("v0.1 results are unchanged", () => {
       unknown
     >;
     expect(entry.type).toBe(PDPP_DATA_ACCESS_TYPE);
-    // The v0.1 shape is a projection, not a grant envelope.
-    expect(entry.grant).toBeUndefined();
-    expect(entry.streams).toBeDefined();
-    // And it still omits the members §6 keeps out of enforcement.
-    expect(entry.retention).toBeUndefined();
+    // AS item 32 / §7 "Client-visible authorization result": one
+    // {type, grant} element carrying the complete immutable grant.
+    const delivered = entry.grant as Record<string, unknown> & {
+      streams: Array<{ required_fields?: string[] }>;
+    };
+    expect(delivered.version).toBe("0.1.0");
+    expect(delivered.retention).toEqual({
+      max_duration: "P30D",
+      on_expiry: "delete",
+    });
+    expect(delivered.streams[0]?.required_fields).toEqual([]);
+    expect(entry).not.toHaveProperty("streams");
+  });
+
+  it("refuses to redeem a pre-lock v0.1 grant (AS item 21)", () => {
+    const grant = v01Grant();
+    for (const stream of grant.streams)
+      delete (stream as { required_fields?: string[] }).required_fields;
+    const result = redeem(seed(grant));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("invalid_grant");
   });
 });
 

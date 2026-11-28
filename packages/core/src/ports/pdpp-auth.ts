@@ -35,6 +35,12 @@ export interface StreamGrant {
    * sparse-read floor from this set, never from a later declaration.
    */
   required_fields?: string[];
+  /**
+   * The declared date or date-time `cursor_field`, frozen at issuance when
+   * the grant includes it; absent means key order (spec-core §6, §8 "Stable
+   * sort").
+   */
+  sort_field?: string;
 }
 
 export interface ClientDisplay {
@@ -86,7 +92,17 @@ export function grantIsV02(grant: Grant | undefined): boolean {
 }
 
 export type PdppInactiveReason =
-  "unknown" | "expired" | "revoked" | "grant_revoked" | "grant_expired";
+  | "unknown"
+  | "expired"
+  | "revoked"
+  | "grant_revoked"
+  | "grant_expired"
+  /**
+   * The token's grant was issued under the pre-lock rules and does not have
+   * the locked v0.1.0 shape. AS item 21: rejected before use; fresh consent
+   * is required.
+   */
+  | "unsupported_legacy_shape";
 
 export interface PdppTokenContext {
   active: boolean;
@@ -107,6 +123,42 @@ export interface PdppTokenContext {
   clientId?: string;
   expiresAt?: string;
   inactiveReason?: PdppInactiveReason;
+  /**
+   * AS item 29: stored instance → the client's pairwise handle. When set,
+   * every `instance_id` the RS shows this client goes through it, and the
+   * client's `instance_id` parameter is resolved back through it.
+   */
+  clientInstanceHandles?: Record<string, string>;
+}
+
+/** The handle a client sees for a stored instance. */
+export function clientHandleFor(
+  context: Pick<PdppTokenContext, "tokenKind" | "clientInstanceHandles">,
+  instance: string,
+): string {
+  if (context.tokenKind !== "client" || !context.clientInstanceHandles)
+    return instance;
+  const handle = context.clientInstanceHandles[instance];
+  // Fail closed: never fall back to the stored id for a pairwise grant.
+  if (handle === undefined)
+    throw new Error("no pairwise handle for a served instance");
+  return handle;
+}
+
+/**
+ * The stored instance a client's `instance_id` names, or a value no stored
+ * instance has when the handle is not this client's. Owner tokens and older
+ * grants use stored ids directly.
+ */
+export function storedInstanceFor(
+  context: Pick<PdppTokenContext, "tokenKind" | "clientInstanceHandles">,
+  handle: string,
+): string {
+  if (context.tokenKind !== "client" || !context.clientInstanceHandles)
+    return handle;
+  for (const [instance, h] of Object.entries(context.clientInstanceHandles))
+    if (h === handle) return instance;
+  return "\u0000unknown-handle";
 }
 
 /**

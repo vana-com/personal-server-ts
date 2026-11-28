@@ -116,7 +116,7 @@ for (const backend of ["memory", "sqlite"])
             "",
             version.endsWith("candidate")
               ? "?changes_since=beginning"
-              : "?changes_since=",
+              : "?changes_since=beginning",
           ]) {
             const response = await records.request(
               `/streams/events/records${suffix}`,
@@ -139,8 +139,12 @@ for (const backend of ["memory", "sqlite"])
             ).toBe(id === "visible" ? 200 : 404);
           for (const method of ["GET", "HEAD"])
             expect(
-              (await blobs.request(`/${blob.blobId}`, { method, headers }))
-                .status,
+              (
+                await blobs.request(`/${blob.blobId}?instance_id=i`, {
+                  method,
+                  headers,
+                })
+              ).status,
             ).toBe(404);
           // Making one referencing record eligible admits the same content, proving
           // the negative case was the temporal gate rather than missing blob bytes.
@@ -162,7 +166,8 @@ for (const backend of ["memory", "sqlite"])
             () => ["id"],
           );
           expect(
-            (await blobs.request(`/${blob.blobId}`, { headers })).status,
+            (await blobs.request(`/${blob.blobId}?instance_id=i`, { headers }))
+              .status,
           ).toBe(200);
           if (version.endsWith("candidate")) {
             expect(checkpoint).toBeTruthy();

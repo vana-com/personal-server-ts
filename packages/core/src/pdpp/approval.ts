@@ -46,6 +46,7 @@ import type { PdppTokenService } from "./tokens.js";
 import { resolveCommitments } from "./commitments.js";
 import {
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  isSupportedPersistedGrant,
   type DeclarationSnapshot,
   type Grant,
   type OwnerConditions,
@@ -77,6 +78,23 @@ export interface AuthorizationSession {
   stream_descriptions?: Record<string, string>;
   /** The owner's optional reason for denying. Never sent to the client. */
   denial_reason?: string;
+  /**
+   * The parseable `ui_locales` tags of the authorization request, in request
+   * order (spec-core L1073, L1079). Drives the display-language choice the
+   * review binds (AS item 34). Never part of the grant.
+   */
+  language_priority?: string[];
+  /**
+   * Set when an owner-dependent check failed when the request arrived:
+   * private declaration acceptance, declaration-dependent validation, or the
+   * owner token's instance scope (spec-core L1220-L1222). The session still
+   * opens, with the same response a valid request gets, so the client cannot
+   * tell the two apart (L1238). Review and approval then refuse with
+   * `selection_refused` and this owner-only explanation; the client sees only
+   * the `access_denied` an owner's decline produces (L1230). Never sent to
+   * the client.
+   */
+  ineligible?: { message: string };
 }
 
 export type ApprovalFailureCode =
@@ -136,6 +154,8 @@ export class AuthorizationSessionStore {
     codeChallengeMethod?: string;
     grantExpiresAt?: string;
     streamDescriptions?: Record<string, string>;
+    languagePriority?: string[];
+    ineligible?: { message: string };
     now?: Date;
   }): AuthorizationSession {
     const now = input.now ?? new Date();
@@ -159,6 +179,11 @@ export class AuthorizationSessionStore {
       ...(input.streamDescriptions && {
         stream_descriptions: input.streamDescriptions,
       }),
+      ...(input.languagePriority &&
+        input.languagePriority.length > 0 && {
+          language_priority: input.languagePriority,
+        }),
+      ...(input.ineligible && { ineligible: input.ineligible }),
     };
     this.sessions.set(session.session_id, session);
     return session;
@@ -367,6 +392,8 @@ function existingActiveGrantsForClient(
     .filter((stored) => stored.clientId === clientId)
     .filter(
       (stored) =>
+        // A pre-lock grant is not an existing grant: it needs fresh consent.
+        isSupportedPersistedGrant(stored.grant) &&
         store.grantStatus(stored, now) === "active" &&
         !(stored.grant.access_mode === "single_use" && stored.consumedAt),
     )
@@ -455,6 +482,19 @@ export function fetchReview(input: {
     };
   }
 
+  // spec-core L1228: an owner-dependent failure is explained to the
+  // authenticated owner only; the only thing the client ever sees is the
+  // `access_denied` the owner's decline produces (deny route).
+  if (session.ineligible) {
+    return {
+      ok: false,
+      failure: {
+        code: "selection_refused",
+        message: session.ineligible.message,
+      },
+    };
+  }
+
   if (
     requestsFanIn(
       session.request,
@@ -514,7 +554,8 @@ export function fetchReview(input: {
     const refused =
       resolution.failure.code === "minimum_not_met" ||
       resolution.failure.code === "required_stream_declined" ||
-      resolution.failure.code === "no_streams_approved";
+      resolution.failure.code === "no_streams_approved" ||
+      resolution.failure.code === "required_stream_ineligible";
     return {
       ok: false,
       failure: {
@@ -563,6 +604,7 @@ export function fetchReview(input: {
     requester: session.requester,
     expiresAt: session.grant_expires_at,
     streamDescriptions: session.stream_descriptions,
+    languagePriority: session.language_priority,
     existingGrants: input.store
       ? existingActiveGrantsForClient(
           input.store,
@@ -654,6 +696,19 @@ export function approveAuthorization(input: {
     };
   }
 
+  // spec-core L1228: an owner-dependent failure is explained to the
+  // authenticated owner only; the only thing the client ever sees is the
+  // `access_denied` the owner's decline produces (deny route).
+  if (session.ineligible) {
+    return {
+      ok: false,
+      failure: {
+        code: "selection_refused",
+        message: session.ineligible.message,
+      },
+    };
+  }
+
   if (
     requestsFanIn(
       session.request,
@@ -694,6 +749,7 @@ export function approveAuthorization(input: {
     explicitAiTrainingConsent: input.explicitAiTrainingConsent,
     expiresAt: session.grant_expires_at,
     streamDescriptions: session.stream_descriptions,
+    languagePriority: session.language_priority,
     now,
   });
 

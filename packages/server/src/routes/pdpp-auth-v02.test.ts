@@ -126,6 +126,8 @@ function candidateBody() {
         type: "https://pdpp.dev/data-access/candidate-0.1.0",
         source: { id: snapshot.source_id },
         purpose_code: "https://apps.example.com/purposes/budget",
+        // AS item 6: a non-Appendix-A code needs a non-empty description.
+        purpose_description: "Plan your monthly budget",
         access_mode: "continuous",
         streams: [
           { name: "profile", necessity: "required", fields: ["id"] },

@@ -376,11 +376,10 @@ describe("optional-stream minima drop the stream", () => {
   });
 });
 
-describe("resolution ignores owner choices under v0.1", () => {
-  it("does not let a v0.1 request be narrowed by owner choices", () => {
-    // v0.1 has no narrowing step, so passing choices alongside a v0.1 request
-    // must not quietly change what that revision resolves. A v0.1 client's
-    // grant is the same one it has always received.
+describe("owner choices under the locked v0.1.0 type", () => {
+  // The pre-lock v0.1 rules had no narrowing step and ignored owner choices.
+  // The locked type does narrow, within the schema-required floor.
+  it("lets the owner narrow a retained stream, not below its required fields", () => {
     const result = resolveSelection(
       {
         type: PDPP_DATA_ACCESS_TYPE,
@@ -391,10 +390,31 @@ describe("resolution ignores owner choices under v0.1", () => {
       },
       snapshot,
       singleInstance,
-      { fields: { profile: ["id"] }, declined_streams: ["profile"] },
+      { fields: { profile: ["id"] } },
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.streams[0].fields).toEqual(["id", "display_name"]);
+    // locked v0.1.0: "The AS MAY let the owner remove optional streams and narrow retained streams, but not below a stream's schema-required fields." (spec-core L1250)
+    expect(result.streams[0].fields).toEqual(["id"]);
+    expect(result.streams[0].required_fields).toEqual(["id"]);
+  });
+
+  it("omits a declined optional stream and refuses when none remains", () => {
+    const result = resolveSelection(
+      {
+        type: PDPP_DATA_ACCESS_TYPE,
+        source: { id: snapshot.source_id },
+        purpose_code: "https://pdpp.dev/purpose/portability",
+        access_mode: "single_use",
+        streams: [{ name: "profile", fields: ["id", "display_name"] }],
+      },
+      snapshot,
+      singleInstance,
+      { declined_streams: ["profile"] },
+    );
+    // locked v0.1.0: "The AS MUST omit a declined optional stream from the grant ... If no stream remains, the AS MUST refuse issuance" (spec-core L1183)
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("no_streams_approved");
   });
 });

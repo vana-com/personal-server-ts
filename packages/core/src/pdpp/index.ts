@@ -11,11 +11,13 @@ export {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
-  grantIsCandidate,
+  grantUsesLockedRules,
+  usesLockedRules,
+  isPreLockGrant,
+  isSupportedPersistedGrant,
   PDPP_GRANT_VERSION_CANDIDATE,
   PDPP_GRANT_VERSION,
   PDPP_GRANT_VERSION_V02,
-  PDPP_API_VERSION,
   AI_TRAINING_PURPOSE,
   isV02Grant,
 } from "./types.js";
@@ -32,8 +34,10 @@ export type {
   InactiveReason,
   PdppAuthorizationDetail,
   PdppAuthorizationEntry,
+  PdppAuthorizationResult,
   PdppAuthorizationResultV02,
   PdppIntrospectionResponse,
+  PdppInstanceBinding,
   PdppTokenContext,
   PdppTokenKind,
   OwnerConditions,
@@ -51,6 +55,26 @@ export type {
 } from "./types.js";
 
 export { validateSelectionRequest } from "./selection.js";
+export {
+  APPENDIX_A_PURPOSE_CODES,
+  SUPPORTED_PROCESSING_PERMISSIONS,
+  validatePublicDetail,
+} from "./public-validation.js";
+export type {
+  PublicDetailFailure,
+  PublicDetailValidation,
+} from "./public-validation.js";
+export {
+  chooseLanguageVersion,
+  isWellFormedLanguageTag,
+  parseUiLocales,
+  validateLanguageMap,
+} from "./language.js";
+export type {
+  ChosenVersion,
+  LanguageMap,
+  LocalizableValue,
+} from "./language.js";
 export type {
   SelectionFailure,
   SelectionFailureCode,
@@ -77,18 +101,20 @@ export type {
 export {
   buildConsentReview,
   computeReviewDigest,
+  ENVELOPE_DISCLOSURE_STATEMENT,
   isRegisteredPurposeCode,
   normalizeClientClaims,
 } from "./review.js";
 export type {
   BuildReviewInput,
   ConsentReviewModel,
+  DisplayValueShown,
   ExistingGrant,
   RequesterIdentity,
   ReviewStream,
 } from "./review.js";
 
-export { issueGrant } from "./issuance.js";
+export { issueGrant, withPairwiseSubject } from "./issuance.js";
 export type {
   ConsentEvidence,
   IssuanceFailure,
@@ -154,13 +180,70 @@ export {
   openPdppAuthStore,
   PdppAuthStore,
   PDPP_AUTH_STATE_VERSION,
+  translateGrantInstances,
   UnsupportedAuthStateError,
 } from "./store.js";
 export type {
   AccessTokenRecord,
   AuthCodeRecord,
+  ChainRegistration,
+  GrantEndingReason,
+  OpenPdppAuthStoreOptions,
   StoredGrant,
 } from "./store.js";
+
+export {
+  defaultAnchorIo,
+  defaultPendingJournalIo,
+  HistoryEvidenceError,
+  HistoryRecorder,
+  PendingActionJournal,
+} from "./history.js";
+export type {
+  AnchorDocument,
+  AnchoredErasure,
+  AnchorIo,
+  HistoryStatus,
+  PendingJournalIo,
+  PendingOwnerAction,
+} from "./history.js";
+
+export {
+  DELETION_BOUND_MS,
+  GrantLifecycleService,
+  HISTORY_RETRY_AFTER_SECONDS,
+  isRfc3339,
+  parseRetainedUntil,
+  PDPP_GRANT_LIFECYCLE_TYPE,
+  RECONCILIATION_INTERVAL_MS,
+  RETRY_INTERVAL_MS,
+  STOP_USE_BOUND_MS,
+} from "./lifecycle.js";
+export type {
+  AffectedGrant,
+  ErasureOwnerView,
+  GrantLifecycleServiceOptions,
+  LifecycleAnswer,
+  LifecycleEntry,
+  LifecycleHttpResult,
+  OwnerActionResult,
+  OwnerEndingAction,
+  OwnerGrantLifecycleView,
+  ReadState,
+} from "./lifecycle.js";
+export type {
+  ErasureInstructionRecord,
+  RetainedReportRecord,
+} from "./lifecycle-store.js";
+
+export {
+  deleteStatements,
+  finalReviewHeldDataStatements,
+  keepStatement,
+  narrowingStatements,
+  PENDING_HISTORY_STATEMENT,
+  RECOVERY_STATEMENT,
+} from "./held-data-statements.js";
 
 export {
   checkDeclarationUrl,

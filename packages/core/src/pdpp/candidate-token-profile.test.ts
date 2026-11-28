@@ -18,11 +18,13 @@ it("preserves the explicit candidate profile in token and introspection authoriz
         name: "events",
         instance_ids: ["i"],
         fields: ["id"],
+        required_fields: ["id"],
         time_constraint: { field: "at", type: "date", since: "2026-01-01" },
       },
     ],
   };
   const entry = toAuthorizationEntry(grant);
   expect(entry.type).toBe(PDPP_DATA_ACCESS_TYPE_CANDIDATE);
-  expect("streams" in entry && entry.streams).toEqual(grant.streams);
+  // AS item 32: the complete grant, never a projection (spec-core L1415).
+  expect("grant" in entry && entry.grant).toEqual(grant);
 });

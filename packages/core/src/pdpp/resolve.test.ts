@@ -26,6 +26,13 @@ const snapshot: DeclarationSnapshot = {
       fields: ["id", "name", "genres", "popularity", "source_updated_at"],
       required_fields: ["id", "source_updated_at"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
     {
@@ -92,8 +99,10 @@ describe("§9 AS item 4 — wildcards expand to explicit streams", () => {
     const profile = result.streams.find((s) => s.name === "profile");
     const artists = result.streams.find((s) => s.name === "top_artists");
     expect(profile?.time_constraint).toBeUndefined();
+    // locked v0.1.0: "Frozen `{ field, type, since?, until? }` ... the AS sets it at issuance from the field's format" (spec-core L1402)
     expect(artists?.time_constraint).toEqual({
       field: "source_updated_at",
+      type: "date-time",
       since: "2026-01-01T00:00:00Z",
     });
   });
@@ -224,7 +233,10 @@ describe("§6 / §9 AS item 15 — instance handle resolution", () => {
     expect(result.streams[0].instance_ids).toEqual(["account-a", "account-b"]);
   });
 
-  it("rejects an instance handle that is not eligible", () => {
+  // spec-core L1226 / AS item 53: an otherwise valid stream with no eligible
+  // instance is unapproved. Optional: omitted. Required: refused, which the
+  // binding reports as access_denied. Never authorized.
+  it("leaves an optional stream naming an ineligible handle unapproved", () => {
     const result = resolveSelection(
       request({
         streams: [
@@ -236,15 +248,71 @@ describe("§6 / §9 AS item 15 — instance handle resolution", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.failure.code).toBe("unknown_instance");
+    expect(result.failure.code).toBe("no_streams_approved");
+    expect(result.failure.omittedStreams).toEqual(["top_artists"]);
   });
 
-  it("fails when no instance is connected", () => {
+  it("refuses a required stream naming an ineligible handle", () => {
+    const result = resolveSelection(
+      request({
+        streams: [
+          {
+            name: "top_artists",
+            necessity: "required",
+            instance_ids: ["someone-elses-account"],
+          },
+        ],
+      }),
+      snapshot,
+      singleInstance,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("required_stream_ineligible");
+  });
+
+  it("leaves an optional stream unapproved when no instance is connected", () => {
     const none: InstanceInventory = { eligibleFor: () => [] };
     const result = resolveSelection(request(), snapshot, none);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.failure.code).toBe("no_eligible_instance");
+    expect(result.failure.code).toBe("no_streams_approved");
+  });
+
+  it("refuses a required stream when no instance is connected", () => {
+    const none: InstanceInventory = { eligibleFor: () => [] };
+    const result = resolveSelection(
+      request({
+        streams: [
+          { name: "top_artists", necessity: "required", fields: ["*"] },
+        ],
+      }),
+      snapshot,
+      none,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.failure.code).toBe("required_stream_ineligible");
+  });
+
+  it("omits an ineligible optional stream and keeps the eligible one", () => {
+    const perStream: InstanceInventory = {
+      eligibleFor: (stream) => (stream === "top_artists" ? ["account-a"] : []),
+    };
+    const result = resolveSelection(
+      request({
+        streams: [
+          { name: "top_artists", fields: ["*"] },
+          { name: "profile", fields: ["*"] },
+        ],
+      }),
+      snapshot,
+      perStream,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.streams.map((s) => s.name)).toEqual(["top_artists"]);
+    expect(result.omittedStreams).toEqual(["profile"]);
   });
 
   it("verifies wildcard-carried handles against every expanded stream", () => {
@@ -256,14 +324,18 @@ describe("§6 / §9 AS item 15 — instance handle resolution", () => {
       eligibleFor: (stream) =>
         stream === "top_artists" ? ["account-a"] : ["account-b"],
     };
+    // Locked rules (L1226): the stream the handle is not eligible for is
+    // unapproved and, being optional, omitted -- never authorized.
     const result = resolveSelection(
       request({ streams: [{ name: "*", instance_ids: ["account-a"] }] }),
       snapshot,
       perStream,
     );
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.failure.code).toBe("unknown_instance");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.streams.map((s) => s.name)).toEqual(["top_artists"]);
+    expect(result.streams[0].instance_ids).toEqual(["account-a"]);
+    expect(result.omittedStreams).toEqual(["profile"]);
   });
 });
 
@@ -286,8 +358,10 @@ describe("§7 — time constraints freeze", () => {
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    // locked v0.1.0: "Frozen `{ field, type, since?, until? }` ... the AS sets it at issuance from the field's format" (spec-core L1402)
     expect(result.streams[0].time_constraint).toEqual({
       field: "source_updated_at",
+      type: "date-time",
       since: "2025-09-28T00:00:00Z",
       until: "2026-09-28T00:00:00Z",
     });
@@ -342,5 +416,52 @@ describe("§7 — resources pass through as canonical keys", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.streams[0].resources).toBeUndefined();
+  });
+});
+
+describe("§9 AS item 13 — cursor_field frozen as sort_field", () => {
+  const withCursor = (format: string | undefined): DeclarationSnapshot => ({
+    ...snapshot,
+    streams: [
+      {
+        ...snapshot.streams[0]!,
+        cursor_field: "source_updated_at",
+        schema: {
+          properties: {
+            source_updated_at:
+              format === undefined
+                ? { type: "string" }
+                : { type: "string", format },
+          },
+        },
+        ...(format === undefined && { consent_time_field: undefined }),
+      },
+    ],
+  });
+  const streamOf = (snap: DeclarationSnapshot, fields: string[]) => {
+    const result = resolveSelection(
+      request({ streams: [{ name: "top_artists", fields }] }),
+      snap,
+      singleInstance,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unresolved");
+    return result.streams[0]!;
+  };
+
+  it("freezes a date-time cursor_field the grant includes", () => {
+    expect(
+      streamOf(withCursor("date-time"), ["id", "source_updated_at"]).sort_field,
+    ).toBe("source_updated_at");
+  });
+
+  it("omits sort_field when the cursor_field is not date or date-time", () => {
+    expect(
+      streamOf(withCursor(undefined), ["id", "source_updated_at"]).sort_field,
+    ).toBeUndefined();
+  });
+
+  it("omits sort_field when the stream declares no cursor_field", () => {
+    expect(streamOf(snapshot, ["id"]).sort_field).toBeUndefined();
   });
 });

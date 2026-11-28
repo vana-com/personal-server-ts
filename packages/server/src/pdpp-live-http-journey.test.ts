@@ -55,6 +55,13 @@ const DECLARATION = JSON.stringify({
       fields: ["id", "name", "genres", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
   ],
@@ -251,7 +258,10 @@ describe("PDPP journey over a real listening HTTP server", () => {
         authorization: `Bearer ${owner}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ grant_id: grantId }).toString(),
+      body: new URLSearchParams({
+        grant_id: grantId,
+        disposition: "keep",
+      }).toString(),
     });
     expect(revoked.status).toBe(200);
 
@@ -259,7 +269,7 @@ describe("PDPP journey over a real listening HTTP server", () => {
     const after = await fetch(`${baseUrl}/v1/streams/top_artists/records`, {
       headers: { authorization: `Bearer ${accessToken}` },
     });
-    expect(after.status).toBe(403);
+    expect(after.status).toBe(401);
     expect(JSON.stringify(await after.json())).toContain("grant_revoked");
   });
 

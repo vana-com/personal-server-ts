@@ -92,7 +92,7 @@ describe("GET /v1/streams/:stream/records on the Lite runtime", () => {
   it("serves page two with the browser Buffer shim", async () => {
     const runtime = await liteRuntime(await switchedStore());
     vi.stubGlobal("Buffer", BrowserBuffer);
-    const path = `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`;
+    const path = `/v1/streams/posts/records?limit=2&order=asc&source=${CONNECTOR}`;
     const first = await liteGet(runtime, path);
     expect(first.status, await first.clone().text()).toBe(200);
     const page = await first.json();
@@ -115,7 +115,7 @@ describe("GET /v1/streams/:stream/records on the Lite runtime", () => {
     const runtime = await liteRuntime(await switchedStore());
     const res = await liteGet(
       runtime,
-      `/v1/streams/posts/records?limit=2&source=${CONNECTOR}`,
+      `/v1/streams/posts/records?limit=2&order=asc&source=${CONNECTOR}`,
     );
     expect(res.status, await res.clone().text()).toBe(200);
     const body = await res.json();
@@ -153,23 +153,30 @@ describe("Node and Lite serve identical pages for one store", () => {
     const local = await switchedStore();
     const runtime = await liteRuntime(local);
     const app = nodeApp(local);
-    let cursor: string | undefined;
+    // Each runtime seals its own cursors with a fresh IV (RS item 21), so the
+    // bodies match apart from `next_cursor`, and each walk follows its own.
+    let liteCursor: string | undefined;
+    let nodeCursor: string | undefined;
     const seen: string[] = [];
+    const base = `/v1/streams/posts/records?limit=2&order=asc&source=${CONNECTOR}`;
+    const at = (cursor: string | undefined) =>
+      cursor ? `${base}&cursor=${encodeURIComponent(cursor)}` : base;
     for (let page = 0; page < 5; page++) {
-      const query =
-        `limit=2&source=${CONNECTOR}` +
-        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
-      const path = `/v1/streams/posts/records?${query}`;
       const [lite, node] = [
-        await liteGet(runtime, path),
-        await nodeGet(app, path),
+        await liteGet(runtime, at(liteCursor)),
+        await nodeGet(app, at(nodeCursor)),
       ];
       expect(lite.status).toBe(200);
       expect(node.status).toBe(200);
       const liteBody = await lite.json();
-      expect(liteBody).toEqual(await node.json());
+      const nodeBody = await node.json();
+      liteCursor = liteBody.next_cursor;
+      nodeCursor = nodeBody.next_cursor;
+      expect({ ...liteBody, next_cursor: undefined }).toEqual({
+        ...nodeBody,
+        next_cursor: undefined,
+      });
       seen.push(...liteBody.data.map((row: { id: string }) => row.id));
-      cursor = liteBody.next_cursor;
       if (!liteBody.has_more) break;
     }
     expect(seen).toEqual(POSTS.map((post) => post.id));
@@ -211,6 +218,14 @@ describe("PDPP-Version negotiation on both hosts", () => {
         },
       });
     }) as LocalSync["recordsFor"];
+    // Owner lists read the frozen history (spec-core §8 "Stable sort").
+    counted.changesFor = ((link: Parameters<LocalSync["changesFor"]>[0]) => {
+      const history = base.changesFor(link);
+      return (...args: Parameters<typeof history>) => {
+        calls.queries++;
+        return history(...args);
+      };
+    }) as LocalSync["changesFor"];
     return { local: counted, calls };
   }
 

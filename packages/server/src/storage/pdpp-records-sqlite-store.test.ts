@@ -421,7 +421,9 @@ describe("sqlite record store", () => {
     expect(store.getRecord("inst_1", "playlists", "pl_1")).toBeUndefined();
   });
 
-  it("rejects delete on an append_only stream", () => {
+  // spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+  // permitted." §8 "Delete a record" makes no exception (RS item 1).
+  it("deletes a record on an append_only stream (owner delete)", () => {
     store.ingestBatch(
       [
         {
@@ -443,7 +445,8 @@ describe("sqlite record store", () => {
         "2026-04-02T00:00:00.000Z",
         "append_only",
       ),
-    ).toBe(false);
+    ).toBe(true);
+    expect(store.getRecord("inst_1", "messages", "msg_1")).toBeUndefined();
   });
 
   it("paginates list records with a stable cursor and clamps by limit", () => {

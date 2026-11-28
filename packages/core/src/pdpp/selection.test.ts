@@ -23,6 +23,13 @@ const snapshot: DeclarationSnapshot = {
       fields: ["id", "name", "genres", "popularity", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
     {
@@ -37,6 +44,9 @@ const snapshot: DeclarationSnapshot = {
       fields: ["user_id", "track_id", "played_at"],
       required_fields: ["user_id", "track_id"],
       consent_time_field: "played_at",
+      schema: {
+        properties: { played_at: { type: "string", format: "date-time" } },
+      },
       primary_key: ["user_id", "track_id"],
     },
   ],
@@ -48,19 +58,35 @@ const snapshot: DeclarationSnapshot = {
   selection_presets: [
     {
       name: "social_summary",
-      streams: [{ name: "top_artists" }, { name: "profile" }],
+      streams: [
+        { name: "top_artists", fields: ["*"] },
+        { name: "profile", fields: ["*"] },
+      ],
     },
   ],
 };
 
 function request(overrides: Partial<SelectionRequest> = {}): SelectionRequest {
-  return {
+  const base: SelectionRequest = {
     type: PDPP_DATA_ACCESS_TYPE,
     source: { id: snapshot.source_id },
     purpose_code: "https://pdpp.dev/purpose/personalization",
     access_mode: "single_use",
     streams: [{ name: "top_artists" }],
     ...overrides,
+  };
+  // locked v0.1.0: "Each stream request, including each stream in a selection
+  // preset, MUST carry either `fields` or `view`" (spec-core L1210). These
+  // oracles test other rules, so an entry that names neither asks for `*`.
+  return {
+    ...base,
+    ...(base.streams && {
+      streams: base.streams.map((s) =>
+        s.fields === undefined && s.view === undefined
+          ? { ...s, fields: ["*"] }
+          : s,
+      ),
+    }),
   };
 }
 
@@ -369,5 +395,49 @@ describe("§7 — retention", () => {
       snapshot,
     );
     expect(result.ok).toBe(false);
+  });
+});
+
+describe("locked v0.1.0 minimum field ceiling (spec-core L1248, L1258)", () => {
+  const snap: DeclarationSnapshot = {
+    source_id: "https://registry.pdpp.dev/connectors/spotify",
+    source_kind: "connector",
+    version: "1",
+    digest: "d".repeat(64),
+    streams: [
+      {
+        name: "top_artists",
+        fields: ["id", "name", "genres"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+      },
+    ],
+  };
+  const req = (minimumFields: string[]) =>
+    validateSelectionRequest(
+      {
+        type: PDPP_DATA_ACCESS_TYPE,
+        source: { id: snap.source_id },
+        purpose_code: "https://pdpp.dev/purpose/personalization",
+        access_mode: "single_use",
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["name"],
+            minimum: { fields: minimumFields },
+          },
+        ],
+      },
+      snap,
+    );
+
+  it("accepts a minimum naming a schema-required field the client did not list", () => {
+    expect(req(["id"]).ok).toBe(true);
+  });
+
+  it("still refuses a minimum outside the field ceiling", () => {
+    const result = req(["genres"]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.failure.code).toBe("invalid_minimum");
   });
 });

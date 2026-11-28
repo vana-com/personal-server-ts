@@ -130,7 +130,7 @@ describe("resolveReadScope", () => {
     }
   });
 
-  it("maps grant_revoked inactiveReason to a 403 grant_revoked error", () => {
+  it("maps grant_revoked inactiveReason to a 401 grant_revoked error", () => {
     const context: PdppTokenContext = {
       active: false,
       tokenKind: "client",
@@ -142,7 +142,7 @@ describe("resolveReadScope", () => {
       expect.unreachable();
     } catch (err) {
       expect((err as PdppError).code).toBe("grant_revoked");
-      expect((err as PdppError).status).toBe(403);
+      expect((err as PdppError).status).toBe(401);
     }
   });
 

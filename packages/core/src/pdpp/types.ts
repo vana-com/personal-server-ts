@@ -1,4 +1,5 @@
 import type { TimeType } from "./time.js";
+import type { LanguageMap } from "./language.js";
 
 /**
  * PDPP Core v0.1.0 authorization types.
@@ -43,23 +44,6 @@ export const PDPP_GRANT_VERSION = "0.1.0";
 
 /** The v0.2 grant schema version, issued for `PDPP_DATA_ACCESS_TYPE_V02`. */
 export const PDPP_GRANT_VERSION_V02 = "0.2.0";
-
-/**
- * The PDPP HTTP API contract version, sent and echoed in the `PDPP-Version`
- * header. Normative value from Core §8 "API versioning".
- *
- * §7 "Version layering" is explicit that the three version axes MUST NOT be
- * conflated, and this is the one that is easiest to get wrong: it is the HTTP
- * *contract* version, not `PDPP_GRANT_VERSION` (the grant schema, `0.1.0`) and
- * not `source_declaration.version` (an opaque declaration revision). This
- * previously carried the grant schema version, which meant a client pinning
- * the spec's own header value was rejected by the AS while the RS accepted it —
- * a client could reach only half the server.
- *
- * Both the AS and RS surfaces import this one constant so they cannot drift
- * apart again.
- */
-export const PDPP_API_VERSION = "2026-04-06";
 
 /**
  * The one purpose code Core gives a protocol-level consent requirement
@@ -206,6 +190,14 @@ export interface SelectionRequest {
   /** Alternative to explicit streams. Exactly one of the two. */
   selection_preset?: string;
   client_claims?: ClientClaims;
+  /**
+   * spec-core L1093 / AS item 14: unique absolute-URI processing-permission
+   * identifiers. This build implements no processing permission, so any value
+   * is rejected with `invalid_authorization_details` before consent
+   * (`public-validation.ts`); the member exists here only so the request type
+   * names what the AS refuses.
+   */
+  processing_permissions?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +231,12 @@ export interface StreamGrant {
    * sparse-read floor from this set, never from a later declaration.
    */
   required_fields?: string[];
+  /**
+   * Locked v0.1.0 (AS item 13): the declared `cursor_field`, frozen at
+   * issuance when its schema format is `date` or `date-time` and `fields`
+   * includes it; otherwise absent. Client list reads sort by it.
+   */
+  sort_field?: string;
 }
 
 /**
@@ -323,6 +321,31 @@ export interface DeclaredDisplay {
    * part an owner cannot reconstruct from a field list.
    */
   detail?: string;
+  /**
+   * spec-core L834 "Display text languages": the declaration authored
+   * `label` / `detail` as a language map. The plain member above then holds
+   * the `display.default_language` version, so a reader that predates
+   * language maps keeps rendering a string; the AS chooses among the map's
+   * versions per "Display language" (L1071) when it builds a review.
+   */
+  label_map?: LanguageMap;
+  detail_map?: LanguageMap;
+  /**
+   * §5 `display.fields`: per-field consent text keyed by top-level field
+   * name. Each key names a declared field (checked at acceptance). `label` /
+   * `meaning` hold the plain or default-language version; the `_map` members
+   * keep an authored language map so the AS can choose per AS item 34.
+   */
+  fields?: Record<string, DeclaredFieldDisplay>;
+}
+
+/** One §5 `streams[].display.fields` entry. */
+export interface DeclaredFieldDisplay {
+  label?: string;
+  label_map?: LanguageMap;
+  /** What the value records, e.g. "The day Oura assigns, in your local time". */
+  meaning?: string;
+  meaning_map?: LanguageMap;
 }
 
 export interface DeclaredStream {
@@ -335,6 +358,8 @@ export interface DeclaredStream {
    * (label → description → name) instead of guessing at render time.
    */
   description?: string;
+  /** L834: `description` authored as a language map (see `DeclaredDisplay`). */
+  description_map?: LanguageMap;
   /** §5 consent-surface metadata. Absent means the declaration authored none. */
   display?: DeclaredDisplay;
   /**
@@ -363,6 +388,14 @@ export interface DeclaredStream {
    * (§6 "Note on `time_range`").
    */
   consent_time_field?: string;
+  /**
+   * §5 `streams[].consent_time_content_may_exceed` (default false): a record
+   * can contain data from outside its own `consent_time_field` value. Absent
+   * means the declaration did not set it, which reads as false.
+   */
+  consent_time_content_may_exceed?: boolean;
+  /** §5 `cursor_field`: the declared ordering field, when the stream has one. */
+  cursor_field?: string;
   /** Arity of the primary key; `resources` entries are validated against it. */
   primary_key: string[];
   /** The stream's JSON Schema from a normative §5 declaration, when present. */
@@ -396,7 +429,17 @@ export interface DeclarationSnapshot {
    * Absent means the declaration authored none, and the surface falls back to
    * the id rather than rendering a blank.
    */
-  display?: { name?: string };
+  display?: {
+    name?: string;
+    /** L834: `display.name` authored as a language map. */
+    name_map?: LanguageMap;
+    /**
+     * L779 `display.default_language`: the language of every plain-string
+     * display value. Absent means the declaration states none and the AS
+     * must not assume one (L857).
+     */
+    default_language?: string;
+  };
   /** Opaque revision identifier recorded into the grant. */
   version: string;
   /** Digest over the retrieved document, verified before the snapshot is trusted. */
@@ -437,9 +480,22 @@ export interface PdppAuthorizationResultV02 {
   grant: Grant;
 }
 
+/**
+ * The locked v0.1.0 client-visible authorization result (spec-core L1413, AS
+ * item 32): `{ type, grant }` with the complete immutable grant, never the
+ * lossy projection above. `type` is `https://pdpp.dev/data-access`; a grant
+ * issued under the development alias carries the alias type.
+ */
+export interface PdppAuthorizationResult {
+  type: typeof PDPP_DATA_ACCESS_TYPE | typeof PDPP_DATA_ACCESS_TYPE_CANDIDATE;
+  grant: Grant;
+}
+
 /** Either revision's element, as it appears in `authorization_details`. */
 export type PdppAuthorizationEntry =
-  PdppAuthorizationDetail | PdppAuthorizationResultV02;
+  | PdppAuthorizationDetail
+  | PdppAuthorizationResult
+  | PdppAuthorizationResultV02;
 
 /**
  * RFC 7662 introspection response with the PDPP extension members. An inactive
@@ -465,11 +521,21 @@ export interface PdppIntrospectionResponse {
    * which is why this is the same projection the token response uses.
    */
   authorization_details?: PdppAuthorizationEntry[];
+  /**
+   * RS-only (spec-core §8, L2002): each handle the token can use → the
+   * instance the RS stores. Never returned to a client.
+   */
+  pdpp_instance_bindings?: PdppInstanceBinding[];
 }
 
 /** Why a token did not resolve. Drives the RS error; never echoed to the client. */
 export type InactiveReason =
-  "unknown" | "expired" | "revoked" | "grant_revoked" | "grant_expired";
+  | "unknown"
+  | "expired"
+  | "revoked"
+  | "grant_revoked"
+  | "grant_expired"
+  | "unsupported_legacy_shape";
 
 /**
  * The co-located equivalent of an introspection call. The RS resolves a token
@@ -484,18 +550,110 @@ export interface PdppTokenContext {
   instanceIds?: string[];
   /** Owner tokens only. The AS and RS enforce this source scope directly. */
   sourceId?: string;
-  /** Client tokens only. An owner token carries no grant. */
+  /**
+   * Client tokens only. An owner token carries no grant. This is the RS
+   * enforcement view: its `instance_ids` are the instances the RS stores.
+   */
   grant?: Grant;
   clientId?: string;
   expiresAt?: string;
   inactiveReason?: InactiveReason;
+  /**
+   * AS item 29: stored instance → this client's pairwise handle, for a grant
+   * issued with pairwise handles. The RS shows a client only these handles
+   * (record and tombstone `instance_id`, blob `fetch_url`) and resolves the
+   * client's `instance_id` parameter through them. Absent: the client's
+   * handles are the stored instance ids (owner tokens, older grants).
+   */
+  clientInstanceHandles?: Record<string, string>;
+}
+
+/** spec-core §8 `pdpp_instance_bindings` entry (RS-only). */
+export interface PdppInstanceBinding {
+  source_id: string;
+  /** Client tokens: the stream the handle authorizes. */
+  stream?: string;
+  /** The handle the token's holder uses. */
+  instance_id: string;
+  /** Opaque: the instance the RS stores. */
+  rs_instance: string;
 }
 
 export type GrantStatus = "active" | "expired" | "revoked";
 
-/** Explicit opt-in candidate profile; unknown versions retain current behavior. */
-export function grantIsCandidate(
-  grant: { version: string } | undefined,
+/**
+ * Whether a request type resolves under the locked PDPP Core v0.1.0 rules.
+ *
+ * The locked type `https://pdpp.dev/data-access` uses them by default. The
+ * development alias `…/candidate-0.1.0` (behind `protocolProfile:
+ * "candidate-0.1.0"`) uses the same rules. The pre-lock rule set that the
+ * plain type used to select is no longer reachable for new requests.
+ */
+export function usesLockedRules(type: string | undefined): boolean {
+  return (
+    type === PDPP_DATA_ACCESS_TYPE || type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+  );
+}
+
+/**
+ * Whether an issued grant carries the locked v0.1.0 shape.
+ *
+ * Locked grants use `version: "0.1.0"` (spec-core §7: "This contract requires
+ * exactly `0.1.0`"), the same value pre-lock grants carried, so they are told
+ * apart by shape: every StreamGrant of a locked grant carries a
+ * `required_fields` array (AS item 51: "Includes an empty array for an empty
+ * floor"). Candidate-alias grants carry their own version string.
+ */
+export function grantUsesLockedRules(
+  grant:
+    | {
+        version: string;
+        streams?: ReadonlyArray<{ required_fields?: unknown }>;
+      }
+    | undefined,
 ): boolean {
-  return grant?.version === PDPP_GRANT_VERSION_CANDIDATE;
+  if (!grant) return false;
+  if (grant.version === PDPP_GRANT_VERSION_CANDIDATE) return true;
+  return (
+    grant.version === PDPP_GRANT_VERSION &&
+    Array.isArray(grant.streams) &&
+    grant.streams.length > 0 &&
+    grant.streams.every((s) => Array.isArray(s.required_fields))
+  );
+}
+
+/**
+ * A persisted grant issued under the pre-lock rules: `0.1.0` without the
+ * locked shape. AS item 21 / §7 "Version layering": such state is rejected
+ * before use, missing facts are not reconstructed from current configuration,
+ * and fresh consent is required.
+ */
+/**
+ * Whether persisted grant state is a contract this build supports (§7
+ * "Version layering": "MUST reject any persisted authorization state whose
+ * version or shape it cannot validate against a supported contract").
+ * An allowlist: locked v0.1.0 shape, the candidate alias, or v0.2.
+ */
+export function isSupportedPersistedGrant(
+  grant:
+    | {
+        version: string;
+        streams?: ReadonlyArray<{ required_fields?: unknown }>;
+      }
+    | undefined,
+): boolean {
+  if (!grant) return false;
+  if (grantUsesLockedRules(grant)) return true;
+  return grant.version === PDPP_GRANT_VERSION_V02;
+}
+
+export function isPreLockGrant(
+  grant:
+    | {
+        version: string;
+        streams?: ReadonlyArray<{ required_fields?: unknown }>;
+      }
+    | undefined,
+): boolean {
+  return grant?.version === PDPP_GRANT_VERSION && !grantUsesLockedRules(grant);
 }

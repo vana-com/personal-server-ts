@@ -38,6 +38,9 @@ export type PdppErrorCode =
   | "blob_not_found"
   | "instance_unavailable"
   | "not_found"
+  | "conflict"
+  | "update_required"
+  | "append_only_delete_unsupported"
   | "cursor_expired"
   | "rate_limit_exceeded"
   | "api_error";
@@ -57,13 +60,24 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   insufficient_scope: 403,
   grant_stream_not_allowed: 403,
   grant_time_range_exceeded: 403,
-  grant_expired: 403,
-  grant_revoked: 403,
+  // spec-core §8 error table: inactive grants are 401 authentication_error
+  // with the Bearer invalid_token challenge (RS item 19), not 403.
+  grant_expired: 401,
+  grant_revoked: 401,
   grant_invalid: 403,
   disclosure_unavailable: 403,
   blob_not_found: 404,
   instance_unavailable: 404,
   not_found: 404,
+  // Not in the §8 table: a write refused by connection state. An unknown
+  // code is opaque to a client, which falls back to the status (§8 Errors).
+  conflict: 409,
+  // Not in the §8 table: a record delete on a stream-sync account, whose
+  // local database has no per-record owner delete (see the records route).
+  update_required: 426,
+  // Not in the §8 table: replication cannot carry an append-only delete yet
+  // (merge-plan.ts `append_only_delete`), so a replicating store refuses it.
+  append_only_delete_unsupported: 409,
   cursor_expired: 410,
   rate_limit_exceeded: 429,
   api_error: 500,
@@ -84,13 +98,16 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   insufficient_scope: "permission_error",
   grant_stream_not_allowed: "permission_error",
   grant_time_range_exceeded: "permission_error",
-  grant_expired: "permission_error",
-  grant_revoked: "permission_error",
+  grant_expired: "authentication_error",
+  grant_revoked: "authentication_error",
   grant_invalid: "permission_error",
   disclosure_unavailable: "permission_error",
   blob_not_found: "not_found_error",
   instance_unavailable: "not_found_error",
   not_found: "not_found_error",
+  conflict: "invalid_request_error",
+  update_required: "invalid_request_error",
+  append_only_delete_unsupported: "invalid_request_error",
   cursor_expired: "gone_error",
   rate_limit_exceeded: "rate_limit_error",
   api_error: "api_error",
@@ -120,11 +137,17 @@ export class PdppError extends Error {
   public readonly code: PdppErrorCode;
   public readonly type: PdppErrorType;
   public readonly param?: string;
+  /**
+   * A machine-readable refusal reason, when the code alone is too broad.
+   * Not part of the §8 error body (RS item 6 keeps that body closed); routes
+   * send it as the `PDPP-Refusal-Reason` response header.
+   */
+  public readonly reason?: string;
 
   constructor(
     code: PdppErrorCode,
     message: string,
-    options?: { param?: string; status?: number },
+    options?: { param?: string; status?: number; reason?: string },
   ) {
     super(message);
     this.name = "PdppError";
@@ -151,6 +174,7 @@ export class PdppError extends Error {
       this.type = type;
     }
     this.param = options?.param;
+    this.reason = options?.reason;
   }
 
   toJSON(requestId?: string): PdppErrorBody {

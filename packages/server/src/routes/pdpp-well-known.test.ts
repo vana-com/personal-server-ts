@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { pdppWellKnownRoutes } from "./pdpp-well-known.js";
-import { PDPP_API_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp";
 
 describe("pdpp well-known protected-resource metadata", () => {
   it("publishes the RFC 9728 document with the 4 pdpp_ members", async () => {
@@ -17,7 +16,8 @@ describe("pdpp well-known protected-resource metadata", () => {
     expect(body.pdpp_core_query_base).toBe("/v1");
     expect(body.pdpp_token_kinds_supported).toEqual(["owner", "client"]);
     expect(body.pdpp_self_export_supported).toBe(true);
-    expect(body.pdpp_provider_connect_version).toBe(PDPP_API_VERSION);
+    // spec-core §8 PRM table: "the value MUST be \"0.1\"" for a v0.1 RS.
+    expect(body.pdpp_provider_connect_version).toBe("0.1");
   });
 
   it("omits authorization_servers when not enumerable, rather than publishing a partial list", async () => {

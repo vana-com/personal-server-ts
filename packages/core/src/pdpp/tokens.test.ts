@@ -8,6 +8,7 @@
  * the methods it calls, which is not the property that matters.
  */
 
+import { createRequire } from "node:module";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,6 +49,9 @@ function makeGrant(overrides: Partial<Grant> = {}): Grant {
         name: "top_artists",
         instance_ids: ["spotify-account-a"],
         fields: ["id", "name"],
+        // locked v0.1.0 grant shape (AS item 51): every StreamGrant carries
+        // its frozen `required_fields`.
+        required_fields: ["id"],
       },
     ],
     ...overrides,
@@ -347,12 +351,15 @@ describe("§8 — introspection carries the full enforcement context", () => {
     expect(response.client_id).toBe("music_recommendations");
     expect(response.authorization_details).toHaveLength(1);
 
-    const detail = response.authorization_details![0];
+    // AS item 32 / spec-core L1415: `{ type, grant }` with the complete
+    // immutable grant -- the same element the token response carries.
+    const detail = response.authorization_details![0] as {
+      type: string;
+      grant: typeof grant;
+    };
     expect(detail.type).toBe(PDPP_DATA_ACCESS_TYPE);
-    // The complete Section 7 constraints, in one response.
-    expect(detail.streams).toEqual(grant.streams);
-    expect(detail.access_mode).toBe("continuous");
-    expect(detail.source).toEqual(grant.source);
+    expect(detail.grant).toEqual(grant);
+    expect(issued.issued.authorization_details).toEqual([detail]);
   });
 
   it("returns exactly { active: false } for an inactive token", () => {
@@ -410,6 +417,25 @@ describe("delivery §2 / §9 AS item 8 — revocation and lifecycle", () => {
     expect(context.inactiveReason).toBe("grant_revoked");
   });
 
+  it("refuses to redeem a code for a persisted pre-lock grant (AS item 21)", () => {
+    // A 0.1.0 grant without `required_fields` was issued under the pre-lock
+    // rules. It is rejected before use; fresh consent is required.
+    const { code } = seedGrant("continuous", {
+      streams: [
+        {
+          name: "top_artists",
+          instance_ids: ["spotify-account-a"],
+          fields: ["id", "name"],
+        },
+      ],
+    });
+    // Refused at redemption: no token that is dead on arrival is issued.
+    const issued = redeem(code);
+    expect(issued.ok).toBe(false);
+    if (issued.ok) return;
+    expect(issued.failure.code).toBe("invalid_grant");
+  });
+
   it("refuses to refresh after the grant is revoked", () => {
     const { grant, code } = seedGrant("continuous");
     const issued = redeem(code);
@@ -443,14 +469,26 @@ describe("delivery §2 / §9 AS item 8 — revocation and lifecycle", () => {
     expect(store.grantStatus(store.getGrant(active.grant_id)!)).toBe("revoked");
   });
 
-  it("reports revoked rather than expired when a grant is both", () => {
-    // Revocation is the owner's decision and stays the reported fact; it does
-    // not silently become "expired" once the clock passes.
+  it("keeps the first ending: revoking an already expired grant leaves it expired", () => {
+    // spec-core L1735: "A grant keeps its first ending. [...] A later
+    // revocation attempt [...] for an ended grant does not change its
+    // `read_state` or `ended_at`." (WP6 replaced the earlier revoked-wins rule.)
     const { grant } = seedGrant("continuous", {
       expires_at: new Date(Date.now() - 1000).toISOString(),
     });
+    expect(tokens.revokeGrant(grant.grant_id)).toBe(false);
+    expect(store.grantStatus(store.getGrant(grant.grant_id)!)).toBe("expired");
+  });
+
+  it("still reports revoked after expiry when the revocation came first", () => {
+    const { grant } = seedGrant("continuous", {
+      expires_at: new Date(Date.now() + 1000).toISOString(),
+    });
     tokens.revokeGrant(grant.grant_id);
-    expect(store.grantStatus(store.getGrant(grant.grant_id)!)).toBe("revoked");
+    const later = new Date(Date.now() + 5000);
+    expect(store.grantStatus(store.getGrant(grant.grant_id)!, later)).toBe(
+      "revoked",
+    );
   });
 });
 
@@ -490,5 +528,89 @@ describe("§10 — tokens are not stored in plaintext", () => {
     // Only the hash is retained, so a store dump yields no usable credential.
     expect(record!.tokenHash).not.toBe(issued.issued.access_token);
     expect(record!.tokenHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("§9 AS item 21 — persisted pre-lock state is rejected on every path", () => {
+  /** Rewrite a stored grant in place, as a pre-lock build would have left it. */
+  function rewriteGrant(
+    grantId: string,
+    mutate: (g: Record<string, unknown>) => void,
+  ) {
+    const Database = createRequire(import.meta.url)("better-sqlite3");
+    const db = new Database(join(dir, "auth.db"));
+    const row = db
+      .prepare("SELECT grant_json FROM pdpp_grants WHERE grant_id = ?")
+      .get(grantId) as { grant_json: string };
+    const grant = JSON.parse(row.grant_json) as Record<string, unknown>;
+    mutate(grant);
+    db.prepare("UPDATE pdpp_grants SET grant_json = ? WHERE grant_id = ?").run(
+      JSON.stringify(grant),
+      grantId,
+    );
+    db.close();
+  }
+  const stripFloor = (g: Record<string, unknown>) => {
+    for (const s of g.streams as Array<Record<string, unknown>>)
+      delete s.required_fields;
+  };
+
+  it("refuses refresh, resolution and introspection for a live grant left in pre-lock shape", () => {
+    const { grant, code } = seedGrant("continuous");
+    const issued = redeem(code);
+    expect(issued.ok).toBe(true);
+    if (!issued.ok || !issued.issued.refresh_token) throw new Error("setup");
+    rewriteGrant(grant.grant_id, stripFloor);
+
+    const context = tokens.resolveToken(issued.issued.access_token);
+    expect(context.active).toBe(false);
+    expect(context.inactiveReason).toBe("unsupported_legacy_shape");
+    expect(tokens.introspect(issued.issued.access_token)).toEqual({
+      active: false,
+    });
+    const refreshed = tokens.refresh({
+      refreshToken: issued.issued.refresh_token,
+    });
+    expect(refreshed.ok).toBe(false);
+    if (!refreshed.ok) expect(refreshed.failure.code).toBe("invalid_grant");
+  });
+
+  it("refuses an unknown persisted grant version (allowlist, §7 Version layering)", () => {
+    const { grant, code } = seedGrant("continuous");
+    const issued = redeem(code);
+    if (!issued.ok) throw new Error("setup");
+    rewriteGrant(grant.grant_id, (g) => {
+      g.version = "0.9.0";
+    });
+    expect(tokens.resolveToken(issued.issued.access_token).inactiveReason).toBe(
+      "unsupported_legacy_shape",
+    );
+  });
+
+  it("treats mixed-shape streams as pre-lock and empty floors as locked", () => {
+    const mixed = seedGrant("continuous", {
+      streams: [
+        {
+          name: "a",
+          instance_ids: ["i1"],
+          fields: ["id"],
+          required_fields: ["id"],
+        },
+        { name: "b", instance_ids: ["i2"], fields: ["id"] } as never,
+      ],
+    });
+    const m = redeem(mixed.code);
+    expect(m.ok).toBe(false);
+    const emptyFloor = seedGrant("continuous", {
+      streams: [
+        {
+          name: "a",
+          instance_ids: ["i1"],
+          fields: ["id"],
+          required_fields: [],
+        },
+      ],
+    });
+    expect(redeem(emptyFloor.code).ok).toBe(true);
   });
 });

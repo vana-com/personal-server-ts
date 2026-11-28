@@ -150,7 +150,19 @@ export const DEFAULTS = {
       // today's behavior. This is deployment policy, not something a client
       // can request — there is deliberately no client-supplied expiry field.
       grantLifetimeSeconds?: number;
+      // Design 2: the app's grantee wallet (its Context Gateway builder
+      // address). Required for this client when `chainGrants.enabled`.
+      granteeAddress?: string;
     }>,
+    // Design 2 (Vana-6.1 / 6.2): register every issued PDPP grant as a
+    // salted entry in the owner's PermissionsV2 slot for the app, and refuse
+    // client reads unless that entry is live on chain. Off by default: it
+    // needs a gateway with the design-2 routes, a registered server key and a
+    // grantee address for every client.
+    // `allowDisableWithRegistrations`: boot with chain grants off even
+    // though grants are still registered on chain (their entries then stay
+    // there; see docs/pdpp-identifiers-and-chain-grants.md).
+    chainGrants: { enabled: false, allowDisableWithRegistrations: false },
     // Hosts this deployment allows to resolve URL-hosted (§6) client
     // identities. Empty means no client_id is ever fetched: registration in
     // `clients` above stays the only way a client is admitted, and this
@@ -387,12 +399,25 @@ export const ServerConfigSchema = z.object({
               .positive()
               .max(100 * 365 * 24 * 60 * 60)
               .optional(),
+            granteeAddress: z
+              .string()
+              .regex(/^0x[0-9a-fA-F]{40}$/)
+              .optional(),
           }),
         )
         .default(DEFAULTS.pdpp.clients),
-      // Opt-in allowlist: no host here means no client_id URL is ever
-      // fetched. A static registration in `clients` remains first choice and
-      // is always checked before this path runs.
+      chainGrants: z
+        .object({
+          enabled: z.boolean().default(false),
+          allowDisableWithRegistrations: z.boolean().default(false),
+        })
+        .default(DEFAULTS.pdpp.chainGrants),
+      // Local admission policy for URL-hosted clients (AS item 50). Empty
+      // (the default) admits any valid client ID metadata document served
+      // over HTTPS from a public address. Non-empty admits only these hosts;
+      // others are denied by policy (`unauthorized_client`) without a fetch.
+      // A static registration in `clients` remains first choice and is always
+      // checked before this path runs.
       urlHostedClientHosts: z
         .array(z.string().min(1))
         .default(DEFAULTS.pdpp.urlHostedClientHosts),

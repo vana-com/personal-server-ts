@@ -214,6 +214,36 @@ export function manifestArtifactResolver(
 }
 
 /**
+ * The digest of a verified manifest for `connector`, for a run the host
+ * writes itself (the owner record delete, localdb/owner-delete.ts): the one
+ * whose version is `version` when given and held, else the only one held.
+ * Several versions and no match: undefined, so the host does not guess
+ * which declarations the connection's rows were written under.
+ */
+export function manifestDigestFinder(
+  documents: Iterable<string>,
+): (connector: string, version: string | null) => string | undefined {
+  const table = new Map<string, { digest: string; version: string }[]>();
+  for (const document of documents) {
+    const artifact = manifestArtifact(document);
+    if (!artifact) continue;
+    const list = table.get(artifact.declarations.connector) ?? [];
+    list.push({
+      digest: documentDigest(document),
+      version: artifact.declarations.version,
+    });
+    table.set(artifact.declarations.connector, list);
+  }
+  return (connector, version) => {
+    const held = table.get(connector) ?? [];
+    const match = held.find((entry) => entry.version === version);
+    if (match) return match.digest;
+    const versions = new Set(held.map((entry) => entry.version));
+    return versions.size === 1 ? held[0]!.digest : undefined;
+  };
+}
+
+/**
  * The stream names each connector declares, from the manifest documents a host
  * verified. The connector is the manifest's own `connector_key`, so no caller
  * names a key. A connector with several verified manifest versions yields the

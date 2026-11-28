@@ -18,7 +18,6 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
-  PDPP_API_VERSION,
   PDPP_DATA_ACCESS_TYPE,
   PdppTokenService,
   type DeclarationSnapshot,
@@ -48,6 +47,13 @@ const snapshot: DeclarationSnapshot = {
       fields: ["id", "name", "genres", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
   ],
@@ -78,7 +84,9 @@ function selectionBody(overrides: Record<string, unknown> = {}) {
         source: { id: snapshot.source_id },
         purpose_code: "https://pdpp.dev/purpose/personalization",
         access_mode: "continuous",
-        streams: [{ name: "top_artists" }],
+        // locked v0.1.0: each stream request carries `fields` or `view`
+        // (spec-core L1210).
+        streams: [{ name: "top_artists", fields: ["*"] }],
         ...overrides,
       },
     ],
@@ -253,13 +261,20 @@ describe("the full authorization journey", () => {
       active: boolean;
       grant_id: string;
       pdpp_token_kind: string;
-      authorization_details: Array<{ streams: Array<{ fields: string[] }> }>;
+      authorization_details: Array<{
+        type: string;
+        grant: { grant_id: string; streams: Array<{ fields: string[] }> };
+      }>;
     };
     expect(context.active).toBe(true);
     expect(context.pdpp_token_kind).toBe("client");
     expect(context.grant_id).toBe(grant_id);
-    // The RS gets the complete resolved enforcement context in one response.
-    expect(context.authorization_details[0].streams[0].fields).toContain("id");
+    // AS item 32 / L1415: `{ type, grant }` with the complete grant.
+    expect(context.authorization_details[0].type).toBe(PDPP_DATA_ACCESS_TYPE);
+    expect(context.authorization_details[0].grant.grant_id).toBe(grant_id);
+    expect(context.authorization_details[0].grant.streams[0].fields).toContain(
+      "id",
+    );
     // RFC 9396 §7: the token response MUST carry the authorization_details as
     // granted — identical to what the RS later resolves via introspection.
     expect(issued.authorization_details).toEqual(context.authorization_details);
@@ -288,7 +303,7 @@ describe("the full authorization journey", () => {
 
     const revoked = await postForm(
       "/pdpp/v1/revoke",
-      { grant_id },
+      { grant_id, disposition: "keep" },
       ownerAuth(ownerToken),
     );
     expect(revoked.status).toBe(200);
@@ -363,7 +378,7 @@ describe("owner authentication on the decision endpoints", () => {
     const intruder = scopedOwnerToken(OTHER_OWNER);
     const response = await postForm(
       "/pdpp/v1/revoke",
-      { grant_id },
+      { grant_id, disposition: "keep" },
       ownerAuth(intruder),
     );
     expect(response.status).toBe(404);
@@ -497,7 +512,7 @@ describe("§9 AS item 5 — Source validation failures map to RFC 9396", () => {
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        streams: [{ name: "top_artists" }],
+        streams: [{ name: "top_artists", fields: ["*"] }],
         selection_preset: "anything",
       }),
     );
@@ -514,19 +529,56 @@ describe("§9 AS item 5 — Source validation failures map to RFC 9396", () => {
     expect((await response.json()).error).toBe("invalid_authorization_details");
   });
 
-  it("rejects an unknown source with no retained snapshot", async () => {
+  // spec-core L1220: whether a source is accepted for this owner is protected
+  // owner state, so an unaccepted source is not public invalidity. The
+  // session opens as for any request, review refuses, and the client sees
+  // only the owner-decline `access_denied` (AS items 2, 52).
+  it("defers an unknown source with no retained snapshot to review", async () => {
+    const NOPE = "https://registry.pdpp.dev/connectors/nope";
+    const ownerToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+      sourceId: NOPE,
+    }).access_token;
+    const response = await post(
+      "/pdpp/v1/authorize",
+      selectionBody({ source: { id: NOPE } }),
+      ownerAuth(ownerToken),
+    );
+    expect(response.status).toBe(201);
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(403);
+    expect((await reviewed.json()).error).toBe("access_denied");
+    const denied = await post(
+      `/pdpp/v1/authorize/${session_id}/deny`,
+      {},
+      ownerAuth(ownerToken),
+    );
+    expect(denied.status).toBe(200);
+    const { redirect_uri } = (await denied.json()) as { redirect_uri: string };
+    expect(redirect_uri).toBe(`${REDIRECT}?error=access_denied&state=xyz`);
+  });
+
+  it("refuses an owner token scoped to a different source", async () => {
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
         source: { id: "https://registry.pdpp.dev/connectors/nope" },
       }),
     );
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(403);
+    expect((await response.json()).error).toBe("access_denied");
   });
 });
 
-describe("§9 AS item 17 — PDPP-Version negotiation", () => {
-  it("returns 400 unsupported_version for a version it does not implement", async () => {
+describe("§8 API versioning — the AS does not negotiate PDPP-Version", () => {
+  // spec-core §8: PDPP-Version "does not negotiate OAuth authorization, token,
+  // revocation, introspection, or grant lifecycle endpoints"; §9 AS item 17
+  // is "Not used".
+  it("ignores a PDPP-Version field on an AS request, even an unknown one", async () => {
     const response = await app.request("/pdpp/v1/authorize", {
       method: "POST",
       headers: {
@@ -535,25 +587,25 @@ describe("§9 AS item 17 — PDPP-Version negotiation", () => {
       },
       body: JSON.stringify(selectionBody()),
     });
-    expect(response.status).toBe(400);
-    expect((await response.json()).error).toBe("unsupported_version");
+    expect(response.status).not.toBe(400);
   });
 
-  it("echoes the selected version on a response", async () => {
-    const response = await post("/pdpp/v1/authorize", selectionBody());
-    expect(response.headers.get("pdpp-version")).toBe(PDPP_API_VERSION);
-  });
-
-  it("accepts an absent version header and uses the current stable version", async () => {
+  it("does not echo PDPP-Version on AS responses", async () => {
     const response = await post("/pdpp/v1/authorize", selectionBody());
     expect(response.status).toBe(201);
+    expect(response.headers.get("pdpp-version")).toBeNull();
   });
 });
 
 describe("§9 AS item 14 — AI training consent over the wire", () => {
   it("refuses approval without the explicit flag", async () => {
     const { sessionId, ownerToken, digest } = await openSessionAndReview(
-      selectionBody({ purpose_code: "https://pdpp.dev/purpose/ai_training" }),
+      // The withdrawn code (spec-core L3233) is outside Appendix A, so it
+      // needs a purpose_description (AS item 6).
+      selectionBody({
+        purpose_code: "https://pdpp.dev/purpose/ai_training",
+        purpose_description: "Train a recommendation model",
+      }),
     );
     const response = await post(
       `/pdpp/v1/authorize/${sessionId}/approve`,
@@ -566,7 +618,12 @@ describe("§9 AS item 14 — AI training consent over the wire", () => {
 
   it("issues with the explicit flag", async () => {
     const { sessionId, ownerToken, digest } = await openSessionAndReview(
-      selectionBody({ purpose_code: "https://pdpp.dev/purpose/ai_training" }),
+      // The withdrawn code (spec-core L3233) is outside Appendix A, so it
+      // needs a purpose_description (AS item 6).
+      selectionBody({
+        purpose_code: "https://pdpp.dev/purpose/ai_training",
+        purpose_description: "Train a recommendation model",
+      }),
     );
     const response = await post(
       `/pdpp/v1/authorize/${sessionId}/approve`,
@@ -735,7 +792,7 @@ describe("the consent review model the UI renders", () => {
     const ownerToken = scopedOwnerToken();
     const created = await post(
       "/pdpp/v1/authorize",
-      selectionBody({ streams: [{ name: "*" }] }),
+      selectionBody({ streams: [{ name: "*", fields: ["*"] }] }),
     );
     const { session_id } = (await created.json()) as { session_id: string };
     const reviewed = await app.request(
@@ -866,6 +923,29 @@ describe("existing_grants — the review lists this client's active grants", () 
     ]);
     expect(entry).not.toHaveProperty("review_digest");
     expect(entry).not.toHaveProperty("consent_evidence");
+  });
+
+  it("does not list a persisted pre-lock grant as an existing grant (AS item 21)", async () => {
+    // This seed has no required_fields: the shape a pre-lock build stored.
+    seedGrant({
+      grantId: "grant_prelock_1",
+      clientId: "music_recommendations",
+    });
+    const ownerToken = scopedOwnerToken();
+    const created = await post("/pdpp/v1/authorize", selectionBody());
+    const { session_id } = (await created.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(200);
+    const body = (await reviewed.json()) as {
+      review: { existing_grants?: Array<{ grant_id: string }> };
+    };
+    // An empty list is omitted from the review model.
+    expect(
+      (body.review.existing_grants ?? []).map((g) => g.grant_id),
+    ).not.toContain("grant_prelock_1");
   });
 
   it("keeps approval behavior unchanged when existing grants are present", async () => {
@@ -1282,17 +1362,41 @@ describe("§6 — instance choice over the wire", () => {
 describe("owner instance ceiling — a scoped owner token stays inside its instances", () => {
   const ACCOUNT_B = "spotify-account-b";
 
-  it("refuses to open an authorization that explicitly names an instance outside the token", async () => {
+  // spec-core L1220: instance handles and their eligibility are protected
+  // owner state, so an out-of-ceiling handle no longer changes what
+  // /authorize returns. The session opens, review refuses for the owner, and
+  // the handle is never resolved, counted or shown.
+  it("never resolves an instance outside the token named at /authorize", async () => {
     eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const ownerToken = scopedOwnerToken();
     const response = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        streams: [{ name: "top_artists", instance_ids: [ACCOUNT_B] }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["*"],
+            instance_ids: [ACCOUNT_B],
+          },
+        ],
       }),
-      ownerAuth(scopedOwnerToken()),
+      ownerAuth(ownerToken),
     );
-    expect(response.status).toBe(403);
-    expect((await response.json()).error).toBe("access_denied");
+    expect(response.status).toBe(201);
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(403);
+    expect((await reviewed.json()).error).toBe("access_denied");
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      { review_digest: "x" },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(403);
+    expect(store.listGrantsForSubject(OWNER)).toHaveLength(0);
   });
 
   it("refuses an instance choice outside the token at review, and never shows it", async () => {
@@ -1384,7 +1488,13 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
     const created = await post(
       "/pdpp/v1/authorize",
       selectionBody({
-        streams: [{ name: "top_artists", instance_ids: [ACCOUNT_B] }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["*"],
+            instance_ids: [ACCOUNT_B],
+          },
+        ],
       }),
       ownerAuth(source),
     );
@@ -1413,7 +1523,13 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
     const ownerToken = scopedOwnerToken();
     const { sessionId, digest } = await openSessionAndReview(
       selectionBody({
-        streams: [{ name: "top_artists", instance_ids: [OWNER_INSTANCE] }],
+        streams: [
+          {
+            name: "top_artists",
+            fields: ["*"],
+            instance_ids: [OWNER_INSTANCE],
+          },
+        ],
       }),
       ownerToken,
     );
@@ -1460,7 +1576,14 @@ describe("owner instance ceiling — a scoped owner token stays inside its insta
       selectionBody(),
       ownerAuth(emptyToken),
     );
-    expect(response.status).toBe(403);
+    // Deferred (L1220): the session opens, review refuses, nothing issues.
+    expect(response.status).toBe(201);
+    const { session_id } = (await response.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(emptyToken) },
+    );
+    expect(reviewed.status).toBe(403);
   });
 });
 
@@ -1550,6 +1673,8 @@ describe("GET /grants — the owner's own grants, with status", () => {
     expiresAt?: string;
     accessMode?: "continuous" | "single_use";
     revoked?: boolean;
+    /** Persist the grant as a pre-lock build left it (no required_fields). */
+    preLock?: boolean;
   }) {
     const subjectId = overrides.subjectId ?? OWNER;
     const grant = {
@@ -1568,6 +1693,7 @@ describe("GET /grants — the owner's own grants, with status", () => {
           name: "top_artists",
           instance_ids: ["spotify-account-a"],
           fields: ["id", "name"],
+          ...(!overrides.preLock && { required_fields: ["id"] }),
         },
       ],
     };
@@ -1605,6 +1731,20 @@ describe("GET /grants — the owner's own grants, with status", () => {
       headers: token ? ownerAuth(token) : {},
     });
   }
+
+  it("lists a persisted pre-lock grant as requires_fresh_consent (AS item 21)", async () => {
+    seedGrant({
+      grantId: "grant_prelock",
+      clientId: "music_recommendations",
+      preLock: true,
+    });
+    const response = await listGrants(scopedOwnerToken());
+    expect(response.status).toBe(200);
+    const { grants } = (await response.json()) as { grants: Listed[] };
+    expect(grants.find((g) => g.grant_id === "grant_prelock")?.status).toBe(
+      "requires_fresh_consent",
+    );
+  });
 
   it("lists the owner's grants with each one's status, newest first", async () => {
     seedGrant({

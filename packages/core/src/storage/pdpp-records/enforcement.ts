@@ -1,4 +1,4 @@
-import { grantIsCandidate } from "../../pdpp/types.js";
+import { grantUsesLockedRules } from "../../pdpp/types.js";
 import { PdppError } from "../../errors/pdpp-catalog.js";
 import {
   findStreamGrant,
@@ -30,18 +30,28 @@ export interface ResolvedReadScope {
 export function resolveReadScope(
   context: PdppTokenContext,
   stream: string,
-  declaration: StreamDeclaration | undefined,
+  /**
+   * The current declaration, or a lookup for it. A client read resolves the
+   * lookup only after its grant checks pass, so a `fields` request outside
+   * the grant is refused before any source-schema lookup (spec-core §4
+   * "Effective projection"; §9 RS item 32).
+   */
+  declarationOrLookup:
+    StreamDeclaration | undefined | (() => StreamDeclaration | undefined),
   requestedFields?: string[],
 ): ResolvedReadScope {
   if (!context.active) {
     throw mapInactiveToError(context);
   }
-
-  if (!declaration) {
-    throw new PdppError("not_found", `Stream '${stream}' not found`);
-  }
+  const lookup = () =>
+    typeof declarationOrLookup === "function"
+      ? declarationOrLookup()
+      : declarationOrLookup;
 
   if (context.tokenKind === "owner") {
+    if (!lookup()) {
+      throw new PdppError("not_found", `Stream '${stream}' not found`);
+    }
     // Owner tokens carry no grant: full current-capability read, but still
     // scoped to the owner's own subject — enforced by the caller passing
     // only that subject's instance_ids into the store query, which for the
@@ -84,7 +94,7 @@ export function resolveReadScope(
   }
 
   if (
-    grantIsCandidate(context.grant) &&
+    grantUsesLockedRules(context.grant) &&
     streamGrant.time_constraint &&
     !["date", "date-time"].includes(streamGrant.time_constraint.type ?? "")
   ) {
@@ -94,13 +104,37 @@ export function resolveReadScope(
     );
   }
 
+  // spec-core §4 "Effective projection": "If Q is not a subset of G, the RS
+  // MUST reject the whole read with HTTP 403 `field_not_granted` before any
+  // source-schema or record-data lookup." The grant and stream are resolved
+  // above; the declaration is looked up only after this check (RS 31, 32).
+  if (requestedFields && requestedFields.length > 0) {
+    const ungranted = [
+      ...new Set(
+        requestedFields.filter((f) => !streamGrant.fields.includes(f)),
+      ),
+    ];
+    if (ungranted.length > 0) {
+      throw new PdppError(
+        "field_not_granted",
+        `Fields not granted for stream '${stream}': ${ungranted.join(", ")}`,
+        { param: "fields" },
+      );
+    }
+  }
+
+  const declaration = lookup();
+  if (!declaration) {
+    throw new PdppError("not_found", `Stream '${stream}' not found`);
+  }
+
   // Issuance resolves required fields into grant.fields. A later declaration
   // never adds authority. The current v0.1 sparse-read floor is restricted to
   // fields the grant already carries; private v0.2 selects exactly. The
   // candidate freezes its floor in the grant itself.
   const schemaRequiredFloor = !grantIsV02(context.grant);
   let requiredFloor = declaration.requiredFields ?? [];
-  if (grantIsCandidate(context.grant)) {
+  if (grantUsesLockedRules(context.grant)) {
     const frozen = streamGrant.required_fields;
     if (
       !Array.isArray(frozen) ||
@@ -163,15 +197,8 @@ function resolveReadFields(
 ): string[] {
   const allowed = [...granted];
   if (!requested || requested.length === 0) return allowed;
-  for (const field of requested) {
-    if (!allowed.includes(field)) {
-      throw new PdppError(
-        "invalid_request",
-        `Field '${field}' is not in this grant's authorized fields for the stream`,
-        { param: "fields" },
-      );
-    }
-  }
+  // `resolveReadScope` refused every requested name outside the grant before
+  // the declaration lookup (field_not_granted); none reaches here.
   const floor = requiredFloor.filter((field) => granted.includes(field));
   return [...new Set([...requested, ...floor])];
 }
@@ -208,7 +235,7 @@ export function recordKeyWithinGrantResources(
  * Exported so every route answers an inactive token with the SAME reason.
  * `/v1/streams` previously inlined a flat `authentication_error` while record
  * reads used this mapping, so one revoked grant produced a 401 on one endpoint
- * and a 403 `grant_revoked` on another.
+ * and a 401 `grant_revoked` on another.
  */
 export function mapInactiveToError(context: PdppTokenContext): PdppError {
   switch (context.inactiveReason) {
@@ -216,6 +243,11 @@ export function mapInactiveToError(context: PdppTokenContext): PdppError {
       return new PdppError("grant_revoked", "Grant has been revoked");
     case "grant_expired":
       return new PdppError("grant_expired", "Grant has expired");
+    case "unsupported_legacy_shape":
+      return new PdppError(
+        "authorization_state.unsupported_legacy_shape",
+        "This grant was issued under rules that predate PDPP Core v0.1.0; fresh consent is required",
+      );
     case "expired":
     case "revoked":
     case "unknown":

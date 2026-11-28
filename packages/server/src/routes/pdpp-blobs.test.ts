@@ -80,7 +80,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       }),
       declarations,
     });
-    const res = await app.request("/blob_unknown", {
+    const res = await app.request("/blob_unknown?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
@@ -125,7 +125,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => new Uint8Array(10),
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(200);
@@ -168,7 +168,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       instancesForSubject: () => ["inst_1"],
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       method: "HEAD",
       headers: { Authorization: "Bearer owner-tok" },
     });
@@ -210,7 +210,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       instancesForSubject: () => ["inst_1"], // does not include inst_other
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_other", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
@@ -257,7 +257,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       // instancesForSubject intentionally omitted.
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
@@ -302,7 +302,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       instancesForSubject: () => [],
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
@@ -342,7 +342,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       instancesForSubject: () => ["inst_1"],
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(404);
@@ -358,7 +358,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       auth: createFixtureAuthorizationService({}),
       declarations,
     });
-    const res = await app.request("/blob_1");
+    const res = await app.request("/blob_1?instance_id=inst_1");
     expect(res.status).toBe(401);
   });
 
@@ -399,7 +399,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_ok", {
+    const res = await app.request("/blob_ok?instance_id=inst_1", {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(res.status).toBe(200);
@@ -447,7 +447,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_private", {
+    const res = await app.request("/blob_private?instance_id=inst_private", {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(res.status).toBe(404);
@@ -488,7 +488,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       }),
       declarations,
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(res.status).toBe(404);
@@ -529,7 +529,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"],
       // readBlobBytes intentionally omitted.
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(500);
@@ -573,7 +573,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => undefined,
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(500);
@@ -621,7 +621,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
         );
       },
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(500);
@@ -667,7 +667,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => new Uint8Array(0),
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(200);
@@ -711,7 +711,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => payload,
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(200);
@@ -765,7 +765,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_shared", {
+    const res = await app.request("/blob_shared?instance_id=inst_1", {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(res.status).toBe(200);
@@ -817,7 +817,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"], // does not include inst_other
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_shared_owner", {
+    const res = await app.request("/blob_shared_owner?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(200);
@@ -860,7 +860,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       readBlobBytes: async () => new Uint8Array(3),
     });
 
-    const res = await app.request("/blob_other", {
+    const res = await app.request("/blob_other?instance_id=inst_other", {
       headers: { Authorization: "Bearer owner-tok" },
     });
 
@@ -904,7 +904,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       readBlobBytes: async () => new Uint8Array(3),
     });
 
-    const res = await app.request("/blob_mine", {
+    const res = await app.request("/blob_mine?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
 
@@ -960,12 +960,16 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_shared_private", {
-      headers: { Authorization: "Bearer client-tok" },
-    });
-    expect(res.status).toBe(404);
-    const body = await res.json();
-    expect(body.error.code).toBe("blob_not_found");
+    // Each instance that holds a reference, so the grant check decides.
+    for (const instance of ["inst_private_a", "inst_private_b"]) {
+      const res = await app.request(
+        `/blob_shared_private?instance_id=${instance}`,
+        { headers: { Authorization: "Bearer client-tok" } },
+      );
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error.code).toBe("blob_not_found");
+    }
   });
 
   it("denies a blob whose only visible reference has been deleted, even when an unauthorized instance's reference still exists", async () => {
@@ -1019,7 +1023,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       declarations,
       readBlobBytes: async () => new Uint8Array(3),
     });
-    const res = await app.request("/blob_deleted_ref", {
+    const res = await app.request("/blob_deleted_ref?instance_id=inst_1", {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(res.status).toBe(404);
@@ -1062,7 +1066,7 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
       instancesForSubject: () => ["inst_1"],
       readBlobBytes: async () => new Uint8Array(3), // does not match sizeBytes: 10
     });
-    const res = await app.request("/blob_1", {
+    const res = await app.request("/blob_1?instance_id=inst_1", {
       headers: { Authorization: "Bearer owner-tok" },
     });
     expect(res.status).toBe(500);
@@ -1134,7 +1138,7 @@ describe.each(backends)(
         () => ["id"],
       );
       const app = appFor(store);
-      const res = await app.request(`/${meta.blobId}`, {
+      const res = await app.request(`/${meta.blobId}?instance_id=inst_1`, {
         headers: { Authorization: "Bearer owner-tok" },
       });
       expect(res.status).toBe(200);
@@ -1166,7 +1170,7 @@ describe.each(backends)(
       // Owner-scoped instances resolver excludes inst_1 -- an authenticated
       // but unauthorized-for-this-blob caller.
       const app = appFor(store, { instancesForSubject: () => ["inst_other"] });
-      const res = await app.request(`/${meta.blobId}`, {
+      const res = await app.request(`/${meta.blobId}?instance_id=inst_1`, {
         headers: { Authorization: "Bearer owner-tok" },
       });
       expect(res.status).toBe(404);
@@ -1199,7 +1203,7 @@ describe.each(backends)(
         "mutable_state",
       );
       const app = appFor(store);
-      const res = await app.request(`/${meta.blobId}`, {
+      const res = await app.request(`/${meta.blobId}?instance_id=inst_1`, {
         headers: { Authorization: "Bearer owner-tok" },
       });
       expect(res.status).toBe(404);
@@ -1232,7 +1236,7 @@ describe.each(backends)(
         () => ["id"],
       );
       const app = appFor(store);
-      const res = await app.request("/blob_metadata_only", {
+      const res = await app.request("/blob_metadata_only?instance_id=inst_1", {
         headers: { Authorization: "Bearer owner-tok" },
       });
       expect(res.status).toBe(500);
@@ -1261,12 +1265,202 @@ describe.each(backends)(
         () => ["id"],
       );
       const app = appFor(store);
-      const res = await app.request(`/${meta.blobId}`, {
+      const res = await app.request(`/${meta.blobId}?instance_id=inst_1`, {
         headers: { Authorization: "Bearer owner-tok" },
       });
       expect(res.status).toBe(500);
       const body = await res.json();
       expect(body.error.code).toBe("api_error");
+    });
+  },
+);
+
+describe("pdpp blobs: PDPP-Version (spec-core §8, RS item 11)", () => {
+  function ownerBlobApp() {
+    const store = backends[0]!.createStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "image/jpeg",
+      sizeBytes: 10,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    return pdppBlobsRoutes({
+      store,
+      auth: createFixtureAuthorizationService({
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      }),
+      declarations,
+      instancesForSubject: () => ["inst_1"],
+      readBlobBytes: async () => new Uint8Array(10),
+    });
+  }
+
+  it("echoes the selected 0.1 contract on a blob response", async () => {
+    const res = await ownerBlobApp().request("/blob_1?instance_id=inst_1", {
+      headers: { Authorization: "Bearer owner-tok", "PDPP-Version": "0.1" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("PDPP-Version")).toBe("0.1");
+  });
+
+  it("refuses an unsupported version without disclosing the blob or echoing a version", async () => {
+    const res = await ownerBlobApp().request("/blob_1?instance_id=inst_1", {
+      headers: {
+        Authorization: "Bearer owner-tok",
+        "PDPP-Version": "2026-04-06",
+      },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("unsupported_version");
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+    expect(res.headers.get("Content-Type")).toMatch(/json/);
+  });
+
+  it("answers 401 for a missing token even when the version is invalid", async () => {
+    const res = await ownerBlobApp().request("/blob_1?instance_id=inst_1", {
+      headers: { "PDPP-Version": '"0.1"' },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+});
+
+/**
+ * spec-core §8 "Get a blob" (§9 RS items 10, 18, 23): `instance_id` is
+ * required on every blob fetch, unknown parameters are a 400, only a
+ * reference in the selected instance counts, and the field holding the
+ * reference is found by its blob_ref shape, not by the name `blob_ref`.
+ */
+describe.each(backends)(
+  "pdpp blobs route: instance and field rules ($name store)",
+  ({ createStore }) => {
+    function appWith(fields: string[], instances = ["inst_1", "inst_2"]) {
+      const store = createStore();
+      store.putBlobMeta({
+        blobId: "blob_photo",
+        mimeType: "image/png",
+        sizeBytes: 3,
+        sha256: "abc",
+      });
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "media",
+            key: "m1",
+            data: {
+              id: "m1",
+              blob_ref: { blob_id: "blob_photo", mime_type: "image/png" },
+            },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+      );
+      return pdppBlobsRoutes({
+        store,
+        auth: createFixtureAuthorizationService({
+          client: {
+            active: true,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            clientId: "client_1",
+            grant: clientGrant({
+              instance_ids: instances,
+              fields,
+              required_fields: ["id"],
+            } as never),
+          },
+          owner: {
+            active: true,
+            tokenKind: "owner",
+            subjectId: "sub_1",
+            instanceIds: ["inst_1", "inst_2"],
+          },
+        }),
+        declarations,
+        instancesForSubject: () => ["inst_1", "inst_2"],
+        readBlobBytes: async () => new Uint8Array(3),
+      });
+    }
+    const get = (
+      app: ReturnType<typeof appWith>,
+      path: string,
+      token = "client",
+    ) => app.request(path, { headers: { Authorization: `Bearer ${token}` } });
+
+    it("rejects a blob fetch without instance_id with 400 invalid_request (client and owner)", async () => {
+      const app = appWith(["id", "blob_ref"]);
+      for (const token of ["client", "owner"]) {
+        const res = await get(app, "/blob_photo", token);
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatchObject({
+          code: "invalid_request",
+          param: "instance_id",
+        });
+      }
+    });
+
+    it("rejects an unknown query parameter with 400", async () => {
+      const res = await get(
+        appWith(["id", "blob_ref"]),
+        "/blob_photo?instance_id=inst_1&x=1",
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatchObject({
+        code: "invalid_request",
+        param: "x",
+      });
+    });
+
+    it("serves a blob whose referencing field is granted", async () => {
+      const res = await get(
+        appWith(["id", "blob_ref"]),
+        "/blob_photo?instance_id=inst_1",
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Type")).toBe("image/png");
+    });
+
+    it("refuses when the referencing field is outside the grant's projection", async () => {
+      const res = await get(
+        appWith(["id", "photo"]),
+        "/blob_photo?instance_id=inst_1",
+      );
+      expect(res.status).toBe(404);
+      expect((await res.json()).error.code).toBe("blob_not_found");
+    });
+
+    it("refuses a reference outside the selected instance (client and owner)", async () => {
+      const app = appWith(["id", "blob_ref"]);
+      for (const token of ["client", "owner"]) {
+        const res = await get(app, "/blob_photo?instance_id=inst_2", token);
+        expect(res.status).toBe(404);
+        expect((await res.json()).error.code).toBe("blob_not_found");
+      }
+      expect(
+        (await get(app, "/blob_photo?instance_id=inst_1", "owner")).status,
+      ).toBe(200);
     });
   },
 );

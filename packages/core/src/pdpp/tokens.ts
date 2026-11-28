@@ -18,14 +18,18 @@
 
 import { verifyCodeVerifier } from "./pkce.js";
 import {
+  hashToken,
   newOpaqueToken,
+  translateGrantInstances,
   type PdppAuthStore,
   type StoredGrant,
 } from "./store.js";
 import {
   isV02Grant,
-  grantIsCandidate,
+  grantUsesLockedRules,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  PDPP_GRANT_VERSION_CANDIDATE,
+  isSupportedPersistedGrant,
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   type AccessMode,
@@ -65,7 +69,17 @@ export interface TokenIssuanceResult {
   authorization_details: PdppAuthorizationEntry[];
 }
 
-export type TokenFailureCode = "invalid_grant" | "invalid_request";
+export type TokenFailureCode =
+  | "invalid_grant"
+  | "invalid_request"
+  /** AS item 44 / L1825: the history is not current; the AS issues nothing. */
+  | "temporarily_unavailable";
+
+const HISTORY_UNAVAILABLE: TokenFailure = {
+  code: "temporarily_unavailable",
+  message:
+    "the authorization history cannot be established as current; no token is issued until it is",
+};
 
 export interface TokenFailure {
   code: TokenFailureCode;
@@ -93,18 +107,34 @@ function grantInactiveReason(
   stored: StoredGrant,
   now: Date,
 ): InactiveReason | null {
+  // AS item 21: a grant persisted under the pre-lock rules is unsupported
+  // state. Every issuance, refresh and introspection path asks here, so a
+  // pre-lock code or refresh token redeems to `invalid_grant`, not to a token
+  // that is dead on arrival.
+  if (!isSupportedPersistedGrant(stored.grant))
+    return "unsupported_legacy_shape";
   const status = store.grantStatus(stored, now);
   if (status === "revoked") return "grant_revoked";
   if (status === "expired") return "grant_expired";
   return null;
 }
 
+function inactiveGrantMessage(reason: InactiveReason): string {
+  if (reason === "grant_revoked") return "grant is revoked";
+  if (reason === "unsupported_legacy_shape")
+    return "grant predates PDPP Core v0.1.0; fresh consent is required";
+  return "grant is expired";
+}
+
 export interface PdppTokenServiceOptions {
   accessTokenTtlSeconds?: number;
+  /** The AS clock. Tests control it (spec-core §9 held-data cases). */
+  clock?: () => Date;
 }
 
 export class PdppTokenService {
   private readonly accessTtl: number;
+  readonly clock: () => Date;
 
   constructor(
     private readonly store: PdppAuthStore,
@@ -112,6 +142,7 @@ export class PdppTokenService {
   ) {
     this.accessTtl =
       options.accessTokenTtlSeconds ?? DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
+    this.clock = options.clock ?? (() => new Date());
   }
 
   /**
@@ -130,7 +161,13 @@ export class PdppTokenService {
     codeVerifier?: string;
     now?: Date;
   }): TokenResult {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
+    // AS item 44 / L1825 (case D1a): no code exchange from a history that
+    // may omit a terminal event. Checked before the code is touched, so the
+    // code is not burned by a refusal the client did not cause.
+    if (!this.store.history.isCurrent()) {
+      return { ok: false, failure: HISTORY_UNAVAILABLE };
+    }
 
     const record = this.store.consumeAuthCode(input.code, now);
     if (!record) {
@@ -198,7 +235,7 @@ export class PdppTokenService {
         ok: false,
         failure: {
           code: "invalid_grant",
-          message: `grant is ${inactive === "grant_revoked" ? "revoked" : "expired"}`,
+          message: inactiveGrantMessage(inactive),
         },
       };
     }
@@ -215,7 +252,12 @@ export class PdppTokenService {
    * and require fresh authorization.
    */
   refresh(input: { refreshToken: string; now?: Date }): TokenResult {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
+    // AS item 44 / L1825 (case D1a): no refresh exchange, and no rotation,
+    // from a history that may omit a terminal event.
+    if (!this.store.history.isCurrent()) {
+      return { ok: false, failure: HISTORY_UNAVAILABLE };
+    }
     const rotation = this.store.rotateRefreshToken(input.refreshToken, now);
 
     if (!rotation.ok) {
@@ -245,7 +287,7 @@ export class PdppTokenService {
         ok: false,
         failure: {
           code: "invalid_grant",
-          message: `grant is ${inactive === "grant_revoked" ? "revoked" : "expired"}`,
+          message: inactiveGrantMessage(inactive),
         },
       };
     }
@@ -267,6 +309,17 @@ export class PdppTokenService {
     existingFamilyId?: string,
   ): TokenResult {
     const { grant } = stored;
+    // AS item 40 / L1593: a token response returning the grant is a positive
+    // assessment, so none is returned while an erasure instruction applies.
+    // An effective instruction always ends the grant (L1612), so this is a
+    // second line of defence behind grantInactiveReason.
+    const instruction = this.store.lifecycle.getInstruction(grant.grant_id);
+    if (instruction?.effectiveAt) {
+      return {
+        ok: false,
+        failure: { code: "invalid_grant", message: "grant is revoked" },
+      };
+    }
     const continuous = mayIssueRefreshToken([grant.access_mode]);
 
     let familyId: string | null = existingFamilyId ?? null;
@@ -328,7 +381,10 @@ export class PdppTokenService {
         expires_in: expiresIn,
         ...(refreshToken && { refresh_token: refreshToken }),
         grant_id: grant.grant_id,
-        authorization_details: [toAuthorizationEntry(grant)],
+        // AS item 29: the client's document carries its pairwise handles.
+        authorization_details: [
+          toAuthorizationEntry(this.store.clientGrantView(stored)),
+        ],
       },
     };
   }
@@ -339,16 +395,26 @@ export class PdppTokenService {
    * Reads live store state every call. That is what makes revocation immediate
    * in introspection (§9 AS item 8) — there is no AS-side cache to invalidate.
    */
-  resolveToken(accessToken: string, now: Date = new Date()): PdppTokenContext {
+  resolveToken(
+    accessToken: string,
+    now: Date = this.clock(),
+  ): PdppTokenContext {
     const record = this.store.getAccessToken(accessToken);
     if (!record) {
+      return { active: false, inactiveReason: "unknown" };
+    }
+    // AS item 44 / L1825: while the history is not current, no client token
+    // resolves active — not at the RS, not in introspection. "unknown" keeps
+    // the RS answer a plain 401 rather than a claim about the grant. Owner
+    // tokens carry no grant and still resolve, so the owner can act (L1827).
+    if (record.tokenKind === "client" && !this.store.history.isCurrent()) {
       return { active: false, inactiveReason: "unknown" };
     }
 
     // Grant state is checked BEFORE the token's own revocation flag, because
     // revoking a grant also marks its linked tokens revoked. Checking the
     // token first would report `revoked` for what is really a grant
-    // revocation, and the RS keys 403 `grant_revoked` off this exact reason
+    // revocation, and the RS keys 401 `grant_revoked` off this exact reason
     // (§2 revocation propagation) — it would return the wrong error.
     if (record.tokenKind === "client" && record.grantId) {
       const stored = this.store.getGrant(record.grantId);
@@ -403,9 +469,10 @@ export class PdppTokenService {
 
     const inactive = grantInactiveReason(this.store, stored, now);
     if (inactive) {
-      // grant_revoked is the reason the RS turns into 403 grant_revoked.
+      // grant_revoked is the reason the RS turns into 401 grant_revoked.
       return { active: false, inactiveReason: inactive };
     }
+    const handles = this.store.clientInstanceHandles(stored);
 
     return {
       active: true,
@@ -414,6 +481,7 @@ export class PdppTokenService {
       grant: stored.grant,
       clientId: stored.grant.client.client_id,
       ...(record.expiresAt && { expiresAt: record.expiresAt }),
+      ...(handles && { clientInstanceHandles: handles }),
     };
   }
 
@@ -423,11 +491,11 @@ export class PdppTokenService {
    * An inactive token yields exactly `{ active: false }`. RFC 7662 §2.2 is
    * clear that the response must not distinguish revoked from expired from
    * never-issued — the reason stays internal (`resolveToken`) for the
-   * co-located RS, which needs it to pick 403 `grant_revoked`.
+   * co-located RS, which needs it to pick 401 `grant_revoked`.
    */
   introspect(
     accessToken: string,
-    now: Date = new Date(),
+    now: Date = this.clock(),
   ): PdppIntrospectionResponse {
     const context = this.resolveToken(accessToken, now);
     if (!context.active) {
@@ -449,17 +517,31 @@ export class PdppTokenService {
       return base;
     }
 
+    // The grant as its client holds it (pairwise handles), and the RS-only
+    // bindings from each handle to the stored instance (spec-core §8, L2002).
+    const handles = context.clientInstanceHandles;
+    const clientGrant = handles
+      ? translateGrantInstances(context.grant, handles)
+      : context.grant;
     return {
       ...base,
       grant_id: context.grant.grant_id,
       client_id: context.grant.client.client_id,
       // The complete resolved enforcement context, in one response (§9 item 18).
-      authorization_details: [toAuthorizationEntry(context.grant)],
+      authorization_details: [toAuthorizationEntry(clientGrant)],
+      pdpp_instance_bindings: context.grant.streams.flatMap((stream) =>
+        stream.instance_ids.map((instance) => ({
+          source_id: context.grant!.source.id,
+          stream: stream.name,
+          instance_id: handles?.[instance] ?? instance,
+          rs_instance: instance,
+        })),
+      ),
     };
   }
 
   /** Revoke a grant and every linked token family. Immediate (§2, §9 item 8). */
-  revokeGrant(grantId: string, now: Date = new Date()): boolean {
+  revokeGrant(grantId: string, now: Date = this.clock()): boolean {
     return this.store.revokeGrant(grantId, now);
   }
 
@@ -482,7 +564,7 @@ export class PdppTokenService {
     ttlSeconds?: number;
     now?: Date;
   }): { access_token: string; token_type: "Bearer"; expires_in: number } {
-    const now = input.now ?? new Date();
+    const now = input.now ?? this.clock();
     const ttl = input.ttlSeconds ?? this.accessTtl;
     const token = newOpaqueToken("pdpp_ot");
     const expiresAt = new Date(now.getTime() + ttl * 1000);
@@ -503,8 +585,160 @@ export class PdppTokenService {
     return { access_token: token, token_type: "Bearer", expires_in: ttl };
   }
 
+  /**
+   * RFC 7009 client-initiated revocation (AS item 25, spec-core L2777-L2789).
+   *
+   * Semantics fixed by L2777:
+   *   - a refresh token, current or superseded, ends every grant its family
+   *     covers, with every access token issued under them;
+   *   - an access token ends itself, and ends its grant only when no
+   *     refresh-token family covers it.
+   *
+   * `pdpp_disposition` is recorded only with current client authentication
+   * (L2785): an active access token covering the grant, or the current
+   * (not superseded, family live) refresh token — presented as the revoked
+   * token itself or as a bearer. Without it the grants still end and nothing
+   * is recorded. Revocation and record commit in one transaction before the
+   * route acknowledges (AS item 44).
+   *
+   * An unknown token is not an error (RFC 7009 §2.2). A token issued to a
+   * different client is refused (RFC 7009 §2.1).
+   */
+  revokeClientToken(input: {
+    token: string;
+    clientId: string;
+    tokenTypeHint?: string;
+    disposition?: "keep" | "delete";
+    reportedAt?: string;
+    /** A bearer the request carried as extra current client authentication. */
+    bearer?: string;
+    now?: Date;
+  }):
+    | { ok: true; endedGrants: string[]; dispositionRecorded: boolean }
+    | {
+        ok: false;
+        code:
+          "unauthorized_client" | "invalid_request" | "temporarily_unavailable";
+        message: string;
+      } {
+    const now = input.now ?? this.clock();
+    // AS item 44: client revocation authenticates a write (a disposition)
+    // and changes ordered state, so it waits for a current history.
+    if (!this.store.history.isCurrent()) {
+      return {
+        ok: false,
+        code: "temporarily_unavailable",
+        message: HISTORY_UNAVAILABLE.message,
+      };
+    }
+    // A lifecycle recovery token (L1802) is revocable like any access token
+    // it issued; revoking it ends no grant.
+    const recovery = this.store.lifecycle.getRecoveryToken(
+      hashToken(input.token),
+    );
+    if (recovery) {
+      if (recovery.clientId === input.clientId) {
+        this.store.commit(
+          () =>
+            this.store.lifecycle.revokeRecoveryToken(
+              hashToken(input.token),
+              now.toISOString(),
+            ),
+          now,
+        );
+      }
+      return { ok: true, endedGrants: [], dispositionRecorded: false };
+    }
+    const lookups =
+      input.tokenTypeHint === "refresh_token"
+        ? (["refresh", "access"] as const)
+        : (["access", "refresh"] as const);
+
+    let grantId: string | null = null;
+    let credential: "access_token" | "refresh_token" | null = null;
+    let current = false;
+    let accessTokenOnly: string | undefined;
+    for (const kind of lookups) {
+      if (kind === "access") {
+        const record = this.store.getAccessToken(input.token);
+        if (!record) continue;
+        // A token that is not this client's is treated exactly like an
+        // unknown one: no effect and the same empty 200 (RFC 7009 §2.2).
+        // `client_id` is not authenticated here, so a distinct refusal would
+        // only let a token holder probe which client a token belongs to.
+        if (
+          record.tokenKind !== "client" ||
+          record.clientId !== input.clientId ||
+          !record.grantId
+        )
+          return { ok: true, endedGrants: [], dispositionRecorded: false };
+        grantId = record.grantId;
+        credential = "access_token";
+        current = this.resolveToken(input.token, now).active;
+        if (this.store.refreshFamilyCovers(record.grantId))
+          accessTokenOnly = input.token;
+        break;
+      }
+      const refresh = this.store.inspectRefreshToken(input.token);
+      if (!refresh) continue;
+      const stored = this.store.getGrant(refresh.grantId);
+      if (!stored || stored.clientId !== input.clientId)
+        return { ok: true, endedGrants: [], dispositionRecorded: false };
+      grantId = refresh.grantId;
+      credential = "refresh_token";
+      current =
+        !refresh.superseded &&
+        !refresh.familyRevoked &&
+        grantInactiveReason(this.store, stored, now) === null;
+      break;
+    }
+    if (grantId === null || credential === null)
+      // RFC 7009 §2.2: an invalid token is not an error.
+      return { ok: true, endedGrants: [], dispositionRecorded: false };
+
+    if (!current && input.bearer !== undefined) {
+      const bearer = this.resolveToken(input.bearer, now);
+      current =
+        bearer.active &&
+        bearer.tokenKind === "client" &&
+        bearer.clientId === input.clientId &&
+        bearer.grant?.grant_id === grantId;
+    }
+
+    // An access-token revocation that a live refresh family covers ends no
+    // grant, so a conveyed disposition has no ending to ride on (L2785 scopes
+    // it to the grants a revoked family covers). The token is still ended
+    // (L2777 "MUST end that token") and nothing is recorded, which the result
+    // reports as `dispositionRecorded: false` (L2785: "Without it, the AS
+    // still ends the grants but records no disposition").
+    const endedGrants = accessTokenOnly !== undefined ? [] : [grantId];
+    const record =
+      input.disposition !== undefined &&
+      current &&
+      accessTokenOnly === undefined;
+    const ended = this.store.revokeForClient({
+      endGrants: endedGrants,
+      ...(accessTokenOnly !== undefined && { accessTokenOnly }),
+      ...(record && {
+        disposition: {
+          value: input.disposition!,
+          ...(input.reportedAt !== undefined && {
+            reportedAt: input.reportedAt,
+          }),
+          clientId: input.clientId,
+          credential,
+          scope: [grantId],
+        },
+      }),
+      now,
+    });
+    // Report only grants this request actually ended (an already revoked or
+    // expired grant keeps its own ending, L2785).
+    return { ok: true, endedGrants: ended, dispositionRecorded: record };
+  }
+
   /** Revoke a single access token without touching its grant. */
-  revokeAccessToken(token: string, now: Date = new Date()): boolean {
+  revokeAccessToken(token: string, now: Date = this.clock()): boolean {
     return this.store.revokeAccessToken(token, now);
   }
 }
@@ -538,14 +772,30 @@ export function toAuthorizationEntry(grant: Grant): PdppAuthorizationEntry {
   if (isV02Grant(grant)) {
     return { type: PDPP_DATA_ACCESS_TYPE_V02, grant };
   }
+  // AS item 32 / spec-core L1415: "Each element MUST contain `type` equal to
+  // `https://pdpp.dev/data-access` and `grant` containing the complete
+  // immutable grant [...]. The AS MUST NOT substitute the original selection
+  // request or a lossy summary." The same element serves the token response
+  // (code and refresh) and introspection, so client and RS see one fact set.
+  if (grantUsesLockedRules(grant)) {
+    return {
+      type:
+        grant.version === PDPP_GRANT_VERSION_CANDIDATE
+          ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
+          : PDPP_DATA_ACCESS_TYPE,
+      grant,
+    };
+  }
+  // Pre-lock grants never reach here: they resolve inactive (AS item 21).
   return toAuthorizationDetail(grant);
 }
 
 export function toAuthorizationDetail(grant: Grant): PdppAuthorizationDetail {
   return {
-    type: grantIsCandidate(grant)
-      ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
-      : PDPP_DATA_ACCESS_TYPE,
+    type:
+      grant.version === PDPP_GRANT_VERSION_CANDIDATE
+        ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
+        : PDPP_DATA_ACCESS_TYPE,
     source: grant.source,
     purpose_code: grant.purpose_code,
     ...(grant.purpose_description && {

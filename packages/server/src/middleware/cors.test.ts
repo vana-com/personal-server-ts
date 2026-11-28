@@ -105,3 +105,40 @@ describe("CORS middleware", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 });
+
+describe("CORS: PDPP-Version (spec-core §8 API versioning)", () => {
+  function createApp() {
+    const app = new Hono();
+    app.use("*", corsMiddleware());
+    app.get("/v1/streams", (c) => {
+      c.header("PDPP-Version", "0.1");
+      return c.json({ object: "list", data: [] });
+    });
+    return app;
+  }
+
+  it("permits PDPP-Version on a cross-origin preflight", async () => {
+    const res = await createApp().request("/v1/streams", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://app.example.com",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "Authorization, PDPP-Version",
+      },
+    });
+    expect(
+      lowerList(res.headers.get("Access-Control-Allow-Headers")),
+    ).toContain("pdpp-version");
+  });
+
+  it("exposes PDPP-Version so a browser client can verify the selected contract", async () => {
+    const res = await createApp().request("/v1/streams", {
+      headers: { Origin: "https://app.example.com" },
+    });
+    expect(
+      lowerList(res.headers.get("Access-Control-Expose-Headers")),
+    ).toContain("pdpp-version");
+    expect(CORS_ALLOW_HEADERS).toContain("PDPP-Version");
+    expect(CORS_EXPOSE_HEADERS).toContain("PDPP-Version");
+  });
+});

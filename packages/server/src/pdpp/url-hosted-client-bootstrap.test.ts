@@ -139,25 +139,36 @@ function authorizeBody(overrides: Record<string, unknown> = {}) {
         source: { id: SOURCE_ID },
         purpose_code: "https://pdpp.dev/purpose/personalization",
         access_mode: "continuous",
-        streams: [{ name: "top_artists" }],
+        streams: [{ name: "top_artists", fields: ["*"] }],
       },
     ],
     ...overrides,
   };
 }
 
-describe("an empty allowlist makes zero outbound calls", () => {
-  it("never invokes the fetcher and refuses the unregistered client", async () => {
-    const fetchSpy = vi.spyOn(
-      clientDocumentFetch,
-      "boundedClientDocumentFetcher",
-    );
+// AS item 50 / spec-core L1025-L1029: by default a valid client ID metadata
+// document is accepted as an identity without preregistration, and a denial
+// under local policy is a distinct outcome from a rejected identity form.
+describe("default config accepts a URL-hosted identity without preregistration", () => {
+  it("accepts a valid unregistered client ID metadata document (empty allowlist)", async () => {
+    const fetchSpy = vi
+      .spyOn(clientDocumentFetch, "boundedClientDocumentFetcher")
+      .mockImplementation(async (url) => ({
+        status: 200,
+        finalUrl: url,
+        body: JSON.stringify({
+          client_id: CLIENT_ID,
+          client_name: "Unregistered Client",
+          redirect_uris: [REDIRECT],
+        }),
+      }));
 
     await seedScope("spotify.top_artists");
     ctx = await boot(
       pdppConfig({
         declarationPaths: [await writeDeclaration()],
-        urlHostedClientHosts: [], // the default; explicit here for clarity
+        clients: [],
+        urlHostedClientHosts: [], // the default
       }),
     );
     const token = await ownerToken(ctx);
@@ -171,10 +182,40 @@ describe("an empty allowlist makes zero outbound calls", () => {
       body: JSON.stringify(authorizeBody()),
     });
 
-    // Registration-only behavior, preserved exactly: an unregistered client
-    // is refused, not fetched.
+    expect(response.status).toBe(201);
+    expect(fetchSpy).toHaveBeenCalledWith(CLIENT_ID);
+  });
+
+  it("rejects an invalid identity document with invalid_request, not a policy error", async () => {
+    vi.spyOn(
+      clientDocumentFetch,
+      "boundedClientDocumentFetcher",
+    ).mockImplementation(async (url) => ({
+      status: 200,
+      finalUrl: url,
+      // Asserts a different client_id than the URL it was fetched from.
+      body: JSON.stringify({
+        client_id: "https://attacker.example/client.json",
+        redirect_uris: [REDIRECT],
+      }),
+    }));
+    await seedScope("spotify.top_artists");
+    ctx = await boot(
+      pdppConfig({ declarationPaths: [await writeDeclaration()], clients: [] }),
+    );
+    const token = await ownerToken(ctx);
+    const response = await ctx.app.request("/pdpp/v1/authorize", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(authorizeBody()),
+    });
     expect(response.status).toBe(400);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(((await response.json()) as { error: string }).error).toBe(
+      "invalid_request",
+    );
   });
 });
 
@@ -265,6 +306,11 @@ describe("the allowlist wires the real resolver into a real boot", () => {
     });
 
     expect(response.status).toBe(400);
+    // AS item 50: a denial under local admission policy, distinct from a
+    // rejected identity form (which is invalid_request above).
+    expect(((await response.json()) as { error: string }).error).toBe(
+      "unauthorized_client",
+    );
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

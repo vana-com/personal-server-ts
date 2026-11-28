@@ -22,7 +22,7 @@ afterEach(closeStores);
 
 const POSTS = ["p1", "p2", "p3"].map((id) => ({ id, caption: `c ${id}` }));
 const path = (stream: string) =>
-  `/v1/streams/${stream}/records?source=${CONNECTOR}`;
+  `/v1/streams/${stream}/records?order=asc&source=${CONNECTOR}`;
 
 async function recordsOf(
   local: Awaited<ReturnType<typeof syncedStore>>["local"],

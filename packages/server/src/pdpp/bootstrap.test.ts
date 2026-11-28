@@ -53,6 +53,13 @@ const DECLARATION = JSON.stringify({
       fields: ["id", "name", "genres", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: {
+        properties: {
+          source_updated_at: { type: "string", format: "date-time" },
+        },
+      },
       primary_key: ["id"],
     },
   ],
@@ -285,7 +292,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -361,11 +368,20 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
     const context = (await introspected.json()) as {
       active: boolean;
       grant_id: string;
-      authorization_details: Array<{ streams: Array<{ fields: string[] }> }>;
+      // AS item 32: `{ type, grant }` with the complete grant (L1415).
+      authorization_details: Array<{
+        type: string;
+        grant: { streams: Array<{ fields: string[] }> };
+      }>;
     };
     expect(context.active).toBe(true);
     expect(context.grant_id).toBe(grant_id);
-    expect(context.authorization_details[0].streams[0].fields).toContain("id");
+    expect(context.authorization_details[0].type).toBe(
+      "https://pdpp.dev/data-access",
+    );
+    expect(context.authorization_details[0].grant.streams[0].fields).toContain(
+      "id",
+    );
 
     // 6. Revocation is immediate.
     const revoked = await app.request("/pdpp/v1/revoke", {
@@ -374,7 +390,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
         "content-type": "application/x-www-form-urlencoded",
         authorization: `Bearer ${token}`,
       },
-      body: new URLSearchParams({ grant_id }).toString(),
+      body: new URLSearchParams({ grant_id, disposition: "keep" }).toString(),
     });
     expect(revoked.status).toBe(200);
 
@@ -409,7 +425,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -434,7 +450,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -498,7 +514,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -545,7 +561,7 @@ describe("the real OAuth grant flow on a bootstrapped server", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -653,7 +669,7 @@ describe("redirect_uri is validated on the bootstrapped server", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -699,7 +715,7 @@ describe("review C5 — /authorize binds an authenticated owner", () => {
           source: { id: SOURCE_ID },
           purpose_code: "https://pdpp.dev/purpose/personalization",
           access_mode: "continuous",
-          streams: [{ name: "top_artists" }],
+          streams: [{ name: "top_artists", fields: ["*"] }],
         },
       ],
     };
@@ -757,42 +773,31 @@ describe("review C5 — /authorize binds an authenticated owner", () => {
   });
 });
 
-describe("review C1 — PDPP-Version is the spec's HTTP contract version", () => {
+describe("review C1 — PDPP-Version is the RS HTTP contract version only", () => {
   beforeEach(async () => {
     await seedScope("spotify.top_artists");
     ctx = await boot(pdppConfig([await writeDeclaration()]));
   });
 
-  it("accepts the normative header value from Core §8", async () => {
-    // Core §8 "API versioning" states `PDPP-Version: 2026-04-06`. The AS
-    // previously advertised the GRANT SCHEMA version here, which §7 says must
-    // not be conflated with the HTTP contract version — so a client pinning
-    // the spec's own value could reach the RS but not the AS.
-    const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${ctx!.devToken}`,
-        "content-type": "application/json",
-        "pdpp-version": "2026-04-06",
-      },
-      body: JSON.stringify(await ownerTokenRequestBody()),
-    });
-    expect(response.status).toBe(200);
-    expect(response.headers.get("pdpp-version")).toBe("2026-04-06");
-  });
-
-  it("rejects the grant schema version as an API version", async () => {
-    const response = await ctx!.app.request("/pdpp/v1/owner/token", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${ctx!.devToken}`,
-        "content-type": "application/json",
-        "pdpp-version": "0.1.0",
-      },
-      body: JSON.stringify(await ownerTokenRequestBody()),
-    });
-    expect(response.status).toBe(400);
-    expect((await response.json()).error).toBe("unsupported_version");
+  it("does not negotiate PDPP-Version on AS endpoints (spec-core §8)", async () => {
+    // Locked v0.1.0: PDPP-Version selects the RS HTTP contract only; it "does
+    // not negotiate OAuth authorization, token, revocation, introspection, or
+    // grant lifecycle endpoints". So any value — the pre-lock date, the grant
+    // schema version, or the RS identifier — leaves the AS response unchanged
+    // and the AS echoes none.
+    for (const value of ["2026-04-06", "0.1.0", "0.1"]) {
+      const response = await ctx!.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/json",
+          "pdpp-version": value,
+        },
+        body: JSON.stringify(await ownerTokenRequestBody()),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("pdpp-version")).toBeNull();
+    }
   });
 });
 
@@ -888,7 +893,7 @@ describe("the real boot path mounts the AS for a normative declaration", () => {
             source: { id: "https://registry.pdpp.dev/connectors/instagram" },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "profile" }],
+            streams: [{ name: "profile", fields: ["*"] }],
           },
         ],
       }),
@@ -1030,7 +1035,7 @@ describe("operator per-client grant lifetime policy", () => {
             source: { id: SOURCE_ID },
             purpose_code: "https://pdpp.dev/purpose/personalization",
             access_mode: "continuous",
-            streams: [{ name: "top_artists" }],
+            streams: [{ name: "top_artists", fields: ["*"] }],
           },
         ],
       }),
@@ -1157,7 +1162,7 @@ describe("operator per-client grant lifetime policy", () => {
       // The SAME token, unchanged, is now refused reading the SAME record —
       // grant expiry, not a fabricated or alternate token or record.
       const afterRead = await readRecord(shortLived.accessToken, RECORD_ID);
-      expect(afterRead.status).toBe(403);
+      expect(afterRead.status).toBe(401);
       expect((await afterRead.json()).error.code).toBe("grant_expired");
       expect(
         (await introspect(shortLived.ownerAccessToken, shortLived.accessToken))

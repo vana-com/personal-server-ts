@@ -27,27 +27,49 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function fixture(subject = owner, resourceOwner = owner) {
+function fixture(
+  subject = owner,
+  resourceOwner = owner,
+  options: { locked?: boolean; pairwise?: boolean } = {},
+) {
   const store = openPdppAuthStore(":memory:");
   stores.push(store);
   const grant: Grant = {
-    version: "0.2.0",
+    version: options.locked ? "0.1.0" : "0.2.0",
     grant_id: "grant-a",
     issued_at: new Date().toISOString(),
-    subject: { id: subject },
+    // A locked grant carries the client's pairwise subject.id (AS item 29);
+    // the internal subject travels only as introspection subject_id.
+    subject: { id: options.locked ? "pws_pairwise-for-app-a" : subject },
     client: { client_id: "app-a" },
     source: { id: sourceId, kind: "connector" },
     source_declaration: { version: "1" },
     purpose_code: "https://pdpp.dev/purpose/personalization",
     access_mode: "continuous",
     streams: [
-      { name: "messages", instance_ids: ["issuer-handle"], fields: ["text"] },
+      options.locked
+        ? {
+            name: "messages",
+            instance_ids: ["issuer-handle"],
+            fields: ["text"],
+            required_fields: [],
+          }
+        : {
+            name: "messages",
+            instance_ids: ["issuer-handle"],
+            fields: ["text"],
+          },
     ],
   };
+  if (options.pairwise)
+    store.assignPairwiseInstanceHandles(subject, "app-a", ["issuer-handle"]);
   store.insertGrant({
     grant,
     subjectId: subject,
     reviewDigest: "exact-owner-review",
+    ...(options.pairwise && {
+      consentEvidence: { instance_handles: "pairwise" },
+    }),
   });
   store.insertAuthCode("code", {
     grantId: grant.grant_id,
@@ -154,6 +176,7 @@ function fixture(subject = owner, resourceOwner = owner) {
     });
   return {
     read,
+    store,
     auth,
     tokens,
     grant,
@@ -506,6 +529,13 @@ it("denies two approved issuer handles mapped to the same logical connection and
   const entry = wire.authorization_details![0];
   if (!("grant" in entry)) throw new Error("fixture must issue a v0.2 grant");
   entry.grant.streams[0].instance_ids.push("second-issuer-handle");
+  // A conformant issuer binds every handle it lists (spec-core L2002).
+  wire.pdpp_instance_bindings!.push({
+    source_id: sourceId,
+    stream: "messages",
+    instance_id: "second-issuer-handle",
+    rs_instance: "second-issuer-handle",
+  });
   f.setResponse(() => Response.json(wire));
   f.setConnections(
     ["issuer-handle", "second-issuer-handle"].map((issuerInstanceId) => ({
@@ -520,5 +550,100 @@ it("denies two approved issuer handles mapped to the same logical connection and
   expect(f.decisions.at(-1)).toEqual({
     outcome: "denied",
     reason: "mapping_collapsed",
+  });
+});
+
+it("accepts a locked 0.1.0 grant whose subject.id is the client's pairwise identifier", async () => {
+  const f = fixture(owner, owner, { locked: true });
+  const wire = f.wire();
+  expect(wire.subject_id).toBe(owner);
+  const entry = wire.authorization_details![0];
+  expect("grant" in entry && entry.grant.subject.id).toBe(
+    "pws_pairwise-for-app-a",
+  );
+  const response = await f.read();
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.data[0].data).toEqual({ text: "approved" });
+  expect(
+    (await f.auth.resolveToken(f.accessToken)).grant?.streams[0].instance_ids,
+  ).toEqual(["replica-handle"]);
+});
+
+it("still denies a locked grant whose introspection subject is another owner", async () => {
+  const f = fixture("owner-b", owner, { locked: true });
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "owner_mismatch",
+  });
+});
+
+it("refuses a pre-lock 0.1.0 grant shape (no required_fields) as an invalid response", async () => {
+  const f = fixture(owner, owner, { locked: true });
+  const wire = structuredClone(f.wire());
+  const entry = wire.authorization_details![0];
+  if (!("grant" in entry)) throw new Error("fixture must issue a full grant");
+  delete (entry.grant.streams[0] as { required_fields?: string[] })
+    .required_fields;
+  f.setResponse(() => Response.json(wire));
+  const response = await f.read();
+  expect(response.status).toBe(500);
+  expect((await response.json()).error.code).toBe("api_error");
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "unavailable",
+    reason: "invalid_response",
+  });
+});
+
+it("serves a pairwise-handle grant through pdpp_instance_bindings and shows the client only its handle", async () => {
+  const f = fixture(owner, owner, { locked: true, pairwise: true });
+  const handle = f.store.findInstanceHandle(owner, "app-a", "issuer-handle")!;
+  expect(handle).toMatch(/^pwi_/);
+  const wire = f.wire();
+  expect(wire.pdpp_instance_bindings).toEqual([
+    {
+      source_id: sourceId,
+      stream: "messages",
+      instance_id: handle,
+      rs_instance: "issuer-handle",
+    },
+  ]);
+  const entry = wire.authorization_details![0];
+  expect("grant" in entry && entry.grant.streams[0].instance_ids).toEqual([
+    handle,
+  ]);
+  const response = await f.read();
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.data[0].instance_id).toBe(handle);
+  expect(JSON.stringify(body)).not.toContain("replica-handle");
+  expect(JSON.stringify(body)).not.toContain("issuer-handle");
+});
+
+it("denies a locked grant whose introspection carries no binding for a handle", async () => {
+  const f = fixture(owner, owner, { locked: true, pairwise: true });
+  const wire = structuredClone(f.wire());
+  delete wire.pdpp_instance_bindings;
+  f.setResponse(() => Response.json(wire));
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "mapping_missing",
+  });
+});
+
+it("denies conflicting bindings for one handle", async () => {
+  const f = fixture(owner, owner, { locked: true, pairwise: true });
+  const wire = structuredClone(f.wire());
+  wire.pdpp_instance_bindings!.push({
+    ...wire.pdpp_instance_bindings![0],
+    rs_instance: "independent",
+  });
+  f.setResponse(() => Response.json(wire));
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "mapping_ambiguous",
   });
 });

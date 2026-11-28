@@ -7,7 +7,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/api";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import type { LocalSync } from "@opendatalabs/personal-server-ts-core/localdb";
-import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppTokenContext } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import type { StreamDeclaration } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
@@ -32,22 +31,30 @@ export async function handleLitePdppRecordList(
   deps: LitePdppRecordsDeps,
 ): Promise<Response> {
   const requestId = `req_${globalThis.crypto.randomUUID()}`;
-  const headers = {
+  const headers: Record<string, string> = {
     "Request-Id": requestId,
-    "PDPP-Version": PDPP_VERSION,
     "Cache-Control": "private, no-store",
   };
+  // Negotiated up front but reported only after the owner credential check:
+  // an inactive credential still gets its own failure first (spec-core §8
+  // "API versioning"), and no query runs under an unselected contract.
+  let versionError: PdppError | undefined;
   try {
-    // Negotiated before authentication and any query, as on Node.
-    assertSupportedPdppVersion(request.headers.get("PDPP-Version"));
+    headers["PDPP-Version"] = assertSupportedPdppVersion(
+      request.headers.get("PDPP-Version"),
+    );
   } catch (error) {
     if (!(error instanceof PdppError)) throw error;
-    return Response.json(error.toJSON(requestId), {
-      status: error.status,
+    versionError = error;
+  }
+  await deps.authorizeOwner(request);
+  if (versionError) {
+    // No contract was selected, so the response carries no PDPP-Version.
+    return Response.json(versionError.toJSON(requestId), {
+      status: versionError.status,
       headers,
     });
   }
-  await deps.authorizeOwner(request);
   try {
     const subjectId = deps.ownerAddress();
     if (!subjectId) {
@@ -64,10 +71,11 @@ export async function handleLitePdppRecordList(
     const local = await deps.localSync();
     // A connection's identity here is its connector id in the
     // identity-less namespace, the same link the Node host registers.
-    const linked = local.recordsFor((connector) => ({
-      connector,
-      namespace: "",
-    }));
+    const link = (connector: string) => ({ connector, namespace: "" });
+    const linked = local.recordsFor(link);
+    // The frozen two-horizon history serves owner lists and change sessions,
+    // as on Node (spec-core §4, §8; RS items 7, 20, 21).
+    const history = local.changesFor(link);
     const connectors = await local.declarations.connectors();
     // The port is synchronous: read each connector's streams once per request.
     const streams = new Map(
@@ -81,6 +89,7 @@ export async function handleLitePdppRecordList(
     const ports: PdppRecordListPorts = {
       accountMode: deps.accountStorageMode,
       recordQuery: linked,
+      recordHistory: (stream, options) => history(stream, options),
       declarations: liteDeclarations(connectors, streams),
       // Lite holds connector ids only, not canonical source ids. `source`
       // names a held connector exactly; any other string names no source here
@@ -122,7 +131,7 @@ function liteDeclarations(
     name: stream,
     semantics: "mutable_state",
     primaryKey: [],
-    cursorField: "",
+    // Lite holds no declared cursor_field: owner lists use key order.
     requiredFields: [],
   });
   const forInstance = (connector: string, stream: string) =>

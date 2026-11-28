@@ -48,6 +48,11 @@ export interface ListCursorPayload extends IntegrityBinding {
    * rows.
    */
   orderKey?: "instant";
+  /**
+   * `listSortTag` of the order this position belongs to. `sortValue` is then
+   * that order's sort key (`listPosition`). Absent: emitted order.
+   */
+  sort?: string;
 }
 
 export interface ChangesSinceCursorPayload extends IntegrityBinding {
@@ -69,6 +74,8 @@ export interface ChangesSinceCursorPayload extends IntegrityBinding {
    * Checkpoints carry no position and need none.
    */
   orderKey?: "code-point";
+  /** Page cursors only: the session's direction. Absent: ascending. */
+  order?: "asc" | "desc";
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

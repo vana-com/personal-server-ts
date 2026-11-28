@@ -178,3 +178,4 @@ export {
   type RetirementRows,
   type RetirementAuthority,
 } from "./legacy-retire-pipeline.js";
+export * from "./owner-delete.js";

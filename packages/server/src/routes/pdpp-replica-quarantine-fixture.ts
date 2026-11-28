@@ -139,6 +139,9 @@ export async function openConsentIssuer(
 }
 export type ConsentIssuer = Awaited<ReturnType<typeof openConsentIssuer>>;
 
+/** One seal key across restarts, as the host's persisted key file gives. */
+const CURSOR_SEAL_KEY = new Uint8Array(32).fill(7);
+
 export async function openReplicaResourceServer(
   store: ReturnType<typeof createReplicaRecordStore>,
   options: {
@@ -182,6 +185,7 @@ export async function openReplicaResourceServer(
       declarations,
       ownerSubjectId: options.owner,
       reads: options.reads,
+      cursorSealKey: CURSOR_SEAL_KEY,
       instancesForSource: (subject, source) =>
         subject === options.owner && source === sourceId
           ? ["conn", "conn-other"]

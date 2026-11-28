@@ -4,9 +4,19 @@ import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
+import {
+  pdppVersionFailure,
+  pdppVersionMiddleware,
+  versionedHeaders,
+} from "./pdpp-version-negotiation.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import {
+  PdppAuthorizationUnavailableError,
+  storedInstanceFor,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { PdppChainEnforcementPort } from "./pdpp-records.js";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
+import { parseRecordQuery } from "./pdpp-record-query.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -48,10 +58,26 @@ export interface PdppBlobsRouteDeps {
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
+  /**
+   * Design 2 (Vana-6.1): the same chain gate the record routes apply. A
+   * client blob read needs its grant's chain entry live, exactly like a
+   * record read; owner reads are not gated.
+   */
+  chainEnforcement?: PdppChainEnforcementPort;
 }
 
 function requestId(): string {
   return `req_${randomUUID()}`;
+}
+
+/** A §4 `blob_ref` value naming `blobId`. */
+function isBlobRefTo(value: unknown, blobId: string): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { blob_id?: unknown }).blob_id === blobId
+  );
 }
 
 function jsonError(
@@ -63,14 +89,17 @@ function jsonError(
   // Every 401 carries the challenge, not just the missing-token branch: a
   // client holding a STALE token is exactly who needs the pointer back to the
   // metadata document in order to re-authorize.
-  const headers: Record<string, string> = {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-    ...(err.status === 401 && {
-      "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
-    }),
-    ...extraHeaders,
-  };
+  const headers: Record<string, string> = versionedHeaders(
+    c,
+    {
+      "Request-Id": reqId,
+      ...(err.status === 401 && {
+        "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
+      }),
+      ...extraHeaders,
+    },
+    PDPP_VERSION,
+  );
   if (err instanceof PdppAuthorizationUnavailableError) {
     headers["Retry-After"] = String(err.retryAfterSeconds);
   }
@@ -79,10 +108,24 @@ function jsonError(
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
-  app.onError((error, c) => {
-    if (error instanceof PdppError) return jsonError(c, error, requestId());
-    throw error;
-  });
+  // Every failure on this route answers the unified §8 error body; a fault
+  // is `api_error`, never the legacy handler's shape (RS item 6).
+  app.onError((error, c) =>
+    jsonError(
+      c,
+      error instanceof PdppError
+        ? error
+        : new PdppError("api_error", "Internal server error"),
+      requestId(),
+    ),
+  );
+  // The blob endpoint is a Core RS operation, so it negotiates PDPP-Version
+  // like every other one (spec-core §8; RS item 11).
+  app.use(
+    "*",
+    // Every path of this router is the Core blob operation.
+    pdppVersionMiddleware(requestId),
+  );
   const readsFor = deps.reads ?? (() => deps.store);
 
   /**
@@ -132,6 +175,67 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       const err = new PdppError("authentication_error", "Invalid access token");
       return { error: jsonError(c, err, reqId) };
     }
+    // Version is reported only once the token is active (spec-core §8).
+    const versionFailure = pdppVersionFailure(c);
+    if (versionFailure) return { error: jsonError(c, versionFailure, reqId) };
+
+    // spec-core §8 "Get a blob": unknown parameters are a 400 (RS item 10),
+    // and `instance_id` is REQUIRED on every blob request: "The resource
+    // server MUST reject a blob request without it with 400
+    // `invalid_request`" (RS items 18, 23).
+    let instanceId: string;
+    try {
+      const query = parseRecordQuery(c.req.url, "getBlob");
+      if (query.instanceId === undefined) {
+        throw new PdppError(
+          "invalid_request",
+          "instance_id is required on every blob request",
+          { param: "instance_id" },
+        );
+      }
+      // AS item 29: a client names its pairwise handle.
+      instanceId = storedInstanceFor(context, query.instanceId);
+    } catch (error) {
+      if (!(error instanceof PdppError)) throw error;
+      return { error: jsonError(c, error, reqId) };
+    }
+
+    // Design 2: the chain gate, before any blob metadata is looked at, so a
+    // client whose chain entry is gone learns nothing about the blob.
+    if (deps.chainEnforcement && context.tokenKind === "client") {
+      const grantId = context.grant?.grant_id;
+      const decision = grantId
+        ? await deps.chainEnforcement.authorize({
+            clientId: context.clientId ?? "",
+            pdppGrantId: grantId,
+          })
+        : ({
+            ok: false,
+            retryable: false,
+            reason: "No chain binding for this grant",
+          } as const);
+      if (!decision.ok) {
+        if (decision.retryable)
+          return {
+            error: jsonError(
+              c,
+              new PdppError(
+                "api_error",
+                "Chain authorization could not be verified",
+              ),
+              reqId,
+              { "Retry-After": "5" },
+            ),
+          };
+        return {
+          error: jsonError(
+            c,
+            new PdppError("grant_revoked", decision.reason),
+            reqId,
+          ),
+        };
+      }
+    }
 
     // DELETE removes the grant's record references and claim rows. Check its
     // connection before blob metadata so callers still get the K7 refusal.
@@ -158,7 +262,11 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const authorizedMeta = () => {
       const meta = store.getBlobMeta(blobId);
       if (!meta) return undefined;
-      const references = store.findBlobReferences(blobId);
+      // A blob_id is unique only within one instance: only references in
+      // the selected instance count (spec-core §8 "Get a blob").
+      const references = store
+        .findBlobReferences(blobId)
+        .filter((reference) => reference.instance === instanceId);
       if (context.tokenKind === "owner") {
         if (!context.subjectId) return undefined;
         const currentInstances = deps.instancesForSubject?.(context.subjectId);
@@ -196,7 +304,6 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
           !recordKeyWithinGrantResources(reference.recordKey, scope.streamGrant)
         )
           continue;
-        if (!scope.fields?.includes("blob_ref")) continue;
         const record = store.getRecord(
           reference.instance,
           reference.stream,
@@ -206,6 +313,18 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
           !record ||
           record.deleted ||
           !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+        )
+          continue;
+        // spec-core §8 "Get a blob" check 3: the field that holds the
+        // reference is in the grant's authorized projection. The field is
+        // found by its blob_ref shape (`{ blob_id, ... }`), not by the name
+        // `blob_ref` (RS item 18).
+        const granted = new Set(scope.fields ?? []);
+        if (
+          !Object.entries(record.data).some(
+            ([field, value]) =>
+              granted.has(field) && isBlobRefTo(value, blobId),
+          )
         )
           continue;
         return meta;

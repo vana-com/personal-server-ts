@@ -171,7 +171,7 @@ async function issueClientToken(): Promise<string> {
           source: { id: OURA },
           purpose_code: "https://pdpp.dev/purpose/personalization",
           access_mode: "continuous",
-          streams: [{ name: "sleep" }],
+          streams: [{ name: "sleep", fields: ["*"] }],
         },
       ],
     }),

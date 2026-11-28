@@ -136,10 +136,13 @@ describe("§8 stream metadata carries schema and selection", () => {
     // Only granted fields. A client must not learn that `secret` exists.
     expect(Object.keys(body.schema.properties).sort()).toEqual(["id", "name"]);
     expect(body.schema.properties.secret).toBeUndefined();
-    // `required` is intersected with the grant, not passed through.
-    expect(body.schema.required).toEqual(["id"]);
-    // The declared capability is still reported.
-    expect(body.selection).toEqual({ fields: true, resources: false });
+    // spec-core §8: a closed projection of the frozen grant (RS item 15). No
+    // current schema detail, cursor_field, primary key or selection.
+    expect(body.schema.properties.id).toEqual({});
+    expect(body.schema.required).toBeUndefined();
+    expect(body.selection).toBeUndefined();
+    expect(body.cursor_field).toBeUndefined();
+    expect(body.primary_key).toBeUndefined();
   });
 });
 
@@ -176,9 +179,10 @@ describe("§8 client `fields` narrows within the grant", () => {
       "/v1/streams/s/records?fields=secret",
       { headers: AUTH },
     );
-    expect(res.status).toBe(400);
+    // spec-core §4 "Effective projection": 403 field_not_granted (RS 31).
+    expect(res.status).toBe(403);
     const body = await res.json();
-    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.code).toBe("field_not_granted");
     expect(body.error.param).toBe("fields");
   });
 
@@ -187,7 +191,8 @@ describe("§8 client `fields` narrows within the grant", () => {
       "/v1/streams/s/records?fields=id,name,secret",
       { headers: AUTH },
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toMatch(/: secret$/);
   });
 
   it("still returns the full granted set when no fields are requested", async () => {

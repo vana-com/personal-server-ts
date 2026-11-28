@@ -19,6 +19,7 @@ import {
   buildConsentReview,
   computeReviewDigest,
   normalizeClientClaims,
+  type DisplayValueShown,
   type RequesterIdentity,
 } from "./review.js";
 import { resolveCommitments } from "./commitments.js";
@@ -29,6 +30,7 @@ import {
 } from "./resolve.js";
 import {
   AI_TRAINING_PURPOSE,
+  grantUsesLockedRules,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   PDPP_GRANT_VERSION_CANDIDATE,
@@ -95,6 +97,27 @@ export interface ConsentEvidence {
    * not.
    */
   recipient_terms?: { id: string; version: string };
+  /**
+   * AS items 15 and 34: what final review showed, as bound into the digest —
+   * the requester identity and each declaration display value with its exact
+   * string and chosen language tag. Locked-rule grants only.
+   */
+  displayed?: {
+    client: RequesterIdentity;
+    display_values: DisplayValueShown[];
+  };
+  /**
+   * AS item 29: the `subject.id` this client received and how it was chosen.
+   * `pairwise` is the only kind this build assigns; an owner-chosen globally
+   * resolvable identifier (L1433) is not offered.
+   */
+  subject_identifier?: { id: string; client_id: string; kind: "pairwise" };
+  /**
+   * AS item 29: the client receives pairwise instance handles for this grant
+   * (`pdpp_pairwise_instances`). The stored grant keeps internal ids; the
+   * client's document is derived (`PdppAuthStore.clientGrantView`).
+   */
+  instance_handles?: "pairwise";
 }
 
 export interface IssueGrantInput {
@@ -125,6 +148,8 @@ export interface IssueGrantInput {
   /** AS-policy grant expiry. Absent means the grant never expires. */
   expiresAt?: string;
   streamDescriptions?: Record<string, string>;
+  /** The review's language priority list (AS item 34); see `BuildReviewInput`. */
+  languagePriority?: string[];
   now?: Date;
 }
 
@@ -160,7 +185,8 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     const refused =
       resolution.failure.code === "minimum_not_met" ||
       resolution.failure.code === "required_stream_declined" ||
-      resolution.failure.code === "no_streams_approved";
+      resolution.failure.code === "no_streams_approved" ||
+      resolution.failure.code === "required_stream_ineligible";
     return {
       ok: false,
       failure: {
@@ -223,6 +249,7 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
     requester: input.requester,
     expiresAt: input.expiresAt,
     streamDescriptions: input.streamDescriptions,
+    languagePriority: input.languagePriority,
   });
 
   if (review.review_digest !== input.approvedReviewDigest) {
@@ -306,9 +333,48 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
       explicit_ai_training_consent: true,
     }),
     recipient_terms: commitments.evidence,
+    ...(review.display_values && {
+      displayed: {
+        client: input.requester,
+        display_values: review.display_values,
+      },
+    }),
   };
 
   return { ok: true, grant, consentEvidence };
+}
+
+/**
+ * AS item 29 / spec-core L1427-L1435: give a locked-rule grant the client's
+ * pairwise `subject.id`, and record it in consent evidence.
+ *
+ * Applied after issuance validation, once the caller has the durable
+ * assignment (`PdppAuthStore.pairwiseSubjectId`). The internal subject stays
+ * the stored grant's `subjectId` and the introspection `subject_id`, which go
+ * only to the RS. v0.2 and pre-lock grants are returned unchanged: their
+ * revisions define `subject.id` as the subject identifier itself.
+ */
+export function withPairwiseSubject(
+  issued: { grant: Grant; consentEvidence: ConsentEvidence },
+  pairwiseId: string,
+): { grant: Grant; consentEvidence: ConsentEvidence } {
+  // Every newly issued grant gets the pairwise `subject.id` (review F8: no
+  // new grant carries the internal subject, which on a PS is the owner's
+  // wallet address). Pairwise instance handles are a locked-rule (v0.1.0)
+  // requirement; the private v0.2 revision keeps stored instance ids.
+  const locked = grantUsesLockedRules(issued.grant);
+  return {
+    grant: { ...issued.grant, subject: { id: pairwiseId } },
+    consentEvidence: {
+      ...issued.consentEvidence,
+      subject_identifier: {
+        id: pairwiseId,
+        client_id: issued.grant.client.client_id,
+        kind: "pairwise",
+      },
+      ...(locked && { instance_handles: "pairwise" as const }),
+    },
+  };
 }
 
 /** Re-export so callers get the digest helper from the issuance seam. */

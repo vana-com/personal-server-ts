@@ -228,14 +228,18 @@ it("a staged delete leaves data intact if its run aborts", async () => {
   await b.sync.apply();
   expect(await b.keys()).toEqual(["keep"]);
 });
-it("append-only streams refuse explicit deletion", async () => {
-  const { a } = await world("checkpoint_window", "append_only");
-  await a.run("seed", ["keep"]);
+// spec-core §4 "Stream semantics", `append_only`: "Explicit deletion is
+// permitted." The duplicate rule "does not block `op: delete`".
+it("append-only streams accept explicit deletion and it reaches another device", async () => {
+  const { a, b } = await world("checkpoint_window", "append_only");
+  await a.run("seed", ["keep", "gone"]);
   await a.publish();
-  await expect(
-    a.run("invalid-delete", ["keep"], { remove: true }),
-  ).rejects.toMatchObject({ code: "invalid_request" });
+  await b.sync.apply();
+  await a.run("explicit-delete", ["gone"], { remove: true });
   expect(await a.keys()).toEqual(["keep"]);
+  await a.publish();
+  await b.sync.apply();
+  expect(await b.keys()).toEqual(["keep"]);
 });
 it("a mismatched declared key rejects the whole delete batch", async () => {
   const { a } = await world("checkpoint_window");

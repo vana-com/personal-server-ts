@@ -23,10 +23,14 @@
  * cover `issued_at` or `grant_id`, which do not exist yet at review time.
  */
 
+import { finalReviewHeldDataStatements } from "./held-data-statements.js";
 import { createHash } from "node:crypto";
 import { resolveCommitments, type ResolvedCommitments } from "./commitments.js";
+import { chooseLanguageVersion, type LocalizableValue } from "./language.js";
+import { APPENDIX_A_PURPOSE_CODES } from "./public-validation.js";
 import {
   AI_TRAINING_PURPOSE,
+  usesLockedRules,
   type ClientClaims,
   type ClientDisplay,
   type DeclarationSnapshot,
@@ -76,7 +80,27 @@ export interface ReviewStream {
   display_detail?: string;
   instance_ids: string[];
   fields: string[];
-  time_constraint?: { field: string; since?: string; until?: string };
+  time_constraint?: {
+    field: string;
+    /** AS item 27/28: the frozen schema format of `field`. Locked rules only. */
+    type?: "date" | "date-time";
+    since?: string;
+    until?: string;
+    /**
+     * AS item 28: the field's declared meaning
+     * (`streams[].display.fields.<field>.meaning`) in the language the review
+     * chose. Absent when the declaration states none; the surface then uses
+     * its own words. Also listed in `display_values` (AS item 34).
+     */
+    meaning?: string;
+  };
+  /**
+   * AS item 28 / §5: the declaration's `consent_time_content_may_exceed`
+   * (default false), sent on every time-bounded stream of a locked-rule
+   * review so the surface can disclose that matched records can contain data
+   * from outside the bounds.
+   */
+  consent_time_content_may_exceed?: boolean;
   resources?: string[];
   /**
    * v0.2 consent-flow control. `optional` means the owner may remove this
@@ -99,6 +123,34 @@ export interface ReviewStream {
     fields?: string[];
     time_range?: { since: string; until: string };
   };
+  /**
+   * AS item 31 / spec-core L286: the identifiers every disclosed record of
+   * this stream carries in its envelope, outside `data` — the record key
+   * (the declared `primary_key` values), the stream name and the instance
+   * handle. Withholding a key field from `fields` does not hide its value.
+   * Locked-rule reviews only.
+   */
+  envelope_identifiers?: {
+    primary_key: string[];
+    stream: string;
+    instance_ids: string[];
+  };
+}
+
+/**
+ * One declaration display value the review shows, as the AS bound it.
+ *
+ * AS item 34 / spec-core L1083: the AS "Binds the identity, exact string, and
+ * any chosen language tag of each declaration display value shown on final
+ * review into the final approval artifact, the review revision or digest, and
+ * retained consent evidence." `id` names the value's place in the
+ * declaration, e.g. `streams[following].display.label`.
+ */
+export interface DisplayValueShown {
+  id: string;
+  value: string;
+  /** The chosen language-map key, or the declared default for a plain string. */
+  language?: string;
 }
 
 /**
@@ -170,6 +222,28 @@ export interface ConsentReviewModel {
     attributed_to: string;
     commitments: string[];
   };
+  /**
+   * AS item 31 / spec-core L286: the review discloses that envelope
+   * identifiers are part of every disclosed record. Locked-rule reviews only;
+   * each stream row names its identifiers in `envelope_identifiers`.
+   */
+  envelope_disclosure?: { statement: string };
+  /**
+   * AS item 45 / spec-core L1286-L1299: what happens to held data after the
+   * grant ends, and (L1284) that ordinary access does not authorize
+   * disclosure to an independent recipient. Locked-rule reviews only. A
+   * pure function of `retention` and the processing-permission set (none in
+   * this build), both already decision fields, so it is not separately
+   * digested.
+   */
+  held_data?: { after_grant_ends: string[]; onward_disclosure: string };
+  /**
+   * AS item 34: every declaration display value this review shows, with the
+   * exact string and chosen language tag, in the order the surface lists
+   * them. Bound into `review_digest` and into consent evidence. Locked-rule
+   * reviews only.
+   */
+  display_values?: DisplayValueShown[];
   /** Digest over the decision fields. The approval must carry this back. */
   review_digest: string;
   /**
@@ -197,6 +271,12 @@ const REGISTERED_PURPOSE_CODES = new Set([
 export function isRegisteredPurposeCode(code: string): boolean {
   return REGISTERED_PURPOSE_CODES.has(code);
 }
+
+/** AS item 31 envelope disclosure text, constant across reviews. */
+export const ENVELOPE_DISCLOSURE_STATEMENT =
+  "Every record this app receives carries its identifiers outside the shared " +
+  "fields: the record key, the stream name and the connection handle. " +
+  "Leaving a key field out of the shared fields does not hide its value.";
 
 /**
  * Normalize client claims before binding. §6 requires the *normalized exact*
@@ -248,6 +328,15 @@ interface ReviewDecisionFields {
   expires_at?: string;
   /** Bound with attribution when rendered; stays outside the grant regardless. */
   client_claims?: { attributed_to: string; commitments: string[] };
+  /**
+   * AS item 15 / item 7: the requester identity the review showed — resolved
+   * display name, display metadata (incl. any `policy_uri`/`tos_uri`),
+   * verified domain and approval signal. Locked-rule reviews only, so the
+   * digest of existing v0.2 reviews does not move.
+   */
+  client_display_shown?: RequesterIdentity;
+  /** AS item 34: the declaration display values shown, with chosen tags. */
+  display_values?: DisplayValueShown[];
 }
 
 /**
@@ -319,6 +408,68 @@ export interface BuildReviewInput {
   streamDescriptions?: Record<string, string>;
   /** This client's other active grants for this owner, newest first. */
   existingGrants?: ExistingGrant[];
+  /**
+   * The language priority list (spec-core L1079 step 1): the parseable
+   * `ui_locales` tags of the authorization request, in order. This build has
+   * no owner language preference at the AS, so nothing precedes them.
+   */
+  languagePriority?: string[];
+}
+
+/**
+ * The declaration display values a review shows, each in the version the AS
+ * chose (spec-core L1077-L1083). A value the declaration did not author is
+ * absent rather than an empty string.
+ */
+function chooseDisplayValues(
+  snapshot: DeclarationSnapshot,
+  streams: StreamGrant[],
+  priority: string[],
+  streamDescriptions: Record<string, string> | undefined,
+): DisplayValueShown[] {
+  const defaultLanguage = snapshot.display?.default_language;
+  const shown: DisplayValueShown[] = [];
+  const add = (id: string, value: LocalizableValue | undefined) => {
+    if (value === undefined) return;
+    const chosen = chooseLanguageVersion(value, priority, defaultLanguage);
+    if (!chosen || chosen.value.length === 0) return;
+    shown.push({ id, ...chosen });
+  };
+  add("display.name", snapshot.display?.name_map ?? snapshot.display?.name);
+  for (const stream of streams) {
+    const name = stream.name;
+    const declared = snapshot.streams.find((d) => d.name === name);
+    // A deployment-supplied description overrides the declaration's and is
+    // not declaration text, so it carries no language.
+    const override = streamDescriptions?.[name];
+    if (override !== undefined)
+      shown.push({ id: `streams[${name}].description`, value: override });
+    else
+      add(
+        `streams[${name}].description`,
+        declared?.description_map ?? declared?.description,
+      );
+    add(
+      `streams[${name}].display.label`,
+      declared?.display?.label_map ?? declared?.display?.label,
+    );
+    add(
+      `streams[${name}].display.detail`,
+      declared?.display?.detail_map ?? declared?.display?.detail,
+    );
+    // AS item 28: a time-bounded stream shows the declared meaning of its
+    // consent time field, so that meaning is a display value shown on final
+    // review and is bound like the others (AS item 34).
+    const timeField = stream.time_constraint?.field;
+    if (timeField !== undefined) {
+      const entry = declared?.display?.fields?.[timeField];
+      add(
+        `streams[${name}].display.fields.${timeField}.meaning`,
+        entry?.meaning_map ?? entry?.meaning,
+      );
+    }
+  }
+  return shown;
 }
 
 /**
@@ -343,6 +494,20 @@ export function buildConsentReview(
   // owner never reviewed must not be issuable, so they go into the digest.
   const commitments = input.commitments ?? resolveOrThrowCommitments(input);
 
+  const locked = usesLockedRules(request.type);
+  // AS item 34: the versions shown, chosen once and used both for rendering
+  // and for the digest, so the two cannot disagree.
+  const displayValues = locked
+    ? chooseDisplayValues(
+        snapshot,
+        resolvedStreams,
+        input.languagePriority ?? [],
+        input.streamDescriptions,
+      )
+    : undefined;
+  const shownValue = (id: string) =>
+    displayValues?.find((v) => v.id === id)?.value;
+
   const review_digest = computeReviewDigest({
     subject_id: input.subjectId,
     client_id: requester.client_id,
@@ -361,6 +526,12 @@ export function buildConsentReview(
     retention: commitments.retention,
     expires_at: input.expiresAt,
     client_claims: boundClaims,
+    // AS item 15: the client display and declaration display values shown
+    // are final decision fields; a change to either stales the approval.
+    ...(locked && {
+      client_display_shown: requester,
+      display_values: displayValues,
+    }),
   });
 
   return {
@@ -369,8 +540,10 @@ export function buildConsentReview(
       source: {
         kind: snapshot.source_kind,
         id: snapshot.source_id,
-        ...(snapshot.display?.name && {
-          display_name: snapshot.display.name,
+        ...((locked ? shownValue("display.name") : snapshot.display?.name) && {
+          display_name: locked
+            ? shownValue("display.name")
+            : snapshot.display?.name,
         }),
       },
       source_declaration_version: snapshot.version,
@@ -380,23 +553,44 @@ export function buildConsentReview(
         // §5 consent copy, read from the RETAINED SNAPSHOT. `request` is
         // deliberately not consulted: that is the whole provenance guarantee.
         const declared = snapshot.streams.find((d) => d.name === s.name);
+        // Locked reviews render the chosen language version (AS item 34);
+        // others keep the plain strings exactly as before.
+        const description = locked
+          ? shownValue(`streams[${s.name}].description`)
+          : (input.streamDescriptions?.[s.name] ?? declared?.description);
+        const label = locked
+          ? shownValue(`streams[${s.name}].display.label`)
+          : declared?.display?.label;
+        const detail = locked
+          ? shownValue(`streams[${s.name}].display.detail`)
+          : declared?.display?.detail;
         return {
           name: s.name,
           // The deployment-supplied map still wins where a caller set it, so
           // this adds a source of copy without removing the existing one.
-          ...((input.streamDescriptions?.[s.name] ?? declared?.description) && {
-            description:
-              input.streamDescriptions?.[s.name] ?? declared?.description,
-          }),
-          ...(declared?.display?.label && {
-            display_label: declared.display.label,
-          }),
-          ...(declared?.display?.detail && {
-            display_detail: declared.display.detail,
-          }),
+          ...(description && { description }),
+          ...(label && { display_label: label }),
+          ...(detail && { display_detail: detail }),
           instance_ids: s.instance_ids,
           fields: s.fields,
-          ...(s.time_constraint && { time_constraint: s.time_constraint }),
+          ...(s.time_constraint && {
+            time_constraint: {
+              ...s.time_constraint,
+              ...(locked &&
+                shownValue(
+                  `streams[${s.name}].display.fields.${s.time_constraint.field}.meaning`,
+                ) !== undefined && {
+                  meaning: shownValue(
+                    `streams[${s.name}].display.fields.${s.time_constraint.field}.meaning`,
+                  ),
+                }),
+            },
+          }),
+          ...(locked &&
+            s.time_constraint && {
+              consent_time_content_may_exceed:
+                declared?.consent_time_content_may_exceed === true,
+            }),
           ...(s.resources && { resources: s.resources }),
           ...(asked && {
             necessity: asked.necessity,
@@ -404,6 +598,14 @@ export function buildConsentReview(
             ...(asked.time_range && { requested_time_range: asked.time_range }),
             ...(asked.minimum && { minimum: asked.minimum }),
           }),
+          ...(locked &&
+            declared && {
+              envelope_identifiers: {
+                primary_key: declared.primary_key,
+                stream: s.name,
+                instance_ids: s.instance_ids,
+              },
+            }),
         };
       }),
       ...(input.omittedStreams &&
@@ -417,12 +619,23 @@ export function buildConsentReview(
       ...(commitments.purpose_description && {
         purpose_description: commitments.purpose_description,
       }),
-      purpose_unregistered: !isRegisteredPurposeCode(commitments.purpose_code),
+      // Locked rules read Appendix A as published (spec-core L3225); the
+      // pre-lock set stays for the v0.2 type so its rendering is unchanged.
+      purpose_unregistered: locked
+        ? !APPENDIX_A_PURPOSE_CODES.has(commitments.purpose_code)
+        : !isRegisteredPurposeCode(commitments.purpose_code),
       ...(commitments.retention && { retention: commitments.retention }),
       requires_explicit_ai_training_consent:
         commitments.purpose_code === AI_TRAINING_PURPOSE,
     },
     ...(boundClaims && { client_claims: boundClaims }),
+    ...(locked && {
+      envelope_disclosure: { statement: ENVELOPE_DISCLOSURE_STATEMENT },
+      held_data: finalReviewHeldDataStatements({
+        ...(commitments.retention && { retention: commitments.retention }),
+      }),
+      display_values: displayValues,
+    }),
     review_digest,
     ...(input.existingGrants &&
       input.existingGrants.length > 0 && {

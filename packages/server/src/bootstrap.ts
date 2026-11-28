@@ -149,6 +149,18 @@ import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
 import {
+  LEGACY_SCOPE_BINDINGS,
+  legacySourceId,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
+  createDesign2ChainGrants,
+  type PermissionsV2Reader,
+} from "./pdpp/chain-grants.js";
+import {
+  logScope as streamSyncLogScope,
+  streamScope as streamSyncStreamScope,
+} from "@opendatalabs/personal-server-ts-stream-sync";
+import {
   createPdppRecordsDeps,
   legacyScopeRecords,
   coLocatedAuthorizationService,
@@ -186,6 +198,7 @@ import {
   type StreamSyncRegistry,
   createGatewayStreamSyncRegistry,
   manifestArtifactResolver,
+  manifestDigestFinder,
   createStorageStreamSyncBlobs,
   createStreamSyncKeyPorts,
   streamSyncNetwork,
@@ -362,6 +375,11 @@ export interface CreateServerOptions {
    * except in an enclave, which uses `globalThis.fetch`. A test passes its own.
    */
   outboundFetch?: typeof fetch;
+  /**
+   * Design 2: how the PS reads PermissionsV2 at the finalized block. Default:
+   * the deployment's public RPC. A test passes its own.
+   */
+  pdppChainReader?: PermissionsV2Reader;
   /**
    * The stream-sync blob store. Default: the storage service at `gateway.url`.
    * A test with no storage service passes its own (for example
@@ -1678,6 +1696,115 @@ async function bootstrapServer(
     },
   });
 
+  // GET /pdpp/v1/owner/sources: sources holding the owner's connected data.
+  // `instancesForSource` already answers nothing for any other subject.
+  if (pdppAuth && pdppRecords?.instancesForSource) {
+    const instancesForSource = pdppRecords.instancesForSource;
+    pdppAuth.ownerDataSources = (subject) =>
+      [
+        ...new Set([
+          ...pdppAuth.retainedDeclarations.map((d) => d.source_id),
+          ...pdppAuth.connectionMethods.keys(),
+        ]),
+      ].filter((sourceId) => instancesForSource(subject, sourceId).length > 0);
+  }
+
+  // Design 2 (Vana-6.1 / 6.2): chain-enforced PDPP grants, opt-in. Issued
+  // grants are registered as salted entries in the owner's PermissionsV2 slot
+  // for the app, signed by this server as the owner's registered server, and
+  // client reads require the entry live on chain (pdpp/chain-grants.ts).
+  // NEW-3 (L2): turning chain grants off stops every on-chain removal, so an
+  // entry still bound or ending would stay on chain (and payable at the
+  // gateway) for good. The server still boots, but PDPP chain grants run in
+  // their fail-closed mode (approvals refused, client reads denied, with the
+  // reason below) unless the operator sets the override.
+  let chainOffWithRegistrations: string | undefined;
+  if (pdppAuth && !config.pdpp.chainGrants.enabled) {
+    const live = pdppAuth.store.listChainRegistrations(["bound", "ending"]);
+    if (
+      live.length > 0 &&
+      !config.pdpp.chainGrants.allowDisableWithRegistrations
+    ) {
+      chainOffWithRegistrations =
+        `pdpp.chainGrants is off but ${live.length} PDPP grant(s) are still registered on chain. ` +
+        "Turn it back on so their entries can be removed when the grants end, or end those grants first; " +
+        "set pdpp.chainGrants.allowDisableWithRegistrations to serve PDPP without chain grants (the entries then stay on chain).";
+      logger.error(
+        { registrations: live.length },
+        "PDPP chain grants are off with grants still on chain: PDPP approvals and client reads are refused",
+      );
+    } else if (live.length > 0)
+      logger.warn(
+        { registrations: live.length },
+        "PDPP chain grants are off with grants still registered on chain; their entries stay there",
+      );
+  }
+  let chainRegistrar:
+    ReturnType<typeof createDesign2ChainGrants>["registrar"] | undefined;
+  if (pdppAuth && chainOffWithRegistrations) {
+    const chain = createDesign2ChainGrants({
+      store: pdppAuth.store,
+      logger,
+      ready: null,
+      unavailableReason: chainOffWithRegistrations,
+    });
+    pdppAuth.chainRegistrar = chain.registrar;
+    if (pdppRecords) pdppRecords.chainEnforcement = chain.gate;
+  }
+  if (pdppAuth && config.pdpp.chainGrants.enabled) {
+    const chain = createDesign2ChainGrants({
+      store: pdppAuth.store,
+      logger,
+      ready:
+        pdppRecords && serverOwner && serverAccount && serverSigner
+          ? {
+              gatewayUrl: config.gateway.url,
+              ...(outboundFetch && { fetch: outboundFetch }),
+              ...(options?.pdppChainReader && {
+                chain: options.pdppChainReader,
+              }),
+              owner: serverOwner,
+              deployment: {
+                chainId: config.gateway.chainId,
+                contractAddress: config.gateway.contracts
+                  .dataPortabilityPermissions as `0x${string}`,
+              },
+              signMessage: (message) => serverAccount!.signMessage(message),
+              signGrantRegistration: (msg) =>
+                serverSigner!.signGrantRegistration(msg),
+              clients: config.pdpp.clients,
+              link: pdppRecords.connectionLink,
+              declaredStreams: (sourceId) =>
+                pdppAuth.retainedDeclarations
+                  .find((d) => d.source_id === sourceId)
+                  ?.streams.map((st) => st.name) ?? [],
+              legacyScopes: (sourceId) =>
+                [...LEGACY_SCOPE_BINDINGS.values()]
+                  .filter(
+                    (b) =>
+                      b.pdppSource === sourceId ||
+                      legacySourceId(b.pdppSource) === sourceId,
+                  )
+                  .map((b) => ({ scope: b.scope, streams: b.pdppStreams })),
+              logScope: streamSyncLogScope,
+              streamScope: streamSyncStreamScope,
+            }
+          : null,
+    });
+    pdppAuth.chainRegistrar = chain.registrar;
+    chainRegistrar = chain.registrar;
+    // Grants issued while chain grants were off get a pending registration
+    // now, so their reads answer "retry" until they are on chain rather
+    // than `grant_revoked`.
+    const backfilled = chain.registrar.backfill();
+    if (backfilled > 0)
+      logger.info(
+        { backfilled },
+        "PDPP chain grants: existing grants queued for chain registration",
+      );
+    if (pdppRecords) pdppRecords.chainEnforcement = chain.gate;
+  }
+
   const pdppConnections = pdppAuth
     ? {
         store: replicaHost?.store ?? openRecordStore(db, replication.enabled),
@@ -1801,7 +1928,16 @@ async function bootstrapServer(
           operatorToken: accessToken,
         }
       : undefined,
-    pdpp: pdppRecords,
+    pdpp: pdppRecords && {
+      ...pdppRecords,
+      // An owner record delete on a switched account runs under a verified
+      // connector artifact this server holds (localdb/owner-delete.ts).
+      artifactDigestFor: (connector: string, version: string | null) =>
+        manifestDigestFinder(pdppAuth?.retainedManifests ?? [])(
+          connector,
+          version,
+        ),
+    },
     pdppConnections,
     // The SAME stable delegate the download worker was given above, not a
     // second importer: both arrival routes must resolve to one importer over
@@ -1988,6 +2124,7 @@ async function bootstrapServer(
         logger.warn("Replication step did not settle before shutdown");
     });
     await attempt(() => derivativeScheduler.stop());
+    await attempt(() => chainRegistrar?.stop());
     await attempt(() => tunnelManager?.stop());
     await attempt(() => syncManager?.stop());
     // A request may have started an MCP state write it did not await.
@@ -2054,6 +2191,8 @@ async function bootstrapServer(
       if (!isEnclave) {
         derivativeScheduler.start();
       }
+      // Design 2: reconcile chain registrations now and every minute.
+      if (!backgroundClosed) chainRegistrar?.start();
 
       // --- Gateway registration check (slow: HTTP call) ---
       if (serverAccount && identity) {

@@ -25,6 +25,7 @@ import {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  usesLockedRules,
   type DeclarationSnapshot,
   type DeclaredStream,
   type SelectionRequest,
@@ -205,6 +206,7 @@ function validateMinimum(
   declared: DeclaredStream,
   snapshot: DeclarationSnapshot,
   type?: TimeType,
+  lockedRules = false,
 ): SelectionValidation {
   const minimum = stream.minimum;
   if (minimum === undefined) return { ok: true };
@@ -240,10 +242,16 @@ function validateMinimum(
     if (new Set(fields).size !== fields.length) {
       return bad("fields must not contain duplicates");
     }
-    const permitted = expandedRequestFields(stream, declared, snapshot, true);
+    // Locked v0.1.0: the ceiling is "the stream's expanded requested fields
+    // together with its schema-required fields" (spec-core L1248, L1258).
+    // v0.2 keeps its stricter expanded-request-only rule.
+    const expanded = expandedRequestFields(stream, declared, snapshot, true);
+    const permitted = lockedRules
+      ? [...new Set([...expanded, ...declared.required_fields])]
+      : expanded;
     const outside = fields.filter((f) => !permitted.includes(f));
     if (outside.length > 0) {
-      return bad(`fields outside the expanded request: ${outside.join(", ")}`);
+      return bad(`fields outside the field ceiling: ${outside.join(", ")}`);
     }
   }
 
@@ -331,10 +339,11 @@ function validateStreamRequest(
     }
   }
 
-  if (stream.minimum !== undefined && revision !== "0.2") {
-    // v0.1 has no `minimum`. Accepting and ignoring it is the one outcome
-    // worse than rejecting: the client would ship believing a floor is
-    // enforced. A client that wants minima moves to the v0.2 type.
+  if (stream.minimum !== undefined && revision === "0.1") {
+    // The pre-lock v0.1 rule set has no `minimum`. Accepting and ignoring it
+    // is the one outcome worse than rejecting: the client would ship believing
+    // a floor is enforced. The locked v0.1.0 rules ("candidate") and v0.2
+    // validate it (spec-core §6 "Explicit authorization minima").
     return fail(
       "unsupported_selection_parameter",
       `stream '${stream.name}' carries minimum, which requires the ${PDPP_DATA_ACCESS_TYPE_V02} detail type`,
@@ -347,10 +356,18 @@ function validateStreamRequest(
         "unsupported_selection_parameter",
         "view cannot be combined with a wildcard stream selection",
       );
+    // A minimum is a floor for one named stream (spec-core §6 "Explicit
+    // authorization minima"); fanning it out over every declared stream would
+    // assert a floor the client never stated for each.
+    if (stream.name === "*" && stream.minimum !== undefined)
+      return fail(
+        "unsupported_selection_parameter",
+        "minimum cannot be combined with a wildcard stream selection",
+      );
     if (stream.fields === undefined && stream.view === undefined)
       return fail(
         "invalid_request",
-        "each candidate stream requires fields or view",
+        'each stream request requires fields or view (use fields: ["*"] for every permitted field)',
       );
     if (
       stream.fields !== undefined &&
@@ -508,7 +525,7 @@ function validateStreamRequest(
     if (revision === "candidate" && !timeType)
       return fail(
         "unsupported_selection_parameter",
-        "candidate consent_time_field must declare a date or date-time string",
+        "consent_time_field must declare a date or date-time string",
       );
     const bounds = validateTimeRangeBounds(
       stream.time_range,
@@ -555,6 +572,7 @@ function validateStreamRequest(
     declared,
     snapshot,
     revision === "candidate" ? declaredTimeType(declared) : undefined,
+    revision === "candidate",
   );
 }
 
@@ -573,14 +591,13 @@ export function validateSelectionRequest(
   // Each recognized type is resolved under its own revision.
   // Anything else is rejected rather than processed as the nearest PDPP type:
   // a type URI the AS does not implement carries rules it does not apply.
-  const revision =
-    request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
-      ? "candidate"
-      : request.type === PDPP_DATA_ACCESS_TYPE_V02
-        ? "0.2"
-        : request.type === PDPP_DATA_ACCESS_TYPE
-          ? "0.1"
-          : null;
+  const revision = usesLockedRules(request.type)
+    ? "candidate"
+    : request.type === PDPP_DATA_ACCESS_TYPE_V02
+      ? "0.2"
+      : request.type === PDPP_DATA_ACCESS_TYPE
+        ? "0.1"
+        : null;
   if (revision === null) {
     return fail(
       "invalid_request",

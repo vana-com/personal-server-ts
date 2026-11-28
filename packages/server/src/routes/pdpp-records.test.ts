@@ -1,7 +1,7 @@
+import { Hono } from "hono";
 import Database from "better-sqlite3";
 import {
   createRecordQuery,
-  listCursor,
   openLocalDb,
   type SqlDriver,
   type SqlValue,
@@ -150,7 +150,8 @@ describe("PS-2 D.8 local record routes", () => {
         new Date(stamp + 1000).toISOString(),
         new Date(stamp).toISOString(),
       ]);
-      expect(firstBody.next_cursor).toBe(listCursor("b", "b"));
+      // Sealed (spec-core §4; RS item 21): no readable position.
+      expect(firstBody.next_cursor).toMatch(/^pc_/);
       expect(firstBody.has_more).toBe(true);
       expect(listRecords).toHaveBeenCalledWith({
         connectionId: "inst_1",
@@ -159,15 +160,14 @@ describe("PS-2 D.8 local record routes", () => {
         limit: 2,
       });
       expect(readMode).toHaveBeenCalledTimes(1);
-      // A plain record_key cursor from before the pk_hash tiebreak still works.
+      // An unsealed record_key cursor is no longer accepted (RS item 21).
       const plainKey = await app.request(path + "?limit=2&cursor=b", {
         headers,
       });
-      expect(
-        (await plainKey.json()).data.map((row: { id: string }) => row.id),
-      ).toEqual(["c"]);
+      expect(plainKey.status).toBe(400);
+      expect((await plainKey.json()).error.code).toBe("invalid_cursor");
       const second = await app.request(
-        path + "?limit=2&cursor=" + firstBody.next_cursor,
+        path + "?limit=2&cursor=" + encodeURIComponent(firstBody.next_cursor),
         { headers },
       );
       expect(
@@ -188,49 +188,31 @@ describe("PS-2 D.8 local record routes", () => {
         404,
       );
 
-      const changed = await app.request(path + "?changes_since=0&limit=2", {
-        headers,
-      });
-      const changeBody = await changed.json();
-      expect(changed.status).toBe(200);
-      expect(changeBody.data.map((row: { id: string }) => row.id)).toEqual([
-        "b",
-        "a",
-      ]);
-      expect(changeBody.data[1].emitted_at).toBe(
-        new Date(stamp + 1000).toISOString(),
+      // An owner change session reads the frozen two-horizon history, not
+      // the raw change sequence (spec-core §4; RS items 7, 20, 21). Without
+      // a history port it is unavailable rather than served out of order.
+      const changed = await app.request(
+        path + "?changes_since=beginning&limit=2",
+        {
+          headers,
+        },
       );
-      expect(changeBody.next_cursor).toBe("2");
-      expect(changeBody.next_changes_since).toBe("2");
-      expect(changesSince).toHaveBeenCalledWith({
-        connectionId: "inst_1",
-        stream: "playlists",
-        cursor: 0,
-        limit: 2,
-      });
-      const rest = await app.request(path + "?changes_since=0&cursor=2", {
-        headers,
-      });
-      expect(
-        (await rest.json()).data.map((row: { id: string }) => row.id),
-      ).toEqual(["c"]);
-      db.prepare(
-        "INSERT INTO record_changes(connection_id, stream, record_key, pk_hash, op, stamp_o, stamp_r, origin) VALUES ('inst_1', 'playlists', 'removed', 'removed', 'remove', 0, 'fixture', 'local')",
-      ).run();
-      const removal = await app.request(path + "?changes_since=3", { headers });
-      const removed = (await removal.json()).data[0];
-      expect(removed.id).toBe("removed");
-      expect(removed.deleted).toBe(true);
-      expect(removed.emitted_at).toBeNull();
-      for (const cursor of ["", "-1", "1x", "9007199254740992"]) {
+      expect(changed.status).toBe(503);
+      expect((await changed.json()).error.code).toBe(
+        "STREAM_HISTORY_UNAVAILABLE",
+      );
+      expect(changesSince).not.toHaveBeenCalled();
+      for (const cursor of ["", "-1", "1x", "cs_bogus"]) {
         const invalid = await app.request(path + "?changes_since=" + cursor, {
           headers,
         });
         expect(invalid.status).toBe(400);
         expect((await invalid.json()).error.code).toBe("invalid_cursor");
       }
-      db.prepare("DELETE FROM record_changes WHERE seq <= 2").run();
-      const expired = await app.request(path + "?changes_since=0", { headers });
+      // A raw sequence token from before sealing expires (410).
+      const expired = await app.request(path + "?changes_since=3", {
+        headers,
+      });
       expect(expired.status).toBe(410);
       expect((await expired.json()).error.code).toBe("cursor_expired");
 
@@ -285,9 +267,12 @@ describe("PS-2 D.8 local record routes", () => {
         headers: clientHeaders,
       });
       expect(Object.keys((await clientSingle.json()).data)).toEqual(["id"]);
-      const clientChanges = await app.request(path + "?changes_since=2", {
-        headers: clientHeaders,
-      });
+      const clientChanges = await app.request(
+        path + "?changes_since=beginning",
+        {
+          headers: clientHeaders,
+        },
+      );
       expect(clientChanges.status).toBe(503);
 
       // Identical keys in distinct connections survive a one-row page boundary.
@@ -490,14 +475,26 @@ describe("grant-safe database change history", () => {
       },
     );
     const response = await app.request(
-      "/streams/playlists/records?changes_since=opaque-prior-horizon",
+      "/streams/playlists/records?changes_since=beginning",
       { headers: { Authorization: "Bearer client" } },
     );
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.data[0].data).toEqual({ id: "allowed", name: "safe" });
-    expect(body.next_changes_since).toBe("opaque-history-horizon");
-    expect(history).toHaveBeenCalledTimes(1);
+    // The backend token is sealed before it leaves the RS (RS item 21) and
+    // opens back to the backend's own token on the next session.
+    expect(body.next_changes_since).toMatch(/^cs_/);
+    expect(body.next_changes_since).not.toContain("opaque");
+    expect(history.mock.calls[0]![1].changesSince).toBeUndefined();
+    const next = await app.request(
+      "/streams/playlists/records?changes_since=" +
+        encodeURIComponent(body.next_changes_since),
+      { headers: { Authorization: "Bearer client" } },
+    );
+    expect(next.status).toBe(200);
+    expect(history.mock.calls[1]![1].changesSince).toBe(
+      "opaque-history-horizon",
+    );
     expect(legacy).not.toHaveBeenCalled();
   });
 });
@@ -578,7 +575,7 @@ describe("pdpp records routes: authentication", () => {
     expect(body.error.code).toBe("grant_stream_not_allowed");
   });
 
-  it("maps grant_revoked inactiveReason to 403 grant_revoked", async () => {
+  it("maps grant_revoked inactiveReason to 401 grant_revoked", async () => {
     const { app } = buildApp({
       "revoked-tok": {
         active: false,
@@ -590,9 +587,38 @@ describe("pdpp records routes: authentication", () => {
     const res = await app.request("/streams/playlists/records", {
       headers: { Authorization: "Bearer revoked-tok" },
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
+    // RS item 19: every inactive token carries the Bearer invalid_token challenge.
+    expect(res.headers.get("WWW-Authenticate")).toMatch(
+      /^Bearer error="invalid_token"/,
+    );
     const body = await res.json();
     expect(body.error.code).toBe("grant_revoked");
+    expect(body.error.type).toBe("authentication_error");
+  });
+});
+
+describe("pdpp records routes: pre-lock grant state (AS item 21)", () => {
+  it("answers 401 authorization_state.unsupported_legacy_shape with the Bearer challenge", async () => {
+    const { app } = buildApp({
+      "legacy-tok": {
+        active: false,
+        tokenKind: "client",
+        subjectId: "sub_1",
+        inactiveReason: "unsupported_legacy_shape",
+      },
+    });
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer legacy-tok" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toMatch(
+      /^Bearer error="invalid_token"/,
+    );
+    const body = await res.json();
+    expect(body.error.code).toBe(
+      "authorization_state.unsupported_legacy_shape",
+    );
   });
 });
 
@@ -938,9 +964,12 @@ describe("pdpp records routes: field projection", () => {
       { store },
     );
 
-    const res = await app.request("/streams/playlists/records?changes_since=", {
-      headers: { Authorization: "Bearer client-tok" },
-    });
+    const res = await app.request(
+      "/streams/playlists/records?changes_since=beginning",
+      {
+        headers: { Authorization: "Bearer client-tok" },
+      },
+    );
     expect(res.status).toBe(200);
     const body = await res.json();
     const keys = body.data.map((r: { id: string }) => r.id);
@@ -981,7 +1010,7 @@ describe("pdpp records routes: changes_since eligibility", () => {
     );
 
     const session1 = await app.request(
-      "/streams/playlists/records?changes_since=",
+      "/streams/playlists/records?changes_since=beginning",
       {
         headers: { Authorization: "Bearer client-tok" },
       },
@@ -1058,7 +1087,15 @@ describe("pdpp records routes: tombstones", () => {
           });
           expect(post.status).toBe(426);
           expect(removed.status).toBe(post.status);
-          expect(await removed.json()).toEqual(await post.json());
+          // DELETE is a §8 endpoint: the unified error body (RS item 6).
+          expect(await removed.json()).toEqual({
+            error: {
+              type: "invalid_request_error",
+              code: "update_required",
+              message: expect.any(String),
+              request_id: expect.stringMatching(/^req_/),
+            },
+          });
           expect(removed.headers.get("Request-Id")).toMatch(/^req_/);
           expect(removed.headers.get("PDPP-Version")).toBe(PDPP_VERSION);
           expect(deleteRecord).not.toHaveBeenCalled();
@@ -1109,7 +1146,7 @@ describe("pdpp records routes: tombstones", () => {
     );
 
     const session1 = await app.request(
-      "/streams/playlists/records?changes_since=",
+      "/streams/playlists/records?changes_since=beginning",
       {
         headers: { Authorization: "Bearer owner-tok" },
       },
@@ -1212,6 +1249,99 @@ describe("pdpp records routes: version negotiation", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("PDPP-Version")).toBe(PDPP_VERSION);
   });
+});
+
+describe("pdpp records routes: locked v0.1.0 PDPP-Version rules (spec-core §8)", () => {
+  const ownerApp = () =>
+    buildApp({
+      "owner-tok": {
+        active: true,
+        tokenKind: "owner",
+        subjectId: "sub_1",
+        instanceIds: ["inst_1"],
+      },
+    }).app;
+
+  it("selects 0.1 when the field is absent and echoes exactly one value", async () => {
+    const res = await ownerApp().request("/streams", {
+      headers: { Authorization: "Bearer owner-tok" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("PDPP-Version")).toBe("0.1");
+  });
+
+  it.each(["2026-04-06", "0.1.0", "v0.1"])(
+    "refuses the non-alias %s with unsupported_version, param PDPP-Version, and no PDPP-Version echoed",
+    async (value) => {
+      const res = await ownerApp().request("/streams", {
+        headers: { Authorization: "Bearer owner-tok", "PDPP-Version": value },
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("unsupported_version");
+      expect(body.error.param).toBe("PDPP-Version");
+      expect(res.headers.get("PDPP-Version")).toBeNull();
+    },
+  );
+
+  it.each(['"0.1"', "0.1, 0.1", ""])(
+    "rejects the malformed field %j with invalid_request and no PDPP-Version echoed",
+    async (value) => {
+      const res = await ownerApp().request("/streams", {
+        headers: { Authorization: "Bearer owner-tok", "PDPP-Version": value },
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error.code).toBe("invalid_request");
+      expect(body.error.param).toBe("PDPP-Version");
+      expect(res.headers.get("PDPP-Version")).toBeNull();
+    },
+  );
+
+  it("still answers 401 with the Bearer challenge for a missing token, before the version error", async () => {
+    const res = await ownerApp().request("/streams", {
+      headers: { "PDPP-Version": "2026-04-06" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toMatch(/^Bearer /);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+
+  it("still answers 401 for an inactive token, before the version error", async () => {
+    const { app } = buildApp({ "dead-tok": { active: false } as never });
+    const res = await app.request("/streams", {
+      headers: { Authorization: "Bearer dead-tok", "PDPP-Version": "9" },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("PDPP-Version")).toBeNull();
+  });
+});
+
+describe("pdpp records routes: negotiation holds at any mount prefix", () => {
+  it.each(["/v1", "/pdpp/v1"])(
+    "refuses 2026-04-06 when mounted at %s",
+    async (prefix) => {
+      const { app } = buildApp({
+        "owner-tok": {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      });
+      const root = new Hono();
+      root.route(prefix, app);
+      const res = await root.request(`${prefix}/streams`, {
+        headers: {
+          Authorization: "Bearer owner-tok",
+          "PDPP-Version": "2026-04-06",
+        },
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error.code).toBe("unsupported_version");
+      expect(res.headers.get("PDPP-Version")).toBeNull();
+    },
+  );
 });
 
 describe("pdpp records routes: pagination limit clamping", () => {
@@ -1722,7 +1852,7 @@ describe("pdpp records routes: unsupported view/expand shapes", () => {
     expect(body.data.map((r: { id: string }) => r.id)).toContain("pl_1");
 
     const changesRes = await app.request(
-      "/streams/playlists/records?changes_since=",
+      "/streams/playlists/records?changes_since=beginning",
       { headers: { Authorization: "Bearer owner-tok" } },
     );
     expect(changesRes.status).toBe(200);
@@ -2127,7 +2257,7 @@ describe("strict record queries", () => {
           instanceIds: ["inst_1"],
         },
       });
-      for (const suffix of ["", "&changes_since="]) {
+      for (const suffix of ["", "&changes_since=beginning"]) {
         const res = await app.request(
           `/streams/playlists/records?limit=${encodeURIComponent(limit)}${suffix}`,
           { headers: { Authorization: "Bearer owner" } },

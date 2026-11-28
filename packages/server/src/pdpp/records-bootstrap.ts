@@ -27,9 +27,20 @@ import type { ConnectionLink } from "@opendatalabs/personal-server-ts-core/local
  * Returns undefined when the AS did not mount, which leaves the resource
  * surface unmounted too. An RS with no authorization server cannot enforce a
  * grant, and a resource server that cannot enforce is worse than absent.
+ *
+ * Operator policy (PDPP Core §9 RS item 29): the operator does not use owner
+ * data held in this Resource Server role for AI training, except under a
+ * training grant issued to it as a client. See docs/pdpp-operator-policy.md.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import type { Database } from "better-sqlite3";
 import type { Logger } from "pino";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
@@ -53,7 +64,11 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { CanonicalLegacyReadStore } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
-import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
+import {
+  pdppIssuerIdentifier,
+  type PdppAuthRouteDeps,
+} from "../routes/pdpp-auth.js";
+import type { PdppChainEnforcementPort } from "../routes/pdpp-records.js";
 import {
   createSqliteRecordStore,
   PdppBindingError,
@@ -116,6 +131,8 @@ export function resolveReplication(
 
 export interface PdppRecordsDeps {
   connectionLink?: ConnectionLink;
+  /** Design 2 read gate, set by the host when `pdpp.chainGrants` is on. */
+  chainEnforcement?: PdppChainEnforcementPort;
   store: PdppRecordStore;
   /** See `AppDeps.pdpp.reads`. */
   reads: PdppReplicaReads;
@@ -132,6 +149,8 @@ export interface PdppRecordsDeps {
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
   resource: string;
   authorizationServers?: string[];
+  /** Seals RS cursors and sync tokens; see `cursorSealKeyFor`. */
+  cursorSealKey?: Uint8Array;
 }
 
 /**
@@ -473,9 +492,106 @@ export function createPdppRecordsDeps(
     // corruption or metadata-only rows) rather than trusting the disk blindly.
     readBlobBytes: async (blobId) => store.getBlobBytes(blobId),
     resource: options.resource,
-    // Co-located: this server is its own authorization server.
-    authorizationServers: [options.resource],
+    // Co-located: this server is its own authorization server. RFC 9728
+    // `authorization_servers` lists issuer identifiers, and the PDPP AS
+    // issuer is `<origin>/pdpp/v1` (RFC 8414 path insertion then finds the
+    // PDPP document, not the MCP one at the bare well-known).
+    authorizationServers: [pdppIssuerIdentifier(options.resource)],
+    cursorSealKey: cursorSealKeyFor(options.db, logger),
   };
+}
+
+/**
+ * The key that seals page cursors and `changes_since` tokens (spec-core §4;
+ * §9 RS item 21), kept in a file beside the records database so a client's
+ * stored `next_changes_since` survives a restart. Not a database table: a
+ * new table would change the schema older builds open.
+ *
+ * - Absent: created with a fresh key, owner-only (0600), exclusively, so a
+ *   concurrent opener reads the winner's key.
+ * - Group- or world-accessible: repaired to 0600 and logged; when the repair
+ *   fails the file is not used (the key may have been read by others) and
+ *   this process seals with a key of its own.
+ * - Wrong length or unreadable as a key: replaced once, atomically (write a
+ *   temporary file, then rename), so the next boot reads the same new key
+ *   instead of drawing another one.
+ *
+ * An in-memory database gets a fresh key. Whoever can read the file can
+ * already read the database it sits beside.
+ */
+export function cursorSealKeyFor(
+  db: Pick<Database, "name">,
+  logger: Pick<Logger, "warn">,
+): Uint8Array {
+  const file =
+    db.name && db.name !== ":memory:"
+      ? `${db.name}.pdpp-cursor-key`
+      : undefined;
+  if (!file) return randomBytes(32);
+  const readValid = (): Buffer | undefined => {
+    const existing = readFileSync(file);
+    return existing.byteLength === 32 ? existing : undefined;
+  };
+  let mode: number | undefined;
+  try {
+    mode = statSync(file).mode;
+  } catch {
+    // Absent: created below.
+  }
+  if (mode === undefined) {
+    const key = randomBytes(32);
+    try {
+      writeFileSync(file, key, { mode: 0o600, flag: "wx" });
+      return key;
+    } catch {
+      // Another opener won the race: use its key (checked below).
+      try {
+        mode = statSync(file).mode;
+      } catch {
+        logger.warn(
+          "PDPP cursor key file cannot be created; sync tokens will not survive a restart",
+        );
+        return key;
+      }
+    }
+  }
+  if ((mode & 0o077) !== 0) {
+    try {
+      chmodSync(file, 0o600);
+      logger.warn(
+        { file },
+        "PDPP cursor key file was readable by others; its mode is now 0600",
+      );
+    } catch {
+      logger.warn(
+        { file },
+        "PDPP cursor key file is readable by others and cannot be repaired; it is not used",
+      );
+      return randomBytes(32);
+    }
+  }
+  try {
+    const existing = readValid();
+    if (existing) return existing;
+  } catch {
+    // Unreadable: replaced below.
+  }
+  const key = randomBytes(32);
+  const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(temporary, key, { mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+    logger.warn(
+      { file },
+      "PDPP cursor key file was corrupt and has been replaced; outstanding tokens are invalid",
+    );
+  } catch {
+    logger.warn(
+      { file },
+      "PDPP cursor key file is corrupt and cannot be replaced; sync tokens will not survive a restart",
+    );
+  }
+  return key;
 }
 
 /**
@@ -510,6 +626,9 @@ export function coLocatedAuthorizationService(
         grant: context.grant as PdppPortGrant | undefined,
         clientId: context.clientId,
         expiresAt: context.expiresAt,
+        ...(context.clientInstanceHandles && {
+          clientInstanceHandles: context.clientInstanceHandles,
+        }),
       };
     },
   };
@@ -603,9 +722,9 @@ export function createPdppSyncImporter(options: {
 /**
  * Project a retained declaration onto the per-stream shapes the RS enforces.
  *
- * `cursorField` falls back to `emitted_at` because that is what both record
- * store backends actually sort by; naming a declared field the store does not
- * order by would produce cursors that resume at the wrong place.
+ * `cursorField` is the declared field, or absent: owner stream metadata must
+ * report the real current `cursor_field` (spec-core §8; RS item 14). It
+ * never drives a store order or a cursor.
  */
 function toStreamDeclarations(
   snapshot: DeclarationSnapshot,
@@ -618,7 +737,9 @@ function toStreamDeclarations(
     // stream into upsert behavior and left a producer's claim unfalsifiable.
     semantics: stream.semantics ?? ("mutable_state" as const),
     primaryKey: stream.primary_key,
-    cursorField: "emitted_at",
+    ...(stream.cursor_field !== undefined && {
+      cursorField: stream.cursor_field,
+    }),
     consentTimeField: stream.consent_time_field,
     requiredFields: stream.required_fields,
     // The declared member list, carried rather than dropped: it is what makes
@@ -632,5 +753,14 @@ function toStreamDeclarations(
     // owner consented against.
     ...(stream.schema && { schema: stream.schema }),
     ...(stream.selection && { selection: stream.selection }),
+    // §8 owner metadata reports current views. The retained snapshot's
+    // views are source-level field lists; each applies to a stream through
+    // the fields the stream declares, as at issuance (selection.ts).
+    views: (snapshot.views ?? [])
+      .map((view) => ({
+        id: view.name,
+        fields: view.fields.filter((field) => stream.fields.includes(field)),
+      }))
+      .filter((view) => view.fields.length > 0),
   }));
 }

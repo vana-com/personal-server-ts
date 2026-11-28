@@ -250,7 +250,7 @@ describe("chain revocation actually takes effect", () => {
     });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("grant_revoked");
   });
 
@@ -259,7 +259,7 @@ describe("chain revocation actually takes effect", () => {
     const app = harness({ readChainGrant: async () => null });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 });
 
@@ -276,7 +276,7 @@ describe("expiry is enforced on the bearer path too", () => {
     });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 
   it("denies a read once the grant's uint256-seconds expiresAt is in the past", async () => {
@@ -289,7 +289,7 @@ describe("expiry is enforced on the bearer path too", () => {
     });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 
   it("allows a read when expiresAt is in the future", async () => {
@@ -328,7 +328,7 @@ describe("the binding must name this owner and this app", () => {
     });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 
   it("denies when the caller is not the bound grantee", async () => {
@@ -336,14 +336,14 @@ describe("the binding must name this owner and this app", () => {
     const app = harness({ granteeAddressFor: () => OTHER_GRANTEE });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 
   it("denies when the client has no grantee address at all", async () => {
     const app = harness({ granteeAddressFor: () => null });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 
   it("denies a binding recorded for a different deployment", async () => {
@@ -360,7 +360,7 @@ describe("the binding must name this owner and this app", () => {
     });
 
     const response = await read(harness({ binding: foreign }));
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 });
 
@@ -409,7 +409,7 @@ describe("an unverifiable chain denies rather than opens", () => {
     });
 
     const response = await read(app);
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
     expect((await response.json()).error.code).toBe("grant_revoked");
   });
 });
@@ -443,6 +443,6 @@ describe("the gate covers every client endpoint, not just record reads", () => {
     const response = await app.request("/v1/streams", {
       headers: { Authorization: "Bearer client-tok" },
     });
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(401);
   });
 });

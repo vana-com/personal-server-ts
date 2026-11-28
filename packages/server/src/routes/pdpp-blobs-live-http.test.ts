@@ -125,9 +125,12 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
 
     await bootAndListen();
 
-    const res = await fetch(`${baseUrl}/v1/blobs/${meta.blobId}`, {
-      headers: { Authorization: "Bearer owner-tok" },
-    });
+    const res = await fetch(
+      `${baseUrl}/v1/blobs/${meta.blobId}?instance_id=inst_1`,
+      {
+        headers: { Authorization: "Bearer owner-tok" },
+      },
+    );
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/octet-stream");
     expect(res.headers.get("content-length")).toBe(String(payload.byteLength));
@@ -160,7 +163,9 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
 
     await bootAndListen();
 
-    const res = await fetch(`${baseUrl}/v1/blobs/${meta.blobId}`);
+    const res = await fetch(
+      `${baseUrl}/v1/blobs/${meta.blobId}?instance_id=inst_1`,
+    );
     expect(res.status).toBe(401);
   });
 
@@ -218,7 +223,7 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
       });
       const url = `http://127.0.0.1:${bound!.port}`;
 
-      const res = await fetch(`${url}/v1/blobs/${blobId}`, {
+      const res = await fetch(`${url}/v1/blobs/${blobId}?instance_id=inst_1`, {
         headers: { Authorization: "Bearer owner-tok" },
       });
       expect(res.status).toBe(200);
@@ -264,9 +269,12 @@ describe("PDPP blob GET over a real listening HTTP server and real on-disk SQLit
       });
       baseUrl = `http://127.0.0.1:${bound!.port}`;
 
-      const res = await fetch(`${baseUrl}/v1/blobs/${blobId}`, {
-        headers: { Authorization: "Bearer owner-tok" },
-      });
+      const res = await fetch(
+        `${baseUrl}/v1/blobs/${blobId}?instance_id=inst_1`,
+        {
+          headers: { Authorization: "Bearer owner-tok" },
+        },
+      );
       expect(res.status).toBe(200);
       expect(res.headers.get("content-length")).toBe(
         String(payload.byteLength),

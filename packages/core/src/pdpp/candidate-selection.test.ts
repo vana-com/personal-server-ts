@@ -329,17 +329,18 @@ it("rejects invalid owner bounds before intersecting them with a valid ceiling",
   );
   expect(result.ok).toBe(false);
 });
-it("candidate rejects private-v0.2 minimum even on wildcard", () => {
-  for (const name of ["required", "*"])
-    expect(
-      validateSelectionRequest(
-        {
-          ...base,
-          streams: [{ name, fields: ["*"], minimum: { fields: ["id"] } }],
-        },
-        snapshot,
-      ).ok,
-    ).toBe(false);
+it("candidate validates a named-stream minimum and refuses a wildcard one", () => {
+  // locked v0.1.0: minimum is a v0.1.0 stream parameter (spec-core L1189).
+  const request = (name: string) =>
+    validateSelectionRequest(
+      {
+        ...base,
+        streams: [{ name, fields: ["*"], minimum: { fields: ["id"] } }],
+      },
+      snapshot,
+    );
+  expect(request("required").ok).toBe(true);
+  expect(request("*").ok).toBe(false);
 });
 it("candidate wildcard does not permit view shorthand", () => {
   expect(

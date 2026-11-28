@@ -117,7 +117,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
       size_bytes: bytes.length,
     };
     const readBlob = (token: string) =>
-      blobs.request(`/${blobId}`, {
+      blobs.request(`/${blobId}?instance_id=${identity.connectionId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
     const read = async (token: string, suffix = "") => {
@@ -561,7 +561,7 @@ it("uses local journal values for conflicted owners and hides the whole connecti
       return { status: response.status, body: await response.json() };
     };
     const readBlob = (token: string) =>
-      blobs.request(`/${blob.blobId}`, {
+      blobs.request(`/${blob.blobId}?instance_id=${identity.connectionId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
     const oldFeeds = await Promise.all(
@@ -569,9 +569,12 @@ it("uses local journal values for conflicted owners and hides the whole connecti
         token,
         page: await read(
           token,
-          "/streams/messages/records?changes_since=&limit=1",
+          "/streams/messages/records?changes_since=beginning&limit=1",
         ),
-        session: await read(token, "/streams/messages/records?changes_since="),
+        session: await read(
+          token,
+          "/streams/messages/records?changes_since=beginning",
+        ),
         list: await read(token, "/streams/messages/records?limit=1&order=asc"),
       })),
     );
@@ -603,14 +606,18 @@ it("uses local journal values for conflicted owners and hides the whole connecti
     })();
     for (const old of oldFeeds) {
       expect(
-        (await read(old.token, "/streams/messages/records?changes_since=")).body
-          .data,
+        (
+          await read(
+            old.token,
+            "/streams/messages/records?changes_since=beginning",
+          )
+        ).body.data,
       ).toEqual([]);
       expect(
         (
           await read(
             old.token,
-            `/streams/messages/records?changes_since=&cursor=${encodeURIComponent(old.page.body.next_cursor)}`,
+            `/streams/messages/records?changes_since=beginning&cursor=${encodeURIComponent(old.page.body.next_cursor)}`,
           )
         ).status,
       ).toBe(410);

@@ -13,7 +13,12 @@ export interface StreamDeclaration {
   name: string;
   semantics: StreamSemantics;
   primaryKey: string[];
-  cursorField: string;
+  /**
+   * The declared §5 `cursor_field`, absent when the stream declares none.
+   * Reported in owner stream metadata (spec-core §8; RS item 14). The record
+   * stores keep their own internal orders and never read this.
+   */
+  cursorField?: string;
   /** Fields declared as consent_time_field candidates for time_constraint enforcement. */
   consentTimeField?: string;
   /** Always included in a sparse `fields` projection, even if not requested. */
@@ -48,6 +53,12 @@ export interface StreamDeclaration {
    * supports so a client knows which selections are even expressible.
    */
   selection?: Record<string, unknown>;
+  /**
+   * The retained declaration's views that name fields of this stream, each
+   * narrowed to those fields. Owner metadata reports them and owner reads
+   * accept `view=<id>` (spec-core §8; RS item 14).
+   */
+  views?: { id: string; fields: string[] }[];
 }
 
 /**

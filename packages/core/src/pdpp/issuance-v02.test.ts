@@ -42,6 +42,9 @@ const snapshot: DeclarationSnapshot = {
       fields: ["date", "amount", "merchant", "private_note"],
       required_fields: ["date", "private_note"],
       consent_time_field: "date",
+      // locked v0.1.0 (AS item 27): a consent_time_field must name a
+      // declared date or date-time string property.
+      schema: { properties: { date: { type: "string", format: "date-time" } } },
       primary_key: ["date"],
     },
     {

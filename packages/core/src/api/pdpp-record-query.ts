@@ -11,8 +11,13 @@ const PARAMETERS = {
     "changes_since",
     "source",
   ],
-  getRecord: ["fields"],
-  deleteRecord: [],
+  // spec-core §8 "Get a single record" / "Delete a record": `instance_id`
+  // selects the record's instance (RS items 1, 23).
+  getRecord: ["fields", "instance_id"],
+  deleteRecord: ["instance_id"],
+  // spec-core §8 "Get a blob": `instance_id` is the only parameter, and an
+  // unknown one is a 400 like on every other route (RS items 10, 23).
+  getBlob: ["instance_id"],
 } satisfies Record<string, string[]>;
 
 type Endpoint = keyof typeof PARAMETERS;
@@ -26,8 +31,27 @@ export function parseRecordQuery(
   const params = new URL(url).searchParams;
   const allowed: readonly string[] = PARAMETERS[endpoint];
   for (const key of params.keys()) {
-    if (!allowed.includes(key)) {
-      const base = key.replace(/\[.*$/, "");
+    // spec-core §8 "List records": "A `changes_since` request with
+    // `expand[]` or `expand_limit[...]` is rejected with 400
+    // `invalid_request` for every token kind" (RS item 21).
+    const base = key.replace(/\[.*$/, "");
+    if (
+      params.has("changes_since") &&
+      (base === "expand" || base === "expand_limit")
+    ) {
+      throw new PdppError(
+        "invalid_request",
+        "Expansion is not supported on a changes_since request",
+        { param: key },
+      );
+    }
+    // spec-core §8: `view` is an owner-token current-capability read;
+    // client-token record requests reject it (below, as unsupported).
+    const ownerView =
+      key === "view" &&
+      tokenKind === "owner" &&
+      (endpoint === "listRecords" || endpoint === "getRecord");
+    if (!allowed.includes(key) && !ownerView) {
       const ownerExpand =
         tokenKind === "owner" &&
         (endpoint === "listRecords" || endpoint === "getRecord") &&
@@ -60,6 +84,21 @@ export function parseRecordQuery(
       { param: "limit" },
     );
   }
+  if (params.has("view") && params.has("fields")) {
+    throw new PdppError(
+      "invalid_request",
+      "Parameters 'view' and 'fields' are mutually exclusive",
+      { param: "view" },
+    );
+  }
+  const rawFields = params.get("fields");
+  const fieldNames = rawFields?.split(",").map((f) => f.trim());
+  // An empty name is malformed, not a field outside the grant.
+  if (fieldNames?.some((f) => f === "")) {
+    throw new PdppError("invalid_request", "fields names must not be empty", {
+      param: "fields",
+    });
+  }
   const order = params.get("order") ?? "desc";
   if (order !== "asc" && order !== "desc") {
     throw new PdppError("invalid_request", "order must be 'asc' or 'desc'", {
@@ -70,13 +109,12 @@ export function parseRecordQuery(
     limit: Math.min(limit, 100),
     clamped: limit > 100,
     order: order as "asc" | "desc",
-    fields: params
-      .get("fields")
-      ?.split(",")
-      .map((f) => f.trim()),
+    fields: fieldNames,
+    view: params.get("view") ?? undefined,
     cursor: params.get("cursor") ?? undefined,
     changesSince: params.get("changes_since") ?? undefined,
     source: params.get("source") ?? undefined,
+    instanceId: params.get("instance_id") ?? undefined,
   };
 }
 
