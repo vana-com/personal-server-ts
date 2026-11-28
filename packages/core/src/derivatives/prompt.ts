@@ -136,8 +136,20 @@ export function trimSourceData(
     text = JSON.stringify(result) ?? "null";
   }
   if (text.length > maxChars) {
+    // The caller JSON-stringifies the fallback again when assembling the prompt.
+    // Budget the resulting quotes and escapes, not just the raw prefix.
+    const marker = "...[truncated]";
+    const suffix = maxChars >= marker.length + 2 ? marker : "";
+    let low = 0,
+      high = Math.min(text.length, Math.floor(maxChars));
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (JSON.stringify(text.slice(0, mid) + suffix).length <= maxChars)
+        low = mid;
+      else high = mid - 1;
+    }
     return {
-      data: `${text.slice(0, maxChars)}...[truncated]`,
+      data: maxChars < 2 ? undefined : text.slice(0, low) + suffix,
       kept,
       total,
       truncated: true,
