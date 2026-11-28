@@ -53,6 +53,8 @@ export type OfflineDeclarationWitnessErrorCode =
 
 /** Fixed, value-free errors. Native errors and their causes are never exposed. */
 export class OfflineDeclarationWitnessError extends Error {
+  declare cleanupErrorCode?: "close_failed";
+
   constructor(public readonly code: OfflineDeclarationWitnessErrorCode) {
     super(`Offline declaration witness: ${code}`);
     this.name = "OfflineDeclarationWitnessError";
@@ -212,6 +214,7 @@ export async function runDeclarationWitness(
   let db: InstanceType<typeof Database> | undefined;
   let declarationsDb: InstanceType<typeof Database> | undefined;
   let stage: OfflineDeclarationWitnessErrorCode = "open_failed";
+  let primaryError: OfflineDeclarationWitnessError | undefined;
   try {
     try {
       if (!statSync(dbPath).isFile()) {
@@ -317,14 +320,17 @@ export async function runDeclarationWitness(
       ? { verdict: "partial", checked }
       : { verdict: "pass", checked };
   } catch (error) {
-    if (error instanceof OfflineDeclarationWitnessError) throw error;
-    throw new OfflineDeclarationWitnessError(
-      isUnreadable(error)
-        ? "store_unreadable"
-        : error instanceof DeclarationWitnessSchemaError
-          ? "invalid_schema"
-          : stage,
-    );
+    primaryError =
+      error instanceof OfflineDeclarationWitnessError
+        ? error
+        : new OfflineDeclarationWitnessError(
+            isUnreadable(error)
+              ? "store_unreadable"
+              : error instanceof DeclarationWitnessSchemaError
+                ? "invalid_schema"
+                : stage,
+          );
+    throw primaryError;
   } finally {
     let closeFailed = false;
     for (const handle of [declarationsDb, db]) {
@@ -335,6 +341,10 @@ export async function runDeclarationWitness(
         closeFailed = true;
       }
     }
-    if (closeFailed) throw new OfflineDeclarationWitnessError("close_failed");
+    if (closeFailed) {
+      if (!primaryError)
+        throw new OfflineDeclarationWitnessError("close_failed");
+      primaryError.cleanupErrorCode = "close_failed";
+    }
   }
 }
