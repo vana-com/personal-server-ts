@@ -3,6 +3,7 @@
 // that, the connector's run then ends owing work, and only then does the tick
 // go on. The timer must follow the work that is owed when the tick goes on,
 // not what the tick learned earlier.
+import { TOMBSTONE_DATA_HASH } from "../../../core/src/sync/tombstone.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { logScope } from "@opendatalabs/personal-server-ts-stream-sync";
 import type { createConnectionDeleter } from "../../../core/src/localdb/delete.js";
@@ -99,7 +100,7 @@ describe("the delete retry timer follows the work owed when it is decided", () =
           versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
             expectedVersion: String(i + 1),
             dataHash: v.dataHash,
-            isTombstone: false,
+            isTombstone: v.dataHash === TOMBSTONE_DATA_HASH,
           })),
         }),
       },
@@ -114,6 +115,7 @@ describe("the delete retry timer follows the work owed when it is decided", () =
         },
       },
       objects: {
+        tombstone: w.tombstone,
         deleteBlobVersions: async (scope, names) => {
           const out = {
             deleted: [] as string[],
@@ -449,7 +451,7 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
           versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
             expectedVersion: String(i + 1),
             dataHash: v.dataHash,
-            isTombstone: false,
+            isTombstone: v.dataHash === TOMBSTONE_DATA_HASH,
           })),
         }),
       },
@@ -461,6 +463,7 @@ describe("an in-memory retry marker is cleared when the durable fact it mirrors 
         },
       },
       objects: {
+        tombstone: w.tombstone,
         deleteBlobVersions: async (scope, names) => {
           const out = {
             deleted: [] as string[],

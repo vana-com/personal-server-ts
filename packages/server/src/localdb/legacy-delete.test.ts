@@ -3,6 +3,7 @@
 // gateway that enforces cutover policy v3 (an exact tombstone over a live head,
 // signed by the owner or a registered server) and a fake storage.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TOMBSTONE_DATA_HASH } from "../../../core/src/sync/tombstone.js";
 import {
   controlScope,
   logScope,
@@ -57,7 +58,7 @@ function erasurePorts(w: World): LogErasurePorts {
         versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
           expectedVersion: String(i + 1),
           dataHash: v.dataHash,
-          isTombstone: false,
+          isTombstone: v.dataHash === TOMBSTONE_DATA_HASH,
         })),
       }),
     },
@@ -69,6 +70,7 @@ function erasurePorts(w: World): LogErasurePorts {
       }),
     },
     objects: {
+      tombstone: w.tombstone,
       deleteBlobVersions: async (scope, names) => {
         const out = {
           deleted: [] as string[],

@@ -2,7 +2,11 @@
 // implements the wire contract of POST /v1/data/batch and of `requires` on
 // POST /v1/data, in memory, so the real gateway adapter and the real publish
 // driver run against it. Signatures are not checked.
-import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  TOMBSTONE_DATA_HASH,
+  TOMBSTONE_METADATA_HASH,
+  computeDataPointId,
+} from "@opendatalabs/personal-server-ts-core/sync";
 
 import {
   countFencedLogScopes,
@@ -40,6 +44,11 @@ export type GatewayCall =
   | { readonly kind: "policy" }
   | { readonly kind: "read"; readonly scope: string }
   | { readonly kind: "list" }
+  | {
+      readonly kind: "delete";
+      readonly scope: string;
+      readonly body: Record<string, unknown>;
+    }
   | {
       readonly kind: "post";
       readonly scope: string;
@@ -293,6 +302,35 @@ export function createFakeGateway(options: FakeGatewayOptions) {
       }
       const raw = String(init?.body);
       const body = JSON.parse(raw);
+
+      if (method === "DELETE") {
+        const scope = scopeOfId.get(url.pathname.split("/").pop()!);
+        calls.push({ kind: "delete", scope: body.scope, body });
+        if (!scope) return json(404, {});
+        const rows = versions.get(scope)!;
+        const head = rows.at(-1)!;
+        if (options.isTombstone(head))
+          return json(410, { data: rowJson(scope) });
+        const version = Number(body.expectedVersion);
+        // Exclusive DELETE cannot refresh a pending slot held by a publisher.
+        if (
+          version !== rows.length + 1 &&
+          !(
+            options.refresh &&
+            body.exclusive !== true &&
+            version === rows.length
+          )
+        )
+          return json(409, { currentExpectedVersion: String(rows.length) });
+        const tombstone = {
+          dataHash: TOMBSTONE_DATA_HASH,
+          metadataHash: TOMBSTONE_METADATA_HASH,
+          signature: body.signature,
+        };
+        if (version === rows.length) gateway.replaceHead(scope, tombstone);
+        else gateway.write(scope, tombstone);
+        return json(200, { data: rowJson(scope) });
+      }
 
       if (url.pathname === "/v1/data") {
         calls.push({ kind: "post", scope: body.scope, body });

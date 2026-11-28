@@ -9,10 +9,10 @@
 //
 // WHAT IS SAFE TO DELETE, AND WHEN
 //
-// A re-add of the same connection uses the SAME log scope: the log row is not
-// tombstoned by the delete, its position keeps counting, and the new lifetime's
-// first segment starts at `base` = the old position (`log-apply.ts`, "a log of
-// an earlier lifetime holds none of this one"). So physical delete can race a
+// A re-add of the same connection uses the SAME log scope. Its position keeps
+// counting through the eraser's log tombstone. After erasure, a new lifetime's
+// first segment starts after that version (`log-apply.ts`, "The log of an ended
+// lifetime. A new one begins after its version."). Physical delete can race a
 // re-add (`docs/design/write-once-publication.md`: no read-then-delete
 // reclaim). The fence:
 //
@@ -25,7 +25,7 @@
 //    still be the tombstone this pass started from (same version). A log
 //    commit requires the control row active at its generation, in the same
 //    registry transaction (`log-publish.ts`), so while the control row is that
-//    tombstone the log row cannot move: every version the inventory listed
+//    tombstone no publish can move the log row: every inventoried version
 //    belongs to a lifetime that ended. Once the control row moves (a re-add),
 //    the pass stops and deletes nothing more.
 // 3. Segment and part names cannot be shared with a later lifetime: they are
@@ -47,24 +47,30 @@
 //    names them, so the record is the only way the salting change can sweep
 //    them. A name in the record is a candidate, not proof it is unused: a live
 //    log can name the same piece, and the sweep must check that first.
+// 4. Before deleting the head, tombstone the log row with a fence on the
+//    exact inventoried head. A re-add that committed first refuses the fence.
+//    Wait for that log tombstone's finality too: a queued tombstone can roll
+//    back, and a live row must never name a head this pass erased.
 //
 // RETRY WITHOUT A JOURNAL
 //
 // Objects are deleted in an order that keeps the log readable until what it
-// names is gone: parts, then segments, the newest segment (the one the
-// registry's log row names) last. Each phase finishes before the next starts,
-// and a failed batch stops the pass. So a pass that stops anywhere, or a
+// names is gone: parts, then non-head segments, then the fenced log tombstone,
+// then (after finality) the newest segment. Each phase finishes before the
+// next starts, and a failed batch stops the pass. So a pass that stops anywhere, or a
 // restart, leaves every segment that names a remaining part in place, and the
 // next pass enumerates the same objects again. The piece names are recorded
 // before the first delete, so no restart loses them. The newest segment is
-// removed only after a complete inventory and acknowledged deletes. Its
-// absence is checked against the full version inventory before a repeat
-// reports completion. A delete that answers 404 counts as done, so every step
-// repeats.
+// removed only after a complete inventory and acknowledged deletes. A restart
+// recovers its hash from the version immediately before the log tombstone.
+// Its absence and the final log tombstone are checked against the full version
+// inventory before a repeat reports completion. A delete that answers 404
+// counts as done, so every step repeats.
 
 import {
   bodyPieceBlobName,
   classifyControl,
+  classifyStreamRow,
   controlHashes,
   controlScope,
   deriveKeyCheck,
@@ -109,7 +115,7 @@ export interface LogVersionLister {
 }
 
 /**
- * Whether a control tombstone can no longer be rolled back
+ * Whether a control or log tombstone can no longer be rolled back
  * (`TombstoneFinalityPort.tombstoneState`).
  */
 export interface TombstoneFinality {
@@ -219,7 +225,7 @@ export interface LogErasureDeps {
   readonly blobs: Pick<StreamSyncBlobs, "get">;
   readonly keys: Pick<StreamSyncKeyPorts, "namespaceHmac" | "decrypt">;
   readonly streamCrypto?: StreamCryptoPort;
-  readonly objects: LogObjectEraser;
+  readonly objects: LogObjectEraser & Pick<DeleteDataPort, "tombstone">;
   readonly retained: RetainedPieces;
   readonly logger: {
     info(obj: Record<string, unknown>, msg?: string): void;
@@ -471,10 +477,6 @@ async function eraseOne(
       return { kind: "pending", why: "finality" };
 
     const head = await deps.registry.read(scope, signal);
-    const headRef = head.found
-      ? { dataHash: head.dataHash, position: head.version }
-      : null;
-    const headName = headRef ? segmentBlobName(headRef.dataHash) : null;
     const inventory = await deps.versions.list(scope, { signal });
     if (inventory.complete !== true)
       return {
@@ -482,6 +484,63 @@ async function eraseOne(
         why: "inventory",
         detail: "log version inventory is incomplete",
       };
+    const ended = classifyStreamRow(head, target.hashes) === "tombstoned";
+    // On restart the tombstone occupies the slot after the erased head.
+    // Recover that head from the complete inventory, never from the tombstone hash.
+    const previous =
+      head.found && ended
+        ? inventory.versions.find(
+            (v) =>
+              !v.isTombstone && Number(v.expectedVersion) === head.version - 1,
+          )
+        : undefined;
+    if (head.found && ended && !previous)
+      return {
+        kind: "pending",
+        why: "inventory",
+        detail: `log tombstone is not the version after the fenced head: tombstone ${head.version}, expected head ${head.version - 1}, non-tombstone versions [${inventory.versions
+          .filter((v) => !v.isTombstone)
+          .map((v) => v.expectedVersion)
+          .join(", ")}]`,
+      };
+    const headRef = head.found
+      ? ended
+        ? { dataHash: previous!.dataHash, position: head.version - 1 }
+        : { dataHash: head.dataHash, position: head.version }
+      : null;
+    const headName = headRef ? segmentBlobName(headRef.dataHash) : null;
+    const endLog = async (): Promise<ErasureOutcome | null> => {
+      await stillTombstoned(deps, target, signal);
+      if (!head.found) return null;
+      let version = String(head.version);
+      if (!ended) {
+        const outcome = await deps.objects.tombstone(scope, {
+          head: {
+            expectedVersion: version,
+            dataHash: head.dataHash,
+            metadataHash: head.metadataHash,
+          },
+        });
+        if (outcome.status === "not-registered")
+          return { kind: "pending", why: "finality" };
+        if (outcome.version !== String(head.version + 1))
+          return {
+            kind: "pending",
+            why: "inventory",
+            detail: "log tombstone is not the version after the fenced head",
+          };
+        version = outcome.version;
+      }
+      const state = await deps.finality.tombstoneState(scope, version);
+      if (
+        state.rolledBack ||
+        !finalizedAtOrAbove(state.finalized, Number(version))
+      )
+        return { kind: "pending", why: "finality" };
+      // A later re-add owns this scope now, even if the tombstone is final.
+      await stillTombstoned(deps, target, signal);
+      return null;
+    };
 
     // Every object is found by the name its bytes hash to: the registry's
     // data hashes name the segments, and a verified segment names its parts.
@@ -510,6 +569,8 @@ async function eraseOne(
             detail: "log head is missing with listed segments still present",
           };
       }
+      const ending = await endLog();
+      if (ending !== null) return ending;
       // The pieces an earlier pass left are still in storage: say so. Only
       // this device's own enumeration of this log (this head) vouches for
       // them; a log that is gone with no such record was erased by another
@@ -606,7 +667,11 @@ async function eraseOne(
     );
     const present = [...parts.keys()].filter((name) => !gone.has(name));
     let deleted = 0;
-    for (const phase of [present, rest, [headName]]) {
+    for (const [index, phase] of [present, rest, [headName]].entries()) {
+      if (index === 2) {
+        const ending = await endLog();
+        if (ending !== null) return ending;
+      }
       for (let at = 0; at < phase.length; at += DELETE_BATCH) {
         signal?.throwIfAborted();
         await stillTombstoned(deps, target, signal);

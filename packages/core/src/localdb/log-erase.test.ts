@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   LOG_FORMAT,
   controlHashes,
@@ -22,6 +22,23 @@ import {
   inventoryVersionLister,
   type LogErasureDeps,
 } from "./log-erase.js";
+
+import { applyLog, readLogState } from "./log-apply.js";
+import {
+  world as logWorld,
+  closeWorldDrivers,
+  CONNECTOR,
+  CONNECTION_ID,
+  LOG,
+  OWNER,
+  sName,
+} from "../../../server/src/localdb/log-world.test-utils.js";
+
+import { createGatewayDeleteDataPort } from "../sync/delete-data-port.js";
+import { createFakeGateway } from "../../../server/src/localdb/fake-gateway.js";
+import { TOMBSTONE_DATA_HASH } from "../sync/tombstone.js";
+
+afterEach(closeWorldDrivers);
 
 const keccak = keccakOf(undefined);
 const keys = {
@@ -239,6 +256,29 @@ function world() {
         kept.some((k) => k.scope === scope && k.head === head && k.complete),
     },
     objects: {
+      tombstone: async (scope, fence) => {
+        const current = reads.get(scope);
+        if (
+          !current?.found ||
+          String(current.version) !== fence?.head.expectedVersion ||
+          current.dataHash !== fence.head.dataHash ||
+          current.metadataHash !== fence.head.metadataHash
+        )
+          throw new Error("fenced head moved");
+        reads.set(scope, {
+          found: true,
+          version: current.version + 1,
+          dataHash: hashes.tombstoneData,
+          metadataHash: hashes.tombstoneMetadata,
+          deleted: true,
+        });
+        return {
+          status: "tombstoned",
+          dataPointId: scope,
+          version: String(current.version + 1),
+          deletedAt: "now",
+        };
+      },
       deleteBlobVersions: async (scope, names) => {
         calls.push([...names]);
         const out = {
@@ -293,7 +333,284 @@ function world() {
   };
 }
 
+/** A deleted log written by the real publisher, with empty fresh-device databases. */
+async function deletedPublishedLog() {
+  const w = await logWorld({ streams: 1 });
+  const a = await w.device("old");
+  const keyCheck = await deriveKeyCheck(a.deps.keys.namespaceHmac);
+  const hashes = await controlHashes(keccak, keyCheck);
+  await a.run("old", [{ stream: sName(0), id: "old", v: 1 }]);
+  await a.cycle();
+  expect((await a.sync.deleter.requestConnectionDelete(CONNECTOR)).fenced).toBe(
+    true,
+  );
+  const deps: LogErasureDeps = {
+    registry: a.deps.registry,
+    blobs: a.deps.blobs,
+    keys: a.deps.keys,
+    retained: {
+      keep: async () => {},
+      count: async () => 0,
+      enumerated: async () => true,
+    },
+    versions: {
+      list: async (scope) => ({
+        complete: true,
+        versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
+          expectedVersion: String(i + 1),
+          dataHash: v.dataHash,
+          isTombstone: v.dataHash === hashes.tombstoneData,
+        })),
+      }),
+    },
+    finality: {
+      tombstoneState: async () => ({ finalized: "99", rolledBack: null }),
+    },
+    objects: {
+      tombstone: w.tombstone,
+      deleteBlobVersions: async (scope, names) => {
+        const deleted = names.filter((n) =>
+          w.innerBlobs.delete(`${scope}/${n}`),
+        );
+        return {
+          deleted,
+          missing: names.filter((n) => !deleted.includes(n)),
+          failed: [],
+        };
+      },
+    },
+    logger: { info() {}, warn() {} },
+  };
+  return { w, a, deps, keyCheck, hashes };
+}
+
 describe("eraseDeletedConnectionLogs", () => {
+  it("restart with a tombstone two versions above the head leaves the head intact", async () => {
+    const w = world();
+    const head = await w.segment("alpha", NS, { position: 1 });
+    const scope = logScope("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    w.reads.set(scope, {
+      found: true,
+      version: 3,
+      dataHash: hashes.tombstoneData,
+      metadataHash: hashes.tombstoneMetadata,
+      deleted: true,
+    });
+    const report = await eraseDeletedConnectionLogs(w.deps);
+    expect(report.connections[0]!.outcome).toEqual({
+      kind: "pending",
+      why: "inventory",
+      detail:
+        "log tombstone is not the version after the fenced head: tombstone 3, expected head 2, non-tombstone versions [1]",
+    });
+    expect(w.calls).toEqual([]);
+    expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+  });
+
+  it.each(["tombstoned", "already-deleted"] as const)(
+    "a fenced tombstone answered at the wrong version (%s) keeps the head",
+    async (status) => {
+      const w = world();
+      const head = await w.segment("alpha", NS, { position: 1 });
+      w.setControl("alpha", NS, 2, true);
+      w.deps.objects.tombstone = async () => ({
+        status,
+        dataPointId: "log",
+        version: "3",
+        deletedAt: "now",
+      });
+      const report = await eraseDeletedConnectionLogs(w.deps);
+      expect(report.connections[0]!.outcome).toEqual({
+        kind: "pending",
+        why: "inventory",
+        detail: "log tombstone is not the version after the fenced head",
+      });
+      expect(w.calls).toEqual([]);
+      expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+    },
+  );
+
+  it("an exclusive re-add between the DELETE adapter head read and write keeps its live row and storage", async () => {
+    const w = world();
+    const head = await w.segment("alpha", NS, { position: 1 });
+    const scope = logScope("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const gateway = createFakeGateway({
+      owner: OWNER,
+      refresh: true,
+      isTombstone: (v) => v.dataHash === TOMBSTONE_DATA_HASH,
+    });
+    gateway.write(scope, {
+      dataHash: head.dataHash,
+      metadataHash: hashes.activeMetadata,
+    });
+    let deleteStatus: number | undefined;
+    const port = createGatewayDeleteDataPort({
+      gatewayUrl: "https://gateway.test",
+      serverOwner: OWNER,
+      dataPointFeed: {
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        getDataPoint: async () => {
+          const rows = gateway.versions.get(scope)!;
+          const row = rows.at(-1)!;
+          return {
+            id: "log",
+            ownerAddress: OWNER,
+            scope,
+            addedAt: "now",
+            expectedVersion: String(rows.length),
+            ...row,
+            deletedAt: null,
+          };
+        },
+      },
+      signer: { signAddData: async () => "0xdead" },
+      storage: {
+        endpoint: "https://storage.test",
+        chainId: 14800,
+        signMessage: async () => "0xbeef",
+      },
+      fetch: (async (input, init) => {
+        const published = await gateway.fetch("https://gateway.test/v1/data", {
+          method: "POST",
+          body: JSON.stringify({
+            ownerAddress: OWNER,
+            scope,
+            expectedVersion: "2",
+            exclusive: true,
+            dataHash: head.dataHash,
+            metadataHash: hashes.activeMetadata,
+            signature: "0xfeed",
+          }),
+        });
+        expect(published.status).toBe(201);
+        const response = await gateway.fetch(input, init);
+        deleteStatus = response.status;
+        return response;
+      }) as typeof fetch,
+    });
+    w.deps.objects.tombstone = port.tombstone;
+    const report = await eraseDeletedConnectionLogs(w.deps);
+    expect(deleteStatus).toBe(409);
+    expect(report.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "error",
+      detail: expect.stringContaining("another writer moved it"),
+    });
+    expect(gateway.versions.get(scope)).toHaveLength(2);
+    expect(gateway.versions.get(scope)!.at(-1)).toMatchObject({
+      dataHash: head.dataHash,
+      metadataHash: hashes.activeMetadata,
+    });
+    expect(w.calls).toEqual([]);
+    expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+  });
+
+  it("a fresh device reconnects after erasure and publishes a readable new lifetime", async () => {
+    const { w, a, deps, keyCheck, hashes } = await deletedPublishedLog();
+    expect((await eraseDeletedConnectionLogs(deps)).pending).toBe(false);
+    const b = await w.device("fresh");
+    await b.begin("reconnect", { connect: true });
+    const tombstone = await a.deps.registry.read(LOG);
+    expect(tombstone).toMatchObject({
+      found: true,
+      version: 2,
+      dataHash: hashes.tombstoneData,
+    });
+    const context = {
+      connector: CONNECTOR,
+      ns: "",
+      generation: 3,
+      keyCheck,
+      hashes,
+    };
+    expect(await applyLog(b.deps, CONNECTION_ID, context)).toEqual({
+      applied: 0,
+    });
+    expect(await readLogState(b.deps, CONNECTION_ID)).toMatchObject({
+      position: 2,
+      base: 2,
+    });
+    await b.run("new", [{ stream: sName(0), id: "new", v: 2 }]);
+    await b.cycle();
+    const c = await w.device("second-fresh");
+    await c.begin("join");
+    await c.cycle();
+    expect(await c.records()).toEqual([`s0/new={"id":"new","v":2}`]);
+  });
+
+  it("waits for log tombstone finality, then resumes after a restart without deleting the head early", async () => {
+    const w = world();
+    const head = await w.segment("alpha", NS, { position: 1 });
+    w.setControl("alpha", NS, 2, true);
+    let finalized: string | null = null;
+    w.deps.finality.tombstoneState = async (scope) => ({
+      finalized: scope === logScope("alpha", NS) ? finalized : "2",
+      rolledBack: null,
+    });
+    const waiting = await eraseDeletedConnectionLogs(w.deps);
+    expect(waiting.connections[0]!.outcome).toEqual({
+      kind: "pending",
+      why: "finality",
+    });
+    expect(w.reads.get(logScope("alpha", NS))).toMatchObject({
+      deleted: true,
+      version: 2,
+    });
+    expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+    finalized = "1";
+    expect((await eraseDeletedConnectionLogs(w.deps)).pending).toBe(true);
+    expect(w.calls).toEqual([]);
+    finalized = "2";
+    expect((await eraseDeletedConnectionLogs({ ...w.deps })).pending).toBe(
+      false,
+    );
+    expect(w.erasable("alpha", NS)).toEqual([]);
+    expect((await eraseDeletedConnectionLogs({ ...w.deps })).pending).toBe(
+      false,
+    );
+  });
+
+  it("a re-add committing just before the fenced tombstone keeps the log readable", async () => {
+    const { w, a, deps } = await deletedPublishedLog();
+    const oldHead = await a.deps.registry.read(LOG);
+    if (!oldHead.found) throw new Error("fixture has no head");
+    const b = await w.device("re-added");
+    deps.objects.tombstone = async (scope, fence) => {
+      await b.run("re-add", [{ stream: sName(0), id: "new", v: 2 }], {
+        connect: true,
+      });
+      await b.cycle();
+      return w.tombstone(scope, fence);
+    };
+    const report = await eraseDeletedConnectionLogs(deps);
+    expect(report.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "error",
+      detail: "fenced head moved",
+    });
+    expect(
+      await w.innerBlobs.get(`${LOG}/${segmentBlobName(oldHead.dataHash)}`),
+    ).not.toBeNull();
+    const c = await w.device("fresh-after-race");
+    await c.begin("join-race");
+    await c.cycle();
+    expect(await c.records()).toEqual([`s0/new={"id":"new","v":2}`]);
+  });
+
+  it("a missing head under a live current-lifetime log remains a hard error", async () => {
+    const w = await logWorld({ streams: 1 });
+    const a = await w.device("writer");
+    await a.run("live", [{ stream: sName(0), id: "live", v: 1 }]);
+    await a.cycle();
+    for (const key of w.innerBlobs.keys()) w.innerBlobs.delete(key);
+    const b = await w.device("fresh-live");
+    await expect(b.begin("join-live")).rejects.toThrow(
+      "apply: missing log segment 1",
+    );
+  });
+
   it("deletes every segment and part of a deleted connection, and no body piece, and nothing of another", async () => {
     const w = world();
     await w.compactedLog("alpha", NS);
@@ -406,7 +723,7 @@ describe("eraseDeletedConnectionLogs", () => {
     });
     expect(w.calls).toEqual([]);
 
-    w.setFinality("2");
+    w.setFinality("99");
     const done = await eraseDeletedConnectionLogs(w.deps);
     expect(done.pending).toBe(false);
     expect(w.erasable("alpha", NS)).toEqual([]);
@@ -605,6 +922,7 @@ describe("eraseDeletedConnectionLogs", () => {
       const deps: LogErasureDeps = {
         ...w.deps,
         objects: {
+          ...w.deps.objects,
           deleteBlobVersions: async () => {
             throw new Error("offline");
           },
@@ -902,6 +1220,7 @@ describe("eraseDeletedConnectionLogs", () => {
     const partial = await eraseDeletedConnectionLogs({
       ...w.deps,
       objects: {
+        ...w.deps.objects,
         deleteBlobVersions: async (scope, names) => {
           batches.push([...names]);
           // The part batch is answered in full; the older segments' batch
@@ -1202,6 +1521,7 @@ describe("what the erasure refuses to act on", () => {
         const report = await eraseDeletedConnectionLogs({
           ...w.deps,
           objects: {
+            ...w.deps.objects,
             deleteBlobVersions: async (_scope, names) => {
               batches.push([...names]);
               return answer(names);

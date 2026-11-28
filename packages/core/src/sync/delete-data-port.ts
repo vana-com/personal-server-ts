@@ -153,6 +153,7 @@ export function createGatewayDeleteDataPort(
     scope: string,
     dataPointId: string,
     version: bigint,
+    exclusive = false,
   ): Promise<Response> {
     const signature = await options.signer.signAddData({
       ownerAddress: options.serverOwner,
@@ -172,6 +173,7 @@ export function createGatewayDeleteDataPort(
         scope,
         expectedVersion: String(version),
         signature,
+        ...(exclusive ? { exclusive: true } : {}),
       }),
     });
   }
@@ -318,7 +320,7 @@ export function createGatewayDeleteDataPort(
       let answer = await readTombstoneAnswer(
         scope,
         dataPointId,
-        await sendTombstone(scope, dataPointId, version),
+        await sendTombstone(scope, dataPointId, version, fence !== undefined),
       );
       if (answer.kind === "version-conflict") {
         if (fence) {
