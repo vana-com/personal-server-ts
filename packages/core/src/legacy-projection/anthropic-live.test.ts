@@ -13,7 +13,12 @@ const options = {
 const records = [
   {
     stream: "account_plan",
-    data: { id: "team-org", account_id: "team-org", plan_display_name: "Team" },
+    data: {
+      id: "team-org",
+      account_id: "team-org",
+      plan_display_name: "Team",
+      plan_type: "team",
+    },
   },
   {
     stream: "conversations",
@@ -32,6 +37,28 @@ const records = [
 ];
 
 describe("live Claude conversation compatibility", () => {
+  it("uses the plan type when the display name is null", () => {
+    const result = projectPdppRecordsToLegacyPayload(
+      "claude.conversations",
+      [
+        {
+          ...records[0],
+          data: {
+            ...records[0].data,
+            plan_display_name: null,
+            plan_type: "max",
+          },
+        },
+        ...records.slice(1),
+      ],
+      options,
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      payload: { profile: { plan: "max" } },
+    });
+  });
+
   it("delivers the existing conversation and its messages without claiming an official export", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "claude.conversations",
