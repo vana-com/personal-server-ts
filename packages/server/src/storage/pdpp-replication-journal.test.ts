@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
+import { createReplicationJournal } from "./pdpp-replication-sqlite.js";
 
 const emittedAt = "2026-10-20T10:00:00.000Z";
 const binding = { method: "collector", generation: 1 };
@@ -369,6 +370,99 @@ describe("own-write log (replication enabled)", () => {
       db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get(),
     ).toEqual({ n: 0 });
     expect(ownWrites(db)).toEqual(before);
+  });
+
+  it("resetConnection erases rows and starts the next generation, keeping the id writable", () => {
+    store.ingestBatch([envelope()], semantics, primaryKey, binding);
+    const before = ownWrites(db);
+
+    const reset = store.resetConnection("account-a");
+
+    expect(reset).toMatchObject({ generation: 2, deletedAt: null });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM pdpp_records").get()).toEqual({
+      n: 0,
+    });
+    // Earlier evidence is kept (the log is append-only).
+    expect(ownWrites(db)).toEqual(before);
+    // The next collection writes to the same id at the new generation; the
+    // old generation is stale.
+    expect(
+      store.ingestBatch([envelope()], semantics, primaryKey, {
+        ...binding,
+        generation: 2,
+      }).accepted,
+    ).toBe(1);
+    expect(() =>
+      store.ingestBatch([envelope()], semantics, primaryKey, binding),
+    ).toThrow();
+    // Registering the id again (Desktop's PUT) still succeeds.
+    expect(() =>
+      store.registerConnection({
+        instance: "account-a",
+        sourceId: "https://source.invalid/declaration",
+        method: binding.method,
+        label: "Account A",
+      }),
+    ).not.toThrow();
+  });
+
+  it("persists exactly one connection-reset operation in the active replication journal", () => {
+    // The own-write log exists without a replication baseline. Start a real
+    // baseline before reset, but do not add records that need a declaration.
+    const journal = createReplicationJournal(db, () =>
+      store.getInstallationWriterId(),
+    );
+    journal.exporter.beginBaseline({
+      owner: "did:example:replication-journal",
+      declarations: [],
+    });
+    const resetOperations = () =>
+      (
+        db
+          .prepare(
+            "SELECT operation_json FROM pdpp_replica_operations ORDER BY sequence",
+          )
+          .all() as { operation_json: string }[]
+      )
+        .map((row) => JSON.parse(row.operation_json))
+        .filter(
+          (operation) =>
+            operation.kind === "connection-reset" &&
+            operation.connectionId === "account-a",
+        );
+    const writes = ownWrites(db);
+    expect(resetOperations()).toEqual([]);
+
+    expect(store.resetConnection("account-a")).toMatchObject({ generation: 2 });
+    expect(resetOperations()).toMatchObject([
+      {
+        kind: "connection-reset",
+        connectionId: "account-a",
+        generation: 2,
+        previousGeneration: 1,
+      },
+    ]);
+    expect(ownWrites(db)).toEqual(writes);
+  });
+
+  it("resetConnection refuses an unknown id and creates no row", () => {
+    expect(() => store.resetConnection("account-unknown")).toThrow(
+      "connection_not_found",
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM pdpp_instance_binding WHERE instance = ?",
+        )
+        .get("account-unknown"),
+    ).toEqual({ n: 0 });
+  });
+
+  it("resetConnection leaves a deleted connection deleted", () => {
+    store.deleteConnection("account-a");
+    const deleted = store.getInstanceBinding("account-a");
+    expect(store.resetConnection("account-a")).toEqual(deleted);
+    expect(store.getInstanceBinding("account-a")).toEqual(deleted);
   });
 
   it.each(["sequence", "operation_id"])(
