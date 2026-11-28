@@ -66,6 +66,19 @@ function makePort(
 }
 
 describe("createGatewayDeleteDataPort.tombstone", () => {
+  it("sends exclusive only for fenced tombstones", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetchImpl = (async (_input, init) => {
+      bodies.push(JSON.parse(init!.body as string));
+      return jsonResponse(200, { data: { expectedVersion: "4" } });
+    }) as typeof fetch;
+    const { port } = makePort(liveRecord(), fetchImpl);
+    await port.tombstone(SCOPE);
+    await port.tombstone(SCOPE, { head: liveRecord() });
+    expect(bodies[0]).not.toHaveProperty("exclusive");
+    expect(bodies[1]).toHaveProperty("exclusive", true);
+  });
+
   it("signs AddData with the tombstone hashes at current+1 and sends DELETE /v1/data/:id", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(200, {

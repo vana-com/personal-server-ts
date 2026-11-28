@@ -30,8 +30,13 @@ import {
   CONNECTOR,
   CONNECTION_ID,
   LOG,
+  OWNER,
   sName,
 } from "../../../server/src/localdb/log-world.test-utils.js";
+
+import { createGatewayDeleteDataPort } from "../sync/delete-data-port.js";
+import { createFakeGateway } from "../../../server/src/localdb/fake-gateway.js";
+import { TOMBSTONE_DATA_HASH } from "../sync/tombstone.js";
 
 afterEach(closeWorldDrivers);
 
@@ -380,6 +385,128 @@ async function deletedPublishedLog() {
 }
 
 describe("eraseDeletedConnectionLogs", () => {
+  it("restart with a tombstone two versions above the head leaves the head intact", async () => {
+    const w = world();
+    const head = await w.segment("alpha", NS, { position: 1 });
+    const scope = logScope("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    w.reads.set(scope, {
+      found: true,
+      version: 3,
+      dataHash: hashes.tombstoneData,
+      metadataHash: hashes.tombstoneMetadata,
+      deleted: true,
+    });
+    const report = await eraseDeletedConnectionLogs(w.deps);
+    expect(report.connections[0]!.outcome).toEqual({
+      kind: "pending",
+      why: "inventory",
+      detail:
+        "log tombstone is not the version after the fenced head: tombstone 3, expected head 2, non-tombstone versions [1]",
+    });
+    expect(w.calls).toEqual([]);
+    expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+  });
+
+  it.each(["tombstoned", "already-deleted"] as const)(
+    "a fenced tombstone answered at the wrong version (%s) keeps the head",
+    async (status) => {
+      const w = world();
+      const head = await w.segment("alpha", NS, { position: 1 });
+      w.setControl("alpha", NS, 2, true);
+      w.deps.objects.tombstone = async () => ({
+        status,
+        dataPointId: "log",
+        version: "3",
+        deletedAt: "now",
+      });
+      const report = await eraseDeletedConnectionLogs(w.deps);
+      expect(report.connections[0]!.outcome).toEqual({
+        kind: "pending",
+        why: "inventory",
+        detail: "log tombstone is not the version after the fenced head",
+      });
+      expect(w.calls).toEqual([]);
+      expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+    },
+  );
+
+  it("an exclusive re-add between the DELETE adapter head read and write keeps its live row and storage", async () => {
+    const w = world();
+    const head = await w.segment("alpha", NS, { position: 1 });
+    const scope = logScope("alpha", NS);
+    w.setControl("alpha", NS, 2, true);
+    const gateway = createFakeGateway({
+      owner: OWNER,
+      refresh: true,
+      isTombstone: (v) => v.dataHash === TOMBSTONE_DATA_HASH,
+    });
+    gateway.write(scope, {
+      dataHash: head.dataHash,
+      metadataHash: hashes.activeMetadata,
+    });
+    let deleteStatus: number | undefined;
+    const port = createGatewayDeleteDataPort({
+      gatewayUrl: "https://gateway.test",
+      serverOwner: OWNER,
+      dataPointFeed: {
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        getDataPoint: async () => {
+          const rows = gateway.versions.get(scope)!;
+          const row = rows.at(-1)!;
+          return {
+            id: "log",
+            ownerAddress: OWNER,
+            scope,
+            addedAt: "now",
+            expectedVersion: String(rows.length),
+            ...row,
+            deletedAt: null,
+          };
+        },
+      },
+      signer: { signAddData: async () => "0xdead" },
+      storage: {
+        endpoint: "https://storage.test",
+        chainId: 14800,
+        signMessage: async () => "0xbeef",
+      },
+      fetch: (async (input, init) => {
+        const published = await gateway.fetch("https://gateway.test/v1/data", {
+          method: "POST",
+          body: JSON.stringify({
+            ownerAddress: OWNER,
+            scope,
+            expectedVersion: "2",
+            exclusive: true,
+            dataHash: head.dataHash,
+            metadataHash: hashes.activeMetadata,
+            signature: "0xfeed",
+          }),
+        });
+        expect(published.status).toBe(201);
+        const response = await gateway.fetch(input, init);
+        deleteStatus = response.status;
+        return response;
+      }) as typeof fetch,
+    });
+    w.deps.objects.tombstone = port.tombstone;
+    const report = await eraseDeletedConnectionLogs(w.deps);
+    expect(deleteStatus).toBe(409);
+    expect(report.connections[0]!.outcome).toMatchObject({
+      kind: "pending",
+      why: "error",
+      detail: expect.stringContaining("another writer moved it"),
+    });
+    expect(gateway.versions.get(scope)).toHaveLength(2);
+    expect(gateway.versions.get(scope)!.at(-1)).toMatchObject({
+      dataHash: head.dataHash,
+      metadataHash: hashes.activeMetadata,
+    });
+    expect(w.calls).toEqual([]);
+    expect(w.erasable("alpha", NS)).toContain(segmentBlobName(head.dataHash));
+  });
+
   it("a fresh device reconnects after erasure and publishes a readable new lifetime", async () => {
     const { w, a, deps, keyCheck, hashes } = await deletedPublishedLog();
     expect((await eraseDeletedConnectionLogs(deps)).pending).toBe(false);

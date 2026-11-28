@@ -498,7 +498,10 @@ async function eraseOne(
       return {
         kind: "pending",
         why: "inventory",
-        detail: "log tombstone's previous head is missing from inventory",
+        detail: `log tombstone is not the version after the fenced head: tombstone ${head.version}, expected head ${head.version - 1}, non-tombstone versions [${inventory.versions
+          .filter((v) => !v.isTombstone)
+          .map((v) => v.expectedVersion)
+          .join(", ")}]`,
       };
     const headRef = head.found
       ? ended
@@ -506,9 +509,9 @@ async function eraseOne(
         : { dataHash: head.dataHash, position: head.version }
       : null;
     const headName = headRef ? segmentBlobName(headRef.dataHash) : null;
-    const endLog = async (): Promise<boolean> => {
+    const endLog = async (): Promise<ErasureOutcome | null> => {
       await stillTombstoned(deps, target, signal);
-      if (!head.found) return true;
+      if (!head.found) return null;
       let version = String(head.version);
       if (!ended) {
         const outcome = await deps.objects.tombstone(scope, {
@@ -518,8 +521,14 @@ async function eraseOne(
             metadataHash: head.metadataHash,
           },
         });
-        if (outcome.status === "not-registered" || outcome.version === null)
-          return false;
+        if (outcome.status === "not-registered")
+          return { kind: "pending", why: "finality" };
+        if (outcome.version !== String(head.version + 1))
+          return {
+            kind: "pending",
+            why: "inventory",
+            detail: "log tombstone is not the version after the fenced head",
+          };
         version = outcome.version;
       }
       const state = await deps.finality.tombstoneState(scope, version);
@@ -527,10 +536,10 @@ async function eraseOne(
         state.rolledBack ||
         !finalizedAtOrAbove(state.finalized, Number(version))
       )
-        return false;
+        return { kind: "pending", why: "finality" };
       // A later re-add owns this scope now, even if the tombstone is final.
       await stillTombstoned(deps, target, signal);
-      return true;
+      return null;
     };
 
     // Every object is found by the name its bytes hash to: the registry's
@@ -560,7 +569,8 @@ async function eraseOne(
             detail: "log head is missing with listed segments still present",
           };
       }
-      if (!(await endLog())) return { kind: "pending", why: "finality" };
+      const ending = await endLog();
+      if (ending !== null) return ending;
       // The pieces an earlier pass left are still in storage: say so. Only
       // this device's own enumeration of this log (this head) vouches for
       // them; a log that is gone with no such record was erased by another
@@ -659,7 +669,8 @@ async function eraseOne(
     let deleted = 0;
     for (const [index, phase] of [present, rest, [headName]].entries()) {
       if (index === 2) {
-        if (!(await endLog())) return { kind: "pending", why: "finality" };
+        const ending = await endLog();
+        if (ending !== null) return ending;
       }
       for (let at = 0; at < phase.length; at += DELETE_BATCH) {
         signal?.throwIfAborted();
