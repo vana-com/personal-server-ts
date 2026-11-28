@@ -23,7 +23,7 @@ refinement proof from the models to its implementation.
 | Head cursor/replay, 2026-11-16                  | One stream, three devices, two heads/two rounds. Durable-obligation checks and rollback variant pass their listed properties; memory-only variants fail. Pending local writes and compaction are excluded. | [HeadCursor](#headcursor-a-per-stream-head-that-predates-the-log), [stored replay obligation](#the-stored-replay-obligation)                                 |
 | General and keyed log models, 2026-11-15/16     | Corpus/config-specific bounds; `MaxSteps=6` bounds commits/reset, not network steps. Good, LostPush temporal checking and keyed runs include unfinished checks, not established PASS results.              | [State and abstraction](#state-and-abstraction), [TLC results](#tlc-results-host-run), [key-ordered first load](#key-ordered-first-load-host-run-2026-11-16) |
 
-Fresh workspace transaction checks are recorded in [Durable bounded workspace](#durable-bounded-workspace-2026-11-19). The historical run summary above remains specific to its original checks.
+Fresh workspace transaction checks are recorded in [Durable bounded workspace](#durable-bounded-workspace-2026-11-19). A proposed upper cap on record stamps is checked in [Finality cap](#finality-cap-proposed-checked-before-it-is-built-2026-11-20); it is a design check, not a model of shipped code. An alternative that fixes fast clocks at the source (offset plus refusal) is checked in [Source clock](#source-clock-an-alternative-to-the-cap-checked-before-it-is-built-2026-11-21). The historical run summary above remains specific to its original checks.
 
 **Open obligations before relying on this evidence:**
 
@@ -210,6 +210,397 @@ and revision validation; schema migrations; stream metadata; host append offset
 and digest checks; cryptographic verification; bounded-memory ownership and
 adapter measurements. Existing uncompleted log-model obligations above remain
 open. No design claim was contradicted by the completed bounded checks.
+
+## Finality cap (proposed, checked before it is built; 2026-11-20)
+
+`FinalityCap.tla` checks a proposed **upper cap on record stamps** before anyone builds it. It is a new,
+small module. It does not change `LogProtocol.tla`, `SqlRank.tla` or any existing config.
+
+**Proposal.** The registry stamps each segment with `finality[seg]`: the time of ONE registry clock when the
+segment became final. A device that applies a segment orders it by `eff = min(stamp_o, finality)`. The value
+is the same on every device. The lower clamp (`clampRunStart` in
+`packages/core/src/localdb/admit.ts`, built) then reads `eff`, not raw stamps.
+
+**Model SHA-256** (`FinalityCap.tla`): `f31aef9690848c65e4121f992b695b98599658f840b448d1824b00cdc54c3a23`.
+Base tree: `origin/main` at `91022e59`. TLC 2.19 (tools 1.7.4), Java 17, `-workers 2`, `nice -n 19 ionice -c3`.
+Command, from this directory, for every config `X`:
+
+```
+nice -n 19 ionice -c3 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers 2 -config X.cfg FinalityCap
+```
+
+### What the model contains
+
+- Two devices. Device 1 has a clock that reads registry time plus `SkewA` (fast); device 2 reads
+  registry time plus `SkewB`. Clocks do not step back. Registry time `t` is bounded by `MaxT`.
+- A registry log (a sequence). A device holds a prefix of it. A writer appends only when its device holds the
+  whole log (the registry compare-and-swap). Each append gets `finality = t`; one append per tick
+  (the mutant `tieFinality` removes that).
+- Runs with distinct ids, at most `MaxSegs` segments each, published while collecting. A delete is a run's
+  last segment, as in the code (intake admits upserts only; the delete is a run-end entry).
+- The lower clamp as built: the maximum over the held `(stamp, run id)` pairs; the clock if
+  `(clock, run id)` is above it; else the held `o` if the run id sorts after the held run id; else one above.
+- The order: `(eff, run id, kind, ordinal, position)`, kind delete above upsert, position standing for the
+  body hash. The seed is one upsert per key at `(0, run id 0)`.
+- Two keys; bodies unique per segment.
+
+**Not modelled** (so nothing below says anything about them): the compaction watermark and stream floors
+(each is a maximum over stamps the device already held, so the model's held-stamp maximum stands for them
+**only if every stored copy of a stamp is `eff`**; see open risks); the SEEN stamp; omissions; two writers
+with one run id (clones); clock steps backwards; crashes; a rollout in which some devices have the cap and
+some do not; more than two devices or keys; runs that overlap on one device.
+
+### Invariants
+
+| Name                                             | Meaning                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Converged` (a)                                  | Two devices that hold the same log prefix hold the same winner for every key.                                                                                                                                                                                                                                  |
+| `BeginAfterWins` (b)                             | A run that began after its device applied position `j` ranks above `j` at every device that holds both. So its write ends as the winner or a successor wins. This is the fast-clock bug of #846.                                                                                                               |
+| `SameRunOrder`, `DeleteWinsTie`, `SeedLoses` (c) | Later segments of one run outrank earlier ones of the same key. A delete outranks an upsert of its own run. Every run's segment outranks the seed. `DeleteWinsTie` and `SeedLoses` follow from the rank layout; they are guard rails, not discoveries. `DeleteWinsTie` is exercised by the `midDelete` mutant. |
+| `DragRaw`, `DragSlow` (d)                        | A run's raw start is at most `max(its own clock at begin, registry time at begin + 1)`. `DragSlow` is the same bound for a run on the slowest-clock device: the fast device's skew does not enter it.                                                                                                          |
+| `DragEff` (d2)                                   | No stamp a device orders by is above the registry time now.                                                                                                                                                                                                                                                    |
+| `CausalNoFlip`                                   | For a pair whose later run began after the earlier was applied, the cap never puts the later below the earlier when the raw order has it above.                                                                                                                                                                |
+| `ConcurrentNoFlip`                               | For two runs where neither began after applying the other, raw order and eff order agree. Expected to fail.                                                                                                                                                                                                    |
+| `RawCausalMonotone`                              | For a causal pair the RAW order also has the later above. Expected to fail with the cap.                                                                                                                                                                                                                       |
+
+### Results
+
+All counts are TLC "states generated / distinct". Bounds for every row except 3, 4 and 4b: `MaxT = 4`,
+`SkewA = 2`, `SkewB = 0`, device 1 has up to 2 runs, device 2 has 1 run, `MaxSegs = 2`
+(3 runs, up to 6 segments, 2 keys). Rows 3, 4 and 4b widen one bound each. A failing run stops at the first violation: its state counts and depth depend on
+the order in which two workers reach it and are not a measure of the space. Depth is the breadth-first level reached when it stopped
+(about the trace length plus one).
+
+| #   | Config                       | Mode                                            | Invariants                                                | Result                                                                                                             | States                  | Depth             |
+| --- | ---------------------------- | ----------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------- | ----------------- |
+| 1   | `CapGood.cfg`                | proposal                                        | a, b, c, `CausalNoFlip`, `DragRaw`, `DragSlow`, `DragEff` | **PASS**                                                                                                           | 4,026,052 / 2,627,188   | 17                |
+| 2   | `CapGoodSkew31.cfg`          | proposal, `SkewA = 3`, `SkewB = 1`              | as row 1                                                  | **PASS**                                                                                                           | 4,026,052 / 2,627,188   | 17                |
+| 3   | `CapGoodT5.cfg`              | proposal, `MaxT = 5`, 2 + 1 runs, `MaxSegs = 2` | as row 1                                                  | **PASS** (36 min 41 s)                                                                                             | 27,098,627 / 17,673,761 | 19                |
+| 4   | `CapGoodFour.cfg`            | proposal, `MaxT = 4`, 2 + 2 runs, `MaxSegs = 1` | as row 1                                                  | **PASS** (39 min 37 s)                                                                                             | 19,703,116 / 16,189,724 | 16                |
+| 4b  | `CapGoodLong.cfg`            | proposal, `MaxT = 6`, 2 + 2 runs, `MaxSegs = 1` | as row 1                                                  | **NOT COMPLETE**: stopped at the 40-minute limit, no violation seen, 15.4 million states still queued. Not a PASS. | 33,452,489 / 26,285,660 | 14 (when stopped) |
+| 5   | `CapBuilt.cfg`               | `noCap`: the lower clamp as built, no cap       | a, b, c, `CausalNoFlip`, `RawCausalMonotone`              | **PASS** (control: the built clamp keeps (a) to (c))                                                               | 4,026,052 / 2,627,188   | 17                |
+| 6   | `CapRawClampSafe.cfg`        | `rawClamp`: cap orders, clamp reads raw stamps  | as row 5                                                  | **PASS**                                                                                                           | 4,026,052 / 2,627,188   | 17                |
+| 7   | `CapRawClampDragEff.cfg`     | `rawClamp`                                      | `DragEff`                                                 | **PASS**                                                                                                           | 4,026,052 / 2,627,188   | 17                |
+| 8   | `CapNoCapDragSlow.cfg`       | `noCap`                                         | `DragSlow`                                                | **FAIL** (mutant 1)                                                                                                | 1,039 / 847             | 6                 |
+| 9   | `CapNoCapDragEff.cfg`        | `noCap`                                         | `DragEff`                                                 | **FAIL** (mutant 1)                                                                                                | 30 / 30                 | 4                 |
+| 10  | `CapRawClampDragSlow.cfg`    | `rawClamp`                                      | `DragSlow`                                                | **FAIL** (mutant 2)                                                                                                | 990 / 806               | 6                 |
+| 11  | `CapLocalFinality.cfg`       | `localFinality`                                 | `Converged`                                               | **FAIL** (mutant 3)                                                                                                | 34,642 / 28,328         | 9                 |
+| 12  | `CapOwnRaw.cfg`              | `ownRaw`                                        | `Converged`                                               | **FAIL** (extra)                                                                                                   | 30,319 / 23,112         | 9                 |
+| 13  | `CapTieFinality.cfg`         | `tieFinality`                                   | `BeginAfterWins`                                          | **FAIL** (extra)                                                                                                   | 2,846 / 1,889           | 6                 |
+| 14  | `CapNoClamp.cfg`             | `noClamp`: cap, no lower clamp                  | `BeginAfterWins`                                          | **FAIL** (extra)                                                                                                   | 18,789 / 14,524         | 8                 |
+| 15  | `CapMidDelete.cfg`           | `midDelete`                                     | `DeleteWinsTie`                                           | **FAIL** (extra)                                                                                                   | 1,040 / 844             | 6                 |
+| 16  | `CapFlipConcurrent.cfg`      | proposal                                        | `ConcurrentNoFlip`                                        | **FAIL** (a finding, not a mutant)                                                                                 | 9,813 / 7,718           | 8                 |
+| 17  | `CapFlipConcurrentBuilt.cfg` | `rawClamp`                                      | `ConcurrentNoFlip`                                        | **FAIL** (a finding)                                                                                               | 10,165 / 8,033          | 8                 |
+| 18  | `CapRawNotMonotone.cfg`      | proposal                                        | `RawCausalMonotone`                                       | **FAIL** (a finding)                                                                                               | 6,039 / 4,824           | 7                 |
+
+The full runs in rows 1, 2, 5, 6 and 7 generate the same count. The enabled actions do not read the stored
+stamp values; only the invariants do. So the reachable-state graph has the same shape in every mode. That
+equal count does not mean the modes are equal: rows 8 to 10 show the modes differ in the invariants.
+
+**Counterexamples, in plain words** (registry time `t`; `o` is a run's raw start; `F` is finality):
+
+- _Mutant 1, no cap (rows 8, 9)._ Fast device 1 begins a run at `t = 1`, its clock reads 3, so `o = 3`, and
+  publishes at `t = 1`. Slow device 2 applies it, then begins a run at `t = 1` and its clock reads 1, but the
+  clamp raises `o` to 3: two above the registry time. The fast clock reached a device that is not fast.
+  (`DragEff`: the held stamp 3 is above registry time 1.)
+- _Mutant 2, clamp reads raw stamps (row 10)._ The same trace. The cap makes the segment's `eff` 1, but the
+  clamp reads its raw stamp 3, so device 2's run still starts at `o = 3`. Its **ordering** stamp is still
+  bounded (row 7 passes: `eff` never exceeds the registry time), but its raw stamp is dragged.
+- _Mutant 3, local finality (row 11)._ Two concurrent runs. Device 1 (fast) applies its own segment with
+  finality from its own clock (3); device 2 applies the same segment with its own clock (1). After both
+  segments are applied the two devices pick different winners for the key.
+- _`ownRaw` (row 12)._ The same shape: the author keeps its own raw stamp 3 while the other device caps it
+  to 1. The two devices pick different winners. So the author must restamp its own rows to `eff` when the
+  registry acknowledges the segment.
+- _`tieFinality` (row 13)._ Device 1 publishes a delete at `t = 2` with `F = 2`. Its next run begins at
+  `t = 2`, holds `eff = 2`, and publishes at the same tick with `F = 2`: `eff` ties, the new run id is
+  smaller, and the new write loses to the delete it followed. The registry must give a strictly larger
+  finality to each later segment.
+- _`noClamp` (row 14)._ Device 1 publishes at `t = 1` (`eff = 1`). Device 2 applies it, begins at `t = 1`
+  with clock 1 and a smaller run id, and publishes at `t = 2`: `eff = 1` again, tie, it loses. The cap alone
+  does not replace the lower clamp.
+- _`midDelete` (row 15)._ A run publishes a delete at `t = 1` (`eff = 1`) and an upsert of the same key at
+  `t = 2` (`eff = 2`). By raw stamp the delete wins the tie; by `eff` the later upsert wins. The cap needs
+  "a delete is a run's last segment". The code has that rule today; it must stay.
+- _Concurrent flip (rows 16, 17)._ Device 1 and device 2 begin runs at `t = 2` without seeing each other:
+  `o = 4` (fast) and `o = 2`. The fast run is final at `t = 2` (`eff = 2`), the slow one at `t = 3`
+  (`eff = 2`). By raw stamp the fast run wins; under the cap they tie and the larger run id (the slow run)
+  wins. Row 17 shows the same on a history written by the built clamp.
+- _Raw order not causal under the cap (row 18)._ Device 1 deletes key 1 in run 2 (`o = 3`, `F = 1`).
+  Run 1 begins after applying that delete and writes the key (`o = 3`, `F = 2`). The clamp reads `eff = 1`,
+  so run 1 keeps its clock, 3, which ties the delete's raw stamp; run id 1 is below 2, so by **raw** stamp the
+  delete is above the later write. By `eff` the later write wins, as it should.
+
+### Answers in plain words
+
+**What bound does the model prove for (d)?** For every run, in the checked bounds:
+`o <= max(own clock reading at begin, registry time at begin + 1)`. Another device's skew does not enter
+it. The `+ 1` is the lower clamp's tie rule (a run whose id sorts before the held run id starts one above).
+Also, no stamp a device orders by is above the registry time at that moment (`DragEff`). Checked at skews
+2/0 and 3/1 with registry time up to 4, and at skew 2/0 with registry time up to 5 (rows 1 to 3) and with 4 runs
+(row 4).
+Without the cap (row 8) the slow device's run starts at 3 when the registry time is 1.
+
+**Does capping ever reorder two writes that were already ordered on every device?**
+
+- _Causal pairs, no._ If the later run began after its device applied the earlier write, the cap never puts
+  it below, in the proposal (row 1) and on a history written by the built clamp and read under the cap
+  (row 6). That holds because each later finality is strictly larger and the clamp keeps `o` above
+  the held `eff`.
+- _Concurrent pairs, yes._ Neither run saw the other, and the fast run's raw stamp is above its finality.
+  The order every device computed by raw stamp can flip (rows 16, 17). The trace shows a flip decided
+  by the run-id tie-break; TLC stops at the shortest trace and does not show whether a larger gap also flips.
+  Every device that applies the cap flips together, so devices still agree with each other. A value a user
+  saw win can change.
+- _One more direction (row 18)._ Under the cap, the raw stamps of causal pairs are not always in causal order
+  any more. The cap makes `eff` right and raw wrong. Anything that still orders by raw stamps (a device
+  without the cap, a rollback of the cap, a reader of the stored stamp) can mis-order such a pair.
+  The cap cannot be switched off again after it has been on.
+
+**What happens to a run that is still collecting when its segment's finality is earlier than its raw stamp?**
+Each segment is capped by its own finality. Finality is strictly larger for each later segment, so a run's
+`eff` values never go down in publish order: ordinals and "a delete is last" keep working
+(`SameRunOrder`, `DeleteWinsTie`, rows 1 to 4; row 4 has one segment per run, so it adds nothing for this point). The run's early segments rank by their publish time, not its
+start stamp. A concurrent write can therefore win over an early segment and still lose to a later one of the
+same run. Its own rows, before the registry acknowledges them, still carry the raw stamp: the author must
+replace them with `eff` at the acknowledgement, or devices diverge (row 12).
+
+**Does the lower clamp have to read `eff`, not raw stamps?** For (a), (b), (c) and `DragEff`: no. A clamp
+that reads raw stamps keeps all of them (rows 6, 7). For (d) as stated, the raw start of a run on a
+slower device: yes. With a raw-reading clamp the slow device's raw starts still inherit the fast device's
+skew (row 10); the cap hides it from the order but not from the stored stamp. A clamp that does not
+exist (row 14) is not enough: the cap alone loses ties.
+
+### What this does not establish
+
+- The bounds above: 3 runs and 6 segments at `MaxT = 4`, and rows 3 and 4. Registry time 6 with 4 runs (row 4b) did not finish. An intermediate run
+  (`MaxT = 5`, 4 runs) ended without a result at about 21 million states, probably on host memory; it is not
+  recorded as evidence and its config is not kept. Clones,
+  more than two devices, more than two keys, runs overlapping on one device and longer times are not checked.
+- That the code does what the model assumes. The model assumes (1) one registry clock with a strictly larger
+  value for each later segment; (2) every device computes `eff` from the registry's value, including the author
+  for its own rows; (3) every place that stores a stamp the clamp reads (rows, tombstones, the compaction
+  watermark, stream floors, the SEEN stamp) stores `eff`, not the raw stamp. Rows 11, 12 and 13 show what
+  breaks without (1) and (2). Nothing here checks (3); a watermark or floor written from a raw stamp is a
+  place where a fast clock can still lift every later stamp.
+- A mixed rollout. Devices with and without the cap disagree on the order (row 18, row 11 by analogy),
+  so the cap needs the same lockstep as the other order changes. Not modelled.
+- Equal-stamp order between clones of one run (they now differ by finality, not by ordinal and body when the
+  finality is below the stamp). Not modelled.
+- Existing models are not re-run; this change touches none of them.
+
+## Source clock (an alternative to the cap; checked before it is built; 2026-11-21)
+
+`SourceClock.tla` checks design D, an alternative to the cap above. It is a new module that reuses the shape of
+`FinalityCap.tla`. It changes no existing module or config. The cap fixes fast clocks where records are
+_ordered_. D fixes them where records are _stamped_.
+
+**Design D.**
+
+1. A device keeps `off = registry time - device clock`, measured at its last contact with the registry
+   (an append, a refused append, or reading a log position). A run takes its start stamp from the device clock
+   plus that offset. Then the built lower clamp (`clampRunStart`) raises it above the newest held stamp.
+   The device clock can still jump ahead after the last contact, so the corrected stamp can be ahead.
+2. The registry **refuses** an append whose run stamp is greater than the registry time at acceptance. There is
+   no fixed margin. A refused append changes nothing in the log.
+3. On refusal the device measures the offset again. The run takes a new stamp (offset, then the clamp over
+   everything the device holds now), and its causal snapshot becomes the whole log the device holds now. Only
+   a run's first append can be refused: a later append comes at a later registry time than the accepted stamp.
+4. A stored stamp is never rewritten. Every device orders by the raw stored stamp, as it does today.
+   There is no `eff` and no finality.
+
+**Model SHA-256** (`SourceClock.tla`): `8fd782067d414e8b135545777e4c66eedd95bfa1a6897a0124f91e8f0cbebd6e`.
+Base tree: `origin/feat/finality-cap-model` at `1aa0fe92`. TLC 2.19 (tools 1.7.4), Java 17, `-workers 2`,
+`nice -n 19 ionice -c3`, run on a host at load 20 to 50. Command, from this directory, for every config `X`:
+
+```
+nice -n 19 ionice -c3 timeout 2400 java -XX:+UseParallelGC -Xmx4g -cp tla2tools.jar tlc2.TLC -workers 2 -config X.cfg SourceClock
+```
+
+### What the model contains
+
+- Two devices, two keys, one log, one run open per device, as in the cap model. Device clock = registry time +
+  fixed skew (`SkewA`, `SkewB`) + `jmp`. A clock may jump ahead in steps of one, at most `MaxJump` (= 1) in
+  total per device, at any time. A device starts with offset 0 (never measured) or the exact offset.
+- Contact measures the offset exactly and at once: a successful append, a refused append, and applying a log
+  position. A run's stamp is taken once, at its begin or at a retry. A later clock jump does not change it.
+- `Publish` is the registry accepting the first or a later append (the device holds the whole log, the stamp is
+  not above the registry time). `Refuse` is the registry refusing the first append, plus the retry.
+- `OnePerTick = TRUE` allows at most one append per registry tick. **This is not part of D.** It is the bound
+  the cap model uses (one registry clock value per segment). It is a size bound: without it the space is too
+  large for TLC at the cap's bounds (see "Results"). `OnePerTick = FALSE` allows several appends at one
+  registry time.
+- `Flip = "off"` starts with D on and switches it off once. `Flip = "on"` starts with D off and switches it
+  on once. While D is off, a device stamps with its raw clock (no offset) and the registry does not refuse.
+
+**Not modelled:** a clock that steps backwards or runs slow; the delay between the registry's reading and the
+device's use of it; more than two devices or keys; clones; crashes; the compaction watermark and stream floors
+(the held-stamp maximum stands for them, as in the cap model, **only if every stored stamp is the stored raw
+stamp**, which D guarantees by never rewriting it); the SEEN stamp; omissions; the author's own pending rows
+before the registry accepts them; a mixed rollout of devices with and without D.
+
+### Invariants
+
+Names that also appear in the cap model keep their meaning. `Rk` is the rank each device uses; in D it is the
+rank of the raw stored stamp. `RawRk` is the rank of the stamp the author took.
+
+| Name                                   | Meaning                                                                                                                                                         |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Converged`, `BeginAfterWins`          | As in the cap model. `snap` is reset at a retry, so a retried run must also rank above everything the device held at the retry.                                  |
+| `SameRunOrder`, `DeleteWinsTie`, `SeedLoses` | As in the cap model.                                                                                                                                      |
+| `DragAccepted`                         | No stamp accepted while D is on is above the registry time at its acceptance.                                                                                    |
+| `DragEff`                              | No stamp a device orders by is above the registry time now. Same name and meaning as in the cap model.                                                           |
+| `RetryBound`                           | A retried run's new stamp is at most one above the registry time of the retry, whatever the skew.                                                                |
+| `RetryAccepts`                         | One tick after a retry, the run's first append is not refused (if its device holds the whole log). The enabledness half of "eventually accepted".               |
+| `CausalNoFlip`, `RawCausalMonotone`    | As in the cap model: for a causal pair, the order the devices use never puts the later write below, and the raw stamps have it above.                           |
+| `ConcurrentNoFlip` (new for D)         | For two writes where neither run began after applying the other, the order by the author's stamp equals the order every device uses.                            |
+| `ReaderAgrees` (new)                   | For every pair of one key, a reader that orders by the raw stored stamp agrees with the protocol's order. This is switch-off safety.                             |
+| `WinnerOnlyRises` (new, a step property) | A winner a device has applied only ever changes to a higher-ranked segment.                                                                                    |
+
+### Results
+
+Counts are TLC "states generated / distinct". A failing run stops at the first violation; its counts and depth
+depend on worker order and are not a measure of the space. All configs have skew 2/0 unless the row says
+otherwise, and `MaxJump = 1`. "Full" means the cap model's shape: `MaxT = 4`, device 1 up to 2 runs, device 2
+1 run, `MaxSegs = 2`.
+
+| #   | Config                    | Mode / shape                                                          | Invariants                                                | Result                                                                                                         | States                    | Depth |
+| --- | ------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------- | ----- |
+| 1   | `SourceClockGoodOneSeg`   | D, `OnePerTick`, 2 + 1 runs, `MaxSegs = 1`, `MaxT = 4`                 | all of the table above + `WinnerOnlyRises`                | **PASS** (15 min)                                                                                              | 8,296,248 / 4,185,796     | 15    |
+| 2   | `SourceClockGood`         | D, `OnePerTick`, **full**                                             | as row 1                                                  | **NOT COMPLETE**: stopped at the 40-minute limit, no violation seen, 4.06 million states still queued. Not a PASS. | 22,039,437 / 10,910,024 (when stopped) | 14 (when stopped) |
+| 3   | `SourceClockGoodSkew31`   | as row 1, skew 3/1                                                    | as row 1                                                  | **PASS** (14 min)                                                                                                       | 9,733,264 / 4,669,316                 | 15 |
+| 4   | `SourceClockOffSafe`      | D switched off once; `OnePerTick`, 2 + 1 runs, `MaxSegs = 1`, `MaxT = 3` | `TypeOK`, a, b, c, both no-flips, `ReaderAgrees`, `RawCausalMonotone`, `DragAccepted` | **PASS** (17 min)                                          | 10,734,495 / 5,684,070    | 15    |
+| 5   | `SourceClockOnSafe`       | D switched on once from a log written without it; same shape as row 4 | as row 4                                                  | **PASS** (12 min). The order-level checks hold across the switch-on; row 6 shows the progress cost.                                                                                                       | 7,245,013 / 3,435,330                 | 15 |
+| 6   | `SourceClockOnRetry`      | D switched on once; full shape, no `OnePerTick`                       | `RetryAccepts`                                            | **FAIL** (a finding, not a mutant)                                                                             | 183,621 / 88,754          | 7     |
+| 7   | `SourceClockOffDragEff`   | D switched off once                                                   | `DragEff`                                                 | **FAIL** (expected: after switch-off a device may stamp ahead again)                                           | 744 / 459                 | 4     |
+| 8   | `SourceClockNoRefuse`     | `noRefuse`                                                            | `DragAccepted`                                            | **FAIL** (mutant)                                                                                              | 134 / 104                 | 3     |
+| 9   | `SourceClockNoRefuseEff`  | `noRefuse`                                                            | `DragEff`                                                 | **FAIL** (mutant)                                                                                              | 95 / 81                   | 3     |
+| 10  | `SourceClockNoRemeasure`  | `noRemeasure`                                                         | `RetryAccepts`                                            | **FAIL** (mutant)                                                                                              | 1,426 / 827               | 5     |
+| 11  | `SourceClockNoOffset`     | `noOffset`                                                            | `RetryAccepts`                                            | **FAIL** (mutant)                                                                                              | 765 / 459                 | 4     |
+| 12  | `SourceClockDevTime`      | `devTime`                                                             | `DragAccepted`                                            | **FAIL** (mutant)                                                                                              | 115 / 92                  | 3     |
+| 13  | `SourceClockSlack`        | `slack`                                                               | `DragAccepted`                                            | **FAIL** (extra)                                                                                               | 419 / 277                 | 4     |
+| 14  | `SourceClockNoClamp`      | `noClamp`                                                             | `BeginAfterWins`                                          | **FAIL** (extra)                                                                                               | 6,507 / 3,365             | 5     |
+| 15  | `SourceClockRetakeNoClamp`| `retakeNoClamp`                                                       | `BeginAfterWins`                                          | **FAIL** (extra)                                                                                               | 30,651 / 15,178           | 6     |
+| 16  | `SourceClockCapOrderFlip` | `capOrder`: the cap in this module                                    | `ConcurrentNoFlip`                                        | **FAIL** (control: the cap's finding, reproduced here)                                                         | 50,710 / 31,650           | 7     |
+| 17  | `SourceClockCapOrderReader` | `capOrder`                                                          | `ReaderAgrees`                                            | **FAIL** (control)                                                                                             | 18,198 / 11,343           | 6     |
+
+Not run: `MaxT = 5` (row 2 does not complete at `MaxT = 4`). Also run and stopped, so **not evidence**: the
+same shapes without `OnePerTick`. 2 + 1 runs, `MaxSegs = 1`: stopped at 5.6 million distinct states, depth 13,
+no violation. 1 + 1 runs, `MaxSegs = 2`: stopped at 4.4 million distinct states, depth 13, no violation. The
+space without `OnePerTick` is larger because several appends can share one registry time.
+
+**Property by design** (cap: rows of the cap results table above; D: rows of this table). "n/a" means the
+property has no meaning in that design.
+
+| Property                                              | Cap                                                    | D                                                                                    |
+| ----------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| Convergence (a)                                       | PASS (row 1)                                           | PASS (rows 1, 4, 5)                                                                  |
+| Begin-after-wins (b)                                  | PASS (row 1)                                           | PASS (rows 1, 4, 5); fails without the clamp or without it on retry (rows 14, 15)    |
+| Equal-stamp order (c)                                 | PASS (row 1)                                           | PASS (rows 1, 4, 5)                                                                  |
+| Causal no-flip                                        | PASS (row 1)                                           | PASS (rows 1, 4, 5)                                                                  |
+| Drag: a stored stamp is at most the registry time at its acceptance | n/a: the stored stamp is not bounded; only `eff` is | PASS (`DragAccepted`, rows 1, 4, 5); fails without refusal (row 8), with a fixed margin (row 13), or comparing with device time (row 12) |
+| Drag: a stamp a device orders by is at most the registry time now | PASS (`DragEff`, row 1)                | PASS (`DragEff`, rows 1, 3); fails without refusal (row 9)                           |
+| Slow device not dragged by the fast one (`DragSlow`)  | PASS (row 1)                                           | Implied by `DragAccepted`: every accepted stamp is at most the registry time        |
+| **Concurrent no-flip**                                | **FAIL** (row 16)                                      | PASS (rows 1, 4, 5); the cap in this module fails it too (row 16 of this table)        |
+| **Switch-off safety** (raw order agrees)              | **FAIL** (`RawCausalMonotone`, row 18)                 | PASS (`ReaderAgrees` and `RawCausalMonotone`, row 4)                                 |
+| Winner only changes to a higher rank                  | Not run (the cap's order is also fixed per segment)    | PASS (`WinnerOnlyRises`, rows 1, 4, 5)                                               |
+| Progress under refusal                                | n/a: the cap never refuses an append                   | PASS (`RetryBound`, `RetryAccepts`, rows 1, 3); fails without re-measure or offset (rows 10, 11) |
+| Switch D **on** over a log written without it         | Not checked                                            | Order checks PASS (row 5). Progress **FAIL** (row 6): writers wait until the registry time passes the highest held stamp                                                                              |
+
+How to read the D column. `Converged`, `ReaderAgrees` and `ConcurrentNoFlip` are close to true by construction:
+D orders by one stored number that nothing rewrites. They pass, and the `capOrder` control fails them, so the
+checks can fail. The checks with content are `BeginAfterWins` (the clamp and the retry), the two drag bounds,
+and the retry invariants. Each mutant in rows 8 to 15 fails the property it targets.
+
+**Counterexamples, in plain words** (`t` is registry time; `o` is a run's stamp):
+
+- _`noRefuse` (rows 8, 9) and `devTime` (row 12)._ Device 1 (skew 2) has never measured its offset. It begins a
+  run at `t = 1`: `o = 3`. The registry accepts it at `t = 1`. A stamp 2 above the registry time is stored. With
+  `devTime` the registry compares 3 with the device's own clock (3), so it accepts. The drag bound is the
+  refusal against the **registry's** time.
+- _`slack` (row 13)._ Device 1 starts with the exact offset, then its clock jumps ahead by 1. It begins at
+  `t = 1` with `o = 2`. A margin of 1 accepts it. The stored stamp is 1 above the registry time. Any fixed
+  margin lets that much drag in. The bound needs `stamp <= registry time`.
+- _`noRemeasure` (row 10)._ The same first run is refused at `t = 1`. The retry uses the old offset 0, so
+  `o = 3` again. One tick later (`t = 2`) it is still above the registry time. Each retry at time `t` takes
+  `t + 2`, so the run is never accepted while the skew lasts.
+- _`noOffset` (row 11)._ The device measures the offset but never applies it. Same result: a run with a fast
+  clock is refused at every `t`. Refusal without the offset is a lock-out, not a fix.
+- _`noClamp` (row 14)._ Run 2 publishes at `t = 1` with `o = 1`. Run 1 begins after applying it, with `o = 1`,
+  and the smaller run id loses the tie. The offset does not replace the lower clamp.
+- _`retakeNoClamp` (row 15)._ Run 2 publishes at `t = 1` with `o = 1`. Run 1 begins after applying it; the tie
+  rule of the clamp gives `o = 2`, one above the registry time, so the registry refuses. The retry takes the
+  clock reading, `o = 1`, with no clamp. It is accepted and ranks below run 2, which it followed. The retry
+  must clamp again.
+- _Switch D on over old history (rows 5, 6)._ D is off. A fast device publishes a run with `o = 3` at `t = 1`.
+  D is switched on. The next run on that device clamps above the held stamp 3, is refused (`3 > 1`), and the
+  retry again clamps to 3. At `t = 2` it is still refused. The run waits until the registry time reaches 3.
+  That is the lower clamp and the refusal pulling against each other. `RetryAccepts` fails (row 6).
+- _`capOrder` control (rows 16, 17)._ The cap's concurrent flip: device 1 (`o = 3`, finality 1) and device 2
+  (`o = 1`, finality 2) have equal `eff`. The larger run id wins; by stamp the other run wins. Under D, rank is
+  the stored stamp and nothing changes it, so there is no pair to flip.
+
+### Answers in plain words
+
+**Does D fail anything the cap passes?** Not an invariant that the cap model also states: in the checked
+bounds D passes everything the cap passes, and the two the cap fails (concurrent no-flip, switch-off). D
+costs something the cap does not:
+
+- **Availability.** The registry can refuse an append. The refused run retries, and it is accepted one registry
+  tick later at the latest (`RetryBound`, `RetryAccepts`). A refusal needs no skew: the lower clamp's tie rule
+  can produce a stamp one above the registry time (row 15 shows it with exact clocks). The cap never refuses.
+- **Switch-on over history that already has stamps above the registry time** (rows 5 and 6). Row 6 fails: a
+  run waits until the registry time catches up with the highest held stamp. The cap on a log with raw stamps
+  was not checked. D must be switched on from a log in which no stamp is above the registry time, or those
+  writers wait.
+- **A refusal path for old clients.** Not modelled (mixed rollout): an old device does not retry with a new
+  offset.
+
+**Progress, and the fairness it needs.** A run whose device holds the whole log gets its first append accepted
+one registry tick after its last retry (`RetryBound`: the retried stamp is at most `registry time + 1`;
+`RetryAccepts`: one tick later the registry would accept it). The retried stamp does not depend on the skew,
+because the device just measured it: stamp = clock + (registry time - clock) = registry time, then at most
++1 from the clamp's tie rule. So the claim needs no bound on skew. It needs: (1) registry time advances;
+(2) the device attempts the append when it holds the whole log. This is the compare-and-swap condition and is
+independent of clocks: if other writers keep appending between the device's read and its append, the append
+can fail for that reason forever, with or without D; (3) the offset measured at a refusal is exact, or low (a
+device that takes the registry's reading against its clock at the moment of _receipt_ errs low, so its stamp
+is not ahead; this is reasoning, not checked). I could not check liveness in TLC: with a clock bounded by `MaxT`, TLC's fairness check passed
+for the mutants too (every stuck behaviour ends at the time bound and is dropped as unfair). So progress is
+stated and checked as the two bounded invariants above, which the two mutants break.
+
+**Does the offset replace the clamp?** No (rows 14, 15). Does refusal replace the offset? No (row 11): refusal
+alone locks out a device that is ahead. Does the offset replace refusal? No (rows 8, 12, 13): a clock that
+jumps ahead after the last contact still produces a stamp above the registry time. Each of the three rules does
+one job.
+
+**Can D be switched off?** Yes, from a state in which D wrote the log (rows 1, 4). The stored stamps are the
+raw ones, and the built clamp keeps causal order over them (`RawCausalMonotone`, `ReaderAgrees`). After
+switch-off a fast device can drag again (row 7). That is the old behaviour, not new damage.
+
+### What D does not cover
+
+- **A clock that jumps while the device is offline.** The jump itself is modelled (a jump of 1, after the last
+  contact, before the run begins). The registry's refusal catches the stamp when the device comes back. Not
+  modelled: what the device shows locally in the meantime. If the author's own read model applies a run's rows
+  with the unaccepted stamp, a refusal and a new stamp re-rank them. The author may see a write win and then
+  lose. The model assumes no one, including the author, applies the rows of a refused append. Also not checked:
+  jumps larger than 1, and two runs queued on one device while offline.
+- **A clock that steps back or runs slow.** The stamp is then below the registry time. That is safe for
+  ordering (the clamp still holds the causal order) but the device's concurrent writes lose to others more often.
+- **A mixed rollout.** Devices with and without D, and a registry that refuses only some of them. An old
+  fast device is refused with no retry, or accepted and drags. Needs the same lockstep as the cap.
+- **More than two devices or keys.** Nothing in D couples devices except the clamp over held stamps, but this
+  was not checked.
+- **Clones** (two writers with one run id) and **runs that overlap on one device**.
+- **Delay in measuring the offset.** The model measures at one instant. In practice the error is half a round
+  trip at most; the refusal is exact, so the error costs a retry, not safety. Take the registry's reading
+  against the device clock at receipt, so the error is low.
+- **The bounds.** Row 2 (the cap model's full shape) did not complete. The passes use fewer runs or one segment
+  per run, and 3 runs at most. `MaxT = 5` and `MaxJump >= 2` were not run. The code is not checked against the
+  model: the model assumes (1) the registry's time is one clock, never behind an accepted stamp; (2) every
+  stored stamp the clamp reads (rows, tombstones, watermark, floors, SEEN) is the stored raw stamp; (3) the
+  offset is applied at begin and at every retry.
 
 ## History: initial design exploration
 
