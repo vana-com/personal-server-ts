@@ -586,13 +586,19 @@ export function createUploadAttemptLedger(
         if (mine(entry)) {
           if (entry.inFlight) {
             entry.inFlight = false;
-            entry.interrupted += 1;
+            entry.interrupted = Math.min(
+              entry.interrupted + 1,
+              Number.MAX_SAFE_INTEGER,
+            );
             changed = true;
           }
           if (!entry.quarantined && entry.interrupted >= maxInterrupted) {
             entry.quarantined = true;
             entry.quarantinedAt = clock();
-            entry.quarantines = (entry.quarantines ?? 0) + 1;
+            entry.quarantines = Math.min(
+              (entry.quarantines ?? 0) + 1,
+              Number.MAX_SAFE_INTEGER,
+            );
             changed = true;
           }
         }
