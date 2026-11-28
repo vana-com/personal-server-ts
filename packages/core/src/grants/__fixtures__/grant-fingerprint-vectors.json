@@ -1,0 +1,137 @@
+{
+  "domain": "vana.grant-fingerprint.v1",
+  "format": "gf1: + lowercase hex SHA-256 of RFC 8785 JSON of {domain, salt, grant, data_scopes}; data_scopes sorted, duplicates removed",
+  "generated_by": "an independent Python implementation (json.dumps sort_keys, compact separators, ensure_ascii=False)",
+  "vectors": [
+    {
+      "name": "minimal v0.1 grant",
+      "salt": "0000000000000000000000000000000000000000000000000000000000000000",
+      "grant": {
+        "version": "0.1.0",
+        "grant_id": "grt_01JZ8Q4V5R6S7T8U9V0W1X2Y3Z",
+        "issued_at": "2026-11-24T12:00:00.000Z",
+        "subject": {
+          "id": "0x1111111111111111111111111111111111111111"
+        },
+        "client": {
+          "client_id": "https://app.example.com"
+        },
+        "source": {
+          "kind": "connector",
+          "id": "https://registry.pdpp.dev/connectors/chatgpt"
+        },
+        "source_declaration": {
+          "version": "3"
+        },
+        "purpose_code": "research",
+        "access_mode": "single_use",
+        "streams": [
+          {
+            "name": "conversations",
+            "instance_ids": ["default"],
+            "fields": ["id", "title", "create_time"]
+          }
+        ]
+      },
+      "data_scopes": ["pdpp.chatgpt.conversations"],
+      "canonical": "{\"data_scopes\":[\"pdpp.chatgpt.conversations\"],\"domain\":\"vana.grant-fingerprint.v1\",\"grant\":{\"access_mode\":\"single_use\",\"client\":{\"client_id\":\"https://app.example.com\"},\"grant_id\":\"grt_01JZ8Q4V5R6S7T8U9V0W1X2Y3Z\",\"issued_at\":\"2026-11-24T12:00:00.000Z\",\"purpose_code\":\"research\",\"source\":{\"id\":\"https://registry.pdpp.dev/connectors/chatgpt\",\"kind\":\"connector\"},\"source_declaration\":{\"version\":\"3\"},\"streams\":[{\"fields\":[\"id\",\"title\",\"create_time\"],\"instance_ids\":[\"default\"],\"name\":\"conversations\"}],\"subject\":{\"id\":\"0x1111111111111111111111111111111111111111\"},\"version\":\"0.1.0\"},\"salt\":\"0000000000000000000000000000000000000000000000000000000000000000\"}",
+      "fingerprint": "gf1:12f2a586f33859a0cba2509368203e97ee59efa72bed7f2d527598c11913b003"
+    },
+    {
+      "name": "same grant, other salt",
+      "salt": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "grant": {
+        "version": "0.1.0",
+        "grant_id": "grt_01JZ8Q4V5R6S7T8U9V0W1X2Y3Z",
+        "issued_at": "2026-11-24T12:00:00.000Z",
+        "subject": {
+          "id": "0x1111111111111111111111111111111111111111"
+        },
+        "client": {
+          "client_id": "https://app.example.com"
+        },
+        "source": {
+          "kind": "connector",
+          "id": "https://registry.pdpp.dev/connectors/chatgpt"
+        },
+        "source_declaration": {
+          "version": "3"
+        },
+        "purpose_code": "research",
+        "access_mode": "single_use",
+        "streams": [
+          {
+            "name": "conversations",
+            "instance_ids": ["default"],
+            "fields": ["id", "title", "create_time"]
+          }
+        ]
+      },
+      "data_scopes": ["pdpp.chatgpt.conversations"],
+      "canonical": "{\"data_scopes\":[\"pdpp.chatgpt.conversations\"],\"domain\":\"vana.grant-fingerprint.v1\",\"grant\":{\"access_mode\":\"single_use\",\"client\":{\"client_id\":\"https://app.example.com\"},\"grant_id\":\"grt_01JZ8Q4V5R6S7T8U9V0W1X2Y3Z\",\"issued_at\":\"2026-11-24T12:00:00.000Z\",\"purpose_code\":\"research\",\"source\":{\"id\":\"https://registry.pdpp.dev/connectors/chatgpt\",\"kind\":\"connector\"},\"source_declaration\":{\"version\":\"3\"},\"streams\":[{\"fields\":[\"id\",\"title\",\"create_time\"],\"instance_ids\":[\"default\"],\"name\":\"conversations\"}],\"subject\":{\"id\":\"0x1111111111111111111111111111111111111111\"},\"version\":\"0.1.0\"},\"salt\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}",
+      "fingerprint": "gf1:454aa99a45198ce4d9a61a8aaa974e5161ddf8faf8dbe2978f61ac926d1e0beb"
+    },
+    {
+      "name": "v0.2 grant with non-ASCII text, a newline and an expiry; data scopes unsorted with a duplicate",
+      "salt": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "grant": {
+        "version": "0.2.0",
+        "grant_id": "grt_01JZ8Q4V5R6S7T8U9V0W1X2Y40",
+        "issued_at": "2026-11-24T12:00:00.000Z",
+        "subject": {
+          "id": "0x1111111111111111111111111111111111111111"
+        },
+        "client": {
+          "client_id": "https://app.example.com"
+        },
+        "source": {
+          "kind": "connector",
+          "id": "https://registry.pdpp.dev/connectors/chatgpt"
+        },
+        "source_declaration": {
+          "version": "3"
+        },
+        "purpose_code": "research",
+        "access_mode": "single_use",
+        "streams": [
+          {
+            "name": "conversations",
+            "instance_ids": ["default"],
+            "fields": ["id", "title", "create_time"]
+          },
+          {
+            "name": "messages",
+            "instance_ids": ["default"],
+            "fields": ["id", "content"],
+            "time_constraint": {
+              "since": "2026-01-01T00:00:00.000Z"
+            }
+          }
+        ],
+        "purpose_description": "Étude sur l’usage des assistants — 研究\nsecond line",
+        "expires_at": "2027-05-24T12:00:00.000Z",
+        "requested": {
+          "streams": [
+            {
+              "name": "conversations",
+              "necessity": "required",
+              "fields": ["id", "title", "create_time"]
+            },
+            {
+              "name": "messages",
+              "necessity": "optional",
+              "fields": ["id", "content", "author"]
+            }
+          ]
+        }
+      },
+      "data_scopes": [
+        "pdpp.chatgpt.messages",
+        "pdpp.chatgpt.conversations",
+        "pdpp.chatgpt.messages"
+      ],
+      "canonical": "{\"data_scopes\":[\"pdpp.chatgpt.conversations\",\"pdpp.chatgpt.messages\"],\"domain\":\"vana.grant-fingerprint.v1\",\"grant\":{\"access_mode\":\"single_use\",\"client\":{\"client_id\":\"https://app.example.com\"},\"expires_at\":\"2027-05-24T12:00:00.000Z\",\"grant_id\":\"grt_01JZ8Q4V5R6S7T8U9V0W1X2Y40\",\"issued_at\":\"2026-11-24T12:00:00.000Z\",\"purpose_code\":\"research\",\"purpose_description\":\"Étude sur l’usage des assistants — 研究\\nsecond line\",\"requested\":{\"streams\":[{\"fields\":[\"id\",\"title\",\"create_time\"],\"name\":\"conversations\",\"necessity\":\"required\"},{\"fields\":[\"id\",\"content\",\"author\"],\"name\":\"messages\",\"necessity\":\"optional\"}]},\"source\":{\"id\":\"https://registry.pdpp.dev/connectors/chatgpt\",\"kind\":\"connector\"},\"source_declaration\":{\"version\":\"3\"},\"streams\":[{\"fields\":[\"id\",\"title\",\"create_time\"],\"instance_ids\":[\"default\"],\"name\":\"conversations\"},{\"fields\":[\"id\",\"content\"],\"instance_ids\":[\"default\"],\"name\":\"messages\",\"time_constraint\":{\"since\":\"2026-01-01T00:00:00.000Z\"}}],\"subject\":{\"id\":\"0x1111111111111111111111111111111111111111\"},\"version\":\"0.2.0\"},\"salt\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}",
+      "fingerprint": "gf1:023fce678ce701d15de921f8af83843fbcb339d27d5b2c0eb4d2298f94182f8a"
+    }
+  ]
+}
