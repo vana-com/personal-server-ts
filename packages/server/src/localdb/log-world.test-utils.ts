@@ -1,3 +1,4 @@
+import type { DeleteDataPort } from "../../../core/src/ports/index.js";
 import type { LegacyRetirePipelinePorts } from "../../../core/src/localdb/legacy-retire-pipeline.js";
 // A shared world for log-protocol tests: one fake gateway and one blob store,
 // and any number of devices of one owner, each with its own real SQLite and the
@@ -549,7 +550,37 @@ export async function world(options: {
     batches: gateway.batches().length,
     posts: gateway.calls.filter((c) => c.kind === "post").length,
   });
+  const tombstone: DeleteDataPort["tombstone"] = async (scope, fence) => {
+    const rows = gateway.versions.get(scope) ?? [];
+    const head = rows.at(-1);
+    if (!head) return { status: "not-registered", dataPointId: scope };
+    if (head.dataHash === hashes.tombstoneData)
+      return {
+        status: "already-deleted",
+        dataPointId: scope,
+        version: String(rows.length),
+        deletedAt: "now",
+      };
+    if (
+      fence &&
+      (String(rows.length) !== fence.head.expectedVersion ||
+        head.dataHash !== fence.head.dataHash ||
+        head.metadataHash !== fence.head.metadataHash)
+    )
+      throw new Error("fenced head moved");
+    gateway.write(scope, {
+      dataHash: hashes.tombstoneData,
+      metadataHash: hashes.tombstoneMetadata,
+    });
+    return {
+      status: "tombstoned",
+      dataPointId: scope,
+      version: String(rows.length),
+      deletedAt: "now",
+    };
+  };
   return {
+    tombstone,
     device,
     gateway,
     names,

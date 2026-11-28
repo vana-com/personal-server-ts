@@ -2,6 +2,7 @@
 // publisher wrote: real segments, a real compaction into snapshot parts, and a
 // record whose body is stored out of line in pieces. The registry is the
 // fake gateway the publisher commits to; storage is its in-memory store.
+import { TOMBSTONE_DATA_HASH } from "../../../core/src/sync/tombstone.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   controlScope,
@@ -240,7 +241,7 @@ async function deletedCompactedLog() {
         versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
           expectedVersion: String(i + 1),
           dataHash: v.dataHash,
-          isTombstone: false,
+          isTombstone: v.dataHash === TOMBSTONE_DATA_HASH,
         })),
       }),
     },
@@ -251,6 +252,7 @@ async function deletedCompactedLog() {
     keys: a.deps.keys,
     retained: retainedPiecesIn(a.db),
     objects: {
+      tombstone: w.tombstone,
       deleteBlobVersions: async (scope, names) => {
         calls.push([...names]);
         const out = {
@@ -351,6 +353,7 @@ describe("erasing a log the real publisher wrote", () => {
     const failing: LogErasureDeps = {
       ...flaky,
       objects: {
+        tombstone: w.tombstone,
         deleteBlobVersions: async (scope, names) => {
           // The second request of the pass fails for every name in it.
           if (++failures === 2)
@@ -382,7 +385,7 @@ describe("erasing a log the real publisher wrote", () => {
   });
 
   it("finishes under a per-owner delete quota smaller than the log: names storage already lacks are not sent again", async () => {
-    const { keys, deps, before } = await deletedCompactedLog();
+    const { w, keys, deps, before } = await deletedCompactedLog();
     const QUOTA = 3;
     const objects = before.filter(
       (key) => key.includes("/s-") || key.includes("/q-"),
@@ -392,6 +395,7 @@ describe("erasing a log the real publisher wrote", () => {
     let used = 0;
     const limited = deps({
       objects: {
+        tombstone: w.tombstone,
         // vana-storage rate-limits DELETE per owner: every name sent costs one,
         // one storage already lacks included.
         deleteBlobVersions: async (scope, names) => {
@@ -460,7 +464,7 @@ describe("erasure wired into the connection delete", () => {
           versions: (w.gateway.versions.get(scope) ?? []).map((v, i) => ({
             expectedVersion: String(i + 1),
             dataHash: v.dataHash,
-            isTombstone: false,
+            isTombstone: v.dataHash === TOMBSTONE_DATA_HASH,
           })),
         }),
       },
@@ -471,6 +475,7 @@ describe("erasure wired into the connection delete", () => {
         }),
       },
       objects: {
+        tombstone: w.tombstone,
         deleteBlobVersions: async (scope, names) => {
           // The storage DELETE is slow: whatever happens "meanwhile" lands
           // after the pass's last look at the registry and before the DELETE.
@@ -1080,7 +1085,12 @@ describe("erasure wired into the connection delete", () => {
       return part;
     }
     const headOf = (w: World) =>
-      segmentBlobName(w.gateway.versions.get(LOG)!.at(-1)!.dataHash);
+      segmentBlobName(
+        w.gateway.versions
+          .get(LOG)!
+          .filter((v) => v.dataHash !== TOMBSTONE_DATA_HASH)
+          .at(-1)!.dataHash,
+      );
 
     /** A log of one small record: this device enumerates it whole and deletes it. */
     async function completeAndAcknowledged() {
@@ -1144,6 +1154,7 @@ describe("erasure wired into the connection delete", () => {
       const cutOff: LogErasurePorts = {
         ...erasure,
         objects: {
+          tombstone: w.tombstone,
           deleteBlobVersions: async (scope, names) =>
             names.includes(headOf(w))
               ? {
