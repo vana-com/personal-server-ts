@@ -855,9 +855,9 @@ async function refusalMessage(res: Response): Promise<string> {
 
 /**
  * `Batch-Policy: rows=<R>;bytes=<B>;requires=<Q>[;lockedScopes=<L>]`.
- * `undefined` when the header is absent or any field is not a positive
- * integer: a client that cannot read the bounds keeps the ones it had. A field
- * this client does not know is ignored.
+ * `undefined` when the header is absent or a recognized field is not a
+ * positive integer: a client that cannot read the bounds keeps its last
+ * policy. Unknown fields are ignored regardless of their value format.
  */
 export function parseBatchPolicy(
   header: string | null,
@@ -866,8 +866,14 @@ export function parseBatchPolicy(
   const fields = new Map<string, number>();
   for (const part of header.split(";")) {
     const [key, value] = part.trim().split("=");
-    if (key === undefined || value === undefined || !/^[1-9]\d*$/.test(value))
-      return undefined;
+    if (
+      key !== "rows" &&
+      key !== "bytes" &&
+      key !== "requires" &&
+      key !== "lockedScopes"
+    )
+      continue;
+    if (value === undefined || !/^[1-9]\d*$/.test(value)) return undefined;
     fields.set(key, Number(value));
   }
   const rows = fields.get("rows");
@@ -882,8 +888,8 @@ export function parseBatchPolicy(
     !Number.isSafeInteger(bytes)
   )
     return undefined;
-  // Optional, and ignored when it is not a positive integer: an older gateway
-  // sends none, and a client without it packs to `rows` alone.
+  // An older gateway sends no optional lock budget. A value outside the safe
+  // integer range is omitted rather than rounded.
   const lockedScopes = fields.get("lockedScopes");
   return {
     rows,
