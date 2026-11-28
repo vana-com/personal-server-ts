@@ -166,6 +166,7 @@ describe("the file mode record store", () => {
     await expect(store.save("good", record)).rejects.toThrow();
     expect((await store.load()).size).toBe(0);
     expect(await readdir(join(dir, "good.json"))).toEqual([]);
+    expect(await readdir(dir)).toEqual(["good.json"]);
   });
 
   it("loads a valid owner even when reporting invalid JSON throws", async () => {

@@ -929,8 +929,15 @@ export async function createPsLiteSyncManager(
             return { ok: true };
           try {
             const check = await checkRegistration();
-            if (check.confirmed && check.generation === registrationGeneration)
-              return { ok: true };
+            if (check.generation !== registrationGeneration) {
+              return {
+                ok: false,
+                reason: "registration_check_failed",
+                message:
+                  "A newer server registration check is in progress. Retry syncing.",
+              };
+            }
+            if (check.confirmed) return { ok: true };
             return {
               ok: false,
               reason: "unregistered",

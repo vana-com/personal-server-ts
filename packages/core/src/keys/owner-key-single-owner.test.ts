@@ -22,7 +22,15 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ts from "typescript";
+import { publicKeyToAddress } from "viem/accounts";
 import { describe, expect, it } from "vitest";
+import { ServerSigningUnavailableError } from "../errors/catalog.js";
+import { createPublicOnlyAccount } from "./public-only-account.js";
+import {
+  recoverOwnerAddress,
+  signOwnerMasterKey,
+  streamMasterKey,
+} from "./owner-master-key.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const SOURCE_EXT = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -233,5 +241,64 @@ describe("owner key derivation has one owner", () => {
       const source = "const reference = fixture.deriveMasterKey;";
       expect(violationsIn(other, source)).toEqual(["deriveMasterKey"]);
     });
+  });
+});
+
+// Public secp256k1 generator point used only as an inert identity fixture.
+const fixturePublicKey =
+  "0x0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8" as const;
+
+describe("owner key failures", () => {
+  it("propagates a wallet refusal without producing fallback key material", async () => {
+    const declined = new Error("synthetic wallet refusal");
+    let prompts = 0;
+    await expect(
+      signOwnerMasterKey({
+        signMessage: () => {
+          prompts += 1;
+          throw declined;
+        },
+      }),
+    ).rejects.toBe(declined);
+    expect(prompts).toBe(1);
+  });
+
+  it("cannot recover an owner or derive a stream key from a truncated signature", async () => {
+    await expect(
+      Promise.resolve().then(() => recoverOwnerAddress("0x01")),
+    ).rejects.toThrow();
+    expect(() => streamMasterKey(new Uint8Array([1]))).toThrow();
+  });
+});
+
+describe("createPublicOnlyAccount", () => {
+  it("keeps the public identity readable but rejects both signing methods", async () => {
+    const address = publicKeyToAddress(fixturePublicKey);
+    const account = createPublicOnlyAccount({
+      address,
+      publicKey: fixturePublicKey,
+    });
+    expect(account.address).toBe(address);
+    expect(account.publicKey).toBe(fixturePublicKey);
+    await expect(
+      account.signMessage("public-only fixture"),
+    ).rejects.toBeInstanceOf(ServerSigningUnavailableError);
+    await expect(
+      account.signTypedData({
+        domain: {},
+        types: { Fixture: [{ name: "note", type: "string" }] },
+        primaryType: "Fixture",
+        message: { note: "public-only fixture" },
+      }),
+    ).rejects.toBeInstanceOf(ServerSigningUnavailableError);
+  });
+
+  it("refuses a declared address that does not match its public key", () => {
+    expect(() =>
+      createPublicOnlyAccount({
+        address: "0x0000000000000000000000000000000000000000",
+        publicKey: fixturePublicKey,
+      }),
+    ).toThrow("Public key does not match server address");
   });
 });

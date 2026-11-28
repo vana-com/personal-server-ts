@@ -110,6 +110,42 @@ describe("createReplicationDriver", () => {
     expect(steps).toHaveLength(0);
   });
 
+  it.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses an invalid step deadline (%s) before scheduling or stepping",
+    (deadlineMs) => {
+      const { timers, armed } = fakeTimers();
+      const { stepper, steps } = manualStepper();
+      expect(() =>
+        createReplicationDriver({ stepper, timers, budget, deadlineMs }),
+      ).toThrow("invalid replication step deadline");
+      expect(steps).toHaveLength(0);
+      expect(armed()).toEqual([]);
+    },
+  );
+
+  it("refuses an invalid stop grace without interrupting the running step", async () => {
+    const { timers, armed } = fakeTimers();
+    const { stepper, steps } = manualStepper();
+    const driver = createReplicationDriver({
+      stepper,
+      timers,
+      budget,
+      deadlineMs: 1000,
+    });
+    driver.start();
+    const before = armed();
+    await expect(driver.stop(Number.NaN)).rejects.toThrow(
+      "invalid replication stop grace",
+    );
+    expect(driver.status()).toMatchObject({ state: "running", stepping: true });
+    expect(steps[0]?.signal.aborted).toBe(false);
+    expect(armed()).toEqual(before);
+    steps[0]?.done.resolve(report());
+    await flush();
+    expect(await driver.stop(0)).toBe(true);
+    expect(armed()).toEqual([]);
+  });
+
   it("does nothing until started, then steps once and arms one timer at nextWake", async () => {
     const clock = fakeTimers();
     const { stepper, steps } = manualStepper();
@@ -161,6 +197,36 @@ describe("createReplicationDriver", () => {
     await flush();
     expect(steps).toHaveLength(2);
     expect(clock.armed()).toEqual([60_000]);
+  });
+
+  it("a synchronous reentrant trigger joins the reserved step", async () => {
+    const clock = fakeTimers();
+    const first = gate<ProgressReport>();
+    let calls = 0;
+    let joined: Promise<ProgressReport | undefined> | undefined;
+    const driver = createReplicationDriver({
+      budget,
+      timers: clock.timers,
+      stepper: {
+        step() {
+          calls++;
+          if (calls === 1) {
+            joined = driver.trigger();
+            return first.promise;
+          }
+          return Promise.resolve(report());
+        },
+      },
+    });
+    driver.start();
+    expect(calls).toBe(1);
+    const completed = report(T0 + 5_000);
+    first.resolve(completed);
+    expect(await joined).toBe(completed);
+    await flush();
+    expect(calls).toBe(2);
+    expect(clock.armed()).toHaveLength(1);
+    expect(await driver.stop(0)).toBe(true);
   });
 
   it("a trigger replaces the armed timer instead of adding one", async () => {
@@ -542,4 +608,58 @@ it("clears a failed step's retry timer when the driver is stopped", async () => 
   clock.advance(REPLICA_STEP_ERROR_DELAY_MS);
   expect(steps).toHaveLength(1);
   expect(driver.status().state).toBe("stopped");
+});
+
+it("joins a debounced local write and manual triggers into one follow-up", async () => {
+  const clock = fakeTimers();
+  const { stepper, steps } = manualStepper();
+  const driver = createReplicationDriver({
+    stepper,
+    budget,
+    timers: clock.timers,
+  });
+  driver.start();
+
+  driver.localWrite();
+  const joined = driver.trigger();
+  clock.advance(REPLICA_LOCAL_WRITE_DEBOUNCE_MS);
+  expect(steps).toHaveLength(1);
+  expect(clock.armed()).toEqual([]);
+
+  const first = report(undefined);
+  steps[0]!.done.resolve(first);
+  expect(await joined).toBe(first);
+  await flush();
+  expect(steps).toHaveLength(2);
+  steps[1]!.done.resolve(report(undefined));
+  await flush();
+  expect(steps).toHaveLength(2);
+  expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
+});
+
+it("waits for a non-cooperating step to settle before running after a restart", async () => {
+  const clock = fakeTimers();
+  const { stepper, steps } = manualStepper();
+  const driver = createReplicationDriver({
+    stepper,
+    budget,
+    timers: clock.timers,
+  });
+  driver.start();
+
+  const stopping = driver.stop(5_000);
+  clock.advance(5_000);
+  expect(await stopping).toBe(false);
+  driver.start();
+  expect(steps).toHaveLength(1);
+  expect(steps[0]!.signal.aborted).toBe(true);
+
+  steps[0]!.done.resolve(report(T0 + 6_000));
+  await flush();
+  expect(steps).toHaveLength(2);
+  expect(steps[1]!.signal.aborted).toBe(false);
+  expect(clock.armed()).toEqual([]);
+  steps[1]!.done.resolve(report(undefined));
+  await flush();
+  expect(clock.armed()).toEqual([REPLICA_WAKE_MAX_MS]);
 });

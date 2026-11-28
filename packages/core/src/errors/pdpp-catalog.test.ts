@@ -51,6 +51,15 @@ describe("PdppError", () => {
     expect(second.error.request_id).toBe("second-test");
   });
 
+  it("keeps errors serializable with a generated ID when correlation is missing", () => {
+    const error = new PdppError("not_found", "Not found");
+    const ids = [undefined, "", "   "].map(
+      (requestId) => error.toJSON(requestId).error.request_id,
+    );
+    expect(ids.every((id) => /^[0-9a-f-]{36}$/i.test(id))).toBe(true);
+    expect(new Set(ids).size).toBe(3);
+  });
+
   it("treats inherited object keys as unknown codes", () => {
     for (const code of ["constructor", "toString", "__proto__"]) {
       expect(() => new PdppError(code as never, "x")).toThrow(RangeError);

@@ -89,6 +89,61 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
         "The account storage mode is not switched",
       );
   };
+  const isStreamMode = () =>
+    !deps.accountStorageMode || deps.accountStorageMode.read() === "switched";
+  // Once the Response is returned the handler cannot stop its body, so the
+  // body is wrapped: every pull re-checks the mode, and on mode loss the
+  // unread remainder is cancelled instead of streaming to completion.
+  // Unchanged-mode reads pass one chunk per pull, so backpressure is
+  // preserved; a null body is returned untouched.
+  const guardFileStream = (response: Response): Response => {
+    if (!response.body) return response;
+    const source = response.body.getReader();
+    // Do not pull ahead of downstream demand.
+    const guarded = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          if (!isStreamMode()) {
+            await source.cancel().catch(() => undefined);
+            controller.error(
+              new ProtocolError(
+                503,
+                "ACCOUNT_MODE_UNKNOWN",
+                "The account storage mode is not switched",
+              ),
+            );
+            return;
+          }
+          const { value, done } = await source.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          if (!isStreamMode()) {
+            await source.cancel().catch(() => undefined);
+            controller.error(
+              new ProtocolError(
+                503,
+                "ACCOUNT_MODE_UNKNOWN",
+                "The account storage mode is not switched",
+              ),
+            );
+            return;
+          }
+          if (value) controller.enqueue(value);
+        },
+        async cancel() {
+          await source.cancel().catch(() => undefined);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return new Response(guarded, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
   app.post("/trigger", async (c, next) => {
     if (legacy()) return next();
     await auth.authorizeOwner(c.req.raw);
@@ -211,7 +266,7 @@ export function syncRoutes(deps: SyncRouteDeps): Hono {
       void response.body?.cancel().catch(() => undefined);
       throw error;
     }
-    return response;
+    return guardFileStream(response);
   });
 
   app.all("*", (c) =>

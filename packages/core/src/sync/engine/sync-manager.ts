@@ -502,10 +502,8 @@ export function createSyncManager(
   let statusDelivering = false;
   let probeIntervalId: ReturnType<typeof setInterval> | null = null;
   let needsFullReconcile = true;
-  // Once per boot, then only the scopes whose lookup failed, a few times.
+  // Once per boot, then only the scopes whose lookup failed, on every cycle until they recover.
   let lostDataPointRetryScopes: string[] | null = null;
-  let lostDataPointAttempts = 0;
-  const MAX_LOST_DATA_POINT_ATTEMPTS = 5;
   let needsStartupHydration = startupHydrateScopes.length > 0;
   const hydratedScopes = new Set<string>();
   // One retry memory per manager (= per boot session): a blob that 404s is
@@ -879,15 +877,13 @@ export function createSyncManager(
         // DELETE did not. Cheap when nothing is pending; never blocks sync.
         if (transferMode === "upload-download") {
           if (
-            lostDataPointAttempts < MAX_LOST_DATA_POINT_ATTEMPTS &&
             // null: no full pass has completed yet (first cycle, or it threw).
-            (lostDataPointRetryScopes === null ||
-              lostDataPointRetryScopes.length > 0)
+            lostDataPointRetryScopes === null ||
+            lostDataPointRetryScopes.length > 0
           ) {
             // A registration the gateway accepted and later dropped (failed
             // settle) still reads as synced locally. Full pass once per boot;
             // later cycles retry only scopes whose lookup failed.
-            lostDataPointAttempts += 1;
             try {
               const { failed } = await requeueLostDataPoints(
                 uploadDeps,

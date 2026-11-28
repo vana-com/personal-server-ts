@@ -17,7 +17,7 @@ import {
   writeFile,
   constants,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { exec } from "node:child_process";
@@ -198,6 +198,8 @@ export async function extractBinary(
   }
 }
 
+const pendingInstalls = new Map<string, Promise<string>>();
+
 export interface EnsureFrpcOptions {
   log?: (msg: string) => void;
   /**
@@ -234,6 +236,21 @@ export async function ensureFrpcBinary(
     }
   }
 
+  const key = resolve(storageRoot);
+  let pending = pendingInstalls.get(key);
+  if (!pending) {
+    pending = installCachedFrpc(storageRoot, log).finally(() =>
+      pendingInstalls.delete(key),
+    );
+    pendingInstalls.set(key, pending);
+  }
+  return pending;
+}
+
+async function installCachedFrpc(
+  storageRoot: string,
+  log: (msg: string) => void,
+): Promise<string> {
   const binDir = join(storageRoot, "bin");
   const binaryPath = getBinaryPath(storageRoot);
 

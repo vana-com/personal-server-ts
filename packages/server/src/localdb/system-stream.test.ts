@@ -18,6 +18,69 @@ import { openBetterSqlite3 } from "./better-sqlite3-driver.js";
 import { remoteFixture } from "./apply-fixture.test-utils.js";
 import { ACCESS_ACTIVITY_DESCRIPTOR } from "../../../core/src/logging/activity-stream.js";
 
+it("rejects extra network fields rather than including them in access activity", () => {
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    action: "read",
+    scope: "fixture.scope",
+    grantId: "fixture-grant",
+    builder: "fixture-builder",
+    phase: "served-start",
+  };
+  expect(() => ACCESS_ACTIVITY_DESCRIPTOR.validate(event)).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      ...event,
+      networkLabel: "synthetic",
+    }),
+  ).toThrow("Invalid access activity event");
+});
+
+it.each(["eventId", "instanceId"])(
+  "rejects invalid %s UUID variants",
+  (field) => {
+    expect(() =>
+      ACCESS_ACTIVITY_DESCRIPTOR.validate({
+        schemaVersion: 1,
+        eventId: "00000000-0000-4000-8000-000000000001",
+        instanceId: "00000000-0000-4000-8000-000000000002",
+        occurredAt: "2026-01-02T03:04:05.000Z",
+        action: "read",
+        scope: "fixture.scope",
+        grantId: "fixture-grant",
+        builder: "fixture-builder",
+        phase: "served-start",
+        [field]: "00000000-0000-4000-7000-000000000001",
+      }),
+    ).toThrow("Invalid access activity identity");
+  },
+);
+
+it("does not accept an access action as a one-item array", () => {
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000001",
+    instanceId: "00000000-0000-4000-8000-000000000002",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    scope: "fixture.scope",
+    grantId: "fixture-grant",
+    builder: "fixture-builder",
+    phase: "served-start",
+  };
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({ ...event, action: "read" }),
+  ).not.toThrow();
+  expect(() =>
+    ACCESS_ACTIVITY_DESCRIPTOR.validate({
+      ...event,
+      action: ["read"],
+    }),
+  ).toThrow("Invalid access activity event");
+});
+
 it("rejects an access activity descriptor with an unreadable timestamp", () => {
   const event = {
     schemaVersion: 1,
@@ -947,3 +1010,37 @@ it("publishes idle activity on the timer without waking for each record", async 
     vi.useRealTimers();
   }
 });
+
+it.each([
+  [{ timestamp: "not a timestamp" }, "Invalid access activity timestamp"],
+  [{ builder: "" }, "Invalid access activity field"],
+] as const)(
+  "refuses malformed writer input %j without leaving a partial event",
+  async (change, error) => {
+    const { createAccessActivity } =
+      await import("../../../core/src/logging/activity-stream.js");
+    const f = await fixture();
+    const activity = createAccessActivity(f.deps);
+    const entry = {
+      logId: crypto.randomUUID(),
+      grantId: "fixture-grant",
+      builder: owner,
+      action: "read" as const,
+      scope: "fixture.items",
+      timestamp: "2026-06-01T00:00:00.000Z",
+    };
+
+    await expect(activity.write({ ...entry, ...change })).rejects.toThrow(
+      error,
+    );
+    expect(await f.db.query("SELECT * FROM system_stream_outbox")).toEqual([]);
+    expect(await f.db.query("SELECT * FROM system_stream_projection")).toEqual(
+      [],
+    );
+
+    await activity.write(entry);
+    expect(
+      await f.db.query("SELECT count(*) AS n FROM system_stream_outbox"),
+    ).toEqual([{ n: 1 }]);
+  },
+);

@@ -224,9 +224,17 @@ export function createReplicationDriver(input: {
     if (timer !== undefined) timers.clearTimeout(timer);
     timer = undefined;
     nextWakeAt = undefined;
-    const current = run();
+    // Reserve the flight before entering user-supplied stepper code. A
+    // synchronous wake from that code must join rather than start a second step.
+    let resolve!: (report: ProgressReport | undefined) => void;
+    let reject!: (error: unknown) => void;
+    const current = new Promise<ProgressReport | undefined>((ok, fail) => {
+      resolve = ok;
+      reject = fail;
+    });
     running = current;
     void current.then(settle, settle);
+    void run().then(resolve, reject);
     return current;
   }
 

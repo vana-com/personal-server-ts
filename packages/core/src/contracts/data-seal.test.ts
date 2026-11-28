@@ -4,7 +4,11 @@
  * refusal (426 or 503), not an "incomplete write" it would log as a fault.
  */
 import { describe, expect, it } from "vitest";
-import { IngestPersistedError, ingestDataContract } from "./data.js";
+import {
+  IngestPersistedError,
+  ingestDataContract,
+  readDataContract,
+} from "./data.js";
 import {
   LegacyWriteRefusedError,
   legacyWriteRefusedErrorFor,
@@ -73,6 +77,143 @@ describe("persisted-write diagnostic", () => {
     expect(error.cause).toBe("fixture refused");
     expect(error.message).toBe(
       "Envelope persisted at fixtures/version.json but write did not complete: fixture refused",
+    );
+  });
+});
+
+describe("conditional ingest never falls back to a two-step write", () => {
+  const conditional = (storage: ReturnType<typeof twoStepStorage>) =>
+    ingestDataContract({
+      storage,
+      scopeParam: "notes.entries",
+      body: { items: [] },
+      collectedAt: "2026-11-09T00:00:00.000Z",
+      status: "stored",
+      precondition: { kind: "match", version: 1 },
+    });
+
+  it("refuses an unsupported conditional write before any blob or index call", async () => {
+    const storage = twoStepStorage(new Error("index should not be called"));
+    storage.commitEnvelope = undefined;
+    let wrote = false;
+    storage.writeEnvelope = async () => {
+      wrote = true;
+      throw new Error("blob should not be called");
+    };
+    await expect(conditional(storage)).rejects.toThrow(
+      "Conditional legacy writes require atomic storage support",
+    );
+    expect(wrote).toBe(false);
+  });
+
+  it("returns the atomic writer's path without calling either legacy step", async () => {
+    const storage = twoStepStorage(new Error("legacy index should not run"));
+    const writeResult = {
+      path: "fixtures/atomic.json",
+      relativePath: "fixtures/atomic.json",
+      sizeBytes: 12,
+    };
+    let writes = 0;
+    storage.writeEnvelope = async () => {
+      throw new Error("legacy blob writer should not run");
+    };
+    storage.commitEnvelope = async (_envelope, _entry, precondition) => {
+      writes += 1;
+      expect(precondition).toEqual({ kind: "match", version: 1 });
+      return { ok: true, writeResult };
+    };
+    await expect(conditional(storage)).resolves.toMatchObject({
+      ok: true,
+      writeResult,
+    });
+    expect(writes).toBe(1);
+  });
+
+  it("keeps the closed-mode refusal returned by the atomic writer", async () => {
+    const storage = twoStepStorage(new Error("legacy index should not run"));
+    const refusal = legacyWriteRefusedErrorFor("unknown");
+    storage.commitEnvelope = async () => {
+      throw refusal;
+    };
+    await expect(conditional(storage)).rejects.toBe(refusal);
+  });
+
+  it("returns the authoritative 412 rather than attempting a fallback write", async () => {
+    const storage = twoStepStorage(new Error("index should not be called"));
+    let wrote = false;
+    storage.writeEnvelope = async () => {
+      wrote = true;
+      throw new Error("blob should not be called");
+    };
+    storage.commitEnvelope = async (_envelope, _entry, precondition) => {
+      expect(precondition).toEqual({ kind: "match", version: 1 });
+      return { ok: false, currentVersion: 2, currentProducer: null };
+    };
+    await expect(conditional(storage)).resolves.toMatchObject({
+      ok: false,
+      status: 412,
+      body: {
+        error: "PRECONDITION_FAILED",
+        current_version: 2,
+        current_producer: null,
+      },
+    });
+    expect(wrote).toBe(false);
+  });
+});
+
+describe("reading a version whose backing file cannot be opened", () => {
+  const scopeParam = "notes.entries";
+  const collectedAt = "2026-11-09T00:00:00.000Z";
+  async function indexedStorage() {
+    const storage = createMemoryDataStorage({
+      legacyWriteSeal: openLegacyWriteSealForTests(),
+    });
+    const result = await ingestDataContract({
+      storage,
+      scopeParam,
+      collectedAt,
+      body: { items: [] },
+      status: "stored",
+    });
+    expect(result.ok).toBe(true);
+    return storage;
+  }
+
+  it.each(["ENOENT", "ENOTDIR"])(
+    "returns a distinct missing-file response for an indexed version on %s",
+    async (code) => {
+      const storage = await indexedStorage();
+      const readEnvelope = storage.readEnvelope;
+      storage.readEnvelope = async () => {
+        throw Object.assign(new Error("fixture backing file unavailable"), {
+          code,
+        });
+      };
+      await expect(
+        readDataContract({ storage, scopeParam }),
+      ).resolves.toMatchObject({
+        ok: false,
+        status: 404,
+        body: { error: "DATA_FILE_MISSING" },
+      });
+      storage.readEnvelope = readEnvelope;
+      await expect(
+        readDataContract({ storage, scopeParam }),
+      ).resolves.toMatchObject({ ok: true });
+    },
+  );
+
+  it("does not present a genuine storage error as missing data", async () => {
+    const storage = await indexedStorage();
+    const failure = Object.assign(new Error("fixture I/O failed"), {
+      code: "EIO",
+    });
+    storage.readEnvelope = async () => {
+      throw failure;
+    };
+    await expect(readDataContract({ storage, scopeParam })).rejects.toBe(
+      failure,
     );
   });
 });

@@ -42,7 +42,10 @@ import {
 afterEach(closeWorldDrivers);
 
 describe("canonical import source page bounds", () => {
-  async function candidate(page: CanonicalImportPageReader["page"]) {
+  async function candidate(
+    page: CanonicalImportPageReader["page"],
+    assertRevision: CanonicalImportPageReader["assertRevision"] = async () => {},
+  ) {
     type Options = Parameters<typeof createCanonicalImportSource>[0];
     const reader: CanonicalImportPageReader = {
       declarations: [
@@ -59,7 +62,7 @@ describe("canonical import source page bounds", () => {
           rows: 1,
         };
       },
-      assertRevision: async () => {},
+      assertRevision,
       connections: async () => [
         { instance: "fixture-instance", deleted: false, lastActive: 1 },
       ],
@@ -103,6 +106,55 @@ describe("canonical import source page bounds", () => {
       4 * 1024 * 1024,
       "fixture-revision",
     );
+  });
+
+  it("carries opaque continuation cursors into the next canonical import page", async () => {
+    const cursor = "fixture:+/next";
+    const page = vi.fn<CanonicalImportPageReader["page"]>();
+    page.mockResolvedValueOnce({ rows: [{ id: 1 }], next: cursor });
+    page.mockResolvedValueOnce({ rows: [{ id: 2 }], next: null });
+
+    const item = await candidate(page);
+    const records = [];
+    for await (const record of item.records()) records.push(record);
+    expect(records).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(page.mock.calls.map((call) => call[2])).toEqual([null, cursor]);
+  });
+
+  it("finishes an empty terminal canonical import page without fetching another", async () => {
+    const page = vi.fn(async () => ({ rows: [], next: null }));
+    const item = await candidate(page);
+    const step = await item.records()[Symbol.asyncIterator]().next();
+    expect(step.done).toBe(true);
+    expect(page).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not yield a page if the snapshot revision changed while it was read", async () => {
+    let changed = false;
+    const page = vi.fn(async () => {
+      changed = true;
+      return { rows: [{ id: 1 }], next: null };
+    });
+    const check = vi.fn(async () => {
+      if (changed) throw new Error("fixture revision changed");
+    });
+    const item = await candidate(page, check);
+    await expect(item.records()[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "fixture revision changed",
+    );
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenLastCalledWith("fixture-revision");
+  });
+
+  it("rejects a nonempty page that repeats its input cursor before yielding that page", async () => {
+    const page = vi.fn<CanonicalImportPageReader["page"]>();
+    page.mockResolvedValueOnce({ rows: [{ id: 1 }], next: "again" });
+    page.mockResolvedValueOnce({ rows: [{ id: 2 }], next: "again" });
+    const item = await candidate(page);
+    const records = item.records()[Symbol.asyncIterator]();
+    expect(await records.next()).toEqual({ value: { id: 1 }, done: false });
+    await expect(records.next()).rejects.toThrow("invalid_page_cursor");
+    expect(page.mock.calls.map((call) => call[2])).toEqual([null, "again"]);
   });
 
   it("refuses a cursor on an empty page instead of looping to a second page", async () => {
@@ -1769,6 +1821,61 @@ describe("erasure wired into the connection delete", () => {
       expect(await owed(a)).toHaveBeenCalledTimes(1);
     });
   });
+});
+
+describe("alias spool restart and ownership", () => {
+  it("starts from an empty spool after a crash without removing neighbouring state", async () => {
+    const { mkdtemp, readFile, rm, writeFile } =
+      await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { openAliasSpool } = await import("./alias-spool.js");
+    const root = await mkdtemp(join(tmpdir(), "alias-spool-reopen-"));
+    try {
+      const warn = vi.fn();
+      const previous = await openAliasSpool(root, { warn });
+      expect(previous).toBeDefined();
+      if (!previous) throw new Error("fixture spool did not open");
+      await previous.write(
+        "old-response/body",
+        new TextEncoder().encode("fixture"),
+      );
+      await writeFile(join(root, "state.fixture"), "retain");
+      const reopened = await openAliasSpool(root, { warn });
+      expect(reopened).toBeDefined();
+      if (!reopened) throw new Error("fixture spool did not reopen");
+      expect(await reopened.list("")).toEqual([]);
+      expect(await readFile(join(root, "state.fixture"), "utf8")).toBe(
+        "retain",
+      );
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps response spool bodies private",
+    async () => {
+      const { mkdtemp, rm, stat } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const { openAliasSpool } = await import("./alias-spool.js");
+      const root = await mkdtemp(join(tmpdir(), "alias-spool-permissions-"));
+      try {
+        const spool = await openAliasSpool(root, { warn: vi.fn() });
+        expect(spool).toBeDefined();
+        if (!spool) throw new Error("fixture spool did not open");
+        await spool.write("body", new Uint8Array([7]));
+        expect((await stat(join(root, "alias-spool"))).mode & 0o077).toBe(0);
+        expect(
+          (await stat(join(root, "alias-spool", "body"))).mode & 0o077,
+        ).toBe(0);
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+  );
 });
 
 describe("alias spool startup fallback", () => {

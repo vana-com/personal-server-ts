@@ -220,6 +220,31 @@ describe("tunnel/binary", () => {
       expect(logs.some((l) => l.includes("already installed"))).toBe(true);
     });
 
+    it("shares one installation per root and allows a retry after failure", async () => {
+      const originalFetch = globalThis.fetch;
+      const fetch = vi
+        .fn()
+        .mockRejectedValue(new Error("network disabled in test"));
+      globalThis.fetch = fetch;
+      try {
+        const results = await Promise.allSettled([
+          ensureFrpcBinary(tempDir),
+          ensureFrpcBinary(tempDir),
+        ]);
+        expect(results.map(({ status }) => status)).toEqual([
+          "rejected",
+          "rejected",
+        ]);
+        expect(fetch).toHaveBeenCalledTimes(1);
+        await expect(ensureFrpcBinary(tempDir)).rejects.toThrow(
+          "network disabled in test",
+        );
+        expect(fetch).toHaveBeenCalledTimes(2);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     it("attempts download when version file is missing", async () => {
       // No version file, no binary — ensureFrpcBinary should try to download
       // Mock fetch to avoid real network calls
@@ -304,6 +329,55 @@ describe("tunnel/binary", () => {
       await expect(
         access(join(binDir, "_frpc_download.tar.gz")),
       ).rejects.toThrow();
+    });
+
+    it("does not publish a binary or metadata on a successful HTTP response without a body", async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValue(new Response(null, { status: 200 }));
+      try {
+        await expect(
+          ensureFrpcBinary(tempDir, { log: () => {} }),
+        ).rejects.toThrow("No response body received");
+        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        expect(await getInstalledVersion(tempDir)).toBeNull();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("removes the temporary archive and writes no version on a mid-stream download failure", async () => {
+      const originalFetch = globalThis.fetch;
+      const failure = new Error("synthetic response stream interrupted");
+      let pulls = 0;
+      const partial = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulls++ === 0) controller.enqueue(new Uint8Array([1, 2, 3]));
+          else controller.error(failure);
+        },
+      });
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValue(new Response(partial, { status: 200 }));
+      try {
+        await expect(
+          ensureFrpcBinary(tempDir, { log: () => {} }),
+        ).rejects.toThrow(failure.message);
+        await expect(
+          access(
+            join(tempDir, "bin", `_frpc_download.${getPlatformInfo().ext}`),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(access(getBinaryPath(tempDir))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        expect(await getInstalledVersion(tempDir)).toBeNull();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
     });
 
     it("provides clear error on HTTP failure", async () => {

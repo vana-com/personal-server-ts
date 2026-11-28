@@ -44,7 +44,8 @@ export const ACCESS_ACTIVITY_DESCRIPTOR = {
       fields.some((key) => !(key in data)) ||
       data.schemaVersion !== 1 ||
       data.phase !== "served-start" ||
-      !["read", "write", "delete", "lineage"].includes(String(data.action))
+      typeof data.action !== "string" ||
+      !["read", "write", "delete", "lineage"].includes(data.action)
     )
       throw new Error("Invalid access activity event");
     if (

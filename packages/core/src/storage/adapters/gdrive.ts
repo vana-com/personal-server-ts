@@ -449,22 +449,59 @@ export function createGoogleDriveStorageAdapter(
       );
     }
 
-    const putRes = await authorizedFetch(
-      uploadUri,
-      {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "Content-Length": String(data.byteLength),
-        },
-        body: copyToArrayBuffer(data),
-      },
-      signal,
-    );
-    if (!putRes.ok) {
-      throw await classifyHttpError(putRes, "upload");
+    const session = new URL(uploadUri, apiBase);
+    if (
+      session.origin !== new URL(apiBase).origin ||
+      session.username ||
+      session.password ||
+      session.hash
+    ) {
+      throw new Error(
+        "Google Drive resumable upload returned an invalid session URL",
+      );
     }
-    return (await putRes.json()) as DriveFileRecord;
+
+    let offset = 0;
+    // Keep retries within this invocation and only on confirmed progress.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      signal?.throwIfAborted();
+      const remaining = data.subarray(offset);
+      const putRes = await authorizedFetch(
+        session.href,
+        {
+          method: "PUT",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(remaining.byteLength),
+            "Content-Range": `bytes ${offset}-${data.byteLength - 1}/${data.byteLength}`,
+          },
+          body: copyToArrayBuffer(remaining),
+        },
+        signal,
+      );
+      if (putRes.ok) return (await putRes.json()) as DriveFileRecord;
+      if (putRes.status !== 308)
+        throw await classifyHttpError(putRes, "upload");
+
+      const acknowledged = /^bytes=0-(\d+)$/.exec(
+        putRes.headers.get("range") ?? "",
+      );
+      await putRes.body?.cancel();
+      const next = acknowledged ? Number(acknowledged[1]) + 1 : 0;
+      if (
+        !Number.isSafeInteger(next) ||
+        next <= offset ||
+        next >= data.byteLength
+      )
+        throw new Error(
+          "Google Drive resumable upload did not acknowledge a valid advancing range",
+        );
+      offset = next;
+    }
+    throw new Error(
+      "Google Drive resumable upload exceeded its continuation limit",
+    );
   }
 
   return {

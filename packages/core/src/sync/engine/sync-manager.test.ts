@@ -401,7 +401,7 @@ describe("SyncManager", () => {
     }
   });
 
-  it("checks for lost data points once per boot, then retries only failed scopes, a bounded number of times", async () => {
+  it("checks for lost data points once per boot, then keeps retrying failed scopes on every cycle until they recover", async () => {
     const check = vi.mocked(requeueLostDataPoints);
     check.mockReset();
     check
@@ -417,9 +417,27 @@ describe("SyncManager", () => {
 
     for (let i = 0; i < 8; i += 1) await manager.trigger();
 
-    expect(check).toHaveBeenCalledTimes(5);
+    expect(check).toHaveBeenCalledTimes(8);
     expect(check.mock.calls[0]?.[1]).toBeUndefined();
     expect(check.mock.calls[1]?.[1]).toEqual(["a.scope"]);
+    expect(check.mock.calls[7]?.[1]).toEqual(["a.scope"]);
+  });
+
+  it("keeps retrying the lost data point check after it throws", async () => {
+    const check = vi.mocked(requeueLostDataPoints);
+    check.mockReset();
+    check.mockRejectedValue(new Error("lookup failed"));
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      {
+        pollInterval: 60_000,
+      },
+    );
+
+    for (let i = 0; i < 8; i += 1) await manager.trigger();
+
+    expect(check).toHaveBeenCalledTimes(8);
   });
 
   it("stops checking after a clean full pass", async () => {

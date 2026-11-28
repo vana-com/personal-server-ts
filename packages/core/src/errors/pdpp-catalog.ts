@@ -153,14 +153,18 @@ export class PdppError extends Error {
     this.param = options?.param;
   }
 
-  toJSON(requestId: string): PdppErrorBody {
+  toJSON(requestId?: string): PdppErrorBody {
+    const id =
+      typeof requestId === "string" && requestId.trim()
+        ? requestId
+        : crypto.randomUUID();
     return {
       error: {
         type: this.type,
         code: this.code,
         message: this.message,
         ...(this.param !== undefined && { param: this.param }),
-        request_id: requestId,
+        request_id: id,
       },
     };
   }

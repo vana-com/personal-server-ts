@@ -845,3 +845,103 @@ it("a stream refused before its rows were counted is still reported when a later
     rows: 0,
   });
 });
+
+it("does not seed rows after a non-deletion receipt lookup failure", async () => {
+  const scopes: Versions = new Map([
+    ["spotify.saved_tracks", [version([{ id: "track" }])]],
+  ]);
+  const { intake, puts } = recordingIntake();
+  const unavailable = new Error("synthetic receipt unavailable");
+  let ready = false;
+  const live = createLiteLegacyStoreRunner({
+    storage: memoryStorage(scopes),
+    intake: async () => ({
+      ...intake,
+      status: async (...args: Parameters<SeedIntake["status"]>) => {
+        if (!ready) throw unavailable;
+        return intake.status(...args);
+      },
+    }),
+    manifests: () => [manifest],
+  });
+  await expect(live.run(new AbortController().signal)).rejects.toBe(
+    unavailable,
+  );
+  expect(live.report()).toBeNull();
+  expect(puts).toEqual([]);
+  expect(scopes.get("spotify.saved_tracks")).toHaveLength(1);
+  ready = true;
+  await live.run(new AbortController().signal);
+  expect(puts).toEqual(["spotify.saved_tracks"]);
+  expect(live.report()?.rows.staged).toBe(1);
+});
+
+it("keeps the last completed report when a later legacy scan is cancelled", async () => {
+  const scopes: Versions = new Map();
+  const controller = new AbortController();
+  const base = memoryStorage(scopes) as unknown as {
+    listScopes: () => unknown;
+    listVersions: (scope: string) => unknown;
+    readEnvelope: (scope: string, at: string) => Promise<unknown>;
+  };
+  const { intake, puts } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: {
+      ...base,
+      readEnvelope: async (scope: string, at: string) => {
+        controller.abort();
+        return base.readEnvelope(scope, at);
+      },
+    } as never,
+    intake: async () => intake,
+    manifests: () => [manifest],
+  });
+  await live.run(new AbortController().signal);
+  const completed = live.report();
+  expect(completed).not.toBeNull();
+  scopes.set("spotify.saved_tracks", [version([{ id: "track" }])]);
+  await live.run(controller.signal).catch((error: unknown) => {
+    if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+  });
+  expect(controller.signal.aborted).toBe(true);
+  expect(live.report()).toBe(completed);
+  expect(puts).toEqual([]);
+});
+
+it("publishes a completed empty import with the injected finish time", async () => {
+  const { intake, puts } = recordingIntake();
+  const live = createLiteLegacyStoreRunner({
+    storage: memoryStorage(new Map()),
+    intake: async () => intake,
+    manifests: () => [manifest],
+    now: () => 123,
+  });
+  expect(live.report()).toBeNull();
+  await live.run(new AbortController().signal);
+  expect(live.report()).toMatchObject({
+    finishedAt: 123,
+    stopped: false,
+    rows: { legacy: 0, staged: 0 },
+  });
+  expect(puts).toEqual([]);
+});
+
+it("does not replace the last completed report when the next intake is unavailable", async () => {
+  const { intake } = recordingIntake();
+  const notReady = new Error("synthetic intake unavailable");
+  let available = true;
+  const live = createLiteLegacyStoreRunner({
+    storage: memoryStorage(new Map()),
+    intake: async () => {
+      if (!available) throw notReady;
+      return intake;
+    },
+    manifests: () => [manifest],
+  });
+  await live.run(new AbortController().signal);
+  const completed = live.report();
+  expect(completed).not.toBeNull();
+  available = false;
+  await expect(live.run(new AbortController().signal)).rejects.toBe(notReady);
+  expect(live.report()).toEqual(completed);
+});

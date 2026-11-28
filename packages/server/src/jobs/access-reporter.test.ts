@@ -70,6 +70,51 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("access reporter refusal boundaries", () => {
+  it("does not salvage a batch when a 422 happens to name an index", async () => {
+    const send = vi.fn(async () =>
+      refusal(422, { code: "not_accepted", rejected: [{ index: 0 }] }),
+    );
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(logIdsOf(send.mock.calls[0])).toEqual(["log-1", "log-2"]);
+    expect(warn.mock.calls).toEqual([
+      [
+        {
+          count: 2,
+          droppedTotal: 2,
+          reason: "refused_422",
+          code: "not_accepted",
+          attempts: 1,
+        },
+        ACCESS_RECORDS_DROPPED,
+      ],
+    ]);
+  });
+
+  it("refuses a non-JSON 400 once and sends the next batch normally", async () => {
+    const send = okFetch();
+    send.mockResolvedValueOnce(new Response("not json", { status: 400 }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.flush();
+    await instance.report(event(2));
+    await instance.flush();
+
+    expect(send.mock.calls.map(logIdsOf)).toEqual([["log-1"], ["log-2"]]);
+    expect(warn.mock.calls).toEqual([
+      [
+        { count: 1, droppedTotal: 1, reason: "refused_400", attempts: 1 },
+        ACCESS_RECORDS_DROPPED,
+      ],
+    ]);
+  });
+});
+
 describe("access reporter batching", () => {
   it("holds a partial batch until the flush interval", async () => {
     const send = okFetch();
@@ -330,6 +375,38 @@ describe("access reporter batching", () => {
     );
   });
 
+  it("keeps the whole-batch refusal when an index is supplied as text", async () => {
+    const send = vi.fn(async () => refusal(400, { index: "0" }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(logIdsOf(send.mock.calls[0])).toEqual(["log-1", "log-2"]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "refused_400", count: 2, attempts: 1 }),
+      ACCESS_RECORDS_DROPPED,
+    );
+  });
+
+  it("resends every record when a transient error body names a record index", async () => {
+    const send = okFetch();
+    send.mockResolvedValueOnce(refusal(503, { index: 0 }));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+
+    const flushed = instance.flush();
+    await vi.advanceTimersByTimeAsync(500);
+    await flushed;
+
+    expect(send.mock.calls.map(logIdsOf)).toEqual([
+      ["log-1", "log-2"],
+      ["log-1", "log-2"],
+    ]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("retries a transient failure with backoff before giving up", async () => {
     const send = vi.fn(async () => {
       throw new Error("connect ECONNREFUSED");
@@ -404,6 +481,86 @@ describe("access reporter batching", () => {
       expect.objectContaining({ attempts: 1 }),
       ACCESS_RECORDS_DROPPED,
     );
+  });
+});
+
+describe("access reporter recovery after delivery failures", () => {
+  it("gives a timed-out request a new deadline on retry", async () => {
+    const first = new AbortController();
+    const second = new AbortController();
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValueOnce(first.signal)
+      .mockReturnValueOnce(second.signal);
+    try {
+      const send = vi
+        .fn<typeof fetch>()
+        .mockImplementationOnce(
+          (_url, init) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(first.signal.reason),
+                { once: true },
+              );
+            }),
+        )
+        .mockResolvedValueOnce(new Response(null, { status: 202 }));
+      const { instance, warn } = reporter(send);
+      await instance.report(event(1));
+      const flushed = instance.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(send.mock.calls[0]?.[1]?.signal).toBe(first.signal);
+      first.abort(new Error("fixture request timed out"));
+      await vi.advanceTimersByTimeAsync(500);
+      await flushed;
+
+      expect(send.mock.calls[1]?.[1]?.signal).toBe(second.signal);
+      expect(timeout.mock.calls).toEqual([[10_000], [10_000]]);
+      expect(send.mock.calls.map(logIdsOf)).toEqual([["log-1"], ["log-1"]]);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("reports the remainder when salvage loses its connection without blocking the next batch", async () => {
+    const send = okFetch()
+      .mockResolvedValueOnce(refusal(400, { code: "invalid_record", index: 0 }))
+      .mockRejectedValueOnce(new Error("fixture connection lost"));
+    const { instance, warn } = reporter(send as unknown as typeof fetch);
+    await instance.report(event(1));
+    await instance.report(event(2));
+    await instance.flush();
+    await instance.report(event(3));
+    await instance.flush();
+
+    expect(send.mock.calls.map(logIdsOf)).toEqual([
+      ["log-1", "log-2"],
+      ["log-2"],
+      ["log-3"],
+    ]);
+    expect(warn.mock.calls).toEqual([
+      [
+        {
+          count: 1,
+          droppedTotal: 1,
+          reason: "refused_400",
+          code: "invalid_record",
+          attempts: 1,
+        },
+        ACCESS_RECORDS_DROPPED,
+      ],
+      [
+        {
+          count: 1,
+          droppedTotal: 2,
+          reason: "fixture connection lost",
+          attempts: 1,
+        },
+        ACCESS_RECORDS_DROPPED,
+      ],
+    ]);
   });
 });
 

@@ -99,6 +99,44 @@ describe("createGatewayLineageClient", () => {
     await expect(client.getDataPoint(ID)).rejects.toThrow(/Gateway error: 503/);
   });
 
+  it("getDataPoint rejects a malformed successful response instead of returning no record", async () => {
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      fetch: vi
+        .fn()
+        .mockResolvedValue(new Response("not JSON", { status: 200 })),
+    });
+    await expect(client.getDataPoint(ID)).rejects.toThrow(
+      "Gateway error: malformed data point response",
+    );
+  });
+
+  it("getDataPoint preserves a transport failure instead of returning no record", async () => {
+    const failure = new TypeError("synthetic gateway transport failure");
+    const fetchMock = vi.fn().mockRejectedValue(failure);
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      fetch: fetchMock,
+    });
+    await expect(client.getDataPoint(ID)).rejects.toBe(failure);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("getLineage does not contact the gateway when signing fails", async () => {
+    const failure = new Error("synthetic signing failure");
+    const fetchMock = vi.fn();
+    const client = createGatewayLineageClient({
+      gatewayUrl: GATEWAY_URL,
+      requestSigner: {
+        ...requestSignerFor(createTestWallet(5)),
+        signRequest: vi.fn().mockRejectedValue(failure),
+      },
+      fetch: fetchMock,
+    });
+    await expect(client.getLineage({ dataPointId: ID })).rejects.toBe(failure);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("getLineage signs the request as the server: version in the path, grant view as the grantId claim", async () => {
     const wallet = createTestWallet(5);
     // The served view is attested for the grant that was requested.
@@ -433,5 +471,25 @@ describe("stored lineage presentation", () => {
       `0x${"CD".repeat(32)}`,
       `0x${"AB".repeat(32)}`,
     ]);
+  });
+});
+
+describe("stored lineage representation boundaries", () => {
+  it("distinguishes a root record from a present non-object lineage field", async () => {
+    const { readStoredLineage, StoredLineageMalformedError } =
+      await import("./lineage.js");
+    expect(readStoredLineage({ name: "fixture" })).toBeNull();
+    expect(() => readStoredLineage({ $lineage: null })).toThrow(
+      StoredLineageMalformedError,
+    );
+  });
+
+  it("rejects a stored timestamp with the wrong type without dropping the statement", async () => {
+    const { readStoredLineage } = await import("./lineage.js");
+    expect(() =>
+      readStoredLineage({
+        $lineage: { sources: [`0x${"ab".repeat(32)}`], writtenAt: 123 },
+      }),
+    ).toThrow("writtenAt is not a string");
   });
 });

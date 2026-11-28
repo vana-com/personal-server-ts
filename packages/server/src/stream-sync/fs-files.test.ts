@@ -58,6 +58,37 @@ describe("createFsStreamSyncFiles appendMany and sync", () => {
     expect(await files.read("one.bin")).toEqual(enc.encode("fixture"));
   });
 
+  it("reports a failed append without losing earlier bytes or writing later entries", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.write("reserved-dir/existing", enc.encode("keep"));
+    try {
+      await expect(
+        files.appendMany([
+          { path: "kept.bin", bytes: enc.encode("written") },
+          { path: "reserved-dir", bytes: enc.encode("not a regular file") },
+          { path: "never.bin", bytes: enc.encode("not reached") },
+        ]),
+      ).rejects.toMatchObject({ code: "EISDIR" });
+      expect(await files.read("kept.bin")).toEqual(enc.encode("written"));
+      expect(await files.read("never.bin")).toBeNull();
+      expect(await files.read("reserved-dir/existing")).toEqual(
+        enc.encode("keep"),
+      );
+    } finally {
+      await files.sync("");
+    }
+  });
+
+  it("reports a directory passed to chunk reads instead of returning an empty byte stream", async () => {
+    const files = createFsStreamSyncFiles(root);
+    await files.write("folder/child", enc.encode("unchanged"));
+    const collect = async () => {
+      for await (const chunk of files.readChunks("folder")) void chunk;
+    };
+    await expect(collect()).rejects.toMatchObject({ code: "EISDIR" });
+    expect(await files.read("folder/child")).toEqual(enc.encode("unchanged"));
+  });
+
   it("keeps appended bytes readable at once, in order, across many files", async () => {
     const files = createFsStreamSyncFiles(root);
     for (let round = 0; round < 3; round += 1) {

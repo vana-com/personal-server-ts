@@ -228,6 +228,32 @@ describe("the write gate and the read selector share one answer", () => {
     }
   });
 
+  it.each([
+    { mode: "unknown" as const, status: 503, code: "ACCOUNT_MODE_UNKNOWN" },
+    { mode: "switched" as const, status: 426, code: "update_required" },
+  ])(
+    "refuses a $mode write before consuming a malformed body",
+    async ({ mode, status, code }) => {
+      const request = new Request("https://ps.example/notes.entries", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "vana-stream-sync-client": "true",
+        },
+        body: "{",
+      });
+      const response = await handlePersonalServerDataRequest(
+        request,
+        dataDeps({
+          accountStorageMode: fixedOwnedAccountStorageMode(mode, OWNER_A),
+        }),
+      );
+      expect(response.status).toBe(status);
+      expect((await response.json()).error.errorCode).toBe(code);
+      expect(request.bodyUsed).toBe(false);
+    },
+  );
+
   // GATE_AND_SELECTOR_DISAGREE
   it("refuses a legacy write with a retryable 503 when the mode is unknown", async () => {
     const write = await handlePersonalServerDataRequest(
@@ -314,5 +340,27 @@ describe("legacy refusal wire contracts", () => {
     expect(switched.verdict).toBe("switched");
     expect(switched.response.status).toBe(426);
     expect(switched.response.headers.get("retry-after")).toBe(null);
+  });
+});
+
+describe("legacy mode verdict adaptation", () => {
+  it("returns no refusal for the explicit unswitched mode", () => {
+    const read = vi.fn(() => "unswitched" as const);
+    expect(refuseLegacyWrite({ read })).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("infers the verdict when a caller wraps a legacy refusal response directly", async () => {
+    const { LegacyWriteRefusedError, updateRequiredResponse } =
+      await import("./legacy-write-gate.js");
+    const switched = updateRequiredResponse();
+    const paused = accountModeUnknownResponse();
+    const switchedError = new LegacyWriteRefusedError(switched);
+    const pausedError = new LegacyWriteRefusedError(paused);
+
+    expect(switchedError.verdict).toBe("switched");
+    expect(switchedError.response).toBe(switched);
+    expect(pausedError.verdict).toBe("unknown");
+    expect(pausedError.response).toBe(paused);
   });
 });

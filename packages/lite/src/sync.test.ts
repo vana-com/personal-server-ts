@@ -443,7 +443,10 @@ describe("PS Lite sync", () => {
           reason: "unregistered",
         });
         lookups[0]!({ id: "server-1" });
-        expect(await older).toMatchObject({ ok: false });
+        expect(await older).toMatchObject({
+          ok: false,
+          reason: "registration_check_failed",
+        });
       } finally {
         await manager.stop();
       }
